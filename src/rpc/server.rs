@@ -1,7 +1,7 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 use pluvio_runtime::executor::Runtime;
-use pluvio_ucx::{Worker, endpoint::Endpoint};
+use pluvio_ucx::{async_ucx::ucp::WorkerAddress, Worker};
 
 use crate::rpc::{AmRpc, RpcError, Serializable};
 
@@ -20,32 +20,19 @@ use crate::rpc::{AmRpc, RpcError, Serializable};
 /// RPC server that receives and dispatches ActiveMessages
 pub struct RpcServer {
     worker: Rc<Worker>,
-    connections: RefCell<HashMap<String, Endpoint>>,
 }
 
 impl RpcServer {
     pub fn new(worker: Rc<Worker>) -> Self {
-        Self {
-            worker,
-            connections: RefCell::new(HashMap::new()),
-        }
+        Self { worker }
     }
 
-    /// Register a client connection with an identifier
-    /// This allows the server to send replies back to clients
-    pub fn register_connection(&self, id: String, endpoint: Endpoint) {
-        self.connections.borrow_mut().insert(id, endpoint);
+    pub fn get_address(&self) -> Result<WorkerAddress, RpcError> {
+        self.worker.address().map_err(|e| {
+            RpcError::TransportError(format!("Failed to get worker address: {:?}", e))
+        })
     }
 
-    /// Unregister a client connection
-    pub fn unregister_connection(&self, id: &str) {
-        self.connections.borrow_mut().remove(id);
-    }
-
-    // /// Register an RPC handler for a specific RPC ID
-    // pub fn register_handler(&self, rpc_id: RpcId, handler: RpcHandlerFn) {
-    //     self.handlers.borrow_mut().insert(rpc_id, handler);
-    // }
 
     /// Start listening for RPC requests on the given AM stream ID
     ///

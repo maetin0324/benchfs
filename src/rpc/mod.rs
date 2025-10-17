@@ -99,6 +99,12 @@ pub trait AmRpc {
     /// Get the RPC ID for this operation
     fn rpc_id() -> RpcId;
 
+    /// Get the reply stream ID for this operation
+    /// By default, this is rpc_id() + 100 to avoid conflicts with request stream
+    fn reply_stream_id() -> u16 {
+        Self::rpc_id() + 100
+    }
+
     /// Get the RPC call type
     /// Override this method if your RPC uses RDMA operations
     fn call_type(&self) -> AmRpcCallType {

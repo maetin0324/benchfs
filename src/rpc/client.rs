@@ -43,12 +43,13 @@ impl RpcClient {
     /// ```
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         let rpc_id = T::rpc_id();
+        let reply_stream_id = T::reply_stream_id();
         let header = request.request_header();
         let data = request.request_data();
         let need_reply = request.need_reply();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        let reply_stream = self.conn.worker.am_stream(rpc_id).map_err(|e| {
+        let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
                 "Failed to create reply AM stream: {:?}",
                 e.to_string()

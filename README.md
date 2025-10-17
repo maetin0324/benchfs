@@ -66,6 +66,26 @@ BenchFS は、UCX (Unified Communication X) の ActiveMessage 機能を用いた
   - FromBytes/IntoBytes traits
   - ゼロコピーバイト変換
 
+## 実行方法
+
+サンプルコード `examples/rpc_example.rs` で RPC システムを試すことができます。
+
+### サーバー起動
+
+```bash
+cargo run --example rpc_example -- server
+```
+
+### クライアント実行
+
+別のターミナルで:
+
+```bash
+cargo run --example rpc_example -- client
+```
+
+サーバーが Read/Write RPC リクエストを処理し、クライアントがレスポンスを受信します。
+
 ## 使用例
 
 ### 1. RPC リクエスト/レスポンス構造体の定義
