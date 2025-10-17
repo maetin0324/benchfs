@@ -2,10 +2,12 @@
 pub mod error;
 pub mod iouring;
 pub mod local;
+pub mod chunk_store;
 
 pub use error::{StorageError, StorageResult};
 pub use iouring::IOUringBackend;
 pub use local::LocalFileSystem;
+pub use chunk_store::{InMemoryChunkStore, FileChunkStore, ChunkStoreError, ChunkStoreResult, ChunkKey};
 
 use std::path::Path;
 

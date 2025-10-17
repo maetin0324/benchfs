@@ -176,25 +176,29 @@ impl LocalFileSystem {
         metadata.owner_node = "local".to_string();
         metadata.permissions.mode = mode;
 
-        let mut path_to_inode = self.path_to_inode.borrow_mut();
-        path_to_inode.insert(path.to_path_buf(), inode);
+        // 親ディレクトリのinodeを先に取得（borrowの競合を避けるため）
+        let parent_inode_opt = path.parent().and_then(|p| self.get_inode(p));
 
-        let mut file_metadata = self.file_metadata.borrow_mut();
-        file_metadata.insert(inode, metadata);
+        {
+            let mut path_to_inode = self.path_to_inode.borrow_mut();
+            path_to_inode.insert(path.to_path_buf(), inode);
+        }
+
+        {
+            let mut file_metadata = self.file_metadata.borrow_mut();
+            file_metadata.insert(inode, metadata);
+        }
 
         // 親ディレクトリのメタデータを更新
-        if let Some(parent) = path.parent() {
-            let parent_inode = self.get_inode(parent); // 先にinodeを取得
-            if let Some(parent_inode) = parent_inode {
-                let mut dir_metadata = self.dir_metadata.borrow_mut();
-                if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
-                    let filename = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    parent_meta.add_child(filename, inode, InodeType::File);
-                }
+        if let Some(parent_inode) = parent_inode_opt {
+            let mut dir_metadata = self.dir_metadata.borrow_mut();
+            if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
+                let filename = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                parent_meta.add_child(filename, inode, InodeType::File);
             }
         }
 
@@ -220,25 +224,29 @@ impl LocalFileSystem {
         // バックエンドでファイルを削除
         self.backend.unlink(&physical_path).await?;
 
-        // メタデータを削除
-        let mut path_to_inode = self.path_to_inode.borrow_mut();
-        path_to_inode.remove(path);
+        // 親ディレクトリのinodeを先に取得（borrowの競合を避けるため）
+        let parent_inode_opt = path.parent().and_then(|p| self.get_inode(p));
 
-        let mut file_metadata = self.file_metadata.borrow_mut();
-        file_metadata.remove(&inode);
+        // メタデータを削除
+        {
+            let mut path_to_inode = self.path_to_inode.borrow_mut();
+            path_to_inode.remove(path);
+        }
+
+        {
+            let mut file_metadata = self.file_metadata.borrow_mut();
+            file_metadata.remove(&inode);
+        }
 
         // 親ディレクトリのメタデータを更新
-        if let Some(parent) = path.parent() {
-            let parent_inode = self.get_inode(parent); // 先にinodeを取得
-            if let Some(parent_inode) = parent_inode {
-                let mut dir_metadata = self.dir_metadata.borrow_mut();
-                if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
-                    let filename = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    parent_meta.remove_child(filename);
-                }
+        if let Some(parent_inode) = parent_inode_opt {
+            let mut dir_metadata = self.dir_metadata.borrow_mut();
+            if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
+                let filename = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                parent_meta.remove_child(filename);
             }
         }
 
@@ -324,17 +332,21 @@ impl LocalFileSystem {
         // バックエンドでディレクトリを削除
         self.backend.rmdir(&physical_path).await?;
 
+        // 親ディレクトリのinodeを先に取得（borrowの競合を避けるため）
+        let parent_inode_opt = path.parent().and_then(|p| self.get_inode(p));
+
         // メタデータを削除
-        let mut path_to_inode = self.path_to_inode.borrow_mut();
-        path_to_inode.remove(path);
+        {
+            let mut path_to_inode = self.path_to_inode.borrow_mut();
+            path_to_inode.remove(path);
+        }
 
-        let mut dir_metadata = self.dir_metadata.borrow_mut();
-        dir_metadata.remove(&inode);
+        {
+            let mut dir_metadata = self.dir_metadata.borrow_mut();
+            dir_metadata.remove(&inode);
 
-        // 親ディレクトリのメタデータを更新
-        if let Some(parent) = path.parent() {
-            let parent_inode = self.get_inode(parent); // 先にinodeを取得
-            if let Some(parent_inode) = parent_inode {
+            // 親ディレクトリのメタデータを更新
+            if let Some(parent_inode) = parent_inode_opt {
                 if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
                     let dirname = path
                         .file_name()
@@ -379,42 +391,95 @@ impl LocalFileSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pluvio_runtime::executor::Runtime;
+    use pluvio_uring::reactor::IoUringReactor;
+    use std::time::Duration;
     use tempfile::TempDir;
 
-    // Note: LocalFileSystemのテストはIOUringBackendを使用するため、
-    // Pluvio runtimeが必要です。ここではメタデータ操作のみテストします。
+    fn setup_runtime() -> Rc<Runtime> {
+        let runtime = Runtime::new(1024);
 
-    #[tokio::test]
-    async fn test_create_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
+        // IoUringReactorを初期化して登録
+        let reactor = IoUringReactor::builder()
+            .queue_size(2048)
+            .buffer_size(1 << 20) // 1 MiB
+            .submit_depth(64)
+            .wait_submit_timeout(Duration::from_millis(100))
+            .wait_complete_timeout(Duration::from_millis(150))
+            .build();
 
-        let dir_path = Path::new("/testdir");
-
-        // ディレクトリを作成
-        fs.create_directory(dir_path, 0o755).await.unwrap();
-
-        // メタデータを確認
-        let metadata = fs.get_dir_metadata(2).unwrap();
-        assert_eq!(metadata.path, "/testdir");
-        assert_eq!(metadata.inode, 2);
+        // Runtime::newは既にRc<Runtime>を返す
+        runtime.register_reactor("io_uring_reactor", reactor);
+        runtime
     }
 
-    #[tokio::test]
-    async fn test_list_directory() {
+    #[test]
+    fn test_create_directory() {
+        let runtime = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
-        let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
 
-        // ディレクトリを作成
-        fs.create_directory(Path::new("/dir1"), 0o755)
-            .await
-            .unwrap();
+        runtime.clone().run(async move {
+            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
 
-        // ルートディレクトリの内容を一覧
-        let entries = fs.list_directory(Path::new("/")).await.unwrap();
+            let dir_path = Path::new("/testdir");
 
-        assert_eq!(entries.len(), 1);
-        assert!(entries.contains(&("dir1".to_string(), InodeType::Directory)));
+            // ディレクトリを作成
+            fs.create_directory(dir_path, 0o755).await.unwrap();
+
+            // メタデータを確認
+            let metadata = fs.get_dir_metadata(2).unwrap();
+            assert_eq!(metadata.path, "/testdir");
+            assert_eq!(metadata.inode, 2);
+        });
+    }
+
+    #[test]
+    fn test_list_directory() {
+        let runtime = setup_runtime();
+        let temp_dir = TempDir::new().unwrap();
+
+        runtime.clone().run(async move {
+            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
+
+            // ディレクトリを作成
+            fs.create_directory(Path::new("/dir1"), 0o755)
+                .await
+                .unwrap();
+
+            // ルートディレクトリの内容を一覧
+            let entries = fs.list_directory(Path::new("/")).await.unwrap();
+
+            assert_eq!(entries.len(), 1);
+            assert!(entries.contains(&("dir1".to_string(), InodeType::Directory)));
+        });
+    }
+
+    #[test]
+    fn test_create_and_open_file() {
+        let runtime = setup_runtime();
+        let temp_dir = TempDir::new().unwrap();
+
+        runtime.clone().run(async move {
+            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
+
+            let file_path = Path::new("/test.txt");
+
+            // ファイルを作成
+            let handle = fs.create_file(file_path, 0o644).await.unwrap();
+            fs.backend().close(handle).await.unwrap();
+
+            // ファイルを開く
+            let handle = fs
+                .open_file(file_path, OpenFlags::read_only())
+                .await
+                .unwrap();
+            fs.backend().close(handle).await.unwrap();
+
+            // メタデータを確認
+            let metadata = fs.get_file_metadata(2).unwrap(); // inode=2 (1はルート)
+            assert_eq!(metadata.path, "/test.txt");
+            assert_eq!(metadata.size, 0);
+        });
     }
 
     #[test]

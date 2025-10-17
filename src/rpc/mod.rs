@@ -6,6 +6,9 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 use crate::rpc::client::RpcClient;
 
 pub mod file_ops;
+pub mod data_ops;
+pub mod metadata_ops;
+pub mod handlers;
 pub mod server;
 pub mod client;
 

@@ -36,8 +36,5 @@ async-trait = "0.1"
 # System
 libc = "0.2"
 
-# Async runtime (for tests)
-tokio = { version = "1", features = ["full"] }
-
 [dev-dependencies]
 tempfile = "3.0"
