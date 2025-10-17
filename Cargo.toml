@@ -8,3 +8,4 @@ pluvio_runtime = { git = "https://github.com/maetin0324/pluvio", package = "pluv
 pluvio_uring = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_uring" }
 pluvio_ucx = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_ucx" }
 zerocopy = { version = "0.8.27", features = ["std", "derive"] }
+tracing = "0.1.41"
