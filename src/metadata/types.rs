@@ -247,12 +247,18 @@ mod tests {
 
     #[test]
     fn test_file_metadata_chunk_size() {
+        // CHUNK_SIZE = 4MB
+        // size = 10MB + 1KB = 3チャンク必要
+        // chunk 0: 4MB
+        // chunk 1: 4MB
+        // chunk 2: 2MB + 1KB (最終チャンク)
         let size = 10 * 1024 * 1024 + 1024; // 10MB + 1KB
         let meta = FileMetadata::new(1, "/test/file.txt".to_string(), size);
 
+        assert_eq!(meta.chunk_count, 3); // 3チャンク必要
         assert_eq!(meta.chunk_size(0), crate::metadata::CHUNK_SIZE as u64);
         assert_eq!(meta.chunk_size(1), crate::metadata::CHUNK_SIZE as u64);
-        assert_eq!(meta.chunk_size(2), 1024); // 最終チャンク
+        assert_eq!(meta.chunk_size(2), 2 * 1024 * 1024 + 1024); // 2MB + 1KB
         assert_eq!(meta.chunk_size(3), 0); // 範囲外
     }
 
