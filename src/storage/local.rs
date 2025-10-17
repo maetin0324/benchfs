@@ -9,31 +9,33 @@ use crate::metadata::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// ローカルファイルシステム
 ///
 /// ファイルとディレクトリのメタデータを管理し、
 /// IOURINGバックエンドを使ってデータI/Oを行う
+///
+/// Note: シングルスレッド設計のため、RcとRefCellを使用
 pub struct LocalFileSystem {
     /// ストレージバックエンド (IOURING)
-    backend: Arc<IOUringBackend>,
+    backend: Rc<IOUringBackend>,
 
     /// ルートディレクトリ
     root: PathBuf,
 
     /// Inodeカウンター
-    next_inode: Arc<RwLock<InodeId>>,
+    next_inode: RefCell<InodeId>,
 
     /// パス -> Inode マッピング
-    path_to_inode: Arc<RwLock<HashMap<PathBuf, InodeId>>>,
+    path_to_inode: RefCell<HashMap<PathBuf, InodeId>>,
 
     /// Inode -> ファイルメタデータ
-    file_metadata: Arc<RwLock<HashMap<InodeId, FileMetadata>>>,
+    file_metadata: RefCell<HashMap<InodeId, FileMetadata>>,
 
     /// Inode -> ディレクトリメタデータ
-    dir_metadata: Arc<RwLock<HashMap<InodeId, DirectoryMetadata>>>,
+    dir_metadata: RefCell<HashMap<InodeId, DirectoryMetadata>>,
 }
 
 impl LocalFileSystem {
@@ -51,7 +53,7 @@ impl LocalFileSystem {
             )));
         }
 
-        let backend = Arc::new(IOUringBackend::new());
+        let backend = Rc::new(IOUringBackend::new());
 
         let mut path_to_inode = HashMap::new();
         let mut dir_metadata = HashMap::new();
@@ -67,16 +69,16 @@ impl LocalFileSystem {
         Ok(Self {
             backend,
             root,
-            next_inode: Arc::new(RwLock::new(2)), // 1はルート用
-            path_to_inode: Arc::new(RwLock::new(path_to_inode)),
-            file_metadata: Arc::new(RwLock::new(HashMap::new())),
-            dir_metadata: Arc::new(RwLock::new(dir_metadata)),
+            next_inode: RefCell::new(2), // 1はルート用
+            path_to_inode: RefCell::new(path_to_inode),
+            file_metadata: RefCell::new(HashMap::new()),
+            dir_metadata: RefCell::new(dir_metadata),
         })
     }
 
     /// 新しいInodeを割り当て
-    async fn allocate_inode(&self) -> InodeId {
-        let mut next_inode = self.next_inode.write().await;
+    fn allocate_inode(&self) -> InodeId {
+        let mut next_inode = self.next_inode.borrow_mut();
         let inode = *next_inode;
         *next_inode += 1;
         inode
@@ -94,20 +96,20 @@ impl LocalFileSystem {
     }
 
     /// パスからInodeを取得
-    async fn get_inode(&self, path: &Path) -> Option<InodeId> {
-        let path_to_inode = self.path_to_inode.read().await;
+    fn get_inode(&self, path: &Path) -> Option<InodeId> {
+        let path_to_inode = self.path_to_inode.borrow();
         path_to_inode.get(path).copied()
     }
 
     /// ファイルメタデータを取得
-    pub async fn get_file_metadata(&self, inode: InodeId) -> Option<FileMetadata> {
-        let file_metadata = self.file_metadata.read().await;
+    pub fn get_file_metadata(&self, inode: InodeId) -> Option<FileMetadata> {
+        let file_metadata = self.file_metadata.borrow();
         file_metadata.get(&inode).cloned()
     }
 
     /// ディレクトリメタデータを取得
-    pub async fn get_dir_metadata(&self, inode: InodeId) -> Option<DirectoryMetadata> {
-        let dir_metadata = self.dir_metadata.read().await;
+    pub fn get_dir_metadata(&self, inode: InodeId) -> Option<DirectoryMetadata> {
+        let dir_metadata = self.dir_metadata.borrow();
         dir_metadata.get(&inode).cloned()
     }
 
@@ -124,10 +126,10 @@ impl LocalFileSystem {
         let handle = self.backend.open(&physical_path, flags).await?;
 
         // メタデータを登録 (存在しない場合)
-        let inode = match self.get_inode(path).await {
+        let inode = match self.get_inode(path) {
             Some(inode) => inode,
             None => {
-                let inode = self.allocate_inode().await;
+                let inode = self.allocate_inode();
                 let stat = self.backend.stat(&physical_path).await?;
 
                 let mut metadata = FileMetadata::new(inode, path.display().to_string(), stat.size);
@@ -136,10 +138,10 @@ impl LocalFileSystem {
                 metadata.permissions.uid = stat.uid;
                 metadata.permissions.gid = stat.gid;
 
-                let mut path_to_inode = self.path_to_inode.write().await;
+                let mut path_to_inode = self.path_to_inode.borrow_mut();
                 path_to_inode.insert(path.to_path_buf(), inode);
 
-                let mut file_metadata = self.file_metadata.write().await;
+                let mut file_metadata = self.file_metadata.borrow_mut();
                 file_metadata.insert(inode, metadata);
 
                 inode
@@ -169,21 +171,21 @@ impl LocalFileSystem {
         let handle = self.backend.create(&physical_path, mode).await?;
 
         // メタデータを登録
-        let inode = self.allocate_inode().await;
+        let inode = self.allocate_inode();
         let mut metadata = FileMetadata::new(inode, path.display().to_string(), 0);
         metadata.owner_node = "local".to_string();
         metadata.permissions.mode = mode;
 
-        let mut path_to_inode = self.path_to_inode.write().await;
+        let mut path_to_inode = self.path_to_inode.borrow_mut();
         path_to_inode.insert(path.to_path_buf(), inode);
 
-        let mut file_metadata = self.file_metadata.write().await;
+        let mut file_metadata = self.file_metadata.borrow_mut();
         file_metadata.insert(inode, metadata);
 
         // 親ディレクトリのメタデータを更新
         if let Some(parent) = path.parent() {
-            if let Some(parent_inode) = self.get_inode(parent).await {
-                let mut dir_metadata = self.dir_metadata.write().await;
+            if let Some(parent_inode) = self.get_inode(parent) {
+                let mut dir_metadata = self.dir_metadata.borrow_mut();
                 if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
                     let filename = path
                         .file_name()
@@ -212,23 +214,22 @@ impl LocalFileSystem {
         // Inodeを取得
         let inode = self
             .get_inode(path)
-            .await
             .ok_or_else(|| StorageError::NotFound(path.display().to_string()))?;
 
         // バックエンドでファイルを削除
         self.backend.unlink(&physical_path).await?;
 
         // メタデータを削除
-        let mut path_to_inode = self.path_to_inode.write().await;
+        let mut path_to_inode = self.path_to_inode.borrow_mut();
         path_to_inode.remove(path);
 
-        let mut file_metadata = self.file_metadata.write().await;
+        let mut file_metadata = self.file_metadata.borrow_mut();
         file_metadata.remove(&inode);
 
         // 親ディレクトリのメタデータを更新
         if let Some(parent) = path.parent() {
-            if let Some(parent_inode) = self.get_inode(parent).await {
-                let mut dir_metadata = self.dir_metadata.write().await;
+            if let Some(parent_inode) = self.get_inode(parent) {
+                let mut dir_metadata = self.dir_metadata.borrow_mut();
                 if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
                     let filename = path
                         .file_name()
@@ -257,20 +258,20 @@ impl LocalFileSystem {
         self.backend.mkdir(&physical_path, mode).await?;
 
         // メタデータを登録
-        let inode = self.allocate_inode().await;
+        let inode = self.allocate_inode();
         let mut metadata = DirectoryMetadata::new(inode, path.display().to_string());
         metadata.owner_node = "local".to_string();
         metadata.permissions.mode = mode;
 
-        let mut path_to_inode = self.path_to_inode.write().await;
+        let mut path_to_inode = self.path_to_inode.borrow_mut();
         path_to_inode.insert(path.to_path_buf(), inode);
 
-        let mut dir_metadata = self.dir_metadata.write().await;
+        let mut dir_metadata = self.dir_metadata.borrow_mut();
         dir_metadata.insert(inode, metadata);
 
         // 親ディレクトリのメタデータを更新
         if let Some(parent) = path.parent() {
-            if let Some(parent_inode) = self.get_inode(parent).await {
+            if let Some(parent_inode) = self.get_inode(parent) {
                 if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
                     let dirname = path
                         .file_name()
@@ -299,12 +300,11 @@ impl LocalFileSystem {
         // Inodeを取得
         let inode = self
             .get_inode(path)
-            .await
             .ok_or_else(|| StorageError::NotFound(path.display().to_string()))?;
 
         // ディレクトリが空であることを確認
         {
-            let dir_metadata = self.dir_metadata.read().await;
+            let dir_metadata = self.dir_metadata.borrow();
             if let Some(metadata) = dir_metadata.get(&inode) {
                 if !metadata.children.is_empty() {
                     return Err(StorageError::Internal(
@@ -318,15 +318,15 @@ impl LocalFileSystem {
         self.backend.rmdir(&physical_path).await?;
 
         // メタデータを削除
-        let mut path_to_inode = self.path_to_inode.write().await;
+        let mut path_to_inode = self.path_to_inode.borrow_mut();
         path_to_inode.remove(path);
 
-        let mut dir_metadata = self.dir_metadata.write().await;
+        let mut dir_metadata = self.dir_metadata.borrow_mut();
         dir_metadata.remove(&inode);
 
         // 親ディレクトリのメタデータを更新
         if let Some(parent) = path.parent() {
-            if let Some(parent_inode) = self.get_inode(parent).await {
+            if let Some(parent_inode) = self.get_inode(parent) {
                 if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
                     let dirname = path
                         .file_name()
@@ -346,10 +346,9 @@ impl LocalFileSystem {
     pub async fn list_directory(&self, path: &Path) -> StorageResult<Vec<(String, InodeType)>> {
         let inode = self
             .get_inode(path)
-            .await
             .ok_or_else(|| StorageError::NotFound(path.display().to_string()))?;
 
-        let dir_metadata = self.dir_metadata.read().await;
+        let dir_metadata = self.dir_metadata.borrow();
         let metadata = dir_metadata
             .get(&inode)
             .ok_or_else(|| StorageError::NotFound(path.display().to_string()))?;
@@ -393,7 +392,7 @@ mod tests {
         fs.backend().close(handle).await.unwrap();
 
         // メタデータを確認
-        let metadata = fs.get_file_metadata(2).await.unwrap(); // inode=2 (1はルート)
+        let metadata = fs.get_file_metadata(2).unwrap(); // inode=2 (1はルート)
         assert_eq!(metadata.path, "/test.txt");
         assert_eq!(metadata.size, 0);
     }
@@ -409,7 +408,7 @@ mod tests {
         fs.create_directory(dir_path, 0o755).await.unwrap();
 
         // メタデータを確認
-        let metadata = fs.get_dir_metadata(2).await.unwrap();
+        let metadata = fs.get_dir_metadata(2).unwrap();
         assert_eq!(metadata.path, "/testdir");
     }
 

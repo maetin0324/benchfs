@@ -10,8 +10,13 @@ pub use local::LocalFileSystem;
 use std::path::Path;
 
 /// ストレージバックエンドトレイト
-#[async_trait::async_trait]
-pub trait StorageBackend: Send + Sync {
+///
+/// Note: このトレイトは Send + Sync を要求しない。
+/// BenchFSはシングルスレッド・マルチプロセスアーキテクチャを採用しており、
+/// 各プロセスは独立したアドレス空間で動作する。
+/// プロセス間通信はUCX (Shared Memory/RDMA) 経由で行われる。
+#[async_trait::async_trait(?Send)]
+pub trait StorageBackend {
     /// ファイルを開く
     async fn open(&self, path: &Path, flags: OpenFlags) -> StorageResult<FileHandle>;
 

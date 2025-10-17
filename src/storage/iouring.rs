@@ -60,7 +60,7 @@ impl Default for IOUringBackend {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl StorageBackend for IOUringBackend {
     async fn open(&self, path: &Path, flags: OpenFlags) -> StorageResult<FileHandle> {
         let opts = Self::flags_to_open_options(flags);
@@ -114,7 +114,7 @@ impl StorageBackend for IOUringBackend {
             .ok_or(StorageError::InvalidHandle(handle))?;
 
         // DmaFile::read は Vec<u8> を受け取るので、バッファを作成
-        let mut temp_buffer = vec![0u8; buffer.len()];
+        let temp_buffer = vec![0u8; buffer.len()];
         let bytes_read = dma_file
             .read(temp_buffer.clone(), offset)
             .await
@@ -310,7 +310,7 @@ impl StorageBackend for IOUringBackend {
         Ok(())
     }
 
-    async fn fsync(&self, handle: FileHandle) -> StorageResult<()> {
+    async fn fsync(&self, _handle: FileHandle) -> StorageResult<()> {
         // DmaFile には fsync がないため、標準の File::sync_all を使用
         // 実装のためには DmaFile に fsync サポートを追加する必要がある
         tracing::warn!("fsync is not yet fully implemented for IOURING backend");

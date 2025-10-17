@@ -1,3 +1,4 @@
 /target
 *.bin
 CLAUDE.md
+/claude_log
