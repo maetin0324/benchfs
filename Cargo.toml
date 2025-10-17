@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Async runtime
-pluvio_runtime = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_runtime" }
-pluvio_uring = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_uring" }
-pluvio_ucx = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_ucx" }
+# Async runtime (using local pluvio for development)
+pluvio_runtime = { path = "/home/rmaeda/workspace/rust/pluvio/pluvio_runtime" }
+pluvio_uring = { path = "/home/rmaeda/workspace/rust/pluvio/pluvio_uring" }
+pluvio_ucx = { path = "/home/rmaeda/workspace/rust/pluvio/pluvio_ucx" }
 
 # Serialization
 zerocopy = { version = "0.8.27", features = ["std", "derive"] }

@@ -7,6 +7,7 @@ use crate::metadata::{
     types::{InodeId, InodeType},
     DirectoryMetadata, FileMetadata,
 };
+use pluvio_uring::allocator::FixedBufferAllocator;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
@@ -40,7 +41,11 @@ pub struct LocalFileSystem {
 
 impl LocalFileSystem {
     /// 新しいローカルファイルシステムを作成
-    pub fn new(root: PathBuf) -> StorageResult<Self> {
+    ///
+    /// # Arguments
+    /// * `root` - ルートディレクトリのパス
+    /// * `allocator` - Registered buffer allocator
+    pub fn new(root: PathBuf, allocator: Rc<FixedBufferAllocator>) -> StorageResult<Self> {
         // ルートディレクトリが存在することを確認
         if !root.exists() {
             return Err(StorageError::NotFound(root.display().to_string()));
@@ -53,7 +58,7 @@ impl LocalFileSystem {
             )));
         }
 
-        let backend = Rc::new(IOUringBackend::new());
+        let backend = Rc::new(IOUringBackend::new(allocator));
 
         let mut path_to_inode = HashMap::new();
         let mut dir_metadata = HashMap::new();
@@ -396,7 +401,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn setup_runtime() -> Rc<Runtime> {
+    fn setup_runtime() -> (Rc<Runtime>, Rc<FixedBufferAllocator>) {
         let runtime = Runtime::new(1024);
 
         // IoUringReactorを初期化して登録
@@ -408,18 +413,22 @@ mod tests {
             .wait_complete_timeout(Duration::from_millis(150))
             .build();
 
+        // Get buffer allocator from reactor (it's a public field, not a method)
+        let allocator = Rc::clone(&reactor.allocator);
+
         // Runtime::newは既にRc<Runtime>を返す
         runtime.register_reactor("io_uring_reactor", reactor);
-        runtime
+
+        (runtime, allocator)
     }
 
     #[test]
     fn test_create_directory() {
-        let runtime = setup_runtime();
+        let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
         runtime.clone().run(async move {
-            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
+            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
             let dir_path = Path::new("/testdir");
 
@@ -435,11 +444,11 @@ mod tests {
 
     #[test]
     fn test_list_directory() {
-        let runtime = setup_runtime();
+        let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
         runtime.clone().run(async move {
-            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
+            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
             // ディレクトリを作成
             fs.create_directory(Path::new("/dir1"), 0o755)
@@ -456,11 +465,11 @@ mod tests {
 
     #[test]
     fn test_create_and_open_file() {
-        let runtime = setup_runtime();
+        let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
         runtime.clone().run(async move {
-            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
+            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
             let file_path = Path::new("/test.txt");
 
@@ -485,7 +494,25 @@ mod tests {
     #[test]
     fn test_path_to_inode_mapping() {
         let temp_dir = TempDir::new().unwrap();
-        let fs = LocalFileSystem::new(temp_dir.path().to_path_buf()).unwrap();
+        // This test doesn't need runtime, so create a dummy allocator
+        // However, we need an allocator - skip this test for now or create a mock
+        // For simplicity, we'll create a minimal setup
+        use pluvio_runtime::executor::Runtime;
+        use pluvio_uring::reactor::IoUringReactor;
+        use std::time::Duration;
+
+        let runtime = Runtime::new(1024);
+        let reactor = IoUringReactor::builder()
+            .queue_size(256)
+            .buffer_size(4096)
+            .submit_depth(32)
+            .wait_submit_timeout(Duration::from_millis(100))
+            .wait_complete_timeout(Duration::from_millis(150))
+            .build();
+        let allocator = Rc::clone(&reactor.allocator);
+        runtime.register_reactor("io_uring_reactor", reactor);
+
+        let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
         // ルートディレクトリのinodeを確認
         let root_inode = fs.get_inode(Path::new("/"));

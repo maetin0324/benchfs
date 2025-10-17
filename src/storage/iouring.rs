@@ -3,10 +3,12 @@ use super::{
     FileHandle, FileStat, OpenFlags, StorageBackend,
 };
 use pluvio_uring::file::DmaFile;
+use pluvio_uring::allocator::FixedBufferAllocator;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::rc::Rc;
 
 /// IOURINGバックエンド
 ///
@@ -17,14 +19,21 @@ pub struct IOUringBackend {
 
     /// 次のファイルディスクリプタID
     next_fd: RefCell<i32>,
+
+    /// Registered buffer allocator
+    allocator: Rc<FixedBufferAllocator>,
 }
 
 impl IOUringBackend {
     /// 新しいIOURINGバックエンドを作成
-    pub fn new() -> Self {
+    ///
+    /// # Arguments
+    /// * `allocator` - Registered buffer allocator
+    pub fn new(allocator: Rc<FixedBufferAllocator>) -> Self {
         Self {
             files: RefCell::new(HashMap::new()),
             next_fd: RefCell::new(100), // 100から開始 (標準入出力を避ける)
+            allocator,
         }
     }
 
@@ -56,11 +65,7 @@ impl IOUringBackend {
     }
 }
 
-impl Default for IOUringBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Default implementation removed - allocator must be provided
 
 #[async_trait::async_trait(?Send)]
 impl StorageBackend for IOUringBackend {
@@ -115,10 +120,16 @@ impl StorageBackend for IOUringBackend {
             .get(&handle.0)
             .ok_or(StorageError::InvalidHandle(handle))?;
 
-        // DmaFile::read は Vec<u8> を受け取り、その場で読み込む
-        let temp_buffer = buffer.to_vec();
-        let bytes_read = dma_file
-            .read(temp_buffer, offset)
+        // Acquire a registered buffer from the allocator
+        let fixed_buffer = self.allocator.acquire().await;
+
+        // Calculate how much we can read (limited by buffer size and requested size)
+        let read_size = buffer.len().min(fixed_buffer.len());
+
+        // Read data using read_fixed with registered buffer
+        // New API returns (bytes_read, buffer)
+        let (bytes_read, mut fixed_buffer) = dma_file
+            .read_fixed(fixed_buffer, offset)
             .await
             .map_err(StorageError::IoError)?;
 
@@ -128,30 +139,22 @@ impl StorageBackend for IOUringBackend {
             )));
         }
 
-        // DmaFile::readはbufferを変更するため、再度取得が必要
-        // しかしこの実装では所有権が移動してしまっている
-        // 代わりに、RefCellを使ってborrowする必要がある
         let bytes_read = bytes_read as usize;
+        let actual_size = bytes_read.min(read_size);
 
-        // TODO: DmaFileのAPIが所有権を取るため、再読み込みが必要
-        // 実際の実装では別の方法を検討する必要がある
-        drop(files);
+        // Copy data from fixed buffer to user buffer
+        buffer[..actual_size].copy_from_slice(&fixed_buffer.as_mut_slice()[..actual_size]);
 
-        // 再度ファイルを開いて読み直す (workaround)
-        let files = self.files.borrow();
-        let dma_file = files.get(&handle.0).ok_or(StorageError::InvalidHandle(handle))?;
-        let temp_buffer2 = vec![0u8; bytes_read];
-        let _ = dma_file.read(temp_buffer2.clone(), offset).await.map_err(StorageError::IoError)?;
-        buffer[..bytes_read].copy_from_slice(&temp_buffer2[..bytes_read]);
+        // Fixed buffer is automatically returned to allocator when dropped
 
         tracing::trace!(
             "Read {} bytes from fd={} at offset={}",
-            bytes_read,
+            actual_size,
             handle.0,
             offset
         );
 
-        Ok(bytes_read)
+        Ok(actual_size)
     }
 
     async fn write(
@@ -165,18 +168,33 @@ impl StorageBackend for IOUringBackend {
             .get(&handle.0)
             .ok_or(StorageError::InvalidHandle(handle))?;
 
-        let bytes_written = dma_file
-            .write(buffer.to_vec(), offset)
+        // Acquire a registered buffer from the allocator
+        let mut fixed_buffer = self.allocator.acquire().await;
+
+        // Calculate how much we can write (limited by buffer size and data size)
+        let write_size = buffer.len().min(fixed_buffer.len());
+
+        // Copy data from user buffer to fixed buffer
+        fixed_buffer.as_mut_slice()[..write_size].copy_from_slice(&buffer[..write_size]);
+
+        // Write data using write_fixed with registered buffer
+        // New API returns (bytes_written, buffer)
+        let (bytes_written_raw, _fixed_buffer) = dma_file
+            .write_fixed(fixed_buffer, offset)
             .await
             .map_err(StorageError::IoError)?;
 
-        if bytes_written < 0 {
+        if bytes_written_raw < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
-                -bytes_written,
+                -bytes_written_raw,
             )));
         }
 
-        let bytes_written = bytes_written as usize;
+        // Note: io_uring may write the entire buffer, but we only care about
+        // the amount of data the user actually wanted to write
+        let bytes_written = write_size;
+
+        // Fixed buffer is automatically returned to allocator when dropped
 
         tracing::trace!(
             "Wrote {} bytes to fd={} at offset={}",
@@ -345,7 +363,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn setup_runtime() -> Rc<Runtime> {
+    fn setup_runtime() -> (Rc<Runtime>, Rc<FixedBufferAllocator>) {
         let runtime = Runtime::new(1024);
 
         // IoUringReactorを初期化して登録
@@ -357,14 +375,18 @@ mod tests {
             .wait_complete_timeout(Duration::from_millis(150))
             .build();
 
+        // Get buffer allocator from reactor (it's a public field, not a method)
+        let allocator = Rc::clone(&reactor.allocator);
+
         // Runtime::newは既にRc<Runtime>を返す
         runtime.register_reactor("io_uring_reactor", reactor);
-        runtime
+
+        (runtime, allocator)
     }
 
     #[test]
     fn test_stat() {
-        let runtime = setup_runtime();
+        let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("stat_test.txt");
 
@@ -373,16 +395,15 @@ mod tests {
         drop(file);
 
         runtime.clone().run(async move {
-            let backend = IOUringBackend::new();
+            let backend = IOUringBackend::new(allocator);
             let stat = backend.stat(&test_file).await.unwrap();
             assert_eq!(stat.size, 5);
         });
     }
 
     #[test]
-    #[ignore] // TODO: DmaFile::read APIの正しい使い方を確認する必要がある
     fn test_open_read_write() {
-        let runtime = setup_runtime();
+        let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.txt");
 
@@ -392,7 +413,7 @@ mod tests {
         drop(file);
 
         runtime.clone().run(async move {
-            let backend = IOUringBackend::new();
+            let backend = IOUringBackend::new(allocator);
 
             // ファイルを開く
             let handle = backend
@@ -414,12 +435,12 @@ mod tests {
 
     #[test]
     fn test_create_write() {
-        let runtime = setup_runtime();
+        let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("new_file.txt");
 
         runtime.clone().run(async move {
-            let backend = IOUringBackend::new();
+            let backend = IOUringBackend::new(allocator);
 
             // ファイルを作成
             let handle = backend.create(&test_file, 0o644).await.unwrap();

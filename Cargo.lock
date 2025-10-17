@@ -588,7 +588,6 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pluvio_runtime"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio#f9ebf8ba7514366cade6c271681c05f55c36a2e5"
 dependencies = [
  "core_affinity",
  "futures",
@@ -601,7 +600,6 @@ dependencies = [
 [[package]]
 name = "pluvio_ucx"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio#f9ebf8ba7514366cade6c271681c05f55c36a2e5"
 dependencies = [
  "async-ucx",
  "pluvio_runtime",
@@ -612,7 +610,6 @@ dependencies = [
 [[package]]
 name = "pluvio_uring"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio#f9ebf8ba7514366cade6c271681c05f55c36a2e5"
 dependencies = [
  "io-uring",
  "libc",
