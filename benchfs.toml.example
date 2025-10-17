@@ -1,0 +1,44 @@
+# BenchFS Server Configuration Example
+
+[node]
+# Unique node identifier
+node_id = "node1"
+
+# Directory for storing file data
+data_dir = "/tmp/benchfs"
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+[storage]
+# Chunk size in bytes (default: 4MB)
+chunk_size = 4194304
+
+# Use io_uring for file I/O
+use_iouring = true
+
+# Maximum storage size in GB (0 = unlimited)
+max_storage_gb = 0
+
+[network]
+# Server bind address (IP:port)
+bind_addr = "0.0.0.0:50051"
+
+# Known peer nodes for cluster setup
+peers = [
+    # "192.168.1.100:50051",
+    # "192.168.1.101:50051",
+]
+
+# Connection timeout in seconds
+timeout_secs = 30
+
+[cache]
+# Number of metadata cache entries
+metadata_cache_entries = 1000
+
+# Chunk cache size in megabytes
+chunk_cache_mb = 100
+
+# Cache TTL in seconds (0 = no TTL)
+cache_ttl_secs = 0

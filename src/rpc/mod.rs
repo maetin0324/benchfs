@@ -11,6 +11,7 @@ pub mod metadata_ops;
 pub mod handlers;
 pub mod server;
 pub mod client;
+pub mod connection;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
@@ -163,6 +164,7 @@ pub enum RpcError {
     InvalidHeader,
     TransportError(String),
     HandlerError(String),
+    ConnectionError(String),
     Timeout,
 }
 
@@ -172,6 +174,7 @@ impl std::fmt::Display for RpcError {
             RpcError::InvalidHeader => write!(f, "Invalid RPC header"),
             RpcError::TransportError(msg) => write!(f, "Transport error: {}", msg),
             RpcError::HandlerError(msg) => write!(f, "Handler error: {}", msg),
+            RpcError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
             RpcError::Timeout => write!(f, "RPC timeout"),
         }
     }

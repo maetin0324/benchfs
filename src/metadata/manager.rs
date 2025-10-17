@@ -2,6 +2,7 @@ use super::{
     consistent_hash::ConsistentHashRing,
     types::{DirectoryMetadata, FileMetadata, InodeId, NodeId},
 };
+use crate::cache::{MetadataCache, CachePolicy};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,6 +44,9 @@ pub struct MetadataManager {
     /// ローカルに保存されているディレクトリメタデータ (path -> metadata)
     local_dir_metadata: RefCell<HashMap<String, DirectoryMetadata>>,
 
+    /// メタデータキャッシュ
+    cache: MetadataCache,
+
     /// 自ノードのID
     self_node_id: NodeId,
 }
@@ -53,6 +57,15 @@ impl MetadataManager {
     /// # Arguments
     /// * `self_node_id` - 自ノードのID
     pub fn new(self_node_id: NodeId) -> Self {
+        Self::with_cache_policy(self_node_id, CachePolicy::default())
+    }
+
+    /// キャッシュポリシーを指定してメタデータマネージャーを作成
+    ///
+    /// # Arguments
+    /// * `self_node_id` - 自ノードのID
+    /// * `cache_policy` - キャッシュポリシー
+    pub fn with_cache_policy(self_node_id: NodeId, cache_policy: CachePolicy) -> Self {
         let mut ring = ConsistentHashRing::new();
         ring.add_node(self_node_id.clone());
 
@@ -60,6 +73,7 @@ impl MetadataManager {
             ring: RefCell::new(ring),
             local_file_metadata: RefCell::new(HashMap::new()),
             local_dir_metadata: RefCell::new(HashMap::new()),
+            cache: MetadataCache::new(cache_policy),
             self_node_id,
         }
     }
@@ -144,11 +158,23 @@ impl MetadataManager {
             .to_str()
             .ok_or_else(|| MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path)))?;
 
-        self.local_file_metadata
+        // Check cache first
+        if let Some(cached) = self.cache.get_file(path_str) {
+            tracing::trace!("Cache hit for file metadata: {}", path_str);
+            return Ok(cached);
+        }
+
+        // Cache miss, get from local storage
+        let metadata = self.local_file_metadata
             .borrow()
             .get(path_str)
             .cloned()
-            .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))
+            .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+
+        // Cache the result
+        self.cache.put_file(path_str.to_string(), metadata.clone());
+
+        Ok(metadata)
     }
 
     /// ファイルメタデータを更新
@@ -161,7 +187,11 @@ impl MetadataManager {
             return Err(MetadataError::NotFound(path.clone()));
         }
 
-        local_metadata.insert(path.clone(), metadata);
+        local_metadata.insert(path.clone(), metadata.clone());
+
+        // Invalidate cache
+        self.cache.invalidate_file(&path);
+
         tracing::debug!("Updated file metadata for: {}", path);
 
         Ok(())
@@ -178,6 +208,9 @@ impl MetadataManager {
         local_metadata
             .remove(path_str)
             .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+
+        // Invalidate cache
+        self.cache.invalidate_file(path_str);
 
         tracing::debug!("Removed file metadata for: {}", path_str);
 
@@ -206,11 +239,23 @@ impl MetadataManager {
             .to_str()
             .ok_or_else(|| MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path)))?;
 
-        self.local_dir_metadata
+        // Check cache first
+        if let Some(cached) = self.cache.get_dir(path_str) {
+            tracing::trace!("Cache hit for directory metadata: {}", path_str);
+            return Ok(cached);
+        }
+
+        // Cache miss, get from local storage
+        let metadata = self.local_dir_metadata
             .borrow()
             .get(path_str)
             .cloned()
-            .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))
+            .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+
+        // Cache the result
+        self.cache.put_dir(path_str.to_string(), metadata.clone());
+
+        Ok(metadata)
     }
 
     /// ディレクトリメタデータを更新
@@ -223,7 +268,11 @@ impl MetadataManager {
             return Err(MetadataError::NotFound(path.clone()));
         }
 
-        local_metadata.insert(path.clone(), metadata);
+        local_metadata.insert(path.clone(), metadata.clone());
+
+        // Invalidate cache
+        self.cache.invalidate_dir(&path);
+
         tracing::debug!("Updated directory metadata for: {}", path);
 
         Ok(())
@@ -240,6 +289,9 @@ impl MetadataManager {
         local_metadata
             .remove(path_str)
             .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+
+        // Invalidate cache
+        self.cache.invalidate_dir(path_str);
 
         tracing::debug!("Removed directory metadata for: {}", path_str);
 
@@ -276,6 +328,16 @@ impl MetadataManager {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64
+    }
+
+    /// キャッシュ統計を取得
+    pub fn cache_stats(&self) -> crate::cache::metadata_cache::CacheStats {
+        self.cache.stats()
+    }
+
+    /// キャッシュをクリア
+    pub fn clear_cache(&self) {
+        self.cache.clear();
     }
 }
 

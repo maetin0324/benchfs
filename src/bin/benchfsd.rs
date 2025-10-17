@@ -1,0 +1,239 @@
+//! BenchFS Server Daemon
+//!
+//! This is the main server binary for BenchFS distributed file system.
+//! It initializes the RPC server, storage backend, and handles incoming requests.
+
+use benchfs::config::ServerConfig;
+use benchfs::rpc::server::RpcServer;
+use benchfs::rpc::handlers::RpcHandlerContext;
+use benchfs::metadata::MetadataManager;
+use benchfs::storage::InMemoryChunkStore;
+use benchfs::cache::CachePolicy;
+
+use pluvio_runtime::executor::Runtime;
+use pluvio_uring::reactor::IoUringReactor;
+use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
+
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Server state
+struct ServerState {
+    config: ServerConfig,
+    running: Arc<AtomicBool>,
+}
+
+impl ServerState {
+    fn new(config: ServerConfig) -> Self {
+        Self {
+            config,
+            running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    fn shutdown(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+fn main() {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+
+    let config_path = if args.len() > 1 {
+        &args[1]
+    } else {
+        "benchfs.toml"
+    };
+
+    // Load configuration
+    let config = match ServerConfig::from_file(config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Failed to load configuration: {}", e);
+            eprintln!("Using default configuration");
+            ServerConfig::default()
+        }
+    };
+
+    // Setup logging
+    setup_logging(&config.node.log_level);
+
+    tracing::info!("Starting BenchFS server");
+    tracing::info!("Node ID: {}", config.node.node_id);
+    tracing::info!("Data directory: {}", config.node.data_dir.display());
+    tracing::info!("Bind address: {}", config.network.bind_addr);
+
+    // Create data directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(&config.node.data_dir) {
+        eprintln!("Failed to create data directory: {}", e);
+        std::process::exit(1);
+    }
+
+    // Create server state
+    let state = Rc::new(ServerState::new(config.clone()));
+
+    // Setup signal handlers
+    setup_signal_handlers(state.running.clone());
+
+    // Run the server
+    if let Err(e) = run_server(state.clone()) {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
+    }
+
+    tracing::info!("BenchFS server stopped");
+}
+
+fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = &state.config;
+
+    // Create pluvio runtime
+    let runtime = Runtime::new(256);
+
+    // Create io_uring reactor
+    let uring_reactor = IoUringReactor::new();
+    runtime.register_reactor("io_uring", uring_reactor.clone());
+
+    // Create UCX context and reactor
+    let ucx_context = Rc::new(UcxContext::new()?);
+    let ucx_reactor = UCXReactor::new();
+    runtime.register_reactor("ucx", Rc::new(ucx_reactor));
+
+    // Create UCX worker
+    let worker = ucx_context.create_worker()?;
+    // Note: Worker is already an Rc<Worker>
+
+    // Create metadata manager with cache policy
+    let cache_policy = if config.cache.cache_ttl_secs > 0 {
+        CachePolicy::lru_with_ttl(
+            config.cache.metadata_cache_entries,
+            std::time::Duration::from_secs(config.cache.cache_ttl_secs),
+        )
+    } else {
+        CachePolicy::lru(config.cache.metadata_cache_entries)
+    };
+
+    let metadata_manager = Rc::new(MetadataManager::with_cache_policy(
+        config.node.node_id.clone(),
+        cache_policy,
+    ));
+
+    // Create chunk store
+    let chunk_store = Rc::new(InMemoryChunkStore::new());
+
+    // Create RPC handler context
+    let handler_context = Rc::new(RpcHandlerContext::new(
+        metadata_manager.clone(),
+        chunk_store.clone(),
+    ));
+
+    // Create RPC server
+    let rpc_server = Rc::new(RpcServer::new(worker, handler_context));
+
+    // Bind and listen
+    tracing::info!("Binding to address: {}", config.network.bind_addr);
+
+    // Start server main loop
+    let server_handle = {
+        let runtime_clone = runtime.clone();
+        let rpc_server_clone = rpc_server.clone();
+        let state_clone = state.clone();
+
+        runtime.spawn_with_name(
+            async move {
+                tracing::info!("RPC server listening for requests");
+
+                // Register all RPC handlers
+                if let Err(e) = rpc_server_clone.register_all_handlers(runtime_clone.clone()).await {
+                    tracing::error!("Failed to register RPC handlers: {:?}", e);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Handler registration failed: {:?}", e),
+                    ));
+                }
+
+                // Keep server alive while running
+                loop {
+                    if !state_clone.is_running() {
+                        break;
+                    }
+                    // Yield to allow other tasks to run
+                    futures::pending!();
+                }
+
+                tracing::info!("RPC server stopped");
+                Ok::<(), std::io::Error>(())
+            },
+            "rpc_server".to_string(),
+        )
+    };
+
+    // Run the runtime
+    tracing::info!("Server is running (Press Ctrl+C to stop)");
+
+    runtime.clone().run(async move {
+        match server_handle.await {
+            Ok(_) => {
+                tracing::info!("Server shutdown complete");
+            }
+            Err(e) => {
+                tracing::error!("Server error: {:?}", e);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+fn setup_logging(level: &str) {
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level));
+
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+}
+
+fn setup_signal_handlers(running: Arc<AtomicBool>) {
+    use std::sync::Mutex;
+
+    // Store the running flag in a static for signal handler access
+    static RUNNING_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+    *RUNNING_FLAG.lock().unwrap() = Some(running);
+
+    // Setup SIGINT handler (Ctrl+C)
+    #[cfg(unix)]
+    {
+        use libc::{SIGINT, SIGTERM};
+
+        unsafe {
+            libc::signal(SIGINT, signal_handler as libc::sighandler_t);
+            libc::signal(SIGTERM, signal_handler as libc::sighandler_t);
+        }
+    }
+
+    #[cfg(unix)]
+    extern "C" fn signal_handler(_: libc::c_int) {
+        use std::sync::Mutex;
+
+        static RUNNING_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+        if let Some(flag) = RUNNING_FLAG.lock().unwrap().as_ref() {
+            eprintln!("\nReceived shutdown signal, stopping server...");
+            flag.store(false, Ordering::Relaxed);
+        }
+    }
+}

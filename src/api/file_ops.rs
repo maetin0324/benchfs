@@ -11,7 +11,10 @@ use crate::api::types::{ApiError, ApiResult, FileHandle, OpenFlags};
 use crate::metadata::{MetadataManager, FileMetadata, DirectoryMetadata};
 use crate::storage::InMemoryChunkStore;
 use crate::data::{ChunkManager, PlacementStrategy, RoundRobinPlacement};
-use crate::rpc::client::RpcClient;
+use crate::rpc::connection::ConnectionPool;
+use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
+use crate::rpc::AmRpc;
+use crate::cache::{ChunkCache, ChunkId};
 
 /// BenchFS Filesystem Client
 ///
@@ -23,6 +26,9 @@ pub struct BenchFS {
 
     /// Chunk store (for local operations)
     chunk_store: Rc<InMemoryChunkStore>,
+
+    /// Chunk cache
+    chunk_cache: ChunkCache,
 
     /// Chunk manager
     chunk_manager: ChunkManager,
@@ -36,28 +42,54 @@ pub struct BenchFS {
     /// Next file descriptor
     next_fd: RefCell<u64>,
 
-    /// RPC clients (node_id -> client)
-    #[allow(dead_code)]
-    rpc_clients: RefCell<HashMap<String, Rc<RpcClient>>>,
+    /// Connection pool for remote RPC calls
+    connection_pool: Option<Rc<ConnectionPool>>,
 }
 
 impl BenchFS {
-    /// Create a new BenchFS client
+    /// Create a new BenchFS client (local only)
     pub fn new(node_id: String) -> Self {
         let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
         let chunk_store = Rc::new(InMemoryChunkStore::new());
+        let chunk_cache = ChunkCache::with_memory_limit(100); // 100 MB cache
         let chunk_manager = ChunkManager::new();
         let placement = Rc::new(RoundRobinPlacement::new(vec![node_id]));
 
         Self {
             metadata_manager,
             chunk_store,
+            chunk_cache,
             chunk_manager,
             placement,
             open_files: RefCell::new(HashMap::new()),
             next_fd: RefCell::new(3), // Start from 3 (0, 1, 2 are reserved for stdin, stdout, stderr)
-            rpc_clients: RefCell::new(HashMap::new()),
+            connection_pool: None,
         }
+    }
+
+    /// Create a new BenchFS client with connection pool (distributed mode)
+    pub fn with_connection_pool(node_id: String, connection_pool: Rc<ConnectionPool>) -> Self {
+        let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
+        let chunk_store = Rc::new(InMemoryChunkStore::new());
+        let chunk_cache = ChunkCache::with_memory_limit(100);
+        let chunk_manager = ChunkManager::new();
+        let placement = Rc::new(RoundRobinPlacement::new(vec![node_id]));
+
+        Self {
+            metadata_manager,
+            chunk_store,
+            chunk_cache,
+            chunk_manager,
+            placement,
+            open_files: RefCell::new(HashMap::new()),
+            next_fd: RefCell::new(3),
+            connection_pool: Some(connection_pool),
+        }
+    }
+
+    /// Check if distributed mode is enabled
+    pub fn is_distributed(&self) -> bool {
+        self.connection_pool.is_some()
     }
 
     /// Open a file
@@ -137,7 +169,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// Number of bytes read
-    pub fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
+    pub async fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
         if !handle.flags.read {
             return Err(ApiError::PermissionDenied("File not opened for reading".to_string()));
         }
@@ -168,26 +200,113 @@ impl BenchFS {
 
         let mut bytes_read = 0;
         for (chunk_index, chunk_offset, read_size) in chunks {
-            // Read from local chunk store
-            match self.chunk_store.read_chunk(
-                file_meta.inode,
-                chunk_index,
-                chunk_offset,
-                read_size,
-            ) {
-                Ok(data) => {
-                    let buf_offset = bytes_read;
-                    let copy_len = data.len().min(buf.len() - buf_offset);
-                    buf[buf_offset..buf_offset + copy_len].copy_from_slice(&data[..copy_len]);
-                    bytes_read += copy_len;
+            let chunk_id = ChunkId::new(file_meta.inode, chunk_index);
+
+            // Try to get full chunk from cache first
+            let chunk_data = if let Some(cached_chunk) = self.chunk_cache.get(&chunk_id) {
+                // Cache hit - extract the requested portion
+                tracing::trace!("Cache hit for chunk {}", chunk_index);
+                Some(cached_chunk)
+            } else {
+                // Cache miss - need to fetch chunk
+                tracing::trace!("Cache miss for chunk {}", chunk_index);
+
+                // Try local chunk store first
+                match self.chunk_store.read_chunk(
+                    file_meta.inode,
+                    chunk_index,
+                    0, // Read full chunk for caching
+                    self.chunk_manager.chunk_size() as u64,
+                ) {
+                    Ok(full_chunk) => {
+                        // Cache the full chunk for future reads
+                        self.chunk_cache.put(chunk_id, full_chunk.clone());
+                        Some(full_chunk)
+                    }
+                    Err(_) => {
+                        // Local read failed - try remote if distributed mode enabled
+                        if let Some(pool) = &self.connection_pool {
+                            // Get chunk location from metadata
+                            if let Some(node_addr) = crate::rpc::data_ops::get_chunk_node(chunk_index, &file_meta.chunk_locations) {
+                                // Parse node address
+                                if let Ok(socket_addr) = node_addr.parse() {
+                                    tracing::debug!("Fetching chunk {} from remote node {}", chunk_index, node_addr);
+
+                                    // Connect to remote node
+                                    match pool.get_or_connect(socket_addr).await {
+                                        Ok(client) => {
+                                            // Create RPC request
+                                            let request = ReadChunkRequest::new(
+                                                chunk_index,
+                                                0,
+                                                self.chunk_manager.chunk_size() as u64,
+                                                file_meta.inode,
+                                            );
+
+                                            // Execute RPC
+                                            match request.call(&*client).await {
+                                                Ok(response) if response.is_success() => {
+                                                    let full_chunk = request.take_data();
+                                                    tracing::debug!("Successfully fetched {} bytes from remote node", full_chunk.len());
+
+                                                    // Cache for future reads
+                                                    self.chunk_cache.put(chunk_id, full_chunk.clone());
+                                                    Some(full_chunk)
+                                                }
+                                                Ok(response) => {
+                                                    tracing::warn!("Remote read failed with status {}", response.status);
+                                                    None
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("RPC error: {:?}", e);
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to connect to {}: {:?}", node_addr, e);
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!("Invalid node address: {}", node_addr);
+                                    None
+                                }
+                            } else {
+                                // No location info for this chunk - treat as sparse
+                                None
+                            }
+                        } else {
+                            // Not in distributed mode - treat as sparse
+                            None
+                        }
+                    }
                 }
-                Err(_) => {
-                    // Chunk doesn't exist locally, return zeros (sparse file)
-                    let buf_offset = bytes_read;
+            };
+
+            // Extract and copy the requested portion
+            if let Some(chunk) = chunk_data {
+                let buf_offset = bytes_read;
+                let chunk_start = chunk_offset as usize;
+                let chunk_end = (chunk_start + read_size as usize).min(chunk.len());
+                let copy_len = (chunk_end - chunk_start).min(buf.len() - buf_offset);
+
+                if chunk_start < chunk.len() {
+                    buf[buf_offset..buf_offset + copy_len]
+                        .copy_from_slice(&chunk[chunk_start..chunk_start + copy_len]);
+                    bytes_read += copy_len;
+                } else {
+                    // Request is beyond chunk data, fill with zeros
                     let zero_len = read_size as usize;
                     buf[buf_offset..buf_offset + zero_len].fill(0);
                     bytes_read += zero_len;
                 }
+            } else {
+                // Chunk doesn't exist locally, return zeros (sparse file)
+                let buf_offset = bytes_read;
+                let zero_len = read_size as usize;
+                buf[buf_offset..buf_offset + zero_len].fill(0);
+                bytes_read += zero_len;
             }
         }
 
@@ -205,7 +324,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// Number of bytes written
-    pub fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
+    pub async fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
         if !handle.flags.write {
             return Err(ApiError::PermissionDenied("File not opened for writing".to_string()));
         }
@@ -229,22 +348,85 @@ impl BenchFS {
             .map_err(|e| ApiError::Internal(format!("Failed to calculate chunks: {:?}", e)))?;
 
         let mut bytes_written = 0;
+        let mut chunk_locations_updated = false;
+
         for (chunk_index, chunk_offset, write_size) in chunks {
             let data_offset = bytes_written;
             let data_len = write_size as usize;
             let chunk_data = &data[data_offset..data_offset + data_len];
 
-            // Write to local chunk store
-            self.chunk_store
-                .write_chunk(file_meta.inode, chunk_index, chunk_offset, chunk_data)
-                .map_err(|e| ApiError::IoError(format!("Failed to write chunk: {:?}", e)))?;
+            // Invalidate cache for this chunk (write-through)
+            let chunk_id = ChunkId::new(file_meta.inode, chunk_index);
+            self.chunk_cache.invalidate(&chunk_id);
+
+            // Determine where to write this chunk
+            // First, ensure chunk_locations vector is large enough
+            while file_meta.chunk_locations.len() <= chunk_index as usize {
+                file_meta.chunk_locations.push(String::new());
+            }
+
+            // If chunk location is not set, determine it using placement strategy
+            if file_meta.chunk_locations[chunk_index as usize].is_empty() {
+                let node_id = self.metadata_manager.self_node_id();
+                file_meta.chunk_locations[chunk_index as usize] = node_id.to_string();
+                chunk_locations_updated = true;
+            }
+
+            let target_node = &file_meta.chunk_locations[chunk_index as usize];
+            let is_local = target_node == &self.metadata_manager.self_node_id();
+
+            if is_local {
+                // Write to local chunk store
+                self.chunk_store
+                    .write_chunk(file_meta.inode, chunk_index, chunk_offset, chunk_data)
+                    .map_err(|e| ApiError::IoError(format!("Failed to write chunk: {:?}", e)))?;
+            } else if let Some(pool) = &self.connection_pool {
+                // Write to remote node
+                if let Ok(socket_addr) = target_node.parse() {
+                    tracing::debug!("Writing chunk {} to remote node {}", chunk_index, target_node);
+
+                    match pool.get_or_connect(socket_addr).await {
+                        Ok(client) => {
+                            // Create RPC request
+                            let request = WriteChunkRequest::new(
+                                chunk_index,
+                                chunk_offset,
+                                chunk_data.to_vec(),
+                                file_meta.inode,
+                            );
+
+                            // Execute RPC
+                            match request.call(&*client).await {
+                                Ok(response) if response.is_success() => {
+                                    tracing::debug!("Successfully wrote {} bytes to remote node", response.bytes_written);
+                                }
+                                Ok(response) => {
+                                    return Err(ApiError::IoError(format!("Remote write failed with status {}", response.status)));
+                                }
+                                Err(e) => {
+                                    return Err(ApiError::IoError(format!("RPC error: {:?}", e)));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(ApiError::IoError(format!("Failed to connect to {}: {:?}", target_node, e)));
+                        }
+                    }
+                } else {
+                    return Err(ApiError::IoError(format!("Invalid node address: {}", target_node)));
+                }
+            } else {
+                // Not in distributed mode but chunk should be on a different node
+                // This shouldn't happen in normal operation
+                return Err(ApiError::Internal(format!("Chunk {} should be on node {} but distributed mode is not enabled", chunk_index, target_node)));
+            }
 
             bytes_written += data_len;
         }
 
-        // Update file size if we wrote past the end
+        // Update file size if we wrote past the end, or if chunk locations were updated
         let new_size = (offset + length).max(file_meta.size);
-        if new_size != file_meta.size {
+        if new_size != file_meta.size || chunk_locations_updated {
             file_meta.size = new_size;
             file_meta.chunk_count = file_meta.calculate_chunk_count();
 
@@ -282,8 +464,11 @@ impl BenchFS {
             .get_file_metadata(path_ref)
             .map_err(|_| ApiError::NotFound(path.to_string()))?;
 
+        // Invalidate all cached chunks for this inode
+        self.chunk_cache.invalidate_inode(file_meta.inode);
+
         // Delete all chunks
-        self.chunk_store.delete_file_chunks(file_meta.inode);
+        let _ = self.chunk_store.delete_file_chunks(file_meta.inode);
 
         // Delete metadata
         self.metadata_manager
@@ -406,6 +591,16 @@ impl BenchFS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pluvio_runtime::executor::Runtime;
+    use std::rc::Rc;
+
+    fn run_test<F>(test: F)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+    {
+        let runtime = Runtime::new(256);
+        runtime.clone().run(test);
+    }
 
     #[test]
     fn test_benchfs_creation() {
@@ -427,26 +622,28 @@ mod tests {
 
     #[test]
     fn test_write_and_read_file() {
-        let fs = BenchFS::new("node1".to_string());
+        run_test(async {
+            let fs = BenchFS::new("node1".to_string());
 
-        // Create file
-        let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
+            // Create file
+            let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
 
-        // Write data
-        let data = b"Hello, BenchFS!";
-        let written = fs.chfs_write(&handle, data).unwrap();
-        assert_eq!(written, data.len());
+            // Write data
+            let data = b"Hello, BenchFS!";
+            let written = fs.chfs_write(&handle, data).await.unwrap();
+            assert_eq!(written, data.len());
 
-        fs.chfs_close(&handle).unwrap();
+            fs.chfs_close(&handle).unwrap();
 
-        // Read data
-        let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
-        let mut buf = vec![0u8; 100];
-        let read = fs.chfs_read(&handle, &mut buf).unwrap();
-        assert_eq!(read, data.len());
-        assert_eq!(&buf[..read], data);
+            // Read data
+            let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+            let mut buf = vec![0u8; 100];
+            let read = fs.chfs_read(&handle, &mut buf).await.unwrap();
+            assert_eq!(read, data.len());
+            assert_eq!(&buf[..read], data);
 
-        fs.chfs_close(&handle).unwrap();
+            fs.chfs_close(&handle).unwrap();
+        });
     }
 
     #[test]
@@ -478,28 +675,30 @@ mod tests {
 
     #[test]
     fn test_seek() {
-        let fs = BenchFS::new("node1".to_string());
+        run_test(async {
+            let fs = BenchFS::new("node1".to_string());
 
-        // Create file with data
-        let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
-        fs.chfs_write(&handle, b"0123456789").unwrap();
-        fs.chfs_close(&handle).unwrap();
+            // Create file with data
+            let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
+            fs.chfs_write(&handle, b"0123456789").await.unwrap();
+            fs.chfs_close(&handle).unwrap();
 
-        // Open and seek
-        let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+            // Open and seek
+            let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
 
-        // SEEK_SET
-        let pos = fs.chfs_seek(&handle, 5, 0).unwrap();
-        assert_eq!(pos, 5);
+            // SEEK_SET
+            let pos = fs.chfs_seek(&handle, 5, 0).unwrap();
+            assert_eq!(pos, 5);
 
-        // SEEK_CUR
-        let pos = fs.chfs_seek(&handle, 2, 1).unwrap();
-        assert_eq!(pos, 7);
+            // SEEK_CUR
+            let pos = fs.chfs_seek(&handle, 2, 1).unwrap();
+            assert_eq!(pos, 7);
 
-        // SEEK_END
-        let pos = fs.chfs_seek(&handle, -3, 2).unwrap();
-        assert_eq!(pos, 7);
+            // SEEK_END
+            let pos = fs.chfs_seek(&handle, -3, 2).unwrap();
+            assert_eq!(pos, 7);
 
-        fs.chfs_close(&handle).unwrap();
+            fs.chfs_close(&handle).unwrap();
+        });
     }
 }
