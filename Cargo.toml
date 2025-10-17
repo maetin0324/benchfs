@@ -4,8 +4,40 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Async runtime
 pluvio_runtime = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_runtime" }
 pluvio_uring = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_uring" }
 pluvio_ucx = { git = "https://github.com/maetin0324/pluvio", package = "pluvio_ucx" }
+
+# Serialization
 zerocopy = { version = "0.8.27", features = ["std", "derive"] }
+
+# Hashing (Consistent Hashing)
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Cache (LRU)
+lru = "0.12"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Logging
 tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2.0"
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+
+# System
+libc = "0.2"
+
+# Async runtime (for tests)
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3.0"
