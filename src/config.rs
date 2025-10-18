@@ -41,6 +41,14 @@ fn default_log_level() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Chunk size in bytes (default: 4MB)
+    ///
+    /// BenchFS uses 4MB chunks by default for optimal RDMA transfer performance.
+    /// This is larger than CHFS's default of 64KB, chosen because:
+    /// - Better for large sequential I/O workloads
+    /// - More efficient RDMA utilization
+    /// - Reduced metadata overhead
+    ///
+    /// Can be configured to 64KB (65536) for CHFS-compatible behavior.
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
 
@@ -54,7 +62,7 @@ pub struct StorageConfig {
 }
 
 fn default_chunk_size() -> usize {
-    4 * 1024 * 1024 // 4MB
+    4 * 1024 * 1024 // 4MB (larger than CHFS's 64KB for better RDMA performance)
 }
 
 fn default_use_iouring() -> bool {
@@ -74,10 +82,29 @@ pub struct NetworkConfig {
     /// Connection timeout in seconds
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+
+    /// RDMA transfer threshold in bytes (default: 32KB)
+    /// Transfers larger than this use RDMA, smaller use regular RPC
+    /// Based on CHFS's proven threshold of 32KB
+    #[serde(default = "default_rdma_threshold")]
+    pub rdma_threshold_bytes: usize,
+
+    /// WorkerAddress registry directory for connection management
+    /// This should be a shared filesystem path accessible by all nodes
+    #[serde(default = "default_registry_dir")]
+    pub registry_dir: PathBuf,
 }
 
 fn default_timeout() -> u64 {
     30
+}
+
+fn default_rdma_threshold() -> usize {
+    32 * 1024 // 32 KB (same as CHFS)
+}
+
+fn default_registry_dir() -> PathBuf {
+    PathBuf::from("/tmp/benchfs/worker_addrs")
 }
 
 /// Cache configuration
@@ -121,6 +148,8 @@ impl Default for ServerConfig {
                 bind_addr: "0.0.0.0:50051".to_string(),
                 peers: vec![],
                 timeout_secs: default_timeout(),
+                rdma_threshold_bytes: default_rdma_threshold(),
+                registry_dir: default_registry_dir(),
             },
             cache: CacheConfig {
                 metadata_cache_entries: default_metadata_cache_entries(),

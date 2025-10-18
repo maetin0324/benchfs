@@ -64,8 +64,13 @@ impl RpcServer {
             let msg = msg
                 .ok_or_else(|| RpcError::TransportError("Failed to receive message".to_string()))?;
 
-            // Handle request data
-            runtime.spawn(Rpc::server_handler(msg));
+            // Handle request data and surface handler failures for easier debugging
+            let rpc_id = Rpc::rpc_id();
+            runtime.spawn(async move {
+                if let Err(e) = Rpc::server_handler(msg).await {
+                    tracing::error!("RpcServer: handler task for RPC ID {} failed: {:?}", rpc_id, e);
+                }
+            });
         }
 
         Ok(())
@@ -97,7 +102,7 @@ impl RpcServer {
         ReqH: Serializable + 'static,
         Rpc: AmRpc<RequestHeader = ReqH, ResponseHeader = ResH> + 'static,
         F: Fn(Rc<RpcHandlerContext>, pluvio_ucx::async_ucx::ucp::AmMsg) -> Fut + 'static,
-        Fut: std::future::Future<Output = Result<ResH, RpcError>> + 'static,
+        Fut: std::future::Future<Output = Result<(ResH, pluvio_ucx::async_ucx::ucp::AmMsg), (RpcError, pluvio_ucx::async_ucx::ucp::AmMsg)>> + 'static,
     {
         let stream = self.worker.am_stream(Rpc::rpc_id()).map_err(|e| {
             RpcError::TransportError(format!("Failed to create AM stream: {:?}", e))
@@ -121,35 +126,87 @@ impl RpcServer {
 
             // Call the handler function
             match handler(ctx_clone, am_msg).await {
-                Ok(response_header) => {
-                    // Send response back to client via reply stream
-                    let reply_stream_id = Rpc::reply_stream_id();
+                Ok((response_header, am_msg)) => {
+                    // Send response back to client via reply when the client expects one
+                    if am_msg.need_reply() {
+                        let reply_stream_id = Rpc::reply_stream_id();
 
-                    // Get the reply stream
-                    if let Ok(_reply_stream) = self.worker.am_stream(reply_stream_id) {
                         // Serialize response header
-                        let _response_bytes = zerocopy::IntoBytes::as_bytes(&response_header);
+                        let response_bytes = zerocopy::IntoBytes::as_bytes(&response_header);
 
-                        // Send reply (Note: This is a simplified implementation)
-                        // In a full implementation, we would need to:
-                        // 1. Track the client endpoint from the request
-                        // 2. Use that endpoint to send the reply
-                        // For now, we log success
-                        tracing::debug!(
-                            "Handler succeeded for RPC ID {}, response ready (reply_stream_id: {})",
-                            Rpc::rpc_id(),
-                            reply_stream_id
-                        );
-
-                        // TODO: Complete reply sending when we have client endpoint tracking
-                        // endpoint.am_send(reply_stream_id, response_bytes, &[], false, None).await?;
+                        // Send reply to the client that sent the request
+                        // AmMsg has a reply() method that automatically routes back to the sender
+                        // SAFETY: reply() requires unsafe because it deals with raw UCX operations
+                        // We ensure safety by:
+                        // 1. response_bytes is a valid byte slice from zerocopy
+                        // 2. The reply_stream_id is valid (from Rpc::reply_stream_id())
+                        // 3. The am_msg is still valid (not dropped)
+                        unsafe {
+                            if let Err(e) = am_msg
+                                .reply(
+                                    reply_stream_id as u32,
+                                    response_bytes,
+                                    &[],  // No additional data payload
+                                    false, // Not an eager message
+                                    None,  // No special proto
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to send reply for RPC ID {}: {:?}",
+                                    Rpc::rpc_id(),
+                                    e
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Successfully sent reply for RPC ID {} (reply_stream_id: {})",
+                                    Rpc::rpc_id(),
+                                    reply_stream_id
+                                );
+                            }
+                        }
                     } else {
-                        tracing::error!("Failed to get reply stream for RPC ID {}", Rpc::rpc_id());
+                        tracing::debug!(
+                            "Skipping reply for RPC ID {} (fire-and-forget)",
+                            Rpc::rpc_id()
+                        );
                     }
                 }
-                Err(e) => {
+                Err((e, am_msg)) => {
                     tracing::error!("Handler failed for RPC ID {}: {:?}", Rpc::rpc_id(), e);
-                    // TODO: Send error response to client
+
+                    // Send an error response to the client if they expect a reply
+                    if am_msg.need_reply() {
+                        let reply_stream_id = Rpc::reply_stream_id();
+                        let error_response = Rpc::error_response(&e);
+                        let response_bytes = zerocopy::IntoBytes::as_bytes(&error_response);
+
+                        // SAFETY: Same safety considerations as the success case above
+                        unsafe {
+                            if let Err(reply_err) = am_msg
+                                .reply(
+                                    reply_stream_id as u32,
+                                    response_bytes,
+                                    &[],  // No additional data payload
+                                    false, // Not an eager message
+                                    None,  // No special proto
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to send error reply for RPC ID {}: {:?}",
+                                    Rpc::rpc_id(),
+                                    reply_err
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Successfully sent error reply for RPC ID {} (status: {:?})",
+                                    Rpc::rpc_id(),
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

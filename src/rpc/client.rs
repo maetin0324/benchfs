@@ -77,23 +77,19 @@ impl RpcClient {
             .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;
 
         // Wait for reply
-        // TODO: Implement proper reply reception
-        // This requires either:
-        // 1. pluvio_ucx to export AmStream publicly
-        // 2. A different API design where reply handling is done separately
-        // 3. Using a callback-based approach
-
         let mut msg = reply_stream
             .wait_msg()
             .await
             .ok_or_else(|| RpcError::Timeout)?;
 
+        // Deserialize the response header
         let response_header = msg
             .header()
             .get(..std::mem::size_of::<T::ResponseHeader>())
             .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
             .ok_or_else(|| RpcError::InvalidHeader)?;
 
+        // Receive response data if present
         let response_buffer = request.response_buffer();
         if !response_buffer.is_empty() && msg.contains_data() {
             msg.recv_data_vectored(response_buffer).await.map_err(|e| {
@@ -101,6 +97,8 @@ impl RpcClient {
             })?;
         }
 
+        // Note: The caller should check the status field in the response header
+        // to determine if the RPC succeeded or failed on the server side
         Ok(response_header)
     }
 

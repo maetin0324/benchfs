@@ -162,11 +162,23 @@ impl AmRpc for ReadChunkRequest {
     }
 
     async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        // Server handler implementation will be in the server module
-        // This is just a placeholder
+        // NOTE: This method is not used in production.
+        // The server uses listen_with_handler() which calls handle_read_chunk() directly.
+        // This implementation is here to satisfy the trait requirement.
         Err(RpcError::HandlerError(
-            "Server handler not implemented yet".to_string(),
+            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
         ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        ReadChunkResponseHeader::error(status)
     }
 }
 
@@ -315,10 +327,23 @@ impl AmRpc for WriteChunkRequest {
     }
 
     async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        // Server handler implementation will be in the server module
+        // NOTE: This method is not used in production.
+        // The server uses listen_with_handler() which calls handle_write_chunk() directly.
+        // This implementation is here to satisfy the trait requirement.
         Err(RpcError::HandlerError(
-            "Server handler not implemented yet".to_string(),
+            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
         ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        WriteChunkResponseHeader::error(status)
     }
 }
 

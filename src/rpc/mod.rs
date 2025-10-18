@@ -12,6 +12,7 @@ pub mod handlers;
 pub mod server;
 pub mod client;
 pub mod connection;
+pub mod address_registry;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
@@ -152,6 +153,10 @@ pub trait AmRpc {
     async fn server_handler(
         am_msg: AmMsg,
     ) -> Result<Self::ResponseHeader, RpcError>;
+
+    /// Create an error response from an RpcError
+    /// This allows the server to send proper error responses to clients
+    fn error_response(error: &RpcError) -> Self::ResponseHeader;
 }
 
 

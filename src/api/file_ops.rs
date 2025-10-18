@@ -227,13 +227,11 @@ impl BenchFS {
                         // Local read failed - try remote if distributed mode enabled
                         if let Some(pool) = &self.connection_pool {
                             // Get chunk location from metadata
-                            if let Some(node_addr) = crate::rpc::data_ops::get_chunk_node(chunk_index, &file_meta.chunk_locations) {
-                                // Parse node address
-                                if let Ok(socket_addr) = node_addr.parse() {
-                                    tracing::debug!("Fetching chunk {} from remote node {}", chunk_index, node_addr);
+                            if let Some(node_id) = crate::rpc::data_ops::get_chunk_node(chunk_index, &file_meta.chunk_locations) {
+                                tracing::debug!("Fetching chunk {} from remote node {}", chunk_index, node_id);
 
-                                    // Connect to remote node
-                                    match pool.get_or_connect(socket_addr).await {
+                                // Connect to remote node using node_id
+                                match pool.get_or_connect(node_id).await {
                                         Ok(client) => {
                                             // Create RPC request
                                             let request = ReadChunkRequest::new(
@@ -264,14 +262,10 @@ impl BenchFS {
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::error!("Failed to connect to {}: {:?}", node_addr, e);
+                                            tracing::error!("Failed to connect to {}: {:?}", node_id, e);
                                             None
                                         }
                                     }
-                                } else {
-                                    tracing::warn!("Invalid node address: {}", node_addr);
-                                    None
-                                }
                             } else {
                                 // No location info for this chunk - treat as sparse
                                 None
@@ -381,11 +375,10 @@ impl BenchFS {
                     .write_chunk(file_meta.inode, chunk_index, chunk_offset, chunk_data)
                     .map_err(|e| ApiError::IoError(format!("Failed to write chunk: {:?}", e)))?;
             } else if let Some(pool) = &self.connection_pool {
-                // Write to remote node
-                if let Ok(socket_addr) = target_node.parse() {
-                    tracing::debug!("Writing chunk {} to remote node {}", chunk_index, target_node);
+                // Write to remote node using node_id
+                tracing::debug!("Writing chunk {} to remote node {}", chunk_index, target_node);
 
-                    match pool.get_or_connect(socket_addr).await {
+                match pool.get_or_connect(target_node).await {
                         Ok(client) => {
                             // Create RPC request
                             let request = WriteChunkRequest::new(
@@ -412,9 +405,6 @@ impl BenchFS {
                             return Err(ApiError::IoError(format!("Failed to connect to {}: {:?}", target_node, e)));
                         }
                     }
-                } else {
-                    return Err(ApiError::IoError(format!("Invalid node address: {}", target_node)));
-                }
             } else {
                 // Not in distributed mode but chunk should be on a different node
                 // This shouldn't happen in normal operation
@@ -578,6 +568,165 @@ impl BenchFS {
 
         handle.seek(new_pos);
         Ok(new_pos)
+    }
+
+    /// Synchronize file data to storage
+    ///
+    /// # Arguments
+    /// * `handle` - File handle
+    ///
+    /// # Note
+    /// Currently BenchFS uses InMemoryChunkStore, so fsync is a no-op.
+    /// When using a persistent storage backend, this would ensure data is written to disk.
+    pub fn chfs_fsync(&self, _handle: &FileHandle) -> ApiResult<()> {
+        // For InMemoryChunkStore, data is already in memory
+        // For future persistent backends, implement actual fsync
+        tracing::trace!("fsync called (no-op for InMemoryChunkStore)");
+        Ok(())
+    }
+
+    /// Get file or directory status
+    ///
+    /// # Arguments
+    /// * `path` - File or directory path
+    ///
+    /// # Returns
+    /// File metadata
+    pub fn chfs_stat(&self, path: &str) -> ApiResult<FileMetadata> {
+        use std::path::Path;
+        let path_ref = Path::new(path);
+
+        // Try file metadata first
+        if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
+            return Ok(meta);
+        }
+
+        // Try directory metadata
+        if let Ok(_dir_meta) = self.metadata_manager.get_dir_metadata(path_ref) {
+            // Convert directory metadata to file metadata format
+            // For simplicity, return a dummy file metadata for directories
+            return Err(ApiError::InvalidArgument(
+                "stat on directories not fully supported yet".to_string(),
+            ));
+        }
+
+        Err(ApiError::NotFound(path.to_string()))
+    }
+
+    /// Rename a file or directory
+    ///
+    /// # Arguments
+    /// * `old_path` - Current path
+    /// * `new_path` - New path
+    pub fn chfs_rename(&self, old_path: &str, new_path: &str) -> ApiResult<()> {
+        use std::path::Path;
+        let old_path_ref = Path::new(old_path);
+        let new_path_ref = Path::new(new_path);
+
+        // Check if new path already exists
+        if self.metadata_manager.get_file_metadata(new_path_ref).is_ok()
+            || self.metadata_manager.get_dir_metadata(new_path_ref).is_ok()
+        {
+            return Err(ApiError::AlreadyExists(new_path.to_string()));
+        }
+
+        // Try to rename file
+        if let Ok(mut meta) = self.metadata_manager.get_file_metadata(old_path_ref) {
+            // Remove old metadata
+            self.metadata_manager
+                .remove_file_metadata(old_path_ref)
+                .map_err(|e| ApiError::Internal(format!("Failed to remove old metadata: {:?}", e)))?;
+
+            // Update path and store new metadata
+            meta.path = new_path.to_string();
+            self.metadata_manager
+                .store_file_metadata(meta)
+                .map_err(|e| ApiError::Internal(format!("Failed to store new metadata: {:?}", e)))?;
+
+            return Ok(());
+        }
+
+        // Try to rename directory
+        if let Ok(mut meta) = self.metadata_manager.get_dir_metadata(old_path_ref) {
+            // Remove old metadata
+            self.metadata_manager
+                .remove_dir_metadata(old_path_ref)
+                .map_err(|e| ApiError::Internal(format!("Failed to remove old metadata: {:?}", e)))?;
+
+            // Update path and store new metadata
+            meta.path = new_path.to_string();
+            self.metadata_manager
+                .store_dir_metadata(meta)
+                .map_err(|e| ApiError::Internal(format!("Failed to store new metadata: {:?}", e)))?;
+
+            return Ok(());
+        }
+
+        Err(ApiError::NotFound(old_path.to_string()))
+    }
+
+    /// Read directory contents
+    ///
+    /// # Arguments
+    /// * `path` - Directory path
+    ///
+    /// # Returns
+    /// List of entry names in the directory
+    pub fn chfs_readdir(&self, path: &str) -> ApiResult<Vec<String>> {
+        use std::path::Path;
+        let path_ref = Path::new(path);
+
+        let dir_meta = self
+            .metadata_manager
+            .get_dir_metadata(path_ref)
+            .map_err(|_| ApiError::NotFound(path.to_string()))?;
+
+        // Extract names from DirectoryEntry
+        let names = dir_meta.children.iter().map(|e| e.name.clone()).collect();
+        Ok(names)
+    }
+
+    /// Truncate a file to a specified size
+    ///
+    /// # Arguments
+    /// * `path` - File path
+    /// * `size` - New file size
+    pub fn chfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
+        use std::path::Path;
+        let path_ref = Path::new(path);
+
+        let mut file_meta = self
+            .metadata_manager
+            .get_file_metadata(path_ref)
+            .map_err(|_| ApiError::NotFound(path.to_string()))?;
+
+        let old_size = file_meta.size;
+
+        // Update size
+        file_meta.size = size;
+        let old_chunk_count = file_meta.chunk_count;
+        file_meta.chunk_count = file_meta.calculate_chunk_count();
+
+        // If truncating to smaller size, invalidate affected chunks
+        if size < old_size {
+            let chunk_size = self.chunk_manager.chunk_size() as u64;
+            let new_chunk_count = (size + chunk_size - 1) / chunk_size;
+
+            // Invalidate chunks beyond the new size
+            for chunk_idx in new_chunk_count..old_chunk_count {
+                let chunk_id = ChunkId::new(file_meta.inode, chunk_idx);
+                self.chunk_cache.invalidate(&chunk_id);
+            }
+
+            // Truncate chunk_locations
+            file_meta.chunk_locations.truncate(new_chunk_count as usize);
+        }
+
+        self.metadata_manager
+            .update_file_metadata(file_meta)
+            .map_err(|e| ApiError::Internal(format!("Failed to update metadata: {:?}", e)))?;
+
+        Ok(())
     }
 
     /// Allocate a new file descriptor

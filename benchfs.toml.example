@@ -1,4 +1,7 @@
 # BenchFS Server Configuration Example
+#
+# This configuration file demonstrates BenchFS settings with CHFS-inspired optimizations.
+# See docs/ARCHITECTURE_COMPARISON.md for detailed comparisons with CHFS.
 
 [node]
 # Unique node identifier
@@ -11,7 +14,14 @@ data_dir = "/tmp/benchfs"
 log_level = "info"
 
 [storage]
-# Chunk size in bytes (default: 4MB)
+# Chunk size in bytes (default: 4MB = 4194304)
+#
+# BenchFS default: 4MB (optimized for RDMA and large sequential I/O)
+# CHFS default: 64KB (65536)
+#
+# Recommendations:
+# - Use 4MB for large file workloads and RDMA optimization
+# - Use 64KB for CHFS-compatible behavior or small file workloads
 chunk_size = 4194304
 
 # Use io_uring for file I/O
@@ -33,12 +43,63 @@ peers = [
 # Connection timeout in seconds
 timeout_secs = 30
 
+# RDMA transfer threshold in bytes (default: 32KB = 32768)
+#
+# Transfers larger than this threshold will use RDMA for better performance.
+# Transfers smaller than this will use regular RPC.
+#
+# This value is based on CHFS's proven threshold of 32KB, which provides
+# optimal balance between RDMA setup overhead and transfer efficiency.
+rdma_threshold_bytes = 32768
+
+# WorkerAddress registry directory (default: /tmp/benchfs/worker_addrs)
+#
+# This directory is used for WorkerAddress exchange between nodes.
+# IMPORTANT: This should be a shared filesystem path accessible by all nodes.
+#
+# WorkerAddress-based connection avoids the epoll_wait overhead of socket_bind
+# when ucp_worker_progress is called frequently.
+registry_dir = "/tmp/benchfs/worker_addrs"
+
 [cache]
-# Number of metadata cache entries
+# Number of metadata cache entries (default: 1000)
+#
+# Higher values improve metadata lookup performance but consume more memory.
+# CHFS uses a similar approach with LRU eviction.
 metadata_cache_entries = 1000
 
-# Chunk cache size in megabytes
+# Chunk cache size in megabytes (default: 100MB)
+#
+# This cache stores frequently accessed data chunks in memory.
+# Adjust based on available memory and workload characteristics.
 chunk_cache_mb = 100
 
 # Cache TTL in seconds (0 = no TTL)
+#
+# When set to 0, cache entries never expire based on time (only via LRU eviction).
+# Set to a positive value for time-based expiration.
 cache_ttl_secs = 0
+
+#
+# CHFS Comparison Notes:
+# ----------------------
+# BenchFS design is inspired by CHFS but optimized for benchmarking:
+#
+# 1. Consistent Hashing:
+#    - Virtual nodes per physical node: 150 (same as CHFS)
+#    - Hash function: xxHash64 with seed 0 (same as CHFS)
+#
+# 2. RDMA Optimization:
+#    - Threshold: 32KB (same as CHFS)
+#    - Large transfers use RDMA, small use RPC
+#
+# 3. Chunk Size:
+#    - BenchFS: 4MB (optimized for RDMA)
+#    - CHFS: 64KB (optimized for parallel caching)
+#
+# 4. Architecture:
+#    - BenchFS: Single-threaded multi-process (Pluvio + UCX)
+#    - CHFS: Multi-threaded (Margo + Argobots)
+#
+# For detailed architectural comparison, see:
+# docs/ARCHITECTURE_COMPARISON.md

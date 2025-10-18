@@ -37,13 +37,16 @@ impl RpcHandlerContext {
 pub async fn handle_read_chunk(
     ctx: Rc<RpcHandlerContext>,
     am_msg: AmMsg,
-) -> Result<ReadChunkResponseHeader, RpcError> {
+) -> Result<(ReadChunkResponseHeader, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
-    let header: ReadChunkRequestHeader = am_msg
+    let header: ReadChunkRequestHeader = match am_msg
         .header()
         .get(..std::mem::size_of::<ReadChunkRequestHeader>())
         .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-        .ok_or_else(|| RpcError::InvalidHeader)?;
+    {
+        Some(h) => h,
+        None => return Err((RpcError::InvalidHeader, am_msg)),
+    };
 
     tracing::debug!(
         "ReadChunk: inode={}, chunk={}, offset={}, length={}",
@@ -79,11 +82,11 @@ pub async fn handle_read_chunk(
                 header.chunk_index
             );
 
-            Ok(ReadChunkResponseHeader::success(bytes_read))
+            Ok((ReadChunkResponseHeader::success(bytes_read), am_msg))
         }
         Err(e) => {
             tracing::error!("Failed to read chunk: {:?}", e);
-            Ok(ReadChunkResponseHeader::error(-2)) // ENOENT
+            Ok((ReadChunkResponseHeader::error(-2), am_msg)) // ENOENT
         }
     }
 }
@@ -94,13 +97,16 @@ pub async fn handle_read_chunk(
 pub async fn handle_write_chunk(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
-) -> Result<WriteChunkResponseHeader, RpcError> {
+) -> Result<(WriteChunkResponseHeader, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
-    let header: WriteChunkRequestHeader = am_msg
+    let header: WriteChunkRequestHeader = match am_msg
         .header()
         .get(..std::mem::size_of::<WriteChunkRequestHeader>())
         .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-        .ok_or_else(|| RpcError::InvalidHeader)?;
+    {
+        Some(h) => h,
+        None => return Err((RpcError::InvalidHeader, am_msg)),
+    };
 
     tracing::debug!(
         "WriteChunk: inode={}, chunk={}, offset={}, length={}",
@@ -119,7 +125,7 @@ pub async fn handle_write_chunk(
     if am_msg.contains_data() {
         if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut data)]).await {
             tracing::error!("Failed to RDMA-read chunk data from client: {:?}", e);
-            return Ok(WriteChunkResponseHeader::error(-5)); // EIO
+            return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
         }
 
         tracing::debug!(
@@ -142,11 +148,11 @@ pub async fn handle_write_chunk(
                 header.inode,
                 header.chunk_index
             );
-            Ok(WriteChunkResponseHeader::success(bytes_written as u64))
+            Ok((WriteChunkResponseHeader::success(bytes_written as u64), am_msg))
         }
         Err(e) => {
             tracing::error!("Failed to write chunk: {:?}", e);
-            Ok(WriteChunkResponseHeader::error(-5)) // EIO
+            Ok((WriteChunkResponseHeader::error(-5), am_msg)) // EIO
         }
     }
 }
@@ -161,27 +167,30 @@ pub async fn handle_write_chunk(
 pub async fn handle_metadata_lookup(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
-) -> Result<MetadataLookupResponseHeader, RpcError> {
+) -> Result<(MetadataLookupResponseHeader, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
-    let header: MetadataLookupRequestHeader = am_msg
+    let header: MetadataLookupRequestHeader = match am_msg
         .header()
         .get(..std::mem::size_of::<MetadataLookupRequestHeader>())
         .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-        .ok_or_else(|| RpcError::InvalidHeader)?;
+    {
+        Some(h) => h,
+        None => return Err((RpcError::InvalidHeader, am_msg)),
+    };
 
     // Receive path from request data if available
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
         if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
             tracing::error!("Failed to receive path data: {:?}", e);
-            return Ok(MetadataLookupResponseHeader::error(-5)); // EIO
+            return Ok((MetadataLookupResponseHeader::error(-5), am_msg)); // EIO
         }
 
         match String::from_utf8(path_bytes) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Failed to parse path as UTF-8: {:?}", e);
-                return Ok(MetadataLookupResponseHeader::error(-22)); // EINVAL
+                return Ok((MetadataLookupResponseHeader::error(-22), am_msg)); // EINVAL
             }
         }
     } else {
@@ -196,17 +205,17 @@ pub async fn handle_metadata_lookup(
     // Look up file metadata first
     if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path_ref) {
         tracing::debug!("Found file: inode={}, size={}", file_meta.inode, file_meta.size);
-        return Ok(MetadataLookupResponseHeader::file(file_meta.inode, file_meta.size));
+        return Ok((MetadataLookupResponseHeader::file(file_meta.inode, file_meta.size), am_msg));
     }
 
     // Look up directory metadata
     if let Ok(dir_meta) = ctx.metadata_manager.get_dir_metadata(path_ref) {
         tracing::debug!("Found directory: inode={}", dir_meta.inode);
-        return Ok(MetadataLookupResponseHeader::directory(dir_meta.inode));
+        return Ok((MetadataLookupResponseHeader::directory(dir_meta.inode), am_msg));
     }
 
     tracing::debug!("Path not found: {}", path);
-    Ok(MetadataLookupResponseHeader::not_found())
+    Ok((MetadataLookupResponseHeader::not_found(), am_msg))
 }
 
 /// Handle MetadataCreateFile RPC request
@@ -215,32 +224,35 @@ pub async fn handle_metadata_lookup(
 pub async fn handle_metadata_create_file(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
-) -> Result<MetadataCreateFileResponseHeader, RpcError> {
+) -> Result<(MetadataCreateFileResponseHeader, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
-    let header: MetadataCreateFileRequestHeader = am_msg
+    let header: MetadataCreateFileRequestHeader = match am_msg
         .header()
         .get(..std::mem::size_of::<MetadataCreateFileRequestHeader>())
         .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-        .ok_or_else(|| RpcError::InvalidHeader)?;
+    {
+        Some(h) => h,
+        None => return Err((RpcError::InvalidHeader, am_msg)),
+    };
 
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
         if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
             tracing::error!("Failed to receive path data: {:?}", e);
-            return Ok(MetadataCreateFileResponseHeader::error(-5)); // EIO
+            return Ok((MetadataCreateFileResponseHeader::error(-5), am_msg)); // EIO
         }
 
         match String::from_utf8(path_bytes) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Failed to parse path as UTF-8: {:?}", e);
-                return Ok(MetadataCreateFileResponseHeader::error(-22)); // EINVAL
+                return Ok((MetadataCreateFileResponseHeader::error(-22), am_msg)); // EINVAL
             }
         }
     } else {
         tracing::error!("MetadataCreateFile: missing path");
-        return Ok(MetadataCreateFileResponseHeader::error(-22)); // EINVAL
+        return Ok((MetadataCreateFileResponseHeader::error(-22), am_msg)); // EINVAL
     };
 
     tracing::debug!(
@@ -259,11 +271,11 @@ pub async fn handle_metadata_create_file(
     match ctx.metadata_manager.store_file_metadata(file_meta) {
         Ok(()) => {
             tracing::debug!("Created file metadata: path={}, inode={}", path, inode);
-            Ok(MetadataCreateFileResponseHeader::success(inode))
+            Ok((MetadataCreateFileResponseHeader::success(inode), am_msg))
         }
         Err(e) => {
             tracing::error!("Failed to store file metadata: {:?}", e);
-            Ok(MetadataCreateFileResponseHeader::error(-5)) // EIO
+            Ok((MetadataCreateFileResponseHeader::error(-5), am_msg)) // EIO
         }
     }
 }
@@ -274,32 +286,35 @@ pub async fn handle_metadata_create_file(
 pub async fn handle_metadata_create_dir(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
-) -> Result<MetadataCreateDirResponseHeader, RpcError> {
+) -> Result<(MetadataCreateDirResponseHeader, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
-    let header: MetadataCreateDirRequestHeader = am_msg
+    let header: MetadataCreateDirRequestHeader = match am_msg
         .header()
         .get(..std::mem::size_of::<MetadataCreateDirRequestHeader>())
         .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-        .ok_or_else(|| RpcError::InvalidHeader)?;
+    {
+        Some(h) => h,
+        None => return Err((RpcError::InvalidHeader, am_msg)),
+    };
 
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
         if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
             tracing::error!("Failed to receive path data: {:?}", e);
-            return Ok(MetadataCreateDirResponseHeader::error(-5)); // EIO
+            return Ok((MetadataCreateDirResponseHeader::error(-5), am_msg)); // EIO
         }
 
         match String::from_utf8(path_bytes) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Failed to parse path as UTF-8: {:?}", e);
-                return Ok(MetadataCreateDirResponseHeader::error(-22)); // EINVAL
+                return Ok((MetadataCreateDirResponseHeader::error(-22), am_msg)); // EINVAL
             }
         }
     } else {
         tracing::error!("MetadataCreateDir: missing path");
-        return Ok(MetadataCreateDirResponseHeader::error(-22)); // EINVAL
+        return Ok((MetadataCreateDirResponseHeader::error(-22), am_msg)); // EINVAL
     };
 
     tracing::debug!(
@@ -321,11 +336,11 @@ pub async fn handle_metadata_create_dir(
     match ctx.metadata_manager.store_dir_metadata(dir_meta) {
         Ok(()) => {
             tracing::debug!("Created directory metadata: path={}, inode={}", path, inode);
-            Ok(MetadataCreateDirResponseHeader::success(inode))
+            Ok((MetadataCreateDirResponseHeader::success(inode), am_msg))
         }
         Err(e) => {
             tracing::error!("Failed to store directory metadata: {:?}", e);
-            Ok(MetadataCreateDirResponseHeader::error(-5)) // EIO
+            Ok((MetadataCreateDirResponseHeader::error(-5), am_msg)) // EIO
         }
     }
 }
@@ -336,32 +351,35 @@ pub async fn handle_metadata_create_dir(
 pub async fn handle_metadata_delete(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
-) -> Result<MetadataDeleteResponseHeader, RpcError> {
+) -> Result<(MetadataDeleteResponseHeader, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
-    let header: MetadataDeleteRequestHeader = am_msg
+    let header: MetadataDeleteRequestHeader = match am_msg
         .header()
         .get(..std::mem::size_of::<MetadataDeleteRequestHeader>())
         .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-        .ok_or_else(|| RpcError::InvalidHeader)?;
+    {
+        Some(h) => h,
+        None => return Err((RpcError::InvalidHeader, am_msg)),
+    };
 
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
         if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
             tracing::error!("Failed to receive path data: {:?}", e);
-            return Ok(MetadataDeleteResponseHeader::error(-5)); // EIO
+            return Ok((MetadataDeleteResponseHeader::error(-5), am_msg)); // EIO
         }
 
         match String::from_utf8(path_bytes) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Failed to parse path as UTF-8: {:?}", e);
-                return Ok(MetadataDeleteResponseHeader::error(-22)); // EINVAL
+                return Ok((MetadataDeleteResponseHeader::error(-22), am_msg)); // EINVAL
             }
         }
     } else {
         tracing::error!("MetadataDelete: missing path");
-        return Ok(MetadataDeleteResponseHeader::error(-22)); // EINVAL
+        return Ok((MetadataDeleteResponseHeader::error(-22), am_msg)); // EINVAL
     };
 
     tracing::debug!(
@@ -382,17 +400,17 @@ pub async fn handle_metadata_delete(
         ctx.metadata_manager.remove_dir_metadata(path_ref)
     } else {
         tracing::error!("Invalid entry_type: {}", header.entry_type);
-        return Ok(MetadataDeleteResponseHeader::error(-22)); // EINVAL
+        return Ok((MetadataDeleteResponseHeader::error(-22), am_msg)); // EINVAL
     };
 
     match result {
         Ok(()) => {
             tracing::debug!("Deleted metadata: path={}", path);
-            Ok(MetadataDeleteResponseHeader::success())
+            Ok((MetadataDeleteResponseHeader::success(), am_msg))
         }
         Err(e) => {
             tracing::error!("Failed to delete metadata: {:?}", e);
-            Ok(MetadataDeleteResponseHeader::error(-2)) // ENOENT
+            Ok((MetadataDeleteResponseHeader::error(-2), am_msg)) // ENOENT
         }
     }
 }

@@ -1,3 +1,6 @@
+use std::cell::UnsafeCell;
+use std::io::IoSlice;
+
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::{FileMetadata, DirectoryMetadata};
@@ -115,13 +118,29 @@ impl MetadataLookupResponseHeader {
 pub struct MetadataLookupRequest {
     header: MetadataLookupRequestHeader,
     path: String,
+    /// IoSlice for the path data
+    path_ioslice: UnsafeCell<IoSlice<'static>>,
 }
+
+// SAFETY: MetadataLookupRequest is only used in single-threaded context (Pluvio runtime)
+unsafe impl Send for MetadataLookupRequest {}
 
 impl MetadataLookupRequest {
     pub fn new(path: String) -> Self {
+        // SAFETY: We're creating a 'static IoSlice by transmuting the lifetime.
+        // This is safe because:
+        // 1. The path String lives as long as the MetadataLookupRequest
+        // 2. The IoSlice is only accessed through request_data()
+        // 3. The RPC client will only use it during the RPC call
+        let ioslice = unsafe {
+            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            IoSlice::new(slice)
+        };
+
         Self {
             header: MetadataLookupRequestHeader::new(path.len()),
             path,
+            path_ioslice: UnsafeCell::new(ioslice),
         }
     }
 
@@ -146,6 +165,12 @@ impl AmRpc for MetadataLookupRequest {
         &self.header
     }
 
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        // SAFETY: We're returning a slice containing the IoSlice we created in new()
+        // This is safe because the IoSlice lifetime is tied to self
+        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+    }
+
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
@@ -157,9 +182,23 @@ impl AmRpc for MetadataLookupRequest {
     }
 
     async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
+        // NOTE: This method is not used in production.
+        // The server uses listen_with_handler() which calls handle_metadata_lookup() directly.
+        // This implementation is here to satisfy the trait requirement.
         Err(RpcError::HandlerError(
-            "Server handler not implemented yet".to_string(),
+            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
         ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        MetadataLookupResponseHeader::error(status)
     }
 }
 
@@ -231,13 +270,25 @@ impl MetadataCreateFileResponseHeader {
 pub struct MetadataCreateFileRequest {
     header: MetadataCreateFileRequestHeader,
     path: String,
+    /// IoSlice for the path data
+    path_ioslice: UnsafeCell<IoSlice<'static>>,
 }
+
+// SAFETY: MetadataCreateFileRequest is only used in single-threaded context (Pluvio runtime)
+unsafe impl Send for MetadataCreateFileRequest {}
 
 impl MetadataCreateFileRequest {
     pub fn new(path: String, size: u64, mode: u32) -> Self {
+        // SAFETY: Same as MetadataLookupRequest
+        let ioslice = unsafe {
+            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            IoSlice::new(slice)
+        };
+
         Self {
             header: MetadataCreateFileRequestHeader::new(size, mode, path.len()),
             path,
+            path_ioslice: UnsafeCell::new(ioslice),
         }
     }
 
@@ -262,6 +313,10 @@ impl AmRpc for MetadataCreateFileRequest {
         &self.header
     }
 
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+    }
+
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
@@ -274,8 +329,19 @@ impl AmRpc for MetadataCreateFileRequest {
 
     async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
         Err(RpcError::HandlerError(
-            "Server handler not implemented yet".to_string(),
+            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
         ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        MetadataCreateFileResponseHeader::error(status)
     }
 }
 
@@ -310,13 +376,25 @@ pub type MetadataCreateDirResponseHeader = MetadataCreateFileResponseHeader;
 pub struct MetadataCreateDirRequest {
     header: MetadataCreateDirRequestHeader,
     path: String,
+    /// IoSlice for the path data
+    path_ioslice: UnsafeCell<IoSlice<'static>>,
 }
+
+// SAFETY: MetadataCreateDirRequest is only used in single-threaded context (Pluvio runtime)
+unsafe impl Send for MetadataCreateDirRequest {}
 
 impl MetadataCreateDirRequest {
     pub fn new(path: String, mode: u32) -> Self {
+        // SAFETY: Same as MetadataLookupRequest
+        let ioslice = unsafe {
+            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            IoSlice::new(slice)
+        };
+
         Self {
             header: MetadataCreateDirRequestHeader::new(mode, path.len()),
             path,
+            path_ioslice: UnsafeCell::new(ioslice),
         }
     }
 
@@ -341,6 +419,10 @@ impl AmRpc for MetadataCreateDirRequest {
         &self.header
     }
 
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+    }
+
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
@@ -353,8 +435,19 @@ impl AmRpc for MetadataCreateDirRequest {
 
     async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
         Err(RpcError::HandlerError(
-            "Server handler not implemented yet".to_string(),
+            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
         ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        MetadataCreateDirResponseHeader::error(status)
     }
 }
 
@@ -429,20 +522,39 @@ impl MetadataDeleteResponseHeader {
 pub struct MetadataDeleteRequest {
     header: MetadataDeleteRequestHeader,
     path: String,
+    /// IoSlice for the path data
+    path_ioslice: UnsafeCell<IoSlice<'static>>,
 }
+
+// SAFETY: MetadataDeleteRequest is only used in single-threaded context (Pluvio runtime)
+unsafe impl Send for MetadataDeleteRequest {}
 
 impl MetadataDeleteRequest {
     pub fn delete_file(path: String) -> Self {
+        // SAFETY: Same as MetadataLookupRequest
+        let ioslice = unsafe {
+            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            IoSlice::new(slice)
+        };
+
         Self {
             header: MetadataDeleteRequestHeader::file(path.len()),
             path,
+            path_ioslice: UnsafeCell::new(ioslice),
         }
     }
 
     pub fn delete_directory(path: String) -> Self {
+        // SAFETY: Same as MetadataLookupRequest
+        let ioslice = unsafe {
+            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            IoSlice::new(slice)
+        };
+
         Self {
             header: MetadataDeleteRequestHeader::directory(path.len()),
             path,
+            path_ioslice: UnsafeCell::new(ioslice),
         }
     }
 
@@ -475,6 +587,10 @@ impl AmRpc for MetadataDeleteRequest {
         &self.header
     }
 
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+    }
+
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
@@ -487,8 +603,19 @@ impl AmRpc for MetadataDeleteRequest {
 
     async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
         Err(RpcError::HandlerError(
-            "Server handler not implemented yet".to_string(),
+            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
         ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        MetadataDeleteResponseHeader::error(status)
     }
 }
 

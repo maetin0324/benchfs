@@ -342,12 +342,20 @@ impl StorageBackend for IOUringBackend {
         Ok(())
     }
 
-    async fn fsync(&self, _handle: FileHandle) -> StorageResult<()> {
-        // DmaFile には fsync がないため、標準の File::sync_all を使用
-        // 実装のためには DmaFile に fsync サポートを追加する必要がある
-        tracing::warn!("fsync is not yet fully implemented for IOURING backend");
+    async fn fsync(&self, handle: FileHandle) -> StorageResult<()> {
+        let files = self.files.borrow();
+        let dma_file = files
+            .get(&handle.0)
+            .ok_or(StorageError::InvalidHandle(handle))?;
 
-        // とりあえずエラーなしで返す (後で実装)
+        // Use DmaFile's fsync which uses io_uring's Fsync operation
+        dma_file
+            .fsync()
+            .await
+            .map_err(StorageError::IoError)?;
+
+        tracing::debug!("Synced file with fd={}", handle.0);
+
         Ok(())
     }
 }
