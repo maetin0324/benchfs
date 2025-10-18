@@ -115,6 +115,95 @@ pub enum ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// File type enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    RegularFile,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// File status (similar to POSIX stat)
+#[derive(Debug, Clone)]
+pub struct FileStat {
+    /// File inode
+    pub inode: u64,
+
+    /// File type
+    pub file_type: FileType,
+
+    /// File size in bytes
+    pub size: u64,
+
+    /// Number of chunks (for files)
+    pub chunk_count: u64,
+
+    /// File mode/permissions (Unix-style)
+    pub mode: u32,
+
+    /// Access time (Unix timestamp)
+    pub atime: i64,
+
+    /// Modification time (Unix timestamp)
+    pub mtime: i64,
+
+    /// Change time (Unix timestamp)
+    pub ctime: i64,
+}
+
+impl FileStat {
+    /// Create FileStat from FileMetadata
+    pub fn from_file_metadata(meta: &crate::metadata::FileMetadata) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        Self {
+            inode: meta.inode,
+            file_type: FileType::RegularFile,
+            size: meta.size,
+            chunk_count: meta.chunk_count,
+            mode: 0o644, // Default file permissions
+            atime: now,
+            mtime: now,
+            ctime: now,
+        }
+    }
+
+    /// Create FileStat from DirectoryMetadata
+    pub fn from_dir_metadata(meta: &crate::metadata::DirectoryMetadata) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        Self {
+            inode: meta.inode,
+            file_type: FileType::Directory,
+            size: 4096, // Directory size (conventional value)
+            chunk_count: 0,
+            mode: 0o755, // Default directory permissions
+            atime: now,
+            mtime: now,
+            ctime: now,
+        }
+    }
+
+    /// Check if this is a regular file
+    pub fn is_file(&self) -> bool {
+        self.file_type == FileType::RegularFile
+    }
+
+    /// Check if this is a directory
+    pub fn is_dir(&self) -> bool {
+        self.file_type == FileType::Directory
+    }
+}
+
 impl FileHandle {
     /// Create a new file handle
     pub fn new(fd: u64, path: String, inode: u64, flags: OpenFlags) -> Self {

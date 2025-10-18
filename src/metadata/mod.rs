@@ -10,9 +10,10 @@ pub use manager::{MetadataManager, MetadataError, MetadataResult};
 pub use cache::{MetadataCache, MetadataCacheEntry, CacheStats};
 
 // Consistent Hashing用定数
-// 150 virtual nodes per physical node (same as CHFS)
-// This value provides good load balancing across nodes
-pub const VIRTUAL_NODES_PER_NODE: usize = 150;
+// Number of virtual nodes per physical node
+// Set to 1 for direct node-to-node distribution without virtual node overhead
+// This is optimal for real distributed deployments with physical nodes
+pub const VIRTUAL_NODES_PER_NODE: usize = 1;
 
 // xxHash seed for consistent hashing (same as CHFS)
 pub const XXHASH_SEED: u64 = 0;

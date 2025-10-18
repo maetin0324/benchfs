@@ -7,7 +7,7 @@ use benchfs::config::ServerConfig;
 use benchfs::rpc::server::RpcServer;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::metadata::MetadataManager;
-use benchfs::storage::InMemoryChunkStore;
+use benchfs::storage::{IOUringChunkStore, IOUringBackend};
 use benchfs::cache::CachePolicy;
 
 use pluvio_runtime::executor::Runtime;
@@ -102,6 +102,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         .buffer_size(1 << 20) // 1 MiB
         .submit_depth(64)
         .build();
+
+    // Get buffer allocator from reactor
+    let allocator = uring_reactor.allocator.clone();
+
     runtime.register_reactor("io_uring", uring_reactor.clone());
 
     // Create UCX context and reactor
@@ -128,8 +132,15 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         cache_policy,
     ));
 
-    // Create chunk store
-    let chunk_store = Rc::new(InMemoryChunkStore::new());
+    // Create IOUringBackend for chunk storage
+    let io_backend = Rc::new(IOUringBackend::new(allocator));
+
+    // Create chunk store with io_uring backend
+    let chunk_store_dir = config.node.data_dir.join("chunks");
+    let chunk_store = Rc::new(
+        IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())
+            .expect("Failed to create chunk store")
+    );
 
     // Create RPC handler context
     let handler_context = Rc::new(RpcHandlerContext::new(

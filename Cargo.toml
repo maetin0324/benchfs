@@ -38,3 +38,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.0"
+
+[[bench]]
+name = "small"
+harness = false

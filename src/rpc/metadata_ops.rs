@@ -1,7 +1,10 @@
 use std::cell::UnsafeCell;
 use std::io::IoSlice;
+use std::path::Path;
+use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
+use zerocopy::FromBytes;
 
 use crate::metadata::{FileMetadata, DirectoryMetadata};
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId};
@@ -181,12 +184,54 @@ impl AmRpc for MetadataLookupRequest {
         ))
     }
 
-    async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        // NOTE: This method is not used in production.
-        // The server uses listen_with_handler() which calls handle_metadata_lookup() directly.
-        // This implementation is here to satisfy the trait requirement.
-        Err(RpcError::HandlerError(
-            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<MetadataLookupRequestHeader>())
+            .and_then(|bytes| MetadataLookupRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
+        {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        // Receive path data if present
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if am_msg.contains_data() {
+            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
+            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+                return Ok((
+                    crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::error(-2)),
+                    am_msg
+                ));
+            }
+        }
+        let path_str = String::from_utf8_lossy(&path_bytes);
+        let path = Path::new(path_str.as_ref());
+
+        // Try to find file metadata first
+        if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path) {
+            return Ok((
+                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::file(file_meta.inode, file_meta.size)),
+                am_msg
+            ));
+        }
+
+        // Try to find directory metadata
+        if let Ok(dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
+            return Ok((
+                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::directory(dir_meta.inode)),
+                am_msg
+            ));
+        }
+
+        // Not found
+        Ok((
+            crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::not_found()),
+            am_msg
         ))
     }
 
@@ -327,10 +372,48 @@ impl AmRpc for MetadataCreateFileRequest {
         ))
     }
 
-    async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        Err(RpcError::HandlerError(
-            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
-        ))
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<MetadataCreateFileRequestHeader>())
+            .and_then(|bytes| MetadataCreateFileRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
+        {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        // Receive path data
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if am_msg.contains_data() {
+            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
+            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+                return Ok((
+                    crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::error(-2)),
+                    am_msg
+                ));
+            }
+        }
+        let path_str = String::from_utf8_lossy(&path_bytes);
+
+        // Generate inode and create file metadata
+        let inode = ctx.metadata_manager.generate_inode();
+        let file_meta = FileMetadata::new(inode, path_str.to_string(), header.size);
+
+        // Store file metadata
+        match ctx.metadata_manager.store_file_metadata(file_meta) {
+            Ok(()) => Ok((
+                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::success(inode)),
+                am_msg
+            )),
+            Err(_e) => Ok((
+                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::error(-5)),
+                am_msg
+            )),
+        }
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -433,10 +516,48 @@ impl AmRpc for MetadataCreateDirRequest {
         ))
     }
 
-    async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        Err(RpcError::HandlerError(
-            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
-        ))
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<MetadataCreateDirRequestHeader>())
+            .and_then(|bytes| MetadataCreateDirRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
+        {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        // Receive path data
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if am_msg.contains_data() {
+            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
+            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+                return Ok((
+                    crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::error(-2)),
+                    am_msg
+                ));
+            }
+        }
+        let path_str = String::from_utf8_lossy(&path_bytes);
+
+        // Generate inode and create directory metadata
+        let inode = ctx.metadata_manager.generate_inode();
+        let dir_meta = DirectoryMetadata::new(inode, path_str.to_string());
+
+        // Store directory metadata
+        match ctx.metadata_manager.store_dir_metadata(dir_meta) {
+            Ok(()) => Ok((
+                crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::success(inode)),
+                am_msg
+            )),
+            Err(_e) => Ok((
+                crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::error(-5)),
+                am_msg
+            )),
+        }
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -601,10 +722,58 @@ impl AmRpc for MetadataDeleteRequest {
         ))
     }
 
-    async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        Err(RpcError::HandlerError(
-            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
-        ))
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<MetadataDeleteRequestHeader>())
+            .and_then(|bytes| MetadataDeleteRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
+        {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        // Receive path data
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if am_msg.contains_data() {
+            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
+            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+                return Ok((
+                    crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-2)),
+                    am_msg
+                ));
+            }
+        }
+        let path_str = String::from_utf8_lossy(&path_bytes);
+        let path = Path::new(path_str.as_ref());
+
+        // Delete based on entry type
+        let result = if header.entry_type == 1 {
+            // Delete file
+            ctx.metadata_manager.remove_file_metadata(path)
+        } else if header.entry_type == 2 {
+            // Delete directory
+            ctx.metadata_manager.remove_dir_metadata(path)
+        } else {
+            return Ok((
+                crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-22)), // EINVAL
+                am_msg
+            ));
+        };
+
+        match result {
+            Ok(()) => Ok((
+                crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::success()),
+                am_msg
+            )),
+            Err(_e) => Ok((
+                crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-2)), // ENOENT
+                am_msg
+            )),
+        }
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -616,6 +785,240 @@ impl AmRpc for MetadataDeleteRequest {
             RpcError::Timeout => -5,
         };
         MetadataDeleteResponseHeader::error(status)
+    }
+}
+
+// ============================================================================
+// MetadataUpdate RPC
+// ============================================================================
+
+/// Update mask bits for MetadataUpdate
+const UPDATE_SIZE: u8 = 1 << 0;  // Update file size
+const UPDATE_MODE: u8 = 1 << 1;  // Update file mode/permissions
+
+/// MetadataUpdate request header
+#[repr(C)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+pub struct MetadataUpdateRequestHeader {
+    /// New file size (if UPDATE_SIZE is set)
+    pub new_size: u64,
+
+    /// New file mode (if UPDATE_MODE is set)
+    pub new_mode: u32,
+
+    /// Path length
+    pub path_len: u32,
+
+    /// Update mask (which fields to update)
+    pub update_mask: u8,
+
+    /// Padding for alignment
+    _padding: [u8; 7],
+}
+
+impl MetadataUpdateRequestHeader {
+    pub fn new(path_len: usize) -> Self {
+        Self {
+            new_size: 0,
+            new_mode: 0,
+            path_len: path_len as u32,
+            update_mask: 0,
+            _padding: [0; 7],
+        }
+    }
+
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.new_size = size;
+        self.update_mask |= UPDATE_SIZE;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: u32) -> Self {
+        self.new_mode = mode;
+        self.update_mask |= UPDATE_MODE;
+        self
+    }
+
+    pub fn should_update_size(&self) -> bool {
+        self.update_mask & UPDATE_SIZE != 0
+    }
+
+    pub fn should_update_mode(&self) -> bool {
+        self.update_mask & UPDATE_MODE != 0
+    }
+}
+
+/// MetadataUpdate response header
+#[repr(C)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+pub struct MetadataUpdateResponseHeader {
+    /// Status code (0 = success, non-zero = error)
+    pub status: i32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
+}
+
+impl MetadataUpdateResponseHeader {
+    pub fn success() -> Self {
+        Self {
+            status: 0,
+            _padding: [0; 4],
+        }
+    }
+
+    pub fn error(status: i32) -> Self {
+        Self {
+            status,
+            _padding: [0; 4],
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.status == 0
+    }
+}
+
+/// MetadataUpdate RPC request
+pub struct MetadataUpdateRequest {
+    header: MetadataUpdateRequestHeader,
+    path: String,
+    /// IoSlice for the path data
+    path_ioslice: UnsafeCell<IoSlice<'static>>,
+}
+
+// SAFETY: MetadataUpdateRequest is only used in single-threaded context (Pluvio runtime)
+unsafe impl Send for MetadataUpdateRequest {}
+
+impl MetadataUpdateRequest {
+    pub fn new(path: String) -> Self {
+        // SAFETY: Same as MetadataLookupRequest
+        let ioslice = unsafe {
+            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            IoSlice::new(slice)
+        };
+
+        Self {
+            header: MetadataUpdateRequestHeader::new(path.len()),
+            path,
+            path_ioslice: UnsafeCell::new(ioslice),
+        }
+    }
+
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.header = self.header.with_size(size);
+        self
+    }
+
+    pub fn with_mode(mut self, mode: u32) -> Self {
+        self.header = self.header.with_mode(mode);
+        self
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl AmRpc for MetadataUpdateRequest {
+    type RequestHeader = MetadataUpdateRequestHeader;
+    type ResponseHeader = MetadataUpdateResponseHeader;
+
+    fn rpc_id() -> RpcId {
+        RPC_METADATA_UPDATE
+    }
+
+    fn call_type(&self) -> AmRpcCallType {
+        AmRpcCallType::None
+    }
+
+    fn request_header(&self) -> &Self::RequestHeader {
+        &self.header
+    }
+
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+    }
+
+    async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
+        client.execute(self).await
+    }
+
+    async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
+        Err(RpcError::HandlerError(
+            "MetadataUpdate requires a reply".to_string(),
+        ))
+    }
+
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<MetadataUpdateRequestHeader>())
+            .and_then(|bytes| MetadataUpdateRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
+        {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        // Receive path data
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if am_msg.contains_data() {
+            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
+            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+                return Ok((
+                    crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-2)),
+                    am_msg
+                ));
+            }
+        }
+        let path_str = String::from_utf8_lossy(&path_bytes);
+        let path = Path::new(path_str.as_ref());
+
+        // Get current file metadata
+        let mut file_meta = match ctx.metadata_manager.get_file_metadata(path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                return Ok((
+                    crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-2)), // ENOENT
+                    am_msg
+                ));
+            }
+        };
+
+        // Update size if requested
+        if header.should_update_size() {
+            file_meta.size = header.new_size;
+            file_meta.chunk_count = file_meta.calculate_chunk_count();
+        }
+
+        // Note: Mode update would be handled here if FileMetadata supported it
+
+        // Store updated metadata
+        match ctx.metadata_manager.update_file_metadata(file_meta) {
+            Ok(()) => Ok((
+                crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::success()),
+                am_msg
+            )),
+            Err(_e) => Ok((
+                crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-5)), // EIO
+                am_msg
+            )),
+        }
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        MetadataUpdateResponseHeader::error(status)
     }
 }
 

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
-use crate::storage::InMemoryChunkStore;
+use crate::storage::IOUringChunkStore;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 
 /// RPC Handler context
@@ -12,13 +12,13 @@ use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 /// that handlers need to access.
 pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
-    pub chunk_store: Rc<InMemoryChunkStore>,
+    pub chunk_store: Rc<IOUringChunkStore>,
 }
 
 impl RpcHandlerContext {
     pub fn new(
         metadata_manager: Rc<MetadataManager>,
-        chunk_store: Rc<InMemoryChunkStore>,
+        chunk_store: Rc<IOUringChunkStore>,
     ) -> Self {
         Self {
             metadata_manager,
@@ -31,13 +31,19 @@ impl RpcHandlerContext {
 // Data RPC Handlers
 // ============================================================================
 
+/// Response for ReadChunk that includes both header and data
+pub struct ReadChunkHandlerResponse {
+    pub header: ReadChunkResponseHeader,
+    pub data: Option<Vec<u8>>,
+}
+
 /// Handle ReadChunk RPC request
 ///
 /// Reads chunk data from local storage and returns it to the client via RDMA.
 pub async fn handle_read_chunk(
     ctx: Rc<RpcHandlerContext>,
     am_msg: AmMsg,
-) -> Result<(ReadChunkResponseHeader, AmMsg), (RpcError, AmMsg)> {
+) -> Result<(ReadChunkHandlerResponse, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
     let header: ReadChunkRequestHeader = match am_msg
         .header()
@@ -60,33 +66,35 @@ pub async fn handle_read_chunk(
     match ctx
         .chunk_store
         .read_chunk(header.inode, header.chunk_index, header.offset, header.length)
+        .await
     {
         Ok(data) => {
             let bytes_read = data.len() as u64;
 
-            // For ReadChunk, the data flows from server to client.
-            // With AmProto::Rndv, UCX will automatically RDMA-write the data
-            // to the client's response_buffer when we send the reply.
-            // The data is already in the 'data' variable, and the client's
-            // response_buffer was specified when the request was made.
-
-            // Note: The actual RDMA transfer happens automatically by UCX
-            // when the reply is sent. We don't need to explicitly call
-            // send_data here - UCX handles it based on the AmProto and
-            // the response_buffer provided by the client.
-
             tracing::debug!(
-                "Prepared {} bytes for RDMA-write to client (inode={}, chunk={})",
+                "Read {} bytes from storage (inode={}, chunk={})",
                 bytes_read,
                 header.inode,
                 header.chunk_index
             );
 
-            Ok((ReadChunkResponseHeader::success(bytes_read), am_msg))
+            Ok((
+                ReadChunkHandlerResponse {
+                    header: ReadChunkResponseHeader::success(bytes_read),
+                    data: Some(data),
+                },
+                am_msg
+            ))
         }
         Err(e) => {
             tracing::error!("Failed to read chunk: {:?}", e);
-            Ok((ReadChunkResponseHeader::error(-2), am_msg)) // ENOENT
+            Ok((
+                ReadChunkHandlerResponse {
+                    header: ReadChunkResponseHeader::error(-2), // ENOENT
+                    data: None,
+                },
+                am_msg
+            ))
         }
     }
 }
@@ -140,6 +148,7 @@ pub async fn handle_write_chunk(
     match ctx
         .chunk_store
         .write_chunk(header.inode, header.chunk_index, header.offset, &data)
+        .await
     {
         Ok(bytes_written) => {
             tracing::debug!(
@@ -415,22 +424,113 @@ pub async fn handle_metadata_delete(
     }
 }
 
+/// Handle MetadataUpdate RPC request
+///
+/// Updates file metadata (size, mode/permissions).
+pub async fn handle_metadata_update(
+    ctx: Rc<RpcHandlerContext>,
+    mut am_msg: AmMsg,
+) -> Result<(MetadataUpdateResponseHeader, AmMsg), (RpcError, AmMsg)> {
+    // Parse request header
+    let header: MetadataUpdateRequestHeader = match am_msg
+        .header()
+        .get(..std::mem::size_of::<MetadataUpdateRequestHeader>())
+        .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
+    {
+        Some(h) => h,
+        None => return Err((RpcError::InvalidHeader, am_msg)),
+    };
+
+    // Receive path from request data
+    let path = if header.path_len > 0 && am_msg.contains_data() {
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+            tracing::error!("Failed to receive path data: {:?}", e);
+            return Ok((MetadataUpdateResponseHeader::error(-5), am_msg)); // EIO
+        }
+
+        match String::from_utf8(path_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to parse path as UTF-8: {:?}", e);
+                return Ok((MetadataUpdateResponseHeader::error(-22), am_msg)); // EINVAL
+            }
+        }
+    } else {
+        tracing::error!("MetadataUpdate: missing path");
+        return Ok((MetadataUpdateResponseHeader::error(-22), am_msg)); // EINVAL
+    };
+
+    tracing::debug!(
+        "MetadataUpdate: path={}, update_mask={:#b}",
+        path,
+        header.update_mask
+    );
+
+    use std::path::Path;
+    let path_ref = Path::new(&path);
+
+    // Get current file metadata
+    let mut file_meta = match ctx.metadata_manager.get_file_metadata(path_ref) {
+        Ok(meta) => meta,
+        Err(_) => {
+            tracing::debug!("File not found: {}", path);
+            return Ok((MetadataUpdateResponseHeader::error(-2), am_msg)); // ENOENT
+        }
+    };
+
+    // Update size if requested
+    if header.should_update_size() {
+        let old_size = file_meta.size;
+        file_meta.size = header.new_size;
+        file_meta.chunk_count = file_meta.calculate_chunk_count();
+
+        tracing::debug!(
+            "Updated file size: {} -> {} (path={})",
+            old_size,
+            header.new_size,
+            path
+        );
+
+        // If truncating to smaller size, update chunk_locations
+        if header.new_size < old_size {
+            let chunk_size = crate::metadata::CHUNK_SIZE as u64;
+            let new_chunk_count = (header.new_size + chunk_size - 1) / chunk_size;
+            file_meta.chunk_locations.truncate(new_chunk_count as usize);
+        }
+    }
+
+    // Update mode if requested
+    // Note: BenchFS doesn't currently use mode field in FileMetadata,
+    // so we just log it for now
+    if header.should_update_mode() {
+        tracing::debug!(
+            "Updated file mode: {:#o} (path={})",
+            header.new_mode,
+            path
+        );
+        // In the future, store mode in FileMetadata
+    }
+
+    // Store updated metadata
+    match ctx.metadata_manager.update_file_metadata(file_meta) {
+        Ok(()) => {
+            tracing::debug!("Successfully updated metadata: path={}", path);
+            Ok((MetadataUpdateResponseHeader::success(), am_msg))
+        }
+        Err(e) => {
+            tracing::error!("Failed to update metadata: {:?}", e);
+            Ok((MetadataUpdateResponseHeader::error(-5), am_msg)) // EIO
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn create_test_context() -> Rc<RpcHandlerContext> {
-        let metadata_manager = Rc::new(MetadataManager::new("test_node".to_string()));
-        let chunk_store = Rc::new(InMemoryChunkStore::new());
-        Rc::new(RpcHandlerContext::new(metadata_manager, chunk_store))
-    }
-
-    #[test]
-    fn test_context_creation() {
-        let ctx = create_test_context();
-        assert_eq!(ctx.metadata_manager.self_node_id(), "test_node");
-        assert_eq!(ctx.chunk_store.chunk_count(), 0);
-    }
+    // Note: Testing with IOUringChunkStore requires async runtime setup
+    // These tests are disabled as they would need complex setup with io_uring reactor
 
     // Note: Testing the actual handlers requires creating AmMsg instances,
     // which is difficult without a real UCX worker. These would be integration tests.

@@ -4,6 +4,7 @@ use pluvio_ucx::{Worker, endpoint::Endpoint};
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::rpc::client::RpcClient;
+use crate::rpc::handlers::RpcHandlerContext;
 
 pub mod file_ops;
 pub mod data_ops;
@@ -16,6 +17,23 @@ pub mod address_registry;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
+
+/// Unified server response structure
+/// Contains response header and optional data payload
+pub struct ServerResponse<H> {
+    pub header: H,
+    pub data: Option<Vec<u8>>,
+}
+
+impl<H> ServerResponse<H> {
+    pub fn new(header: H) -> Self {
+        Self { header, data: None }
+    }
+
+    pub fn with_data(header: H, data: Vec<u8>) -> Self {
+        Self { header, data: Some(data) }
+    }
+}
 
 pub trait Serializable:
     zerocopy::FromBytes
@@ -150,9 +168,15 @@ pub trait AmRpc {
 
     async fn call_no_reply(&self, client: &RpcClient) -> Result<(), RpcError>;
 
+    /// Server-side handler for this RPC
+    ///
+    /// This is called by RpcServer::listen() when a request is received.
+    /// Returns (ServerResponse, AmMsg) on success, or (RpcError, AmMsg) on failure.
+    /// The AmMsg must be returned so the server can send a reply.
     async fn server_handler(
+        ctx: Rc<RpcHandlerContext>,
         am_msg: AmMsg,
-    ) -> Result<Self::ResponseHeader, RpcError>;
+    ) -> Result<(ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)>;
 
     /// Create an error response from an RpcError
     /// This allows the server to send proper error responses to clients

@@ -1,7 +1,9 @@
 use std::cell::UnsafeCell;
 use std::io::{IoSlice, IoSliceMut};
+use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
+use zerocopy::FromBytes;
 
 use crate::metadata::NodeId;
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId};
@@ -161,13 +163,50 @@ impl AmRpc for ReadChunkRequest {
         ))
     }
 
-    async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        // NOTE: This method is not used in production.
-        // The server uses listen_with_handler() which calls handle_read_chunk() directly.
-        // This implementation is here to satisfy the trait requirement.
-        Err(RpcError::HandlerError(
-            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
-        ))
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<ReadChunkRequestHeader>())
+            .and_then(|bytes| ReadChunkRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
+        {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        tracing::debug!(
+            "ReadChunk request: inode={}, chunk={}, offset={}, length={}",
+            header.inode,
+            header.chunk_index,
+            header.offset,
+            header.length
+        );
+
+        // Read chunk data from storage
+        match ctx.chunk_store.read_chunk(header.inode, header.chunk_index, header.offset, header.length).await {
+            Ok(data) => {
+                let bytes_read = data.len() as u64;
+                tracing::debug!("Read {} bytes from storage (inode={}, chunk={})", bytes_read, header.inode, header.chunk_index);
+
+                Ok((
+                    crate::rpc::ServerResponse::with_data(
+                        ReadChunkResponseHeader::success(bytes_read),
+                        data
+                    ),
+                    am_msg
+                ))
+            }
+            Err(e) => {
+                tracing::error!("Failed to read chunk: {:?}", e);
+                Ok((
+                    crate::rpc::ServerResponse::new(ReadChunkResponseHeader::error(-2)),
+                    am_msg
+                ))
+            }
+        }
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -326,13 +365,64 @@ impl AmRpc for WriteChunkRequest {
         client.execute_no_reply(self).await
     }
 
-    async fn server_handler(_am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError> {
-        // NOTE: This method is not used in production.
-        // The server uses listen_with_handler() which calls handle_write_chunk() directly.
-        // This implementation is here to satisfy the trait requirement.
-        Err(RpcError::HandlerError(
-            "Direct server_handler call not supported. Use listen_with_handler() instead.".to_string(),
-        ))
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<WriteChunkRequestHeader>())
+            .and_then(|bytes| WriteChunkRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
+        {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        tracing::debug!(
+            "WriteChunk request: inode={}, chunk={}, offset={}, length={}",
+            header.inode,
+            header.chunk_index,
+            header.offset,
+            header.length
+        );
+
+        // Receive data from client if present
+        let mut data = vec![0u8; header.length as usize];
+        if am_msg.contains_data() {
+            let mut ioslices = vec![std::io::IoSliceMut::new(&mut data)];
+            if let Err(e) = am_msg.recv_data_vectored(&mut ioslices).await {
+                tracing::error!("Failed to receive data: {:?}", e);
+                return Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-2)),
+                    am_msg
+                ));
+            }
+        } else {
+            tracing::warn!("WriteChunk request contains no data");
+            return Ok((
+                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
+                am_msg
+            ));
+        }
+
+        // Write chunk data to storage
+        match ctx.chunk_store.write_chunk(header.inode, header.chunk_index, header.offset, &data).await {
+            Ok(_bytes_written) => {
+                tracing::debug!("Wrote {} bytes to storage (inode={}, chunk={})", data.len(), header.inode, header.chunk_index);
+                Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::success(header.length)),
+                    am_msg
+                ))
+            }
+            Err(e) => {
+                tracing::error!("Failed to write chunk: {:?}", e);
+                Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
+                    am_msg
+                ))
+            }
+        }
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
