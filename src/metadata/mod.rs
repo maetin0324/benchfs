@@ -3,11 +3,13 @@ pub mod types;
 pub mod consistent_hash;
 pub mod manager;
 pub mod cache;
+pub mod id_generator;
 
 pub use types::{FileMetadata, DirectoryMetadata, InodeType, FilePermissions, NodeId};
 pub use consistent_hash::ConsistentHashRing;
 pub use manager::{MetadataManager, MetadataError, MetadataResult};
 pub use cache::{MetadataCache, MetadataCacheEntry, CacheStats};
+pub use id_generator::{IdGenerator, IdGeneratorError, IdGeneratorResult};
 
 // Consistent Hashing用定数
 // Number of virtual nodes per physical node

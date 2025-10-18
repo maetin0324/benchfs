@@ -173,7 +173,6 @@ impl ConnectionPool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // Note: These tests require UCX setup and can't run in standard test environment
     // They are here as documentation of the expected behavior

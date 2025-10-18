@@ -8,11 +8,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::api::types::{ApiError, ApiResult, FileHandle, OpenFlags};
-use crate::metadata::{MetadataManager, FileMetadata, DirectoryMetadata};
+use crate::metadata::{MetadataManager, FileMetadata, DirectoryMetadata, ConsistentHashRing, InodeType};
 use crate::storage::InMemoryChunkStore;
 use crate::data::{ChunkManager, PlacementStrategy, RoundRobinPlacement};
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
+use crate::rpc::metadata_ops::{MetadataLookupRequest, MetadataCreateFileRequest, MetadataCreateDirRequest};
 use crate::rpc::AmRpc;
 use crate::cache::{ChunkCache, ChunkId};
 
@@ -21,8 +22,14 @@ use crate::cache::{ChunkCache, ChunkId};
 /// This is the main entry point for filesystem operations.
 /// It maintains connections to metadata and data servers.
 pub struct BenchFS {
-    /// Metadata manager
+    /// Node ID for this client
+    node_id: String,
+
+    /// Metadata manager (for local metadata)
     metadata_manager: Rc<MetadataManager>,
+
+    /// Metadata consistent hash ring (for distributed metadata)
+    metadata_ring: Option<Rc<ConsistentHashRing>>,
 
     /// Chunk store (for local operations)
     chunk_store: Rc<InMemoryChunkStore>,
@@ -53,10 +60,12 @@ impl BenchFS {
         let chunk_store = Rc::new(InMemoryChunkStore::new());
         let chunk_cache = ChunkCache::with_memory_limit(100); // 100 MB cache
         let chunk_manager = ChunkManager::new();
-        let placement = Rc::new(RoundRobinPlacement::new(vec![node_id]));
+        let placement = Rc::new(RoundRobinPlacement::new(vec![node_id.clone()]));
 
         Self {
+            node_id,
             metadata_manager,
+            metadata_ring: None,
             chunk_store,
             chunk_cache,
             chunk_manager,
@@ -73,10 +82,12 @@ impl BenchFS {
         let chunk_store = Rc::new(InMemoryChunkStore::new());
         let chunk_cache = ChunkCache::with_memory_limit(100);
         let chunk_manager = ChunkManager::new();
-        let placement = Rc::new(RoundRobinPlacement::new(vec![node_id]));
+        let placement = Rc::new(RoundRobinPlacement::new(vec![node_id.clone()]));
 
         Self {
+            node_id,
             metadata_manager,
+            metadata_ring: None,
             chunk_store,
             chunk_cache,
             chunk_manager,
@@ -105,7 +116,48 @@ impl BenchFS {
         let placement = Rc::new(RoundRobinPlacement::new(target_nodes));
 
         Self {
+            node_id,
             metadata_manager,
+            metadata_ring: None,
+            chunk_store,
+            chunk_cache,
+            chunk_manager,
+            placement,
+            open_files: RefCell::new(HashMap::new()),
+            next_fd: RefCell::new(3),
+            connection_pool: Some(connection_pool),
+        }
+    }
+
+    /// Create a new BenchFS client with distributed metadata support
+    ///
+    /// # Arguments
+    /// * `node_id` - This client's node ID
+    /// * `connection_pool` - Connection pool for RPC communication
+    /// * `data_nodes` - List of data nodes for chunk placement
+    /// * `metadata_nodes` - List of metadata server nodes
+    pub fn with_distributed_metadata(
+        node_id: String,
+        connection_pool: Rc<ConnectionPool>,
+        data_nodes: Vec<String>,
+        metadata_nodes: Vec<String>,
+    ) -> Self {
+        let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
+        let chunk_store = Rc::new(InMemoryChunkStore::new());
+        let chunk_cache = ChunkCache::with_memory_limit(100);
+        let chunk_manager = ChunkManager::new();
+        let placement = Rc::new(RoundRobinPlacement::new(data_nodes));
+
+        // Create metadata consistent hash ring
+        let mut ring = ConsistentHashRing::new();
+        for node in &metadata_nodes {
+            ring.add_node(node.clone());
+        }
+
+        Self {
+            node_id,
+            metadata_manager,
+            metadata_ring: Some(Rc::new(ring)),
             chunk_store,
             chunk_cache,
             chunk_manager,
@@ -121,6 +173,68 @@ impl BenchFS {
         self.connection_pool.is_some()
     }
 
+    /// Get the metadata server node for a given path
+    ///
+    /// Returns the node ID responsible for this path's metadata.
+    /// If distributed metadata is not enabled, returns this node's ID.
+    fn get_metadata_node(&self, path: &str) -> String {
+        if let Some(ring) = &self.metadata_ring {
+            ring.get_node(path).unwrap_or_else(|| self.node_id.clone())
+        } else {
+            self.node_id.clone()
+        }
+    }
+
+    /// Check if metadata for this path is stored locally
+    fn is_local_metadata(&self, path: &str) -> bool {
+        self.get_metadata_node(path) == self.node_id
+    }
+
+    /// Get file metadata with automatic caching for distributed mode
+    ///
+    /// This helper function tries to get metadata locally first.
+    /// If not found locally and in distributed mode, it fetches from remote server and caches locally.
+    async fn get_file_metadata_cached(&self, path: &str) -> ApiResult<FileMetadata> {
+        use std::path::Path;
+        let path_ref = Path::new(path);
+
+        // Try local first
+        if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
+            return Ok(meta);
+        }
+
+        // If not local and in distributed mode, fetch from remote
+        let metadata_node = self.get_metadata_node(path);
+        if let Some(pool) = &self.connection_pool {
+            match pool.get_or_connect(&metadata_node).await {
+                Ok(client) => {
+                    let request = MetadataLookupRequest::new(path.to_string());
+                    match request.call(&*client).await {
+                        Ok(response) if response.is_success() && response.is_file() => {
+                            let mut meta = FileMetadata::new(response.inode, path.to_string(), response.size);
+                            // Restore chunk_locations from response if available
+                            // Note: MetadataLookupResponse might not have chunk_locations, so we start with empty
+                            // The chunk_locations will be populated during write operations
+
+                            // Cache locally for future access
+                            if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone()) {
+                                tracing::warn!("Failed to cache metadata locally: {:?}", e);
+                            } else {
+                                tracing::debug!("Cached metadata for {} locally", path);
+                            }
+                            Ok(meta)
+                        }
+                        Ok(_) => Err(ApiError::NotFound(path.to_string())),
+                        Err(e) => Err(ApiError::Internal(format!("Remote lookup failed: {:?}", e))),
+                    }
+                }
+                Err(e) => Err(ApiError::Internal(format!("Connection failed: {:?}", e))),
+            }
+        } else {
+            Err(ApiError::NotFound(path.to_string()))
+        }
+    }
+
     /// Open a file
     ///
     /// # Arguments
@@ -129,14 +243,53 @@ impl BenchFS {
     ///
     /// # Returns
     /// File handle
-    pub fn benchfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle> {
+    pub async fn benchfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
-        // Check if file exists
-        let file_meta = match self.metadata_manager.get_file_metadata(path_ref) {
-            Ok(meta) => Some(meta),
-            Err(_) => None,
+        // Determine metadata server for this path
+        let metadata_node = self.get_metadata_node(path);
+        let is_local = self.is_local_metadata(path);
+
+        // Lookup file metadata (local or remote)
+        let file_meta = if is_local {
+            // Local metadata lookup
+            match self.metadata_manager.get_file_metadata(path_ref) {
+                Ok(meta) => Some(meta),
+                Err(_) => None,
+            }
+        } else {
+            // Remote metadata lookup via RPC
+            if let Some(pool) = &self.connection_pool {
+                match pool.get_or_connect(&metadata_node).await {
+                    Ok(client) => {
+                        let request = MetadataLookupRequest::new(path.to_string());
+                        match request.call(&*client).await {
+                            Ok(response) if response.is_success() && response.is_file() => {
+                                // File found on remote server - create local cache entry
+                                let meta = FileMetadata::new(response.inode, path.to_string(), response.size);
+                                // Cache locally for future access
+                                if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone()) {
+                                    tracing::warn!("Failed to cache metadata in benchfs_open: {:?}", e);
+                                } else {
+                                    tracing::debug!("Cached metadata for {} in benchfs_open", path);
+                                }
+                                Some(meta)
+                            }
+                            Ok(_) => None, // Not found or is directory
+                            Err(e) => {
+                                tracing::warn!("Remote metadata lookup failed: {:?}", e);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(ApiError::Internal(format!("Failed to connect to metadata server {}: {:?}", metadata_node, e)));
+                    }
+                }
+            } else {
+                return Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()));
+            }
         };
 
         let inode = if let Some(meta) = file_meta {
@@ -147,13 +300,40 @@ impl BenchFS {
 
             if flags.truncate {
                 // Truncate file
-                let mut new_meta = meta.clone();
-                new_meta.size = 0;
-                new_meta.chunk_count = 0;
-                new_meta.chunk_locations.clear();
-                self.metadata_manager
-                    .update_file_metadata(new_meta)
-                    .map_err(|e| ApiError::Internal(format!("Failed to truncate: {:?}", e)))?;
+                if is_local {
+                    // Local truncate
+                    let mut new_meta = meta.clone();
+                    new_meta.size = 0;
+                    new_meta.chunk_count = 0;
+                    new_meta.chunk_locations.clear();
+                    self.metadata_manager
+                        .update_file_metadata(new_meta)
+                        .map_err(|e| ApiError::Internal(format!("Failed to truncate: {:?}", e)))?;
+                } else {
+                    // Remote truncate via RPC
+                    if let Some(pool) = &self.connection_pool {
+                        match pool.get_or_connect(&metadata_node).await {
+                            Ok(client) => {
+                                use crate::rpc::metadata_ops::{MetadataUpdateRequest};
+                                let request = MetadataUpdateRequest::new(path.to_string()).with_size(0);
+                                match request.call(&*client).await {
+                                    Ok(response) if response.is_success() => {
+                                        tracing::debug!("Remote truncate succeeded for {}", path);
+                                    }
+                                    Ok(response) => {
+                                        return Err(ApiError::Internal(format!("Remote truncate failed with status {}", response.status)));
+                                    }
+                                    Err(e) => {
+                                        return Err(ApiError::Internal(format!("Remote truncate RPC error: {:?}", e)));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                return Err(ApiError::Internal(format!("Failed to connect for truncate: {:?}", e)));
+                            }
+                        }
+                    }
+                }
             }
 
             meta.inode
@@ -163,15 +343,64 @@ impl BenchFS {
                 return Err(ApiError::NotFound(path.to_string()));
             }
 
-            // Create new file
-            let inode = self.metadata_manager.generate_inode();
-            let file_meta = FileMetadata::new(inode, path.to_string(), 0);
+            // Create new file (local or remote)
+            let created_inode = if is_local {
+                // Local file creation
+                let inode = self.metadata_manager.generate_inode();
+                let file_meta = FileMetadata::new(inode, path.to_string(), 0);
 
-            self.metadata_manager
-                .store_file_metadata(file_meta)
-                .map_err(|e| ApiError::Internal(format!("Failed to create file: {:?}", e)))?;
+                self.metadata_manager
+                    .store_file_metadata(file_meta)
+                    .map_err(|e| ApiError::Internal(format!("Failed to create file: {:?}", e)))?;
 
-            inode
+                inode
+            } else {
+                // Remote file creation via RPC
+                if let Some(pool) = &self.connection_pool {
+                    match pool.get_or_connect(&metadata_node).await {
+                        Ok(client) => {
+                            let request = MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
+                            match request.call(&*client).await {
+                                Ok(response) if response.is_success() => {
+                                    tracing::debug!("Remote file created: {} with inode {}", path, response.inode);
+                                    response.inode
+                                }
+                                Ok(response) => {
+                                    return Err(ApiError::Internal(format!("Remote create failed with status {}", response.status)));
+                                }
+                                Err(e) => {
+                                    return Err(ApiError::Internal(format!("Remote create RPC error: {:?}", e)));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(ApiError::Internal(format!("Failed to connect for create: {:?}", e)));
+                        }
+                    }
+                } else {
+                    return Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()));
+                }
+            };
+
+            // Update parent directory's children list
+            if let (Some(parent_path), Some(filename)) = (Self::get_parent_path(path), Self::get_filename(path)) {
+                use std::path::Path;
+                let parent_path_ref = Path::new(&parent_path);
+
+                // Only update if parent directory is stored locally
+                if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
+                    parent_meta.add_child(filename, created_inode, InodeType::File);
+                    if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
+                        tracing::warn!("Failed to update parent directory {} after file creation: {:?}", parent_path, e);
+                    } else {
+                        tracing::debug!("Updated parent directory {} with new file {}", parent_path, path);
+                    }
+                } else {
+                    tracing::debug!("Parent directory {} not found locally, skipping children update", parent_path);
+                }
+            }
+
+            created_inode
         };
 
         // Create file handle
@@ -180,9 +409,31 @@ impl BenchFS {
 
         if flags.append {
             // Set position to end of file
-            if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
-                handle.seek(meta.size);
-            }
+            // For remote files, we need to query size again
+            let file_size = if is_local {
+                if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
+                    meta.size
+                } else {
+                    0
+                }
+            } else {
+                // Query remote metadata for size
+                if let Some(pool) = &self.connection_pool {
+                    match pool.get_or_connect(&metadata_node).await {
+                        Ok(client) => {
+                            let request = MetadataLookupRequest::new(path.to_string());
+                            match request.call(&*client).await {
+                                Ok(response) if response.is_success() && response.is_file() => response.size,
+                                _ => 0,
+                            }
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
+                }
+            };
+            handle.seek(file_size);
         }
 
         self.open_files.borrow_mut().insert(fd, handle.clone());
@@ -203,14 +454,8 @@ impl BenchFS {
             return Err(ApiError::PermissionDenied("File not opened for reading".to_string()));
         }
 
-        use std::path::Path;
-        let path_ref = Path::new(&handle.path);
-
-        // Get file metadata
-        let file_meta = self
-            .metadata_manager
-            .get_file_metadata(path_ref)
-            .map_err(|e| ApiError::Internal(format!("Failed to get metadata: {:?}", e)))?;
+        // Get file metadata with caching
+        let file_meta = self.get_file_metadata_cached(&handle.path).await?;
 
         let offset = handle.position();
         let length = buf.len() as u64;
@@ -352,14 +597,8 @@ impl BenchFS {
             return Err(ApiError::PermissionDenied("File not opened for writing".to_string()));
         }
 
-        use std::path::Path;
-        let path_ref = Path::new(&handle.path);
-
-        // Get file metadata
-        let mut file_meta = self
-            .metadata_manager
-            .get_file_metadata(path_ref)
-            .map_err(|e| ApiError::Internal(format!("Failed to get metadata: {:?}", e)))?;
+        // Get file metadata with caching
+        let mut file_meta = self.get_file_metadata_cached(&handle.path).await?;
 
         let offset = handle.position();
         let length = data.len() as u64;
@@ -498,6 +737,24 @@ impl BenchFS {
             .remove_file_metadata(path_ref)
             .map_err(|e| ApiError::Internal(format!("Failed to delete metadata: {:?}", e)))?;
 
+        // Update parent directory's children list
+        if let (Some(parent_path), Some(filename)) = (Self::get_parent_path(path), Self::get_filename(path)) {
+            use std::path::Path;
+            let parent_path_ref = Path::new(&parent_path);
+
+            // Only update if parent directory is stored locally
+            if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
+                parent_meta.remove_child(&filename);
+                if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
+                    tracing::warn!("Failed to update parent directory {} after file deletion: {:?}", parent_path, e);
+                } else {
+                    tracing::debug!("Updated parent directory {} after deleting file {}", parent_path, path);
+                }
+            } else {
+                tracing::debug!("Parent directory {} not found locally, skipping children update", parent_path);
+            }
+        }
+
         Ok(())
     }
 
@@ -506,22 +763,98 @@ impl BenchFS {
     /// # Arguments
     /// * `path` - Directory path
     /// * `mode` - Permissions (Unix-style)
-    pub fn benchfs_mkdir(&self, path: &str, _mode: u32) -> ApiResult<()> {
+    pub async fn benchfs_mkdir(&self, path: &str, mode: u32) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
-        // Check if already exists
-        if self.metadata_manager.get_dir_metadata(path_ref).is_ok() {
-            return Err(ApiError::AlreadyExists(path.to_string()));
+        // Determine metadata server for this path
+        let metadata_node = self.get_metadata_node(path);
+        let is_local = self.is_local_metadata(path);
+
+        let created_inode = if is_local {
+            // Local directory creation
+            // Check if already exists
+            if self.metadata_manager.get_dir_metadata(path_ref).is_ok() {
+                return Err(ApiError::AlreadyExists(path.to_string()));
+            }
+
+            // Create directory metadata
+            let inode = self.metadata_manager.generate_inode();
+            let dir_meta = DirectoryMetadata::new(inode, path.to_string());
+
+            self.metadata_manager
+                .store_dir_metadata(dir_meta)
+                .map_err(|e| ApiError::Internal(format!("Failed to create directory: {:?}", e)))?;
+
+            inode
+        } else {
+            // Remote directory creation via RPC
+            if let Some(pool) = &self.connection_pool {
+                // First check if directory already exists
+                match pool.get_or_connect(&metadata_node).await {
+                    Ok(client) => {
+                        let lookup_request = MetadataLookupRequest::new(path.to_string());
+                        match lookup_request.call(&*client).await {
+                            Ok(response) if response.is_success() => {
+                                // Directory already exists
+                                return Err(ApiError::AlreadyExists(path.to_string()));
+                            }
+                            Ok(_) => {
+                                // Not found, proceed with creation
+                            }
+                            Err(e) => {
+                                tracing::warn!("Remote metadata lookup failed during mkdir: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(ApiError::Internal(format!("Failed to connect to metadata server {}: {:?}", metadata_node, e)));
+                    }
+                }
+
+                // Create directory on remote server
+                match pool.get_or_connect(&metadata_node).await {
+                    Ok(client) => {
+                        let request = MetadataCreateDirRequest::new(path.to_string(), mode);
+                        match request.call(&*client).await {
+                            Ok(response) if response.is_success() => {
+                                tracing::debug!("Remote directory created: {} with inode {}", path, response.inode);
+                                response.inode
+                            }
+                            Ok(response) => {
+                                return Err(ApiError::Internal(format!("Remote mkdir failed with status {}", response.status)));
+                            }
+                            Err(e) => {
+                                return Err(ApiError::Internal(format!("Remote mkdir RPC error: {:?}", e)));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(ApiError::Internal(format!("Failed to connect for mkdir: {:?}", e)));
+                    }
+                }
+            } else {
+                return Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()));
+            }
+        };
+
+        // Update parent directory's children list
+        if let (Some(parent_path), Some(dirname)) = (Self::get_parent_path(path), Self::get_filename(path)) {
+            use std::path::Path;
+            let parent_path_ref = Path::new(&parent_path);
+
+            // Only update if parent directory is stored locally
+            if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
+                parent_meta.add_child(dirname, created_inode, InodeType::Directory);
+                if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
+                    tracing::warn!("Failed to update parent directory {} after mkdir: {:?}", parent_path, e);
+                } else {
+                    tracing::debug!("Updated parent directory {} with new directory {}", parent_path, path);
+                }
+            } else {
+                tracing::debug!("Parent directory {} not found locally, skipping children update", parent_path);
+            }
         }
-
-        // Create directory metadata
-        let inode = self.metadata_manager.generate_inode();
-        let dir_meta = DirectoryMetadata::new(inode, path.to_string());
-
-        self.metadata_manager
-            .store_dir_metadata(dir_meta)
-            .map_err(|e| ApiError::Internal(format!("Failed to create directory: {:?}", e)))?;
 
         Ok(())
     }
@@ -647,23 +980,60 @@ impl BenchFS {
     ///
     /// # Returns
     /// File status information (FileStat)
-    pub fn benchfs_stat(&self, path: &str) -> ApiResult<crate::api::types::FileStat> {
+    pub async fn benchfs_stat(&self, path: &str) -> ApiResult<crate::api::types::FileStat> {
         use std::path::Path;
         use crate::api::types::FileStat;
 
         let path_ref = Path::new(path);
 
-        // Try file metadata first
-        if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
-            return Ok(FileStat::from_file_metadata(&meta));
-        }
+        // Determine metadata server for this path
+        let metadata_node = self.get_metadata_node(path);
+        let is_local = self.is_local_metadata(path);
 
-        // Try directory metadata
-        if let Ok(dir_meta) = self.metadata_manager.get_dir_metadata(path_ref) {
-            return Ok(FileStat::from_dir_metadata(&dir_meta));
-        }
+        if is_local {
+            // Local metadata lookup
+            // Try file metadata first
+            if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
+                return Ok(FileStat::from_file_metadata(&meta));
+            }
 
-        Err(ApiError::NotFound(path.to_string()))
+            // Try directory metadata
+            if let Ok(dir_meta) = self.metadata_manager.get_dir_metadata(path_ref) {
+                return Ok(FileStat::from_dir_metadata(&dir_meta));
+            }
+
+            Err(ApiError::NotFound(path.to_string()))
+        } else {
+            // Remote metadata lookup via RPC
+            if let Some(pool) = &self.connection_pool {
+                match pool.get_or_connect(&metadata_node).await {
+                    Ok(client) => {
+                        let request = MetadataLookupRequest::new(path.to_string());
+                        match request.call(&*client).await {
+                            Ok(response) if response.is_success() && response.is_file() => {
+                                // File found
+                                let meta = FileMetadata::new(response.inode, path.to_string(), response.size);
+                                Ok(FileStat::from_file_metadata(&meta))
+                            }
+                            Ok(response) if response.is_success() && response.is_directory() => {
+                                // Directory found
+                                let dir_meta = DirectoryMetadata::new(response.inode, path.to_string());
+                                Ok(FileStat::from_dir_metadata(&dir_meta))
+                            }
+                            Ok(_) => Err(ApiError::NotFound(path.to_string())),
+                            Err(e) => {
+                                Err(ApiError::Internal(format!("Remote stat RPC error: {:?}", e)))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        Err(ApiError::Internal(format!("Failed to connect to metadata server {}: {:?}", metadata_node, e)))
+                    }
+                }
+            } else {
+                Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()))
+            }
+        }
     }
 
     /// Rename a file or directory
@@ -832,6 +1202,48 @@ impl BenchFS {
         *self.next_fd.borrow_mut() += 1;
         fd
     }
+
+    /// Extract parent directory path from a file/directory path
+    ///
+    /// # Examples
+    /// * "/foo/bar/file.txt" -> Some("/foo/bar")
+    /// * "/file.txt" -> Some("/")
+    /// * "/" -> None
+    fn get_parent_path(path: &str) -> Option<String> {
+        if path == "/" {
+            return None;
+        }
+
+        let path = path.trim_end_matches('/');
+        if let Some(last_slash) = path.rfind('/') {
+            if last_slash == 0 {
+                Some("/".to_string())
+            } else {
+                Some(path[..last_slash].to_string())
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Extract filename from a file/directory path
+    ///
+    /// # Examples
+    /// * "/foo/bar/file.txt" -> Some("file.txt")
+    /// * "/file.txt" -> Some("file.txt")
+    /// * "/" -> None
+    fn get_filename(path: &str) -> Option<String> {
+        if path == "/" {
+            return None;
+        }
+
+        let path = path.trim_end_matches('/');
+        if let Some(last_slash) = path.rfind('/') {
+            Some(path[last_slash + 1..].to_string())
+        } else {
+            Some(path.to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -882,7 +1294,7 @@ mod tests {
             fs.benchfs_close(&handle).unwrap();
 
             // Read data
-            let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+            let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).await.unwrap();
             let mut buf = vec![0u8; 100];
             let read = fs.benchfs_read(&handle, &mut buf).await.unwrap();
             assert_eq!(read, data.len());
@@ -905,7 +1317,7 @@ mod tests {
             fs.benchfs_unlink("/test.txt").await.unwrap();
 
             // Try to open deleted file
-            let result = fs.benchfs_open("/test.txt", OpenFlags::read_only());
+            let result = fs.benchfs_open("/test.txt", OpenFlags::read_only()).await;
             assert!(result.is_err());
         });
     }

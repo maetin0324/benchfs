@@ -7,9 +7,18 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::rc::Rc;
 
-use super::runtime::set_benchfs_ctx;
+use super::runtime::{set_benchfs_ctx, set_runtime, set_rpc_server, set_connection_pool, block_on};
 use super::error::*;
 use crate::api::file_ops::BenchFS;
+use crate::rpc::server::RpcServer;
+use crate::rpc::handlers::RpcHandlerContext;
+use crate::rpc::connection::ConnectionPool;
+use crate::metadata::MetadataManager;
+use crate::storage::{IOUringBackend, IOUringChunkStore};
+
+use pluvio_runtime::executor::Runtime;
+use pluvio_uring::reactor::IoUringReactor;
+use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 
 // Opaque type for BenchFS context
 // This prevents C code from accessing internal structure
@@ -80,25 +89,203 @@ pub extern "C" fn benchfs_init(
         }
     };
 
-    // Create BenchFS instance
-    // TODO: Implement distributed mode initialization
-    // For now, create a simple local instance
+    // Create BenchFS instance based on mode
     let benchfs = if is_server != 0 {
-        // Server mode
+        // ===== SERVER MODE =====
         tracing::info!("Initializing BenchFS server: node_id={}, registry_dir={}, data_dir={:?}",
                       node_id_str, registry_dir_str, data_dir_str);
 
-        // TODO: Start server with UCX endpoint, register in registry
-        // For now, just create a local BenchFS instance
-        Rc::new(BenchFS::new(node_id_str.to_string()))
+        // Require data_dir for server
+        let data_dir = match data_dir_str {
+            Some(d) => d,
+            None => {
+                set_error_message("data_dir is required for server mode");
+                return std::ptr::null_mut();
+            }
+        };
+
+        // Create runtime (Runtime::new() returns Rc<Runtime>)
+        let runtime = Runtime::new(256);
+
+        // Create io_uring reactor
+        let uring_reactor = IoUringReactor::builder()
+            .queue_size(256)
+            .buffer_size(1 << 20) // 1 MiB
+            .submit_depth(32)
+            .wait_submit_timeout(std::time::Duration::from_micros(10))
+            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .build();
+
+        let allocator = uring_reactor.allocator.clone();
+        runtime.register_reactor("io_uring", uring_reactor);
+
+        // Create UCX context and reactor
+        let ucx_context = match UcxContext::new() {
+            Ok(ctx) => Rc::new(ctx),
+            Err(e) => {
+                set_error_message(&format!("Failed to create UCX context: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let ucx_reactor = UCXReactor::current();
+        runtime.register_reactor("ucx", ucx_reactor.clone());
+
+        // Create UCX worker
+        let worker = match ucx_context.create_worker() {
+            Ok(w) => w,
+            Err(e) => {
+                set_error_message(&format!("Failed to create UCX worker: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        ucx_reactor.register_worker(worker.clone());
+
+        // Create metadata manager
+        let metadata_manager = Rc::new(MetadataManager::new(node_id_str.to_string()));
+
+        // Create IOUringBackend and ChunkStore
+        let io_backend = Rc::new(IOUringBackend::new(allocator));
+        let chunk_store_dir = format!("{}/chunks", data_dir);
+        if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
+            set_error_message(&format!("Failed to create chunk store directory: {}", e));
+            return std::ptr::null_mut();
+        }
+
+        let chunk_store = match IOUringChunkStore::new(&chunk_store_dir, io_backend.clone()) {
+            Ok(store) => Rc::new(store),
+            Err(e) => {
+                set_error_message(&format!("Failed to create chunk store: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        // Create RPC handler context
+        let handler_context = Rc::new(RpcHandlerContext::new(
+            metadata_manager.clone(),
+            chunk_store.clone(),
+        ));
+
+        // Create RPC server
+        let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
+
+        // Create connection pool
+        let connection_pool = match ConnectionPool::new(worker.clone(), registry_dir_str) {
+            Ok(pool) => Rc::new(pool),
+            Err(e) => {
+                set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        // Register server's worker address
+        if let Err(e) = connection_pool.register_self(node_id_str) {
+            set_error_message(&format!("Failed to register server address: {:?}", e));
+            return std::ptr::null_mut();
+        }
+        tracing::info!("Server worker address registered to {}", registry_dir_str);
+
+        // Register all RPC handlers (spawn in background, don't block)
+        // These handlers run perpetual listening loops, so we can't block_on() them
+        let server_clone = rpc_server.clone();
+        let runtime_clone = runtime.clone();
+        runtime.spawn(async move {
+            match server_clone.register_all_handlers(runtime_clone).await {
+                Ok(_) => tracing::info!("RPC handlers registered successfully"),
+                Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
+            }
+        });
+        tracing::info!("RPC handler registration initiated");
+
+        // Create BenchFS instance with distributed metadata
+        // For single-server setup: metadata_nodes and data_nodes both point to this server
+        let metadata_nodes = vec![node_id_str.to_string()];
+        let data_nodes = vec![node_id_str.to_string()];
+        let benchfs = Rc::new(BenchFS::with_distributed_metadata(
+            node_id_str.to_string(),
+            connection_pool.clone(),
+            metadata_nodes,
+            data_nodes,
+        ));
+
+        // Store in thread-local storage
+        set_runtime(runtime);
+        set_rpc_server(rpc_server);
+        set_connection_pool(connection_pool);
+
+        benchfs
     } else {
-        // Client mode
+        // ===== CLIENT MODE =====
         tracing::info!("Initializing BenchFS client: node_id={}, registry_dir={}",
                       node_id_str, registry_dir_str);
 
-        // TODO: Connect to server via registry discovery
-        // For now, just create a local BenchFS instance
-        Rc::new(BenchFS::new(node_id_str.to_string()))
+        // Create runtime (Runtime::new() returns Rc<Runtime>)
+        let runtime = Runtime::new(256);
+
+        // Create UCX context and reactor
+        let ucx_context = match UcxContext::new() {
+            Ok(ctx) => Rc::new(ctx),
+            Err(e) => {
+                set_error_message(&format!("Failed to create UCX context: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let ucx_reactor = UCXReactor::current();
+        runtime.register_reactor("ucx", ucx_reactor.clone());
+
+        // Create UCX worker
+        let worker = match ucx_context.create_worker() {
+            Ok(w) => w,
+            Err(e) => {
+                set_error_message(&format!("Failed to create UCX worker: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        ucx_reactor.register_worker(worker.clone());
+
+        // Create connection pool
+        let connection_pool = match ConnectionPool::new(worker, registry_dir_str) {
+            Ok(pool) => Rc::new(pool),
+            Err(e) => {
+                set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        // Wait for server to register and connect
+        tracing::info!("Waiting for server to register (timeout: 30 seconds)...");
+        let pool_clone = connection_pool.clone();
+        let connect_result = block_on(async move {
+            pool_clone.wait_and_connect("server", 30).await
+        });
+
+        match connect_result {
+            Ok(_) => tracing::info!("Successfully connected to server"),
+            Err(e) => {
+                set_error_message(&format!("Failed to connect to server: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        }
+
+        // Create BenchFS instance with distributed metadata
+        // All metadata and data operations target the "server" node
+        let metadata_nodes = vec!["server".to_string()];
+        let data_nodes = vec!["server".to_string()];
+        let benchfs = Rc::new(BenchFS::with_distributed_metadata(
+            node_id_str.to_string(),
+            connection_pool.clone(),
+            metadata_nodes,
+            data_nodes,
+        ));
+
+        // Store in thread-local storage
+        set_runtime(runtime);
+        set_connection_pool(connection_pool);
+
+        benchfs
     };
 
     // Store in thread-local context

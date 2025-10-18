@@ -17,7 +17,7 @@ pub const RPC_METADATA_DELETE: RpcId = 23;
 pub const RPC_METADATA_UPDATE: RpcId = 24;
 
 // Maximum path length for RPC messages
-const MAX_PATH_LEN: usize = 256;
+const _MAX_PATH_LEN: usize = 256;
 
 // ============================================================================
 // MetadataLookup RPC

@@ -7,12 +7,13 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 
-use super::runtime::{block_on, with_benchfs_ctx};
 use super::error::*;
-use crate::api::types::{FileHandle, OpenFlags};
+use super::runtime::{block_on, with_benchfs_ctx};
 use crate::api::file_ops::BenchFS;
+use crate::api::types::{FileHandle, OpenFlags};
 
 // Opaque type for file handle
+#[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct benchfs_file_t {
     _private: [u8; 0],
@@ -108,7 +109,11 @@ pub extern "C" fn benchfs_create(
 
     // Open file using thread-local context
     let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_open(path_str, open_flags)
+        let fs_ptr = fs as *const BenchFS;
+        unsafe {
+            let fs_ref = &*fs_ptr;
+            block_on(async move { fs_ref.benchfs_open(path_str, open_flags).await })
+        }
     });
 
     match result {
@@ -160,13 +165,15 @@ pub extern "C" fn benchfs_open(
     let open_flags = c_flags_to_open_flags(flags);
 
     let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_open(path_str, open_flags)
+        let fs_ptr = fs as *const BenchFS;
+        unsafe {
+            let fs_ref = &*fs_ptr;
+            block_on(async move { fs_ref.benchfs_open(path_str, open_flags).await })
+        }
     });
 
     match result {
-        Ok(Ok(handle)) => {
-            Box::into_raw(Box::new(handle)) as *mut benchfs_file_t
-        }
+        Ok(Ok(handle)) => Box::into_raw(Box::new(handle)) as *mut benchfs_file_t,
         Ok(Err(e)) => {
             set_error_message(&e.to_string());
             std::ptr::null_mut()
@@ -212,12 +219,8 @@ pub extern "C" fn benchfs_write(
             let fs_ptr = fs as *const BenchFS;
 
             // Execute block_on with the pointer
-            unsafe {
-                let fs_ref = &*fs_ptr;
-                block_on(async move {
-                    fs_ref.benchfs_write(&handle_clone, &buf).await
-                })
-            }
+            let fs_ref = &*fs_ptr;
+            block_on(async move { fs_ref.benchfs_write(&handle_clone, &buf).await })
         });
 
         match result {
@@ -270,26 +273,19 @@ pub extern "C" fn benchfs_read(
             let fs_ptr = fs as *const BenchFS;
             let temp_buf_ptr = temp_buf.as_mut_ptr();
 
-            unsafe {
-                let fs_ref = &*fs_ptr;
-                let mut local_buf = std::slice::from_raw_parts_mut(temp_buf_ptr, buf_size);
+            let fs_ref = &*fs_ptr;
+            let mut local_buf = std::slice::from_raw_parts_mut(temp_buf_ptr, buf_size);
 
-                let n = block_on(async move {
-                    fs_ref.benchfs_read(&handle_clone, &mut local_buf).await
-                });
+            let n =
+                block_on(async move { fs_ref.benchfs_read(&handle_clone, &mut local_buf).await });
 
-                match n {
-                    Ok(bytes_read) => {
-                        // Copy data back to C buffer
-                        std::ptr::copy_nonoverlapping(
-                            temp_buf_ptr,
-                            buf_ptr,
-                            bytes_read
-                        );
-                        Ok(bytes_read)
-                    }
-                    Err(e) => Err(e)
+            match n {
+                Ok(bytes_read) => {
+                    // Copy data back to C buffer
+                    std::ptr::copy_nonoverlapping(temp_buf_ptr, buf_ptr, bytes_read);
+                    Ok(bytes_read)
                 }
+                Err(e) => Err(e),
             }
         });
 
@@ -324,9 +320,7 @@ pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
         // Take ownership of the handle and drop it
         let handle = Box::from_raw(file as *mut FileHandle);
 
-        let result = with_benchfs_ctx(|fs| {
-            fs.benchfs_close(&handle).map_err(|e| e.to_string())
-        });
+        let result = with_benchfs_ctx(|fs| fs.benchfs_close(&handle).map_err(|e| e.to_string()));
 
         result_to_error_code(result.and_then(|r| r))
     }
@@ -350,12 +344,13 @@ pub extern "C" fn benchfs_fsync(file: *mut benchfs_file_t) -> i32 {
 
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
-            unsafe {
-                let fs_ref = &*fs_ptr;
-                block_on(async move {
-                    fs_ref.benchfs_fsync(handle).await.map_err(|e| e.to_string())
-                })
-            }
+            let fs_ref = &*fs_ptr;
+            block_on(async move {
+                fs_ref
+                    .benchfs_fsync(handle)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
         });
 
         result_to_error_code(result.and_then(|r| r))
@@ -395,7 +390,10 @@ pub extern "C" fn benchfs_remove(
         unsafe {
             let fs_ref = &*fs_ptr;
             block_on(async move {
-                fs_ref.benchfs_unlink(path_str).await.map_err(|e| e.to_string())
+                fs_ref
+                    .benchfs_unlink(path_str)
+                    .await
+                    .map_err(|e| e.to_string())
             })
         }
     });
@@ -413,11 +411,7 @@ pub extern "C" fn benchfs_remove(
 /// # Returns
 /// New file position, or negative error code
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_lseek(
-    file: *mut benchfs_file_t,
-    offset: i64,
-    whence: i32,
-) -> i64 {
+pub extern "C" fn benchfs_lseek(file: *mut benchfs_file_t, offset: i64, whence: i32) -> i64 {
     if file.is_null() {
         set_error_message("file must not be null");
         return BENCHFS_EINVAL as i64;
@@ -427,7 +421,8 @@ pub extern "C" fn benchfs_lseek(
         let handle = &*(file as *const FileHandle);
 
         let result = with_benchfs_ctx(|fs| {
-            fs.benchfs_seek(handle, offset, whence).map_err(|e| e.to_string())
+            fs.benchfs_seek(handle, offset, whence)
+                .map_err(|e| e.to_string())
         });
 
         match result {

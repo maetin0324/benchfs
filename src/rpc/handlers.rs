@@ -527,7 +527,6 @@ pub async fn handle_metadata_update(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // Note: Testing with IOUringChunkStore requires async runtime setup
     // These tests are disabled as they would need complex setup with io_uring reactor

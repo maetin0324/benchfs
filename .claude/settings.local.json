@@ -25,10 +25,14 @@
       "Bash(ssh:*)",
       "Bash(env RUST_LOG=debug ./target/release/deps/small-309151752e31de5f:*)",
       "Bash(tee:*)",
-      "Bash(env RUST_LOG=info /home/rmaeda/workspace/rust/benchfs/target/release/deps/small-309151752e31de5f:*)",
-      "Bash(env RUST_LOG=debug /home/rmaeda/workspace/rust/benchfs/target/release/deps/small-309151752e31de5f:*)",
       "WebSearch",
-      "Bash(./src/ior:*)"
+      "Bash(./src/ior:*)",
+      "Bash(if [ -f src/ior ])",
+      "Bash(then echo \"IOR binary exists\")",
+      "Bash(else echo \"IOR binary not found\")",
+      "Bash(fi)",
+      "Bash(make:*)",
+      "Bash(mpirun:*)"
     ],
     "deny": [],
     "ask": []

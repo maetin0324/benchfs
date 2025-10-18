@@ -69,7 +69,13 @@ pub extern "C" fn benchfs_stat(
     };
 
     let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_stat(path_str)
+        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+        unsafe {
+            let fs_ref = &*fs_ptr;
+            block_on(async move {
+                fs_ref.benchfs_stat(path_str).await
+            })
+        }
     });
 
     match result {
@@ -128,7 +134,13 @@ pub extern "C" fn benchfs_get_file_size(
     };
 
     let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_stat(path_str)
+        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+        unsafe {
+            let fs_ref = &*fs_ptr;
+            block_on(async move {
+                fs_ref.benchfs_stat(path_str).await
+            })
+        }
     });
 
     match result {
@@ -175,7 +187,13 @@ pub extern "C" fn benchfs_mkdir(
     };
 
     let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_mkdir(path_str, mode).map_err(|e| e.to_string())
+        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+        unsafe {
+            let fs_ref = &*fs_ptr;
+            block_on(async move {
+                fs_ref.benchfs_mkdir(path_str, mode).await.map_err(|e| e.to_string())
+            })
+        }
     });
 
     result_to_error_code(result.and_then(|r| r))
@@ -343,7 +361,13 @@ pub extern "C" fn benchfs_access(
 
     // Check if file exists
     let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_stat(path_str)
+        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+        unsafe {
+            let fs_ref = &*fs_ptr;
+            block_on(async move {
+                fs_ref.benchfs_stat(path_str).await
+            })
+        }
     });
 
     match result {

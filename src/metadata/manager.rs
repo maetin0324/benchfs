@@ -1,5 +1,6 @@
 use super::{
     consistent_hash::ConsistentHashRing,
+    id_generator::IdGenerator,
     types::{DirectoryMetadata, FileMetadata, InodeId, NodeId},
 };
 use crate::cache::{MetadataCache, CachePolicy};
@@ -49,6 +50,9 @@ pub struct MetadataManager {
 
     /// 自ノードのID
     self_node_id: NodeId,
+
+    /// 分散ID生成器（inode番号生成用）
+    id_generator: IdGenerator,
 }
 
 impl MetadataManager {
@@ -69,12 +73,16 @@ impl MetadataManager {
         let mut ring = ConsistentHashRing::new();
         ring.add_node(self_node_id.clone());
 
+        // ノードIDの文字列からID生成器を作成
+        let id_generator = IdGenerator::from_node_string(&self_node_id);
+
         Self {
             ring: RefCell::new(ring),
             local_file_metadata: RefCell::new(HashMap::new()),
             local_dir_metadata: RefCell::new(HashMap::new()),
             cache: MetadataCache::new(cache_policy),
             self_node_id,
+            id_generator,
         }
     }
 
@@ -320,14 +328,17 @@ impl MetadataManager {
 
     /// 新しいinode番号を生成
     ///
-    /// 簡易実装: 現在時刻のナノ秒をベースにしたinode生成
-    /// 本番環境では分散ID生成アルゴリズム（SnowflakeなEd）を使用すべき
+    /// Snowflake-likeな分散ID生成アルゴリズムを使用して、
+    /// グローバルにユニークなinode番号を生成する。
+    ///
+    /// 生成されるIDは以下の特性を持つ:
+    /// - タイムスタンプベースで単調増加
+    /// - ノードID埋め込みで分散環境でのユニーク性保証
+    /// - 1ミリ秒あたり最大4096個のID生成が可能
     pub fn generate_inode(&self) -> InodeId {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+        self.id_generator
+            .next_id()
+            .expect("Failed to generate inode")
     }
 
     /// キャッシュ統計を取得
