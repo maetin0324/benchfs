@@ -107,7 +107,7 @@ impl BenchFS {
 
 #### リモート読み込みの準備
 
-`chfs_read`にリモートチャンク読み込みの構造を準備:
+`benchfs_read`にリモートチャンク読み込みの構造を準備:
 
 ```rust
 // Cache miss - need to fetch chunk
@@ -174,7 +174,7 @@ let endpoint = self.worker.connect_socket(node_addr).await.map_err(...)?;
 **対応**:
 - 現時点では基盤のみ実装
 - 完全な統合には以下が必要:
-  1. `chfs_read`/`chfs_write`を`async`に変更
+  1. `benchfs_read`/`benchfs_write`を`async`に変更
   2. すべてのテストを非同期対応に更新
   3. メタデータのチャンク配置情報の完全な統合
 
@@ -191,7 +191,7 @@ test result: ok. 115 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fi
 ### 分散読み込みフロー (計画)
 
 ```
-Client (chfs_read)
+Client (benchfs_read)
     ↓
 1. メタデータ取得
     ├─> FileMetadata.chunk_locations から該当チャンクのノードを特定
@@ -215,7 +215,7 @@ Client (chfs_read)
 ### 分散書き込みフロー (計画)
 
 ```
-Client (chfs_write)
+Client (benchfs_write)
     ↓
 1. メタデータ取得/更新
     ├─> 新しいチャンクの配置を決定 (PlacementStrategy)
@@ -284,10 +284,10 @@ BenchFSには既に以下のRPC実装が存在:
 
 ```rust
 // 現在 (同期)
-pub fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
+pub fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
 
 // 将来 (非同期)
-pub async fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
+pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
 ```
 
 この変更には以下が必要:
@@ -297,7 +297,7 @@ pub async fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<
 
 #### 8.2 リモートRPC呼び出しの完全統合
 
-`chfs_read`でのリモート読み込み実装例:
+`benchfs_read`でのリモート読み込み実装例:
 
 ```rust
 Err(_) => {
@@ -447,7 +447,7 @@ Phase 7で実装した機能:
 2. **BenchFS分散モード**: `with_connection_pool()`コンストラクタと`is_distributed()`メソッド
 3. **RpcError拡張**: ConnectionErrorバリアント
 4. **ビルドとテスト**: 115個のテストがすべてパス
-5. **リモートRPC統合ポイント**: `chfs_read`/`chfs_write`のリモート呼び出し場所を特定
+5. **リモートRPC統合ポイント**: `benchfs_read`/`benchfs_write`のリモート呼び出し場所を特定
 
 **技術的成果**:
 - **接続管理**: 効率的なコネクションプールによる接続の再利用

@@ -81,7 +81,7 @@ async fn server_handler(am_msg: AmMsg) -> Result<Self::ResponseHeader, RpcError>
 
 **影響**:
 - **リモートチャンク読み書きが動作しない**
-- `chfs_read`/`chfs_write`のリモート部分が失敗する
+- `benchfs_read`/`benchfs_write`のリモート部分が失敗する
 - Phase 8で実装したクライアント側のRPC呼び出しが無駄になる
 
 **修正方法**:

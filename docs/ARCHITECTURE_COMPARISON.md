@@ -497,7 +497,7 @@ struct ring_list {
 2. **I/O認識型スケジューリング**: フラッシュ前にRPCレイテンシ閾値を尊重
 3. **バッチ操作**: 複数スレッドが並列でフラッシュ可能
 4. **同期ポイント**：
-   - `chfs_sync()`: 全dirtyデータがフラッシュされるまでブロック
+   - `benchfs_sync()`: 全dirtyデータがフラッシュされるまでブロック
    - `chfsctl stop`: シャットダウン前に完全フラッシュを保証
    - `fs_inode_flush_sync()`: サーバー側フラッシュ同期
 
@@ -860,12 +860,12 @@ Server2障害:
 
 ```
 書き込みフロー:
-  chfs_write() → pmemkv（即座） → dirtyマーク
+  benchfs_write() → pmemkv（即座） → dirtyマーク
                                 ↓（非同期）
                           バックエンドFS（フラッシュスレッド）
 
 読み取りフロー:
-  chfs_read() → pmemkv検索
+  benchfs_read() → pmemkv検索
                 ├─ ヒット → 即座に返却
                 └─ ミス → バックエンドFS読み取り → pmemkvにキャッシュ
 ```
@@ -1582,7 +1582,7 @@ self.ucx_endpoint.rdma_get(remote_addr, buf)?;
 
 2. **BenchFS**:
    - 現在のリポジトリ
-   - claude_log/001_chfs_implementation_plan.md
+   - claude_log/001_benchfs_implementation_plan.md
    - claude_log/022_CHFS_architecture_analysis.md
    - claude_log/023_CHFS_BENCHFS_COMPARISON.md
 

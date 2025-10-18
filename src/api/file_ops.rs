@@ -129,7 +129,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// File handle
-    pub fn chfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle> {
+    pub fn benchfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
@@ -198,7 +198,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// Number of bytes read
-    pub async fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
+    pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
         if !handle.flags.read {
             return Err(ApiError::PermissionDenied("File not opened for reading".to_string()));
         }
@@ -347,7 +347,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// Number of bytes written
-    pub async fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
+    pub async fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
         if !handle.flags.write {
             return Err(ApiError::PermissionDenied("File not opened for writing".to_string()));
         }
@@ -468,7 +468,7 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `handle` - File handle
-    pub fn chfs_close(&self, handle: &FileHandle) -> ApiResult<()> {
+    pub fn benchfs_close(&self, handle: &FileHandle) -> ApiResult<()> {
         self.open_files.borrow_mut().remove(&handle.fd);
         Ok(())
     }
@@ -477,7 +477,7 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `path` - File path
-    pub async fn chfs_unlink(&self, path: &str) -> ApiResult<()> {
+    pub async fn benchfs_unlink(&self, path: &str) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
@@ -506,7 +506,7 @@ impl BenchFS {
     /// # Arguments
     /// * `path` - Directory path
     /// * `mode` - Permissions (Unix-style)
-    pub fn chfs_mkdir(&self, path: &str, _mode: u32) -> ApiResult<()> {
+    pub fn benchfs_mkdir(&self, path: &str, _mode: u32) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
@@ -530,7 +530,7 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `path` - Directory path
-    pub fn chfs_rmdir(&self, path: &str) -> ApiResult<()> {
+    pub fn benchfs_rmdir(&self, path: &str) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
@@ -562,7 +562,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// New file position
-    pub fn chfs_seek(&self, handle: &FileHandle, offset: i64, whence: i32) -> ApiResult<u64> {
+    pub fn benchfs_seek(&self, handle: &FileHandle, offset: i64, whence: i32) -> ApiResult<u64> {
         use std::path::Path;
         let path_ref = Path::new(&handle.path);
 
@@ -612,7 +612,7 @@ impl BenchFS {
     /// For InMemoryChunkStore, this is a no-op since data is already in memory.
     /// For persistent backends (IOUringChunkStore), this ensures all writes are
     /// flushed to disk before returning.
-    pub async fn chfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
+    pub async fn benchfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(&handle.path);
 
@@ -647,7 +647,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// File status information (FileStat)
-    pub fn chfs_stat(&self, path: &str) -> ApiResult<crate::api::types::FileStat> {
+    pub fn benchfs_stat(&self, path: &str) -> ApiResult<crate::api::types::FileStat> {
         use std::path::Path;
         use crate::api::types::FileStat;
 
@@ -671,7 +671,7 @@ impl BenchFS {
     /// # Arguments
     /// * `old_path` - Current path
     /// * `new_path` - New path
-    pub fn chfs_rename(&self, old_path: &str, new_path: &str) -> ApiResult<()> {
+    pub fn benchfs_rename(&self, old_path: &str, new_path: &str) -> ApiResult<()> {
         use std::path::Path;
         let old_path_ref = Path::new(old_path);
         let new_path_ref = Path::new(new_path);
@@ -725,7 +725,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// List of entry names in the directory
-    pub fn chfs_readdir(&self, path: &str) -> ApiResult<Vec<String>> {
+    pub fn benchfs_readdir(&self, path: &str) -> ApiResult<Vec<String>> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
@@ -748,7 +748,7 @@ impl BenchFS {
     /// # Note
     /// When truncating to a smaller size, chunks beyond the new size are deleted.
     /// When truncating to a larger size, the file is extended with zeros (sparse file).
-    pub async fn chfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
+    pub async fn benchfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);
 
@@ -849,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_benchfs_creation() {
+    fn test_benbenchfs_creation() {
         let fs = BenchFS::new("node1".to_string());
         assert_eq!(fs.metadata_manager.self_node_id(), "node1");
     }
@@ -859,11 +859,11 @@ mod tests {
         let fs = BenchFS::new("node1".to_string());
 
         // Create and open a new file
-        let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
         assert_eq!(handle.path, "/test.txt");
         assert!(handle.flags.write);
 
-        fs.chfs_close(&handle).unwrap();
+        fs.benchfs_close(&handle).unwrap();
     }
 
     #[test]
@@ -872,23 +872,23 @@ mod tests {
             let fs = BenchFS::new("node1".to_string());
 
             // Create file
-            let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
+            let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
 
             // Write data
             let data = b"Hello, BenchFS!";
-            let written = fs.chfs_write(&handle, data).await.unwrap();
+            let written = fs.benchfs_write(&handle, data).await.unwrap();
             assert_eq!(written, data.len());
 
-            fs.chfs_close(&handle).unwrap();
+            fs.benchfs_close(&handle).unwrap();
 
             // Read data
-            let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+            let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).unwrap();
             let mut buf = vec![0u8; 100];
-            let read = fs.chfs_read(&handle, &mut buf).await.unwrap();
+            let read = fs.benchfs_read(&handle, &mut buf).await.unwrap();
             assert_eq!(read, data.len());
             assert_eq!(&buf[..read], data);
 
-            fs.chfs_close(&handle).unwrap();
+            fs.benchfs_close(&handle).unwrap();
         });
     }
 
@@ -898,14 +898,14 @@ mod tests {
             let fs = BenchFS::new("node1".to_string());
 
             // Create file
-            let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
-            fs.chfs_close(&handle).unwrap();
+            let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
+            fs.benchfs_close(&handle).unwrap();
 
             // Delete file
-            fs.chfs_unlink("/test.txt").await.unwrap();
+            fs.benchfs_unlink("/test.txt").await.unwrap();
 
             // Try to open deleted file
-            let result = fs.chfs_open("/test.txt", OpenFlags::read_only());
+            let result = fs.benchfs_open("/test.txt", OpenFlags::read_only());
             assert!(result.is_err());
         });
     }
@@ -915,10 +915,10 @@ mod tests {
         let fs = BenchFS::new("node1".to_string());
 
         // Create directory
-        fs.chfs_mkdir("/testdir", 0o755).unwrap();
+        fs.benchfs_mkdir("/testdir", 0o755).unwrap();
 
         // Remove directory
-        fs.chfs_rmdir("/testdir").unwrap();
+        fs.benchfs_rmdir("/testdir").unwrap();
     }
 
     #[test]
@@ -927,26 +927,26 @@ mod tests {
             let fs = BenchFS::new("node1".to_string());
 
             // Create file with data
-            let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
-            fs.chfs_write(&handle, b"0123456789").await.unwrap();
-            fs.chfs_close(&handle).unwrap();
+            let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
+            fs.benchfs_write(&handle, b"0123456789").await.unwrap();
+            fs.benchfs_close(&handle).unwrap();
 
             // Open and seek
-            let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+            let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).unwrap();
 
             // SEEK_SET
-            let pos = fs.chfs_seek(&handle, 5, 0).unwrap();
+            let pos = fs.benchfs_seek(&handle, 5, 0).unwrap();
             assert_eq!(pos, 5);
 
             // SEEK_CUR
-            let pos = fs.chfs_seek(&handle, 2, 1).unwrap();
+            let pos = fs.benchfs_seek(&handle, 2, 1).unwrap();
             assert_eq!(pos, 7);
 
             // SEEK_END
-            let pos = fs.chfs_seek(&handle, -3, 2).unwrap();
+            let pos = fs.benchfs_seek(&handle, -3, 2).unwrap();
             assert_eq!(pos, 7);
 
-            fs.chfs_close(&handle).unwrap();
+            fs.benchfs_close(&handle).unwrap();
         });
     }
 }

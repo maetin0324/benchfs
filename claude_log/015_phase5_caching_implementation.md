@@ -339,10 +339,10 @@ impl BenchFS {
 }
 ```
 
-#### chfs_read with Chunk Caching
+#### benchfs_read with Chunk Caching
 
 ```rust
-pub fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
+pub fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
     // ... metadata 取得 ...
 
     let mut bytes_read = 0;
@@ -393,10 +393,10 @@ pub fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
 2. キャッシュヒット時は即座にデータ返却
 3. キャッシュミス時はストア→キャッシュ→返却
 
-#### chfs_write with Cache Invalidation
+#### benchfs_write with Cache Invalidation
 
 ```rust
-pub fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
+pub fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
     // ... metadata 取得 ...
 
     let mut bytes_written = 0;
@@ -423,10 +423,10 @@ pub fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
 - ストレージに直接書き込み
 - 次回読み込み時に新しいデータをキャッシュ
 
-#### chfs_unlink with Inode-level Cache Invalidation
+#### benchfs_unlink with Inode-level Cache Invalidation
 
 ```rust
-pub fn chfs_unlink(&self, path: &str) -> ApiResult<()> {
+pub fn benchfs_unlink(&self, path: &str) -> ApiResult<()> {
     // ... metadata 取得 ...
 
     // 該当inodeの全チャンクを無効化

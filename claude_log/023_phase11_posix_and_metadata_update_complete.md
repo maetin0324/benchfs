@@ -50,13 +50,13 @@ impl FileStat {
 }
 ```
 
-#### 1.2 chfs_fsync() - 非同期化と改善
+#### 1.2 benchfs_fsync() - 非同期化と改善
 
 **ファイル**: `src/api/file_ops.rs` (lines 574-609)
 
 **変更前**:
 ```rust
-pub fn chfs_fsync(&self, _handle: &FileHandle) -> ApiResult<()> {
+pub fn benchfs_fsync(&self, _handle: &FileHandle) -> ApiResult<()> {
     // No-op for InMemoryChunkStore
     Ok(())
 }
@@ -64,7 +64,7 @@ pub fn chfs_fsync(&self, _handle: &FileHandle) -> ApiResult<()> {
 
 **変更後**:
 ```rust
-pub async fn chfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
+pub async fn benchfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
     use std::path::Path;
     let path_ref = Path::new(&handle.path);
 
@@ -94,13 +94,13 @@ pub async fn chfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
 - ファイルメタデータを取得して、inode情報をログに記録
 - IOUringChunkStore対応のコメントを追加
 
-#### 1.3 chfs_stat() - ディレクトリ対応
+#### 1.3 benchfs_stat() - ディレクトリ対応
 
 **ファイル**: `src/api/file_ops.rs` (lines 611-635)
 
 **変更前**:
 ```rust
-pub fn chfs_stat(&self, path: &str) -> ApiResult<FileMetadata> {
+pub fn benchfs_stat(&self, path: &str) -> ApiResult<FileMetadata> {
     // Try file metadata first
     if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
         return Ok(meta);
@@ -119,7 +119,7 @@ pub fn chfs_stat(&self, path: &str) -> ApiResult<FileMetadata> {
 
 **変更後**:
 ```rust
-pub fn chfs_stat(&self, path: &str) -> ApiResult<FileStat> {
+pub fn benchfs_stat(&self, path: &str) -> ApiResult<FileStat> {
     use std::path::Path;
     use crate::api::types::FileStat;
 
@@ -144,13 +144,13 @@ pub fn chfs_stat(&self, path: &str) -> ApiResult<FileStat> {
 - `FileStat`構造体を返すように変更
 - ファイルとディレクトリの両方を統一的に扱える
 
-#### 1.4 chfs_truncate() - 完全な実装
+#### 1.4 benchfs_truncate() - 完全な実装
 
 **ファイル**: `src/api/file_ops.rs` (lines 710-795)
 
 **変更前**:
 ```rust
-pub fn chfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
+pub fn benchfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
     // ...
     // If truncating to smaller size, invalidate affected chunks
     if size < old_size {
@@ -169,7 +169,7 @@ pub fn chfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
 
 **変更後**:
 ```rust
-pub async fn chfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
+pub async fn benchfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
     // ...
     // If truncating to smaller size, delete affected chunks
     if size < old_size {
@@ -225,7 +225,7 @@ pub async fn chfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
 - 部分チャンク内でのtruncate時に、残りバイトをゼロで埋める
 - ファイル拡張時はsparse fileとして扱う
 
-#### 1.5 chfs_rename() と chfs_readdir()
+#### 1.5 benchfs_rename() と benchfs_readdir()
 
 すでに完全に実装されているため、変更なし。
 
@@ -600,7 +600,7 @@ test result: ok. 119 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ## 変更ファイル一覧
 
 1. `src/api/types.rs` - FileStat構造体とFileType enumの追加
-2. `src/api/file_ops.rs` - chfs_fsync(), chfs_stat(), chfs_truncate()の改善
+2. `src/api/file_ops.rs` - benchfs_fsync(), benchfs_stat(), benchfs_truncate()の改善
 3. `src/rpc/metadata_ops.rs` - MetadataUpdate RPC構造体とテストの追加
 4. `src/rpc/handlers.rs` - handle_metadata_updateハンドラの追加
 5. `src/rpc/server.rs` - MetadataUpdateハンドラの登録
@@ -655,11 +655,11 @@ Phase 1の高優先度項目はすべて完了しました。次のフェーズ�
 Phase 11では、以下を完全に実装しました：
 
 ✅ **基本POSIX操作**:
-- `chfs_fsync()` - 非同期化と将来のIO_uring対応
-- `chfs_stat()` - ファイルとディレクトリの両方に対応
-- `chfs_truncate()` - 完全な実装（チャンク削除、部分ゼロ埋め）
-- `chfs_rename()` - 既存実装（変更なし）
-- `chfs_readdir()` - 既存実装（変更なし）
+- `benchfs_fsync()` - 非同期化と将来のIO_uring対応
+- `benchfs_stat()` - ファイルとディレクトリの両方に対応
+- `benchfs_truncate()` - 完全な実装（チャンク削除、部分ゼロ埋め）
+- `benchfs_rename()` - 既存実装（変更なし）
+- `benchfs_readdir()` - 既存実装（変更なし）
 
 ✅ **MetadataUpdate RPC**:
 - Request/Response構造体の完全実装

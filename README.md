@@ -383,7 +383,7 @@ cargo doc --no-deps --open
 
 ### 設計ノート
 
-- **[CHFS実装計画](claude_log/001_chfs_implementation_plan.md)**: 当初の実装計画
+- **[CHFS実装計画](claude_log/001_benchfs_implementation_plan.md)**: 当初の実装計画
 - **[CHFS詳細分析](claude_log/022_CHFS_architecture_analysis.md)**: CHFSアーキテクチャの詳細（英語）
 - **[CHFS比較分析](claude_log/023_CHFS_BENCHFS_COMPARISON.md)**: 比較分析（英語）
 

@@ -60,6 +60,7 @@ impl RpcServer {
         let ctx = self.handler_context.clone();
 
         loop {
+            tracing::debug!("RpcServer: Waiting for message on RPC ID {}", Rpc::rpc_id());
             let msg = stream.wait_msg().await;
             if msg.is_none() {
                 tracing::info!("RpcServer: Stream closed for RPC ID {}", Rpc::rpc_id());
@@ -68,6 +69,8 @@ impl RpcServer {
 
             let am_msg = msg
                 .ok_or_else(|| RpcError::TransportError("Failed to receive message".to_string()))?;
+
+            tracing::debug!("RpcServer: Received message on RPC ID {}, calling server_handler", Rpc::rpc_id());
 
             let ctx_clone = ctx.clone();
 

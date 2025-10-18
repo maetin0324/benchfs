@@ -14,36 +14,36 @@ Phase 8では、BenchFSのAPIを完全に非同期化し、リモートノード
 
 すべての主要なBenchFS APIメソッドを同期から非同期に変換しました。
 
-#### chfs_read の非同期化
+#### benchfs_read の非同期化
 
 **変更前**:
 ```rust
-pub fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
+pub fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
 ```
 
 **変更後**:
 ```rust
-pub async fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
+pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
 ```
 
-#### chfs_write の非同期化
+#### benchfs_write の非同期化
 
 **変更前**:
 ```rust
-pub fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize>
+pub fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize>
 ```
 
 **変更後**:
 ```rust
-pub async fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize>
+pub async fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize>
 ```
 
 ### 2. リモートチャンク読み込みの完全実装
 
-`chfs_read`に**完全なリモートRPC呼び出し**を実装しました（プレースホルダーなし）:
+`benchfs_read`に**完全なリモートRPC呼び出し**を実装しました（プレースホルダーなし）:
 
 ```rust
-pub async fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
+pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
     // ... existing local read logic ...
 
     // Try local chunk store first
@@ -128,10 +128,10 @@ pub async fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<
 
 ### 3. リモートチャンク書き込みの完全実装
 
-`chfs_write`に**完全なリモートRPC呼び出し**を実装しました:
+`benchfs_write`に**完全なリモートRPC呼び出し**を実装しました:
 
 ```rust
-pub async fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
+pub async fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
     // ... metadata and chunk calculation ...
 
     for (chunk_index, chunk_offset, write_size) in chunks {
@@ -249,23 +249,23 @@ fn test_write_and_read_file() {
         let fs = BenchFS::new("node1".to_string());
 
         // Create file
-        let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
 
         // Write data (now async)
         let data = b"Hello, BenchFS!";
-        let written = fs.chfs_write(&handle, data).await.unwrap();
+        let written = fs.benchfs_write(&handle, data).await.unwrap();
         assert_eq!(written, data.len());
 
-        fs.chfs_close(&handle).unwrap();
+        fs.benchfs_close(&handle).unwrap();
 
         // Read data (now async)
-        let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+        let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).unwrap();
         let mut buf = vec![0u8; 100];
-        let read = fs.chfs_read(&handle, &mut buf).await.unwrap();
+        let read = fs.benchfs_read(&handle, &mut buf).await.unwrap();
         assert_eq!(read, data.len());
         assert_eq!(&buf[..read], data);
 
-        fs.chfs_close(&handle).unwrap();
+        fs.benchfs_close(&handle).unwrap();
     });
 }
 
@@ -275,26 +275,26 @@ fn test_seek() {
         let fs = BenchFS::new("node1".to_string());
 
         // Create file with data
-        let handle = fs.chfs_open("/test.txt", OpenFlags::create()).unwrap();
-        fs.chfs_write(&handle, b"0123456789").await.unwrap();
-        fs.chfs_close(&handle).unwrap();
+        let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
+        fs.benchfs_write(&handle, b"0123456789").await.unwrap();
+        fs.benchfs_close(&handle).unwrap();
 
         // Open and seek
-        let handle = fs.chfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+        let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).unwrap();
 
         // SEEK_SET
-        let pos = fs.chfs_seek(&handle, 5, 0).unwrap();
+        let pos = fs.benchfs_seek(&handle, 5, 0).unwrap();
         assert_eq!(pos, 5);
 
         // SEEK_CUR
-        let pos = fs.chfs_seek(&handle, 2, 1).unwrap();
+        let pos = fs.benchfs_seek(&handle, 2, 1).unwrap();
         assert_eq!(pos, 7);
 
         // SEEK_END
-        let pos = fs.chfs_seek(&handle, -3, 2).unwrap();
+        let pos = fs.benchfs_seek(&handle, -3, 2).unwrap();
         assert_eq!(pos, 7);
 
-        fs.chfs_close(&handle).unwrap();
+        fs.benchfs_close(&handle).unwrap();
     });
 }
 ```
@@ -437,7 +437,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.20s
 ### 分散読み込みフロー（実装済み）
 
 ```
-Client (chfs_read)
+Client (benchfs_read)
     ↓
 1. メタデータ取得
     ├─> FileMetadata.chunk_locations から該当チャンクのノードを特定
@@ -462,7 +462,7 @@ Client (chfs_read)
 ### 分散書き込みフロー（実装済み）
 
 ```
-Client (chfs_write)
+Client (benchfs_write)
     ↓
 1. メタデータ取得/更新
     ├─> 新しいチャンクの配置を決定 ✅
@@ -598,8 +598,8 @@ fn test_distributed_read_write() {
 Phase 8で実装した機能:
 
 ✅ **完了した項目**:
-1. **chfs_read の完全な非同期実装**: リモートRPC呼び出しをすべて実装（プレースホルダーゼロ）
-2. **chfs_write の完全な非同期実装**: リモートRPC呼び出しをすべて実装（プレースホルダーゼロ）
+1. **benchfs_read の完全な非同期実装**: リモートRPC呼び出しをすべて実装（プレースホルダーゼロ）
+2. **benchfs_write の完全な非同期実装**: リモートRPC呼び出しをすべて実装（プレースホルダーゼロ）
 3. **すべてのテストを非同期対応**: 115個のテストがすべて合格
 4. **benchfsdの修正**: pluvio Runtime APIの最新版に対応
 5. **プロジェクト全体のビルド成功**: ライブラリ + バイナリ

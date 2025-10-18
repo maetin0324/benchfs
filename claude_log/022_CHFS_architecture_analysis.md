@@ -189,7 +189,7 @@ Acknowledge Write Complete
 2. **I/O-Aware Scheduling**: Respect RPC latency threshold before flushing
 3. **Batch Operations**: Multiple threads can flush in parallel
 4. **Synchronization Points**:
-   - `chfs_sync()`: Blocks until all dirty data flushed
+   - `benchfs_sync()`: Blocks until all dirty data flushed
    - `chfsctl stop`: Ensures complete flush before shutdown
    - `fs_inode_flush_sync()`: Server-side flush synchronization
 
@@ -285,57 +285,57 @@ Else:
 
 **Initialization**:
 ```c
-int chfs_init(const char *server);           // Initialize client
-int chfs_initialized();                       // Check initialization
-int chfs_term();                              // Terminate (with sync)
-int chfs_term_without_sync();                 // Terminate (no sync)
-int chfs_size();                              // Get number of servers
-const char *chfs_version();                   // Get version string
+int benchfs_init(const char *server);           // Initialize client
+int benchfs_initialized();                       // Check initialization
+int benchfs_term();                              // Terminate (with sync)
+int benchfs_term_without_sync();                 // Terminate (no sync)
+int benchfs_size();                              // Get number of servers
+const char *benchfs_version();                   // Get version string
 ```
 
 **Configuration**:
 ```c
-void chfs_set_chunk_size(int chunk_size);
-void chfs_set_async_access(int enable);
-void chfs_set_buf_size(int buf_size);
-void chfs_set_rdma_thresh(size_t thresh);
-void chfs_set_rpc_timeout_msec(int timeout);
-void chfs_set_node_list_cache_timeout(int timeout);
+void benchfs_set_chunk_size(int chunk_size);
+void benchfs_set_async_access(int enable);
+void benchfs_set_buf_size(int buf_size);
+void benchfs_set_rdma_thresh(size_t thresh);
+void benchfs_set_rpc_timeout_msec(int timeout);
+void benchfs_set_node_list_cache_timeout(int timeout);
 ```
 
 **File Operations**:
 ```c
-int chfs_create(const char *path, int32_t flags, mode_t mode);
-int chfs_open(const char *path, int32_t flags);
-int chfs_close(int fd);
-ssize_t chfs_pwrite(int fd, const void *buf, size_t size, off_t offset);
-ssize_t chfs_write(int fd, const void *buf, size_t size);
-ssize_t chfs_pread(int fd, void *buf, size_t size, off_t offset);
-ssize_t chfs_read(int fd, void *buf, size_t size);
-off_t chfs_seek(int fd, off_t off, int whence);
+int benchfs_create(const char *path, int32_t flags, mode_t mode);
+int benchfs_open(const char *path, int32_t flags);
+int benchfs_close(int fd);
+ssize_t benchfs_pwrite(int fd, const void *buf, size_t size, off_t offset);
+ssize_t benchfs_write(int fd, const void *buf, size_t size);
+ssize_t benchfs_pread(int fd, void *buf, size_t size, off_t offset);
+ssize_t benchfs_read(int fd, void *buf, size_t size);
+off_t benchfs_seek(int fd, off_t off, int whence);
 ```
 
 **Metadata Operations**:
 ```c
-int chfs_stat(const char *path, struct stat *st);
-int chfs_lstat(const char *path, struct stat *st);
-int chfs_fstat(int fd, struct stat *st);
-int chfs_access(const char *path, int mode);
-int chfs_truncate(const char *path, off_t len);
-int chfs_unlink(const char *path);
+int benchfs_stat(const char *path, struct stat *st);
+int benchfs_lstat(const char *path, struct stat *st);
+int benchfs_fstat(int fd, struct stat *st);
+int benchfs_access(const char *path, int mode);
+int benchfs_truncate(const char *path, off_t len);
+int benchfs_unlink(const char *path);
 ```
 
 **Directory Operations**:
 ```c
-int chfs_mkdir(const char *path, mode_t mode);
-int chfs_rmdir(const char *path);
-int chfs_readdir(const char *path, void *buf, int (*filler)(...));
+int benchfs_mkdir(const char *path, mode_t mode);
+int benchfs_rmdir(const char *path);
+int benchfs_readdir(const char *path, void *buf, int (*filler)(...));
 ```
 
 **Caching & Staging**:
 ```c
-int chfs_stagein(const char *path);   // Cache file from backend
-void chfs_sync();                      // Ensure all data flushed
+int benchfs_stagein(const char *path);   // Cache file from backend
+void benchfs_sync();                      // Ensure all data flushed
 ```
 
 ### 5.2 File Descriptor Management
@@ -361,7 +361,7 @@ struct fd_table {
 
 **Buffering Strategy**:
 - **Purpose**: Reduce RPC overhead for small writes
-- **Activation**: When `chfs_buf_size > 0`
+- **Activation**: When `benchfs_buf_size > 0`
 - **Behavior**:
   - Small writes accumulate in buffer
   - When buffer full or file closed, flush to server
@@ -373,7 +373,7 @@ struct fd_table {
 
 **Default**: Synchronous (configurable via `CHFS_ASYNC_ACCESS`)
 
-**Synchronous Path** (`chfs_pwrite_internal_sync`):
+**Synchronous Path** (`benchfs_pwrite_internal_sync`):
 ```
 Write Request
   → Hash chunk to server
@@ -382,7 +382,7 @@ Write Request
   → Return to application
 ```
 
-**Asynchronous Path** (`chfs_pwrite_internal_async`):
+**Asynchronous Path** (`benchfs_pwrite_internal_async`):
 ```
 Write Request
   → For each chunk:
@@ -516,9 +516,9 @@ Read Operation:
 **Application**:
 ```c
 // Stage-in with caching
-int fd = chfs_create("/path/to/file", O_WRONLY | CHFS_O_CACHE, 0644);
-chfs_write(fd, data, size);
-chfs_close(fd);  // Marks for flushing
+int fd = benchfs_create("/path/to/file", O_WRONLY | CHFS_O_CACHE, 0644);
+benchfs_write(fd, data, size);
+benchfs_close(fd);  // Marks for flushing
 ```
 
 ---
@@ -529,8 +529,8 @@ chfs_close(fd);  // Marks for flushing
 - Each file descriptor has optional write buffer
 - Accumulates writes until:
   - Buffer full
-  - File closed (chfs_close)
-  - Explicit flush (chfs_fsync)
+  - File closed (benchfs_close)
+  - Explicit flush (benchfs_fsync)
 
 **Benefits**:
 - Reduce RPC calls for sequential small writes

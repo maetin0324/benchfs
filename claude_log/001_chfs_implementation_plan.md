@@ -151,20 +151,20 @@ BenchFSプロジェクトにchfs (並列キャッシングファイルシステ�
 
 **タスク**:
 1. ファイル操作API
-   - chfs_open()
-   - chfs_read()
-   - chfs_write()
-   - chfs_close()
-   - chfs_unlink()
+   - benchfs_open()
+   - benchfs_read()
+   - benchfs_write()
+   - benchfs_close()
+   - benchfs_unlink()
 
 2. ディレクトリ操作API
-   - chfs_mkdir()
-   - chfs_rmdir()
-   - chfs_readdir()
+   - benchfs_mkdir()
+   - benchfs_rmdir()
+   - benchfs_readdir()
 
 3. 特殊操作
-   - chfs_stagein() (明示的キャッシング)
-   - chfs_sync() (一貫性保証)
+   - benchfs_stagein() (明示的キャッシング)
+   - benchfs_sync() (一貫性保証)
 
 **成果物**:
 - `src/api/mod.rs`: 公開API定義
@@ -290,13 +290,13 @@ benchfs/
 │       └── chfsd.rs               # サーバーデーモン
 ├── examples/
 │   ├── rpc_example.rs             # 既存
-│   └── chfs_example.rs            # NEW
+│   └── benchfs_example.rs            # NEW
 ├── tests/
 │   └── integration_tests.rs
 ├── benches/
 │   └── file_ops_bench.rs
 └── claude_log/
-    └── 001_chfs_implementation_plan.md  # このファイル
+    └── 001_benchfs_implementation_plan.md  # このファイル
 ```
 
 ---

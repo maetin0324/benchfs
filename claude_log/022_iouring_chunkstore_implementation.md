@@ -160,18 +160,18 @@ match ctx.chunk_store
 
 #### 主要な変更
 
-1. **`chfs_unlink`を非同期化**:
+1. **`benchfs_unlink`を非同期化**:
 ```rust
 // Before
-pub fn chfs_unlink(&self, path: &str) -> ApiResult<()>
+pub fn benchfs_unlink(&self, path: &str) -> ApiResult<()>
 
 // After
-pub async fn chfs_unlink(&self, path: &str) -> ApiResult<()>
+pub async fn benchfs_unlink(&self, path: &str) -> ApiResult<()>
 ```
 
 2. **すべてのchunk操作に`.await`を追加**:
 ```rust
-// chfs_read
+// benchfs_read
 match self.chunk_store.read_chunk(
     file_meta.inode,
     chunk_index,
@@ -181,13 +181,13 @@ match self.chunk_store.read_chunk(
     Ok(full_chunk) => { /* ... */ }
 }
 
-// chfs_write
+// benchfs_write
 self.chunk_store
     .write_chunk(file_meta.inode, chunk_index, chunk_offset, chunk_data)
     .await  // ← 追加
     .map_err(|e| ApiError::IoError(format!("Failed to write chunk: {:?}", e)))?;
 
-// chfs_unlink
+// benchfs_unlink
 let _ = self.chunk_store.delete_file_chunks(file_meta.inode).await;  // ← 追加
 ```
 
@@ -227,7 +227,7 @@ fn test_unlink_file() {
     run_test(async {
         let fs = BenchFS::new("node1".to_string());
         // ...
-        fs.chfs_unlink("/test.txt").await.unwrap();
+        fs.benchfs_unlink("/test.txt").await.unwrap();
         // ...
     });
 }
@@ -286,7 +286,7 @@ test result: ok. 117 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 2. `src/storage/mod.rs` - IOUringChunkStoreのエクスポート
 3. `src/bin/benchfsd.rs` - IOUringChunkStoreの使用、io_uringリアクタ初期化
 4. `src/rpc/handlers.rs` - IOUringChunkStore対応、.await追加
-5. `src/api/file_ops.rs` - chfs_unlink非同期化、.await追加、テスト更新
+5. `src/api/file_ops.rs` - benchfs_unlink非同期化、.await追加、テスト更新
 
 ## 次のステップ
 

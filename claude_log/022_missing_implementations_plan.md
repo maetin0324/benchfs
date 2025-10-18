@@ -140,15 +140,15 @@
 - タイムアウト処理の実装
 
 #### 1.3 基本POSIX操作の実装
-- `chfs_rename()` - ファイル/ディレクトリのリネーム
-- `chfs_stat()` - ファイル属性の取得
-- `chfs_readdir()` - ディレクトリ一覧の公開API化
-- `chfs_truncate()` - ファイルサイズ変更
-- `chfs_fsync()` - データ同期
+- `benchfs_rename()` - ファイル/ディレクトリのリネーム
+- `benchfs_stat()` - ファイル属性の取得
+- `benchfs_readdir()` - ディレクトリ一覧の公開API化
+- `benchfs_truncate()` - ファイルサイズ変更
+- `benchfs_fsync()` - データ同期
 
 優先度低め（Phase 1.5または2）:
-- `chfs_chmod()` / `chfs_chown()` - パーミッション/所有者変更
-- `chfs_link()` / `chfs_symlink()` - ハードリンク/シンボリックリンク
+- `benchfs_chmod()` / `benchfs_chown()` - パーミッション/所有者変更
+- `benchfs_link()` / `benchfs_symlink()` - ハードリンク/シンボリックリンク
 
 #### 1.4 RDMA自動切り替えロジックの検討
 - 現在の実装状況を確認

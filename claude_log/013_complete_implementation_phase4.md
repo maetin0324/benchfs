@@ -227,60 +227,60 @@ pub struct BenchFS {
 
 ### 3.3 実装したAPI
 
-#### chfs_open
+#### benchfs_open
 ```rust
-pub fn chfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle>
+pub fn benchfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle>
 ```
 - ファイルの作成・オープン
 - truncateモードのサポート
 - appendモードのサポート
 
-#### chfs_read
+#### benchfs_read
 ```rust
-pub fn chfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
+pub fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize>
 ```
 - チャンク境界をまたがる読み込み
 - スパースファイルのサポート（存在しないチャンクはゼロ）
 - ファイルポジションの自動更新
 
-#### chfs_write
+#### benchfs_write
 ```rust
-pub fn chfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize>
+pub fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize>
 ```
 - チャンク境界をまたがる書き込み
 - ファイルサイズの自動拡張
 - メタデータの自動更新
 
-#### chfs_close
+#### benchfs_close
 ```rust
-pub fn chfs_close(&self, handle: &FileHandle) -> ApiResult<()>
+pub fn benchfs_close(&self, handle: &FileHandle) -> ApiResult<()>
 ```
 - ファイルディスクリプタのクリーンアップ
 
-#### chfs_unlink
+#### benchfs_unlink
 ```rust
-pub fn chfs_unlink(&self, path: &str) -> ApiResult<()>
+pub fn benchfs_unlink(&self, path: &str) -> ApiResult<()>
 ```
 - ファイルの削除
 - 関連チャンクの削除
 - メタデータの削除
 
-#### chfs_mkdir
+#### benchfs_mkdir
 ```rust
-pub fn chfs_mkdir(&self, path: &str, mode: u32) -> ApiResult<()>
+pub fn benchfs_mkdir(&self, path: &str, mode: u32) -> ApiResult<()>
 ```
 - ディレクトリの作成
 
-#### chfs_rmdir
+#### benchfs_rmdir
 ```rust
-pub fn chfs_rmdir(&self, path: &str) -> ApiResult<()>
+pub fn benchfs_rmdir(&self, path: &str) -> ApiResult<()>
 ```
 - ディレクトリの削除
 - 空チェック
 
-#### chfs_seek
+#### benchfs_seek
 ```rust
-pub fn chfs_seek(&self, handle: &FileHandle, offset: i64, whence: i32) -> ApiResult<u64>
+pub fn benchfs_seek(&self, handle: &FileHandle, offset: i64, whence: i32) -> ApiResult<u64>
 ```
 - SEEK_SET (0): 絶対位置
 - SEEK_CUR (1): 相対位置
@@ -295,7 +295,7 @@ test result: ok. 91 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ### 新規追加されたテスト
 
 **API Tests** (src/api/file_ops.rs:415-480):
-- test_benchfs_creation
+- test_benbenchfs_creation
 - test_create_and_open_file
 - test_write_and_read_file
 - test_unlink_file
@@ -311,7 +311,7 @@ User Application
       │
       ▼
 ┌──────────────────┐
-│   BenchFS API    │  chfs_open, chfs_read, chfs_write, etc.
+│   BenchFS API    │  benchfs_open, benchfs_read, benchfs_write, etc.
 └────────┬─────────┘
          │
     ┌────┴────┐
@@ -368,31 +368,31 @@ use benchfs::api::{BenchFS, OpenFlags};
 let fs = BenchFS::new("node1".to_string());
 
 // Create and write to a file
-let handle = fs.chfs_open("/test.txt", OpenFlags::create())?;
-fs.chfs_write(&handle, b"Hello, BenchFS!")?;
-fs.chfs_close(&handle)?;
+let handle = fs.benchfs_open("/test.txt", OpenFlags::create())?;
+fs.benchfs_write(&handle, b"Hello, BenchFS!")?;
+fs.benchfs_close(&handle)?;
 
 // Read from file
-let handle = fs.chfs_open("/test.txt", OpenFlags::read_only())?;
+let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only())?;
 let mut buf = vec![0u8; 100];
-let bytes_read = fs.chfs_read(&handle, &mut buf)?;
+let bytes_read = fs.benchfs_read(&handle, &mut buf)?;
 println!("Read: {}", String::from_utf8_lossy(&buf[..bytes_read]));
-fs.chfs_close(&handle)?;
+fs.benchfs_close(&handle)?;
 
 // Seek and partial read
-let handle = fs.chfs_open("/test.txt", OpenFlags::read_only())?;
-fs.chfs_seek(&handle, 7, 0)?;  // SEEK_SET to position 7
+let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only())?;
+fs.benchfs_seek(&handle, 7, 0)?;  // SEEK_SET to position 7
 let mut buf = vec![0u8; 8];
-fs.chfs_read(&handle, &mut buf)?;
+fs.benchfs_read(&handle, &mut buf)?;
 println!("Read: {}", String::from_utf8_lossy(&buf));  // "BenchFS!"
-fs.chfs_close(&handle)?;
+fs.benchfs_close(&handle)?;
 
 // Directory operations
-fs.chfs_mkdir("/mydir", 0o755)?;
-fs.chfs_rmdir("/mydir")?;
+fs.benchfs_mkdir("/mydir", 0o755)?;
+fs.benchfs_rmdir("/mydir")?;
 
 // File deletion
-fs.chfs_unlink("/test.txt")?;
+fs.benchfs_unlink("/test.txt")?;
 ```
 
 ## 今後の改善点

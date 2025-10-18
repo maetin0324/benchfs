@@ -276,9 +276,9 @@ async fn bench_metadata_create(fs: &BenchFS, config: &BenchConfig) -> BenchResul
     // Warmup
     for i in 0..config.warmup {
         let path = format!("/warmup_{}.txt", i);
-        let handle = fs.chfs_open(&path, OpenFlags::create()).unwrap();
-        fs.chfs_close(&handle).unwrap();
-        fs.chfs_unlink(&path).await.unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        fs.benchfs_close(&handle).unwrap();
+        fs.benchfs_unlink(&path).await.unwrap();
     }
 
     // Benchmark
@@ -286,14 +286,14 @@ async fn bench_metadata_create(fs: &BenchFS, config: &BenchConfig) -> BenchResul
         let path = format!("/bench_{}.txt", i);
 
         let start = Instant::now();
-        let handle = fs.chfs_open(&path, OpenFlags::create()).unwrap();
-        fs.chfs_close(&handle).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        fs.benchfs_close(&handle).unwrap();
         let duration = start.elapsed();
 
         durations.push(duration);
 
         // Cleanup
-        fs.chfs_unlink(&path).await.unwrap();
+        fs.benchfs_unlink(&path).await.unwrap();
     }
 
     BenchResult::new("Metadata Create (file creation)".to_string(), durations)
@@ -307,25 +307,25 @@ async fn bench_small_write(fs: &BenchFS, config: &BenchConfig, size: usize) -> B
     // Warmup
     for i in 0..config.warmup {
         let path = format!("/warmup_write_{}.txt", i);
-        let handle = fs.chfs_open(&path, OpenFlags::create()).unwrap();
-        fs.chfs_write(&handle, &data).await.unwrap();
-        fs.chfs_close(&handle).unwrap();
-        fs.chfs_unlink(&path).await.unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        fs.benchfs_write(&handle, &data).await.unwrap();
+        fs.benchfs_close(&handle).unwrap();
+        fs.benchfs_unlink(&path).await.unwrap();
     }
 
     // Benchmark
     for i in 0..config.iterations {
         let path = format!("/bench_write_{}.txt", i);
-        let handle = fs.chfs_open(&path, OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
 
         let start = Instant::now();
-        fs.chfs_write(&handle, &data).await.unwrap();
+        fs.benchfs_write(&handle, &data).await.unwrap();
         let duration = start.elapsed();
 
         durations.push(duration);
 
-        fs.chfs_close(&handle).unwrap();
-        fs.chfs_unlink(&path).await.unwrap();
+        fs.benchfs_close(&handle).unwrap();
+        fs.benchfs_unlink(&path).await.unwrap();
     }
 
     BenchResult::new(
@@ -343,37 +343,37 @@ async fn bench_small_read(fs: &BenchFS, config: &BenchConfig, size: usize) -> Be
     let mut test_files = Vec::new();
     for i in 0..config.iterations {
         let path = format!("/bench_read_{}.txt", i);
-        let handle = fs.chfs_open(&path, OpenFlags::create()).unwrap();
-        fs.chfs_write(&handle, &data).await.unwrap();
-        fs.chfs_close(&handle).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        fs.benchfs_write(&handle, &data).await.unwrap();
+        fs.benchfs_close(&handle).unwrap();
         test_files.push(path);
     }
 
     // Warmup
     for path in test_files.iter().take(config.warmup) {
-        let handle = fs.chfs_open(path, OpenFlags::read_only()).unwrap();
+        let handle = fs.benchfs_open(path, OpenFlags::read_only()).unwrap();
         let mut buf = vec![0u8; size];
-        fs.chfs_read(&handle, &mut buf).await.unwrap();
-        fs.chfs_close(&handle).unwrap();
+        fs.benchfs_read(&handle, &mut buf).await.unwrap();
+        fs.benchfs_close(&handle).unwrap();
     }
 
     // Benchmark
     for path in &test_files {
-        let handle = fs.chfs_open(path, OpenFlags::read_only()).unwrap();
+        let handle = fs.benchfs_open(path, OpenFlags::read_only()).unwrap();
         let mut buf = vec![0u8; size];
 
         let start = Instant::now();
-        fs.chfs_read(&handle, &mut buf).await.unwrap();
+        fs.benchfs_read(&handle, &mut buf).await.unwrap();
         let duration = start.elapsed();
 
         durations.push(duration);
 
-        fs.chfs_close(&handle).unwrap();
+        fs.benchfs_close(&handle).unwrap();
     }
 
     // Cleanup
     for path in test_files {
-        fs.chfs_unlink(&path).await.unwrap();
+        fs.benchfs_unlink(&path).await.unwrap();
     }
 
     BenchResult::new(
@@ -462,8 +462,10 @@ fn run_server(args: &Args) {
         }
 
         // Keep server running by waiting forever
-        // This keeps the runtime event loop active
-        std::future::pending::<()>().await;
+        // Use a sleep loop instead of pending() to allow other tasks to run
+        loop {
+            futures_timer::Delay::new(std::time::Duration::from_secs(1)).await;
+        }
     });
 }
 

@@ -17,7 +17,7 @@
 
 ```bash
 # 例: NFSマウントポイント
-mkdir -p /shared/benchfs_registry
+mkdir -p /shared/benbenchfs_registry
 ```
 
 ### 2. サーバーの起動（ノード1）
@@ -25,19 +25,19 @@ mkdir -p /shared/benchfs_registry
 ```bash
 cargo bench --bench small -- \
   --mode server \
-  --registry-dir /shared/benchfs_registry \
-  --data-dir /tmp/benchfs_server_data
+  --registry-dir /shared/benbenchfs_registry \
+  --data-dir /tmp/benbenchfs_server_data
 ```
 
 出力例:
 ```
 Starting BenchFS server...
 
-  Data directory:     /tmp/benchfs_server_data
-  Registry directory: /shared/benchfs_registry
+  Data directory:     /tmp/benbenchfs_server_data
+  Registry directory: /shared/benbenchfs_registry
 
 Setting up server node...
-Server worker address registered to /shared/benchfs_registry
+Server worker address registered to /shared/benbenchfs_registry
 Server address: WorkerAddress(...)
 
 Registering RPC handlers...
@@ -52,14 +52,14 @@ Press Ctrl+C to stop the server.
 ```bash
 cargo bench --bench small -- \
   --mode client \
-  --registry-dir /shared/benchfs_registry
+  --registry-dir /shared/benbenchfs_registry
 ```
 
 出力例:
 ```
 Starting BenchFS client...
 
-  Registry directory: /shared/benchfs_registry
+  Registry directory: /shared/benbenchfs_registry
 
 Setting up client node...
 Waiting for server to register (timeout: 30 seconds)...

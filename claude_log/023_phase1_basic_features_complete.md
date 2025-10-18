@@ -39,25 +39,25 @@
 
 **ファイル**: `src/api/file_ops.rs:573-725`
 
-1. **chfs_fsync()** (行573-586)
+1. **benchfs_fsync()** (行573-586)
    - ファイルデータを同期
    - 現在はInMemoryChunkStoreなのでno-op（将来の永続化バックエンド用に準備）
 
-2. **chfs_stat()** (行588-614)
+2. **benchfs_stat()** (行588-614)
    - ファイル/ディレクトリのメタデータ取得
    - FileMetadataを返す
    - ディレクトリのstat完全対応は今後の課題
 
-3. **chfs_rename()** (行616-666)
+3. **benchfs_rename()** (行616-666)
    - ファイル/ディレクトリのリネーム
    - メタデータの削除→再作成で実現
    - 既存チェックあり
 
-4. **chfs_readdir()** (行668-687)
+4. **benchfs_readdir()** (行668-687)
    - ディレクトリの内容一覧
    - DirectoryEntryからnameを抽出してVec<String>で返す
 
-5. **chfs_truncate()** (行689-729)
+5. **benchfs_truncate()** (行689-729)
    - ファイルサイズ変更
    - 縮小時は不要なチャンクのキャッシュ無効化
    - chunk_locationsも適切にtruncate
@@ -157,7 +157,7 @@
 
 2. `src/api/file_ops.rs`
    - 5つの新機能追加（573-729行）
-   - chfs_fsync, chfs_stat, chfs_rename, chfs_readdir, chfs_truncate
+   - benchfs_fsync, benchfs_stat, benchfs_rename, benchfs_readdir, benchfs_truncate
 
 ### 変更行数
 

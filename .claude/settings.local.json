@@ -21,7 +21,8 @@
       "Bash(cargo check:*)",
       "Read(//home/rmaeda/.cargo/git/checkouts/pluvio-0fdcbbd51664b7d9/**)",
       "Read(//home/rmaeda/.cargo/git/checkouts/**)",
-      "Bash(cargo update:*)"
+      "Bash(cargo update:*)",
+      "Bash(ssh:*)"
     ],
     "deny": [],
     "ask": []

@@ -148,9 +148,11 @@ impl AmRpc for ReadChunkRequest {
     }
 
     fn proto(&self) -> Option<pluvio_ucx::async_ucx::ucp::AmProto> {
-        // Use Rendezvous protocol for RDMA transfer (rdma_write from server)
-        // UCX will use RDMA-write to transfer data to client's response buffer
-        Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+        // ReadChunk request has no data payload (only header)
+        // Rendezvous protocol will be used for the RESPONSE (server->client),
+        // not for the request. The server will use Rendezvous when replying
+        // with data via am_msg.reply().
+        None
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {

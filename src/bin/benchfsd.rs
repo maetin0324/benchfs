@@ -151,8 +151,9 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Create RPC server
     let rpc_server = Rc::new(RpcServer::new(worker, handler_context));
 
-    // Bind and listen
-    tracing::info!("Binding to address: {}", config.network.bind_addr);
+    // Note: This server uses WorkerAddress-based connections (not socket-based),
+    // so no listener is needed. Clients connect via worker.connect_addr() using
+    // WorkerAddress exchange through the address registry.
 
     // Start server main loop
     let server_handle = {
@@ -174,12 +175,15 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                 }
 
                 // Keep server alive while running
+                // Note: The RPC handlers are now running in spawned tasks.
+                // This main task just needs to keep the runtime alive until shutdown.
                 loop {
                     if !state_clone.is_running() {
                         break;
                     }
                     // Yield to allow other tasks to run
-                    futures::pending!();
+                    // We use a short sleep via futures_timer to avoid busy-waiting
+                    futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
                 }
 
                 tracing::info!("RPC server stopped");
