@@ -209,22 +209,22 @@ impl RpcServer {
 
         tracing::info!("Registering all RPC handlers...");
 
-        // Spawn ReadChunk handler
+        // Spawn ReadChunk handler with polling priority
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
+            runtime.spawn_polling(async move {
                 if let Err(e) = server.listen::<ReadChunkRequest, _, _>(rt).await {
                     tracing::error!("ReadChunk handler error: {:?}", e);
                 }
             });
         }
 
-        // Spawn WriteChunk handler
+        // Spawn WriteChunk handler with polling priority
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
+            runtime.spawn_polling(async move {
                 if let Err(e) = server.listen::<WriteChunkRequest, _, _>(rt).await {
                     tracing::error!("WriteChunk handler error: {:?}", e);
                 }

@@ -176,11 +176,13 @@ impl Args {
 fn setup_server(runtime: &Runtime, data_dir: &str, registry_dir: &str) -> Rc<RpcServer> {
     println!("Setting up server node...");
 
-    // Create io_uring reactor
+    // Create io_uring reactor with minimal timeouts for low latency
     let uring_reactor = IoUringReactor::builder()
         .queue_size(256)
         .buffer_size(1 << 20) // 1 MiB
         .submit_depth(32)
+        .wait_submit_timeout(std::time::Duration::from_micros(10))
+        .wait_complete_timeout(std::time::Duration::from_micros(10))
         .build();
 
     let allocator = uring_reactor.allocator.clone();

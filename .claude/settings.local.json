@@ -22,7 +22,13 @@
       "Read(//home/rmaeda/.cargo/git/checkouts/pluvio-0fdcbbd51664b7d9/**)",
       "Read(//home/rmaeda/.cargo/git/checkouts/**)",
       "Bash(cargo update:*)",
-      "Bash(ssh:*)"
+      "Bash(ssh:*)",
+      "Bash(env RUST_LOG=debug ./target/release/deps/small-309151752e31de5f:*)",
+      "Bash(tee:*)",
+      "Bash(env RUST_LOG=info /home/rmaeda/workspace/rust/benchfs/target/release/deps/small-309151752e31de5f:*)",
+      "Bash(env RUST_LOG=debug /home/rmaeda/workspace/rust/benchfs/target/release/deps/small-309151752e31de5f:*)",
+      "WebSearch",
+      "Bash(./src/ior:*)"
     ],
     "deny": [],
     "ask": []

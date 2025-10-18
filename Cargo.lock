@@ -54,6 +54,7 @@ dependencies = [
  "futures-timer",
  "libc",
  "lru",
+ "once_cell",
  "pluvio_runtime",
  "pluvio_ucx",
  "pluvio_uring",

@@ -580,8 +580,10 @@ impl IOUringChunkStore {
             self.backend.write(handle, offset, &data[..bytes_to_write]).await?
         };
 
-        // Sync to ensure data is persisted
-        self.backend.fsync(handle).await?;
+        // NOTE: fsync is disabled for performance. Data is cached by OS and written
+        // asynchronously. For durability guarantees, users should explicitly call fsync.
+        // This is a common trade-off in high-performance filesystems.
+        // self.backend.fsync(handle).await?;
 
         tracing::debug!(
             "Wrote {} bytes to chunk (inode={}, chunk_index={}, offset={})",
