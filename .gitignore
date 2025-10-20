@@ -1,10 +1,40 @@
-/target
-*.bin
-*.addr
-benchfs.toml
+# Rust
+/target/
+Cargo.lock
+
+# IOR (managed separately)
+ior_integration/ior/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Backend/data directories
+backend/
+data/
+
+# Test results
+results/
+raw/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
-*.old
 *.perf
+*.old
 *.folded
 *.data
-/jobs
+
+
