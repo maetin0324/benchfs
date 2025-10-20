@@ -32,7 +32,8 @@
       "Bash(else echo \"IOR binary not found\")",
       "Bash(fi)",
       "Bash(make:*)",
-      "Bash(mpirun:*)"
+      "Bash(mpirun:*)",
+      "Bash(mkdir:*)"
     ],
     "deny": [],
     "ask": []

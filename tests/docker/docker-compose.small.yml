@@ -1,0 +1,110 @@
+version: '3.8'
+
+# Small configuration for quick testing (2 nodes with isolated data directories)
+
+# Explicitly set project name to avoid prefix issues
+name: benchfs
+
+services:
+  server1:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.simple
+    container_name: benchfs_server1
+    hostname: server1
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.11
+    volumes:
+      - shared_registry:/shared/registry:rw  # Shared registry for service discovery
+      - server1_data:/shared/data:rw         # Isolated data directory
+      - ../../target/release/benchfsd_mpi:/usr/local/bin/benchfsd_mpi:ro
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro                # Config files
+    environment:
+      - RUST_LOG=info
+      - UCX_TLS=tcp,sm,self
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE  # Required for io_uring
+    command: /usr/sbin/sshd -D
+
+  server2:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.simple
+    container_name: benchfs_server2
+    hostname: server2
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.12
+    volumes:
+      - shared_registry:/shared/registry:rw  # Shared registry for service discovery
+      - server2_data:/shared/data:rw         # Isolated data directory
+      - ../../target/release/benchfsd_mpi:/usr/local/bin/benchfsd_mpi:ro
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro                # Config files
+    environment:
+      - RUST_LOG=info
+      - UCX_TLS=tcp,sm,self
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE  # Required for io_uring
+    command: /usr/sbin/sshd -D
+
+  controller:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.simple
+    container_name: benchfs_controller
+    hostname: controller
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.10
+    volumes:
+      - shared_registry:/shared/registry:rw   # Shared registry
+      - controller_results:/shared/results:rw # Results directory
+      - ../../target/release/benchfsd_mpi:/usr/local/bin/benchfsd_mpi:ro
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - UCX_TLS=tcp,sm,self
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    depends_on:
+      - server1
+      - server2
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE  # Required for io_uring
+    command: /usr/sbin/sshd -D
+
+volumes:
+  # Shared registry for service discovery
+  shared_registry:
+    driver: local
+
+  # Isolated data volumes per server
+  server1_data:
+    driver: local
+  server2_data:
+    driver: local
+
+  # Results directory for controller
+  controller_results:
+    driver: local
+
+networks:
+  benchfs_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

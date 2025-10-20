@@ -1,0 +1,22 @@
+# BenchFS Test Configuration for Docker Environment
+
+[node]
+node_id = "node0"  # Will be overridden by MPI rank
+data_dir = "/shared/data"
+log_level = "info"
+
+[storage]
+chunk_size = 4194304  # 4 MiB
+use_iouring = false  # Disabled for Docker environment
+max_storage_gb = 0  # Unlimited
+
+[network]
+bind_addr = "0.0.0.0:50051"
+timeout_secs = 30
+rdma_threshold_bytes = 32768  # 32 KB
+registry_dir = "/shared/registry"
+
+[cache]
+metadata_cache_entries = 1000
+chunk_cache_mb = 100
+cache_ttl_secs = 0  # No expiration
