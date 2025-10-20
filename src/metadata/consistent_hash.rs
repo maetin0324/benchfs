@@ -75,23 +75,22 @@ impl ConsistentHashRing {
     /// ノードが存在して削除された場合は `true`、存在しなかった場合は `false`
     pub fn remove_node(&mut self, node_id: &NodeId) -> bool {
         // ノードリストから削除
-        let pos = self.nodes.iter().position(|id| id == node_id);
-        if pos.is_none() {
+        if let Some(pos) = self.nodes.iter().position(|id| id == node_id) {
+            self.nodes.remove(pos);
+
+            // 仮想ノードをリングから削除
+            for i in 0..self.virtual_nodes_per_node {
+                let virtual_node_key = format!("{}:{}", node_id, i);
+                let position = xxh64(virtual_node_key.as_bytes(), XXHASH_SEED);
+                self.ring.remove(&position);
+            }
+
+            tracing::debug!("Removed node {} from the ring", node_id);
+            true
+        } else {
             tracing::warn!("Node {} not found in the ring", node_id);
-            return false;
+            false
         }
-
-        self.nodes.remove(pos.unwrap());
-
-        // 仮想ノードをリングから削除
-        for i in 0..self.virtual_nodes_per_node {
-            let virtual_node_key = format!("{}:{}", node_id, i);
-            let position = xxh64(virtual_node_key.as_bytes(), XXHASH_SEED);
-            self.ring.remove(&position);
-        }
-
-        tracing::debug!("Removed node {} from the ring", node_id);
-        true
     }
 
     /// 指定されたキーに対応するノードを取得

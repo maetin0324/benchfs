@@ -18,6 +18,17 @@ pub mod address_registry;
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
 
+/// RDMA threshold in bytes (32KB, same as CHFS)
+/// Data transfers larger than this will use Rendezvous (RDMA) protocol
+/// Smaller transfers will use Eager protocol for lower latency
+pub const RDMA_THRESHOLD: u64 = 32768;
+
+/// Determine whether to use RDMA based on data size
+#[inline]
+pub fn should_use_rdma(data_size: u64) -> bool {
+    data_size >= RDMA_THRESHOLD
+}
+
 /// Unified server response structure
 /// Contains response header and optional data payload
 pub struct ServerResponse<H> {

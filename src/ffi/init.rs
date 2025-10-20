@@ -204,9 +204,10 @@ pub extern "C" fn benchfs_init(
         let data_nodes = vec![node_id_str.to_string()];
         let benchfs = Rc::new(BenchFS::with_distributed_metadata(
             node_id_str.to_string(),
+            chunk_store,
             connection_pool.clone(),
-            metadata_nodes,
             data_nodes,
+            metadata_nodes,
         ));
 
         // Store in thread-local storage
@@ -270,15 +271,50 @@ pub extern "C" fn benchfs_init(
             }
         }
 
+        // Get data_dir for client (use temp dir if not specified)
+        let client_data_dir = match data_dir_str {
+            Some(d) => d.to_string(),
+            None => format!("/tmp/benchfs_client_{}", node_id_str),
+        };
+
+        // Create io_uring reactor (same as server)
+        let uring_reactor = IoUringReactor::builder()
+            .queue_size(256)
+            .buffer_size(1 << 20) // 1 MiB
+            .submit_depth(32)
+            .wait_submit_timeout(std::time::Duration::from_micros(10))
+            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .build();
+
+        let allocator = uring_reactor.allocator.clone();
+        runtime.register_reactor("io_uring", uring_reactor);
+
+        // Create IOUringBackend and ChunkStore for client
+        let io_backend = Rc::new(IOUringBackend::new(allocator));
+        let chunk_store_dir = format!("{}/chunks", client_data_dir);
+        if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
+            set_error_message(&format!("Failed to create client chunk store directory: {}", e));
+            return std::ptr::null_mut();
+        }
+
+        let chunk_store = match IOUringChunkStore::new(&chunk_store_dir, io_backend.clone()) {
+            Ok(store) => Rc::new(store),
+            Err(e) => {
+                set_error_message(&format!("Failed to create client chunk store: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
         // Create BenchFS instance with distributed metadata
         // All metadata and data operations target the "server" node
         let metadata_nodes = vec!["server".to_string()];
         let data_nodes = vec!["server".to_string()];
         let benchfs = Rc::new(BenchFS::with_distributed_metadata(
             node_id_str.to_string(),
+            chunk_store,
             connection_pool.clone(),
-            metadata_nodes,
             data_nodes,
+            metadata_nodes,
         ));
 
         // Store in thread-local storage

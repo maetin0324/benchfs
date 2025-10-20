@@ -236,6 +236,18 @@ fn setup_server(runtime: &Runtime, data_dir: &str, registry_dir: &str) -> Rc<Rpc
 async fn setup_client(runtime: &Runtime, registry_dir: &str) -> Rc<BenchFS> {
     println!("Setting up client node...");
 
+    // Create io_uring reactor for client-side chunk store
+    let uring_reactor = IoUringReactor::builder()
+        .queue_size(256)
+        .buffer_size(1 << 20) // 1 MiB
+        .submit_depth(32)
+        .wait_submit_timeout(std::time::Duration::from_micros(10))
+        .wait_complete_timeout(std::time::Duration::from_micros(10))
+        .build();
+
+    let allocator = uring_reactor.allocator.clone();
+    runtime.register_reactor("io_uring", uring_reactor.clone());
+
     // Create UCX context and reactor
     let ucx_context = Rc::new(UcxContext::new().expect("Failed to create UCX context"));
     let ucx_reactor = UCXReactor::current();
@@ -245,6 +257,16 @@ async fn setup_client(runtime: &Runtime, registry_dir: &str) -> Rc<BenchFS> {
     let worker = ucx_context.create_worker().expect("Failed to create worker");
 
     ucx_reactor.register_worker(worker.clone());
+
+    // Create IOUringBackend and chunk store for client
+    let io_backend = Rc::new(IOUringBackend::new(allocator));
+    let client_data_dir = "/tmp/benchfs_client";
+    let chunk_store_dir = format!("{}/chunks", client_data_dir);
+    std::fs::create_dir_all(&chunk_store_dir).expect("Failed to create client chunk store dir");
+    let chunk_store = Rc::new(
+        IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())
+            .expect("Failed to create client chunk store")
+    );
 
     // Create connection pool
     let connection_pool = Rc::new(
@@ -266,6 +288,7 @@ async fn setup_client(runtime: &Runtime, registry_dir: &str) -> Rc<BenchFS> {
     // This ensures all chunks are placed on the server node
     Rc::new(BenchFS::with_connection_pool_and_targets(
         "client".to_string(),
+        chunk_store,
         connection_pool,
         vec!["server".to_string()],
     ))
@@ -278,7 +301,7 @@ async fn bench_metadata_create(fs: &BenchFS, config: &BenchConfig) -> BenchResul
     // Warmup
     for i in 0..config.warmup {
         let path = format!("/warmup_{}.txt", i);
-        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).await.unwrap();
         fs.benchfs_close(&handle).unwrap();
         fs.benchfs_unlink(&path).await.unwrap();
     }
@@ -288,7 +311,7 @@ async fn bench_metadata_create(fs: &BenchFS, config: &BenchConfig) -> BenchResul
         let path = format!("/bench_{}.txt", i);
 
         let start = Instant::now();
-        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).await.unwrap();
         fs.benchfs_close(&handle).unwrap();
         let duration = start.elapsed();
 
@@ -309,7 +332,7 @@ async fn bench_small_write(fs: &BenchFS, config: &BenchConfig, size: usize) -> B
     // Warmup
     for i in 0..config.warmup {
         let path = format!("/warmup_write_{}.txt", i);
-        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).await.unwrap();
         fs.benchfs_write(&handle, &data).await.unwrap();
         fs.benchfs_close(&handle).unwrap();
         fs.benchfs_unlink(&path).await.unwrap();
@@ -318,7 +341,7 @@ async fn bench_small_write(fs: &BenchFS, config: &BenchConfig, size: usize) -> B
     // Benchmark
     for i in 0..config.iterations {
         let path = format!("/bench_write_{}.txt", i);
-        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).await.unwrap();
 
         let start = Instant::now();
         fs.benchfs_write(&handle, &data).await.unwrap();
@@ -345,7 +368,7 @@ async fn bench_small_read(fs: &BenchFS, config: &BenchConfig, size: usize) -> Be
     let mut test_files = Vec::new();
     for i in 0..config.iterations {
         let path = format!("/bench_read_{}.txt", i);
-        let handle = fs.benchfs_open(&path, OpenFlags::create()).unwrap();
+        let handle = fs.benchfs_open(&path, OpenFlags::create()).await.unwrap();
         fs.benchfs_write(&handle, &data).await.unwrap();
         fs.benchfs_close(&handle).unwrap();
         test_files.push(path);
@@ -353,7 +376,7 @@ async fn bench_small_read(fs: &BenchFS, config: &BenchConfig, size: usize) -> Be
 
     // Warmup
     for path in test_files.iter().take(config.warmup) {
-        let handle = fs.benchfs_open(path, OpenFlags::read_only()).unwrap();
+        let handle = fs.benchfs_open(path, OpenFlags::read_only()).await.unwrap();
         let mut buf = vec![0u8; size];
         fs.benchfs_read(&handle, &mut buf).await.unwrap();
         fs.benchfs_close(&handle).unwrap();
@@ -361,7 +384,7 @@ async fn bench_small_read(fs: &BenchFS, config: &BenchConfig, size: usize) -> Be
 
     // Benchmark
     for path in &test_files {
-        let handle = fs.benchfs_open(path, OpenFlags::read_only()).unwrap();
+        let handle = fs.benchfs_open(path, OpenFlags::read_only()).await.unwrap();
         let mut buf = vec![0u8; size];
 
         let start = Instant::now();

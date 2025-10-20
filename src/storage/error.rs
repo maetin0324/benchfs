@@ -27,6 +27,9 @@ pub enum StorageError {
     #[error("Operation not supported: {0}")]
     Unsupported(String),
 
+    #[error("Storage full: {0}")]
+    StorageFull(String),
+
     #[error("IO-uring error: {0}")]
     IOUringError(String),
 

@@ -354,9 +354,13 @@ impl AmRpc for WriteChunkRequest {
     }
 
     fn proto(&self) -> Option<pluvio_ucx::async_ucx::ucp::AmProto> {
-        // Use Rendezvous protocol for RDMA transfer (rdma_read from server)
-        // UCX will use RDMA-read to transfer data from client's request buffer
-        Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+        // Use Rendezvous protocol for RDMA transfer if data is large enough
+        // Otherwise use Eager protocol for better latency on small transfers
+        if crate::rpc::should_use_rdma(self.data.len() as u64) {
+            Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+        } else {
+            None // Eager protocol
+        }
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {

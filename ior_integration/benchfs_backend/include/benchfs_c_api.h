@@ -38,6 +38,16 @@ typedef struct benchfs_file_t benchfs_file_t;
 #define BENCHFS_ENOMEM     -4
 #define BENCHFS_EINVAL     -5
 
+/* File stat structure (matching benchfs_stat_t in Rust) */
+typedef struct {
+    uint64_t st_ino;      /* Inode number */
+    uint32_t st_mode;     /* File mode */
+    uint64_t st_nlink;    /* Number of hard links */
+    int64_t st_size;      /* File size in bytes */
+    int64_t st_blocks;    /* Number of 512B blocks allocated */
+    int64_t st_blksize;   /* Preferred I/O block size */
+} benchfs_stat_t;
+
 /**
  * Initialize the BenchFS context
  *
@@ -153,7 +163,7 @@ int benchfs_fsync(benchfs_file_t* file);
 int benchfs_remove(benchfs_context_t* ctx, const char* path);
 
 /**
- * Get file status
+ * Get file status (POSIX-compatible version)
  *
  * @param ctx BenchFS context
  * @param path File path
@@ -163,6 +173,16 @@ int benchfs_remove(benchfs_context_t* ctx, const char* path);
 int benchfs_stat(benchfs_context_t* ctx, const char* path, struct stat* buf);
 
 /**
+ * Get file status (BenchFS-specific version)
+ *
+ * @param ctx BenchFS context
+ * @param path File path
+ * @param buf Buffer to receive file status
+ * @return BENCHFS_SUCCESS on success, error code on failure
+ */
+int benchfs_stat_bfs(benchfs_context_t* ctx, const char* path, benchfs_stat_t* buf);
+
+/**
  * Get file size
  *
  * @param ctx BenchFS context
@@ -170,6 +190,65 @@ int benchfs_stat(benchfs_context_t* ctx, const char* path, struct stat* buf);
  * @return File size on success, negative error code on failure
  */
 off_t benchfs_get_file_size(benchfs_context_t* ctx, const char* path);
+
+/**
+ * Create a directory
+ *
+ * @param ctx BenchFS context
+ * @param path Directory path
+ * @param mode Permission mode
+ * @return BENCHFS_SUCCESS on success, error code on failure
+ */
+int benchfs_mkdir(benchfs_context_t* ctx, const char* path, mode_t mode);
+
+/**
+ * Remove a directory
+ *
+ * @param ctx BenchFS context
+ * @param path Directory path
+ * @return BENCHFS_SUCCESS on success, error code on failure
+ */
+int benchfs_rmdir(benchfs_context_t* ctx, const char* path);
+
+/**
+ * Rename a file or directory
+ *
+ * @param ctx BenchFS context
+ * @param oldpath Old path
+ * @param newpath New path
+ * @return BENCHFS_SUCCESS on success, error code on failure
+ */
+int benchfs_rename(benchfs_context_t* ctx, const char* oldpath, const char* newpath);
+
+/**
+ * Truncate a file to a specified size
+ *
+ * @param ctx BenchFS context
+ * @param path File path
+ * @param size New file size
+ * @return BENCHFS_SUCCESS on success, error code on failure
+ */
+int benchfs_truncate(benchfs_context_t* ctx, const char* path, off_t size);
+
+/**
+ * Check file access permissions
+ *
+ * @param ctx BenchFS context
+ * @param path File path
+ * @param mode Access mode to check (R_OK, W_OK, X_OK, F_OK)
+ * @return BENCHFS_SUCCESS on success, error code on failure
+ */
+int benchfs_access(benchfs_context_t* ctx, const char* path, int mode);
+
+/**
+ * Seek to a position in a file
+ *
+ * @param file File handle
+ * @param offset Offset to seek to
+ * @param whence Position from which to seek (SEEK_SET, SEEK_CUR, SEEK_END)
+ * @return New file position on success, negative error code on failure
+ */
+off_t benchfs_lseek(benchfs_file_t* file, off_t offset, int whence);
 
 /**
  * Get the last error message

@@ -36,6 +36,7 @@ impl ServerState {
         self.running.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     fn shutdown(&self) {
         self.running.store(false, Ordering::Relaxed);
     }

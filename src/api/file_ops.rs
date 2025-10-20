@@ -1,21 +1,24 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 /// File operations for BenchFS
 ///
 /// This module provides POSIX-like file operations that work with
 /// the distributed metadata and data storage.
-
 use std::rc::Rc;
-use std::cell::RefCell;
-use std::collections::HashMap;
 
 use crate::api::types::{ApiError, ApiResult, FileHandle, OpenFlags};
-use crate::metadata::{MetadataManager, FileMetadata, DirectoryMetadata, ConsistentHashRing, InodeType};
-use crate::storage::InMemoryChunkStore;
+use crate::cache::{ChunkCache, ChunkId};
 use crate::data::{ChunkManager, PlacementStrategy, RoundRobinPlacement};
+use crate::metadata::{
+    ConsistentHashRing, DirectoryMetadata, FileMetadata, InodeType, MetadataManager,
+};
+use crate::rpc::AmRpc;
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
-use crate::rpc::metadata_ops::{MetadataLookupRequest, MetadataCreateFileRequest, MetadataCreateDirRequest};
-use crate::rpc::AmRpc;
-use crate::cache::{ChunkCache, ChunkId};
+use crate::rpc::metadata_ops::{
+    MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataLookupRequest,
+};
+use crate::storage::IOUringChunkStore;
 
 /// BenchFS Filesystem Client
 ///
@@ -32,7 +35,7 @@ pub struct BenchFS {
     metadata_ring: Option<Rc<ConsistentHashRing>>,
 
     /// Chunk store (for local operations)
-    chunk_store: Rc<InMemoryChunkStore>,
+    chunk_store: Rc<IOUringChunkStore>,
 
     /// Chunk cache
     chunk_cache: ChunkCache,
@@ -55,9 +58,12 @@ pub struct BenchFS {
 
 impl BenchFS {
     /// Create a new BenchFS client (local only)
-    pub fn new(node_id: String) -> Self {
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier
+    /// * `chunk_store` - Chunk store for local data storage (using io_uring)
+    pub fn new(node_id: String, chunk_store: Rc<IOUringChunkStore>) -> Self {
         let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_store = Rc::new(InMemoryChunkStore::new());
         let chunk_cache = ChunkCache::with_memory_limit(100); // 100 MB cache
         let chunk_manager = ChunkManager::new();
         let placement = Rc::new(RoundRobinPlacement::new(vec![node_id.clone()]));
@@ -77,9 +83,17 @@ impl BenchFS {
     }
 
     /// Create a new BenchFS client with connection pool (distributed mode)
-    pub fn with_connection_pool(node_id: String, connection_pool: Rc<ConnectionPool>) -> Self {
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier
+    /// * `chunk_store` - Chunk store for local data storage (using io_uring)
+    /// * `connection_pool` - Connection pool for RPC communication
+    pub fn with_connection_pool(
+        node_id: String,
+        chunk_store: Rc<IOUringChunkStore>,
+        connection_pool: Rc<ConnectionPool>,
+    ) -> Self {
         let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_store = Rc::new(InMemoryChunkStore::new());
         let chunk_cache = ChunkCache::with_memory_limit(100);
         let chunk_manager = ChunkManager::new();
         let placement = Rc::new(RoundRobinPlacement::new(vec![node_id.clone()]));
@@ -102,15 +116,16 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `node_id` - This client's node ID
+    /// * `chunk_store` - Chunk store for local data storage (using io_uring)
     /// * `connection_pool` - Connection pool for RPC communication
     /// * `target_nodes` - List of target nodes for chunk placement
     pub fn with_connection_pool_and_targets(
         node_id: String,
+        chunk_store: Rc<IOUringChunkStore>,
         connection_pool: Rc<ConnectionPool>,
-        target_nodes: Vec<String>
+        target_nodes: Vec<String>,
     ) -> Self {
         let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_store = Rc::new(InMemoryChunkStore::new());
         let chunk_cache = ChunkCache::with_memory_limit(100);
         let chunk_manager = ChunkManager::new();
         let placement = Rc::new(RoundRobinPlacement::new(target_nodes));
@@ -133,17 +148,18 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `node_id` - This client's node ID
+    /// * `chunk_store` - Chunk store for local data storage (using io_uring)
     /// * `connection_pool` - Connection pool for RPC communication
     /// * `data_nodes` - List of data nodes for chunk placement
     /// * `metadata_nodes` - List of metadata server nodes
     pub fn with_distributed_metadata(
         node_id: String,
+        chunk_store: Rc<IOUringChunkStore>,
         connection_pool: Rc<ConnectionPool>,
         data_nodes: Vec<String>,
         metadata_nodes: Vec<String>,
     ) -> Self {
         let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_store = Rc::new(InMemoryChunkStore::new());
         let chunk_cache = ChunkCache::with_memory_limit(100);
         let chunk_manager = ChunkManager::new();
         let placement = Rc::new(RoundRobinPlacement::new(data_nodes));
@@ -211,13 +227,15 @@ impl BenchFS {
                     let request = MetadataLookupRequest::new(path.to_string());
                     match request.call(&*client).await {
                         Ok(response) if response.is_success() && response.is_file() => {
-                            let mut meta = FileMetadata::new(response.inode, path.to_string(), response.size);
+                            let meta =
+                                FileMetadata::new(response.inode, path.to_string(), response.size);
                             // Restore chunk_locations from response if available
                             // Note: MetadataLookupResponse might not have chunk_locations, so we start with empty
                             // The chunk_locations will be populated during write operations
 
                             // Cache locally for future access
-                            if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone()) {
+                            if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone())
+                            {
                                 tracing::warn!("Failed to cache metadata locally: {:?}", e);
                             } else {
                                 tracing::debug!("Cached metadata for {} locally", path);
@@ -267,10 +285,19 @@ impl BenchFS {
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found on remote server - create local cache entry
-                                let meta = FileMetadata::new(response.inode, path.to_string(), response.size);
+                                let meta = FileMetadata::new(
+                                    response.inode,
+                                    path.to_string(),
+                                    response.size,
+                                );
                                 // Cache locally for future access
-                                if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone()) {
-                                    tracing::warn!("Failed to cache metadata in benchfs_open: {:?}", e);
+                                if let Err(e) =
+                                    self.metadata_manager.store_file_metadata(meta.clone())
+                                {
+                                    tracing::warn!(
+                                        "Failed to cache metadata in benchfs_open: {:?}",
+                                        e
+                                    );
                                 } else {
                                     tracing::debug!("Cached metadata for {} in benchfs_open", path);
                                 }
@@ -284,11 +311,16 @@ impl BenchFS {
                         }
                     }
                     Err(e) => {
-                        return Err(ApiError::Internal(format!("Failed to connect to metadata server {}: {:?}", metadata_node, e)));
+                        return Err(ApiError::Internal(format!(
+                            "Failed to connect to metadata server {}: {:?}",
+                            metadata_node, e
+                        )));
                     }
                 }
             } else {
-                return Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()));
+                return Err(ApiError::Internal(
+                    "Distributed mode not enabled but metadata is remote".to_string(),
+                ));
             }
         };
 
@@ -314,22 +346,32 @@ impl BenchFS {
                     if let Some(pool) = &self.connection_pool {
                         match pool.get_or_connect(&metadata_node).await {
                             Ok(client) => {
-                                use crate::rpc::metadata_ops::{MetadataUpdateRequest};
-                                let request = MetadataUpdateRequest::new(path.to_string()).with_size(0);
+                                use crate::rpc::metadata_ops::MetadataUpdateRequest;
+                                let request =
+                                    MetadataUpdateRequest::new(path.to_string()).with_size(0);
                                 match request.call(&*client).await {
                                     Ok(response) if response.is_success() => {
                                         tracing::debug!("Remote truncate succeeded for {}", path);
                                     }
                                     Ok(response) => {
-                                        return Err(ApiError::Internal(format!("Remote truncate failed with status {}", response.status)));
+                                        return Err(ApiError::Internal(format!(
+                                            "Remote truncate failed with status {}",
+                                            response.status
+                                        )));
                                     }
                                     Err(e) => {
-                                        return Err(ApiError::Internal(format!("Remote truncate RPC error: {:?}", e)));
+                                        return Err(ApiError::Internal(format!(
+                                            "Remote truncate RPC error: {:?}",
+                                            e
+                                        )));
                                     }
                                 }
                             }
                             Err(e) => {
-                                return Err(ApiError::Internal(format!("Failed to connect for truncate: {:?}", e)));
+                                return Err(ApiError::Internal(format!(
+                                    "Failed to connect for truncate: {:?}",
+                                    e
+                                )));
                             }
                         }
                     }
@@ -359,44 +401,74 @@ impl BenchFS {
                 if let Some(pool) = &self.connection_pool {
                     match pool.get_or_connect(&metadata_node).await {
                         Ok(client) => {
-                            let request = MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
+                            let request =
+                                MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
                             match request.call(&*client).await {
                                 Ok(response) if response.is_success() => {
-                                    tracing::debug!("Remote file created: {} with inode {}", path, response.inode);
+                                    tracing::debug!(
+                                        "Remote file created: {} with inode {}",
+                                        path,
+                                        response.inode
+                                    );
                                     response.inode
                                 }
                                 Ok(response) => {
-                                    return Err(ApiError::Internal(format!("Remote create failed with status {}", response.status)));
+                                    return Err(ApiError::Internal(format!(
+                                        "Remote create failed with status {}",
+                                        response.status
+                                    )));
                                 }
                                 Err(e) => {
-                                    return Err(ApiError::Internal(format!("Remote create RPC error: {:?}", e)));
+                                    return Err(ApiError::Internal(format!(
+                                        "Remote create RPC error: {:?}",
+                                        e
+                                    )));
                                 }
                             }
                         }
                         Err(e) => {
-                            return Err(ApiError::Internal(format!("Failed to connect for create: {:?}", e)));
+                            return Err(ApiError::Internal(format!(
+                                "Failed to connect for create: {:?}",
+                                e
+                            )));
                         }
                     }
                 } else {
-                    return Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()));
+                    return Err(ApiError::Internal(
+                        "Distributed mode not enabled but metadata is remote".to_string(),
+                    ));
                 }
             };
 
             // Update parent directory's children list
-            if let (Some(parent_path), Some(filename)) = (Self::get_parent_path(path), Self::get_filename(path)) {
+            if let (Some(parent_path), Some(filename)) =
+                (Self::get_parent_path(path), Self::get_filename(path))
+            {
                 use std::path::Path;
                 let parent_path_ref = Path::new(&parent_path);
 
                 // Only update if parent directory is stored locally
-                if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
+                if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref)
+                {
                     parent_meta.add_child(filename, created_inode, InodeType::File);
                     if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
-                        tracing::warn!("Failed to update parent directory {} after file creation: {:?}", parent_path, e);
+                        tracing::warn!(
+                            "Failed to update parent directory {} after file creation: {:?}",
+                            parent_path,
+                            e
+                        );
                     } else {
-                        tracing::debug!("Updated parent directory {} with new file {}", parent_path, path);
+                        tracing::debug!(
+                            "Updated parent directory {} with new file {}",
+                            parent_path,
+                            path
+                        );
                     }
                 } else {
-                    tracing::debug!("Parent directory {} not found locally, skipping children update", parent_path);
+                    tracing::debug!(
+                        "Parent directory {} not found locally, skipping children update",
+                        parent_path
+                    );
                 }
             }
 
@@ -423,7 +495,9 @@ impl BenchFS {
                         Ok(client) => {
                             let request = MetadataLookupRequest::new(path.to_string());
                             match request.call(&*client).await {
-                                Ok(response) if response.is_success() && response.is_file() => response.size,
+                                Ok(response) if response.is_success() && response.is_file() => {
+                                    response.size
+                                }
                                 _ => 0,
                             }
                         }
@@ -451,7 +525,9 @@ impl BenchFS {
     /// Number of bytes read
     pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
         if !handle.flags.read {
-            return Err(ApiError::PermissionDenied("File not opened for reading".to_string()));
+            return Err(ApiError::PermissionDenied(
+                "File not opened for reading".to_string(),
+            ));
         }
 
         // Get file metadata with caching
@@ -469,94 +545,138 @@ impl BenchFS {
         let actual_length = length.min(file_meta.size - offset);
 
         // Calculate which chunks to read
-        let chunks = self.chunk_manager.calculate_read_chunks(offset, actual_length, file_meta.size)
+        let chunks = self
+            .chunk_manager
+            .calculate_read_chunks(offset, actual_length, file_meta.size)
             .map_err(|e| ApiError::Internal(format!("Failed to calculate chunks: {:?}", e)))?;
 
-        let mut bytes_read = 0;
-        for (chunk_index, chunk_offset, read_size) in chunks {
-            let chunk_id = ChunkId::new(file_meta.inode, chunk_index);
+        // Read all chunks concurrently
+        use futures::future::join_all;
 
-            // Try to get full chunk from cache first
-            let chunk_data = if let Some(cached_chunk) = self.chunk_cache.get(&chunk_id) {
-                // Cache hit - extract the requested portion
-                tracing::trace!("Cache hit for chunk {}", chunk_index);
-                Some(cached_chunk)
-            } else {
-                // Cache miss - need to fetch chunk
-                tracing::trace!("Cache miss for chunk {}", chunk_index);
+        // Collect futures for reading all chunks
+        let inode = file_meta.inode;
+        let chunk_locations = file_meta.chunk_locations.clone();
+        let chunk_futures: Vec<_> = chunks
+            .iter()
+            .map(|(chunk_index, _chunk_offset, _read_size)| {
+                let chunk_id = ChunkId::new(inode, *chunk_index);
+                let chunk_index = *chunk_index;
+                let chunk_locations = chunk_locations.clone();
 
-                // Try local chunk store first
-                match self.chunk_store.read_chunk(
-                    file_meta.inode,
-                    chunk_index,
-                    0, // Read full chunk for caching
-                    self.chunk_manager.chunk_size() as u64,
-                ).await {
-                    Ok(full_chunk) => {
-                        // Cache the full chunk for future reads
-                        self.chunk_cache.put(chunk_id, full_chunk.clone());
-                        Some(full_chunk)
+                async move {
+                    // Try to get full chunk from cache first
+                    if let Some(cached_chunk) = self.chunk_cache.get(&chunk_id) {
+                        // Cache hit
+                        tracing::trace!("Cache hit for chunk {}", chunk_index);
+                        return (chunk_index, Some(cached_chunk));
                     }
-                    Err(_) => {
-                        // Local read failed - try remote if distributed mode enabled
-                        if let Some(pool) = &self.connection_pool {
-                            // Get chunk location from metadata
-                            if let Some(node_id) = crate::rpc::data_ops::get_chunk_node(chunk_index, &file_meta.chunk_locations) {
-                                tracing::debug!("Fetching chunk {} from remote node {}", chunk_index, node_id);
 
-                                // Connect to remote node using node_id
-                                match pool.get_or_connect(node_id).await {
+                    // Cache miss - need to fetch chunk
+                    tracing::trace!("Cache miss for chunk {}", chunk_index);
+
+                    // Try local chunk store first
+                    match self
+                        .chunk_store
+                        .read_chunk(
+                            inode,
+                            chunk_index,
+                            0, // Read full chunk for caching
+                            self.chunk_manager.chunk_size() as u64,
+                        )
+                        .await
+                    {
+                        Ok(full_chunk) => {
+                            // Cache the full chunk for future reads
+                            self.chunk_cache.put(chunk_id, full_chunk.clone());
+                            (chunk_index, Some(full_chunk))
+                        }
+                        Err(_) => {
+                            // Local read failed - try remote if distributed mode enabled
+                            if let Some(pool) = &self.connection_pool {
+                                // Get chunk location from metadata
+                                if let Some(node_id) = crate::rpc::data_ops::get_chunk_node(
+                                    chunk_index,
+                                    &chunk_locations,
+                                ) {
+                                    tracing::debug!(
+                                        "Fetching chunk {} from remote node {}",
+                                        chunk_index,
+                                        node_id
+                                    );
+
+                                    // Connect to remote node using node_id
+                                    match pool.get_or_connect(node_id).await {
                                         Ok(client) => {
                                             // Create RPC request
                                             let request = ReadChunkRequest::new(
                                                 chunk_index,
                                                 0,
                                                 self.chunk_manager.chunk_size() as u64,
-                                                file_meta.inode,
+                                                inode,
                                             );
 
                                             // Execute RPC
                                             match request.call(&*client).await {
                                                 Ok(response) if response.is_success() => {
                                                     let full_chunk = request.take_data();
-                                                    tracing::debug!("Successfully fetched {} bytes from remote node", full_chunk.len());
+                                                    tracing::debug!(
+                                                        "Successfully fetched {} bytes from remote node",
+                                                        full_chunk.len()
+                                                    );
 
                                                     // Cache for future reads
                                                     self.chunk_cache.put(chunk_id, full_chunk.clone());
-                                                    Some(full_chunk)
+                                                    (chunk_index, Some(full_chunk))
                                                 }
                                                 Ok(response) => {
-                                                    tracing::warn!("Remote read failed with status {}", response.status);
-                                                    None
+                                                    tracing::warn!(
+                                                        "Remote read failed with status {}",
+                                                        response.status
+                                                    );
+                                                    (chunk_index, None)
                                                 }
                                                 Err(e) => {
                                                     tracing::error!("RPC error: {:?}", e);
-                                                    None
+                                                    (chunk_index, None)
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::error!("Failed to connect to {}: {:?}", node_id, e);
-                                            None
+                                            tracing::error!(
+                                                "Failed to connect to {}: {:?}",
+                                                node_id,
+                                                e
+                                            );
+                                            (chunk_index, None)
                                         }
                                     }
+                                } else {
+                                    // No location info for this chunk - treat as sparse
+                                    (chunk_index, None)
+                                }
                             } else {
-                                // No location info for this chunk - treat as sparse
-                                None
+                                // Not in distributed mode - treat as sparse
+                                (chunk_index, None)
                             }
-                        } else {
-                            // Not in distributed mode - treat as sparse
-                            None
                         }
                     }
                 }
-            };
+            })
+            .collect();
 
+        // Execute all reads concurrently
+        let chunk_results = join_all(chunk_futures).await;
+
+        // Copy data to buffer in correct order
+        let mut bytes_read = 0;
+        for ((_chunk_index, chunk_offset, read_size), (_result_idx, chunk_data)) in
+            chunks.iter().zip(chunk_results.iter())
+        {
             // Extract and copy the requested portion
             if let Some(chunk) = chunk_data {
                 let buf_offset = bytes_read;
-                let chunk_start = chunk_offset as usize;
-                let chunk_end = (chunk_start + read_size as usize).min(chunk.len());
+                let chunk_start = *chunk_offset as usize;
+                let chunk_end = (chunk_start + *read_size as usize).min(chunk.len());
                 let copy_len = (chunk_end - chunk_start).min(buf.len() - buf_offset);
 
                 if chunk_start < chunk.len() {
@@ -565,14 +685,14 @@ impl BenchFS {
                     bytes_read += copy_len;
                 } else {
                     // Request is beyond chunk data, fill with zeros
-                    let zero_len = read_size as usize;
+                    let zero_len = *read_size as usize;
                     buf[buf_offset..buf_offset + zero_len].fill(0);
                     bytes_read += zero_len;
                 }
             } else {
                 // Chunk doesn't exist locally, return zeros (sparse file)
                 let buf_offset = bytes_read;
-                let zero_len = read_size as usize;
+                let zero_len = *read_size as usize;
                 buf[buf_offset..buf_offset + zero_len].fill(0);
                 bytes_read += zero_len;
             }
@@ -594,7 +714,9 @@ impl BenchFS {
     /// Number of bytes written
     pub async fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
         if !handle.flags.write {
-            return Err(ApiError::PermissionDenied("File not opened for writing".to_string()));
+            return Err(ApiError::PermissionDenied(
+                "File not opened for writing".to_string(),
+            ));
         }
 
         // Get file metadata with caching
@@ -606,16 +728,16 @@ impl BenchFS {
         // Calculate which chunks to write (using read_chunks as a workaround)
         // Note: For writing, we use the same logic as reading to determine chunk boundaries
         let new_size = (offset + length).max(file_meta.size);
-        let chunks = self.chunk_manager.calculate_read_chunks(offset, length, new_size)
+        let chunks = self
+            .chunk_manager
+            .calculate_read_chunks(offset, length, new_size)
             .map_err(|e| ApiError::Internal(format!("Failed to calculate chunks: {:?}", e)))?;
 
-        let mut bytes_written = 0;
         let mut chunk_locations_updated = false;
 
-        for (chunk_index, chunk_offset, write_size) in chunks {
-            let data_offset = bytes_written;
-            let data_len = write_size as usize;
-            let chunk_data = &data[data_offset..data_offset + data_len];
+        // First, determine chunk locations and invalidate cache (sequential preparation)
+        for (chunk_index, _chunk_offset, _write_size) in &chunks {
+            let chunk_index = *chunk_index;
 
             // Invalidate cache for this chunk (write-through)
             let chunk_id = ChunkId::new(file_meta.inode, chunk_index);
@@ -631,59 +753,106 @@ impl BenchFS {
             if file_meta.chunk_locations[chunk_index as usize].is_empty() {
                 use std::path::Path;
                 let path_ref = Path::new(&file_meta.path);
-                let node_id = self.placement.place_chunk(path_ref, chunk_index)
+                let node_id = self
+                    .placement
+                    .place_chunk(path_ref, chunk_index)
                     .unwrap_or_else(|| self.metadata_manager.self_node_id().to_string());
                 file_meta.chunk_locations[chunk_index as usize] = node_id;
                 chunk_locations_updated = true;
             }
+        }
 
-            let target_node = &file_meta.chunk_locations[chunk_index as usize];
-            let is_local = target_node == &self.metadata_manager.self_node_id();
+        // Write all chunks concurrently
+        use futures::future::join_all;
 
-            if is_local {
-                // Write to local chunk store
-                self.chunk_store
-                    .write_chunk(file_meta.inode, chunk_index, chunk_offset, chunk_data)
-                    .await
-                    .map_err(|e| ApiError::IoError(format!("Failed to write chunk: {:?}", e)))?;
-            } else if let Some(pool) = &self.connection_pool {
-                // Write to remote node using node_id
-                tracing::debug!("Writing chunk {} to remote node {}", chunk_index, target_node);
+        let chunk_write_futures: Vec<_> = chunks
+            .iter()
+            .enumerate()
+            .map(|(idx, (chunk_index, chunk_offset, write_size))| {
+                let chunk_index = *chunk_index;
+                let chunk_offset = *chunk_offset;
+                let write_size = *write_size;
 
-                match pool.get_or_connect(target_node).await {
-                        Ok(client) => {
-                            // Create RPC request
-                            let request = WriteChunkRequest::new(
-                                chunk_index,
-                                chunk_offset,
-                                chunk_data.to_vec(),
-                                file_meta.inode,
-                            );
+                // Calculate data slice for this chunk
+                let data_offset: usize = chunks.iter().take(idx).map(|(_, _, s)| *s as usize).sum();
+                let data_len = write_size as usize;
+                let chunk_data = data[data_offset..data_offset + data_len].to_vec();
 
-                            // Execute RPC
-                            match request.call(&*client).await {
-                                Ok(response) if response.is_success() => {
-                                    tracing::debug!("Successfully wrote {} bytes to remote node", response.bytes_written);
-                                }
-                                Ok(response) => {
-                                    return Err(ApiError::IoError(format!("Remote write failed with status {}", response.status)));
-                                }
-                                Err(e) => {
-                                    return Err(ApiError::IoError(format!("RPC error: {:?}", e)));
+                let target_node = file_meta.chunk_locations[chunk_index as usize].clone();
+                let is_local = target_node == self.metadata_manager.self_node_id();
+                let inode = file_meta.inode;
+
+                async move {
+                    if is_local {
+                        // Write to local chunk store
+                        self.chunk_store
+                            .write_chunk(inode, chunk_index, chunk_offset, &chunk_data)
+                            .await
+                            .map_err(|e| ApiError::IoError(format!("Failed to write chunk {}: {:?}", chunk_index, e)))?;
+                        Ok::<usize, ApiError>(data_len)
+                    } else if let Some(pool) = &self.connection_pool {
+                        // Write to remote node using node_id
+                        tracing::debug!(
+                            "Writing chunk {} to remote node {}",
+                            chunk_index,
+                            target_node
+                        );
+
+                        match pool.get_or_connect(&target_node).await {
+                            Ok(client) => {
+                                // Create RPC request
+                                let request = WriteChunkRequest::new(
+                                    chunk_index,
+                                    chunk_offset,
+                                    chunk_data,
+                                    inode,
+                                );
+
+                                // Execute RPC
+                                match request.call(&*client).await {
+                                    Ok(response) if response.is_success() => {
+                                        tracing::debug!(
+                                            "Successfully wrote {} bytes to remote node",
+                                            response.bytes_written
+                                        );
+                                        Ok(data_len)
+                                    }
+                                    Ok(response) => {
+                                        Err(ApiError::IoError(format!(
+                                            "Remote write failed with status {}",
+                                            response.status
+                                        )))
+                                    }
+                                    Err(e) => {
+                                        Err(ApiError::IoError(format!("RPC error: {:?}", e)))
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                Err(ApiError::IoError(format!(
+                                    "Failed to connect to {}: {:?}",
+                                    target_node, e
+                                )))
+                            }
                         }
-                        Err(e) => {
-                            return Err(ApiError::IoError(format!("Failed to connect to {}: {:?}", target_node, e)));
-                        }
+                    } else {
+                        // Not in distributed mode but chunk should be on a different node
+                        Err(ApiError::Internal(format!(
+                            "Chunk {} should be on node {} but distributed mode is not enabled",
+                            chunk_index, target_node
+                        )))
                     }
-            } else {
-                // Not in distributed mode but chunk should be on a different node
-                // This shouldn't happen in normal operation
-                return Err(ApiError::Internal(format!("Chunk {} should be on node {} but distributed mode is not enabled", chunk_index, target_node)));
-            }
+                }
+            })
+            .collect();
 
-            bytes_written += data_len;
+        // Execute all writes concurrently
+        let write_results = join_all(chunk_write_futures).await;
+
+        // Check results and calculate total bytes written
+        let mut bytes_written = 0;
+        for result in write_results {
+            bytes_written += result?;
         }
 
         // Update file size if we wrote past the end, or if chunk locations were updated
@@ -738,7 +907,9 @@ impl BenchFS {
             .map_err(|e| ApiError::Internal(format!("Failed to delete metadata: {:?}", e)))?;
 
         // Update parent directory's children list
-        if let (Some(parent_path), Some(filename)) = (Self::get_parent_path(path), Self::get_filename(path)) {
+        if let (Some(parent_path), Some(filename)) =
+            (Self::get_parent_path(path), Self::get_filename(path))
+        {
             use std::path::Path;
             let parent_path_ref = Path::new(&parent_path);
 
@@ -746,12 +917,23 @@ impl BenchFS {
             if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
                 parent_meta.remove_child(&filename);
                 if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
-                    tracing::warn!("Failed to update parent directory {} after file deletion: {:?}", parent_path, e);
+                    tracing::warn!(
+                        "Failed to update parent directory {} after file deletion: {:?}",
+                        parent_path,
+                        e
+                    );
                 } else {
-                    tracing::debug!("Updated parent directory {} after deleting file {}", parent_path, path);
+                    tracing::debug!(
+                        "Updated parent directory {} after deleting file {}",
+                        parent_path,
+                        path
+                    );
                 }
             } else {
-                tracing::debug!("Parent directory {} not found locally, skipping children update", parent_path);
+                tracing::debug!(
+                    "Parent directory {} not found locally, skipping children update",
+                    parent_path
+                );
             }
         }
 
@@ -803,12 +985,18 @@ impl BenchFS {
                                 // Not found, proceed with creation
                             }
                             Err(e) => {
-                                tracing::warn!("Remote metadata lookup failed during mkdir: {:?}", e);
+                                tracing::warn!(
+                                    "Remote metadata lookup failed during mkdir: {:?}",
+                                    e
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        return Err(ApiError::Internal(format!("Failed to connect to metadata server {}: {:?}", metadata_node, e)));
+                        return Err(ApiError::Internal(format!(
+                            "Failed to connect to metadata server {}: {:?}",
+                            metadata_node, e
+                        )));
                     }
                 }
 
@@ -818,28 +1006,45 @@ impl BenchFS {
                         let request = MetadataCreateDirRequest::new(path.to_string(), mode);
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() => {
-                                tracing::debug!("Remote directory created: {} with inode {}", path, response.inode);
+                                tracing::debug!(
+                                    "Remote directory created: {} with inode {}",
+                                    path,
+                                    response.inode
+                                );
                                 response.inode
                             }
                             Ok(response) => {
-                                return Err(ApiError::Internal(format!("Remote mkdir failed with status {}", response.status)));
+                                return Err(ApiError::Internal(format!(
+                                    "Remote mkdir failed with status {}",
+                                    response.status
+                                )));
                             }
                             Err(e) => {
-                                return Err(ApiError::Internal(format!("Remote mkdir RPC error: {:?}", e)));
+                                return Err(ApiError::Internal(format!(
+                                    "Remote mkdir RPC error: {:?}",
+                                    e
+                                )));
                             }
                         }
                     }
                     Err(e) => {
-                        return Err(ApiError::Internal(format!("Failed to connect for mkdir: {:?}", e)));
+                        return Err(ApiError::Internal(format!(
+                            "Failed to connect for mkdir: {:?}",
+                            e
+                        )));
                     }
                 }
             } else {
-                return Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()));
+                return Err(ApiError::Internal(
+                    "Distributed mode not enabled but metadata is remote".to_string(),
+                ));
             }
         };
 
         // Update parent directory's children list
-        if let (Some(parent_path), Some(dirname)) = (Self::get_parent_path(path), Self::get_filename(path)) {
+        if let (Some(parent_path), Some(dirname)) =
+            (Self::get_parent_path(path), Self::get_filename(path))
+        {
             use std::path::Path;
             let parent_path_ref = Path::new(&parent_path);
 
@@ -847,12 +1052,23 @@ impl BenchFS {
             if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
                 parent_meta.add_child(dirname, created_inode, InodeType::Directory);
                 if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
-                    tracing::warn!("Failed to update parent directory {} after mkdir: {:?}", parent_path, e);
+                    tracing::warn!(
+                        "Failed to update parent directory {} after mkdir: {:?}",
+                        parent_path,
+                        e
+                    );
                 } else {
-                    tracing::debug!("Updated parent directory {} with new directory {}", parent_path, path);
+                    tracing::debug!(
+                        "Updated parent directory {} with new directory {}",
+                        parent_path,
+                        path
+                    );
                 }
             } else {
-                tracing::debug!("Parent directory {} not found locally, skipping children update", parent_path);
+                tracing::debug!(
+                    "Parent directory {} not found locally, skipping children update",
+                    parent_path
+                );
             }
         }
 
@@ -883,6 +1099,37 @@ impl BenchFS {
             .remove_dir_metadata(path_ref)
             .map_err(|e| ApiError::Internal(format!("Failed to delete directory: {:?}", e)))?;
 
+        // Update parent directory's children list
+        if let (Some(parent_path), Some(dirname)) =
+            (Self::get_parent_path(path), Self::get_filename(path))
+        {
+            use std::path::Path;
+            let parent_path_ref = Path::new(&parent_path);
+
+            // Only update if parent directory is stored locally
+            if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
+                parent_meta.remove_child(&dirname);
+                if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
+                    tracing::warn!(
+                        "Failed to update parent directory {} after rmdir: {:?}",
+                        parent_path,
+                        e
+                    );
+                } else {
+                    tracing::debug!(
+                        "Updated parent directory {} after deleting directory {}",
+                        parent_path,
+                        path
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    "Parent directory {} not found locally, skipping children update",
+                    parent_path
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -912,7 +1159,9 @@ impl BenchFS {
                 let current = handle.position() as i64;
                 let new = current + offset;
                 if new < 0 {
-                    return Err(ApiError::InvalidArgument("Seek before beginning".to_string()));
+                    return Err(ApiError::InvalidArgument(
+                        "Seek before beginning".to_string(),
+                    ));
                 }
                 new as u64
             }
@@ -925,7 +1174,9 @@ impl BenchFS {
                 let end = file_meta.size as i64;
                 let new = end + offset;
                 if new < 0 {
-                    return Err(ApiError::InvalidArgument("Seek before beginning".to_string()));
+                    return Err(ApiError::InvalidArgument(
+                        "Seek before beginning".to_string(),
+                    ));
                 }
                 new as u64
             }
@@ -981,8 +1232,8 @@ impl BenchFS {
     /// # Returns
     /// File status information (FileStat)
     pub async fn benchfs_stat(&self, path: &str) -> ApiResult<crate::api::types::FileStat> {
-        use std::path::Path;
         use crate::api::types::FileStat;
+        use std::path::Path;
 
         let path_ref = Path::new(path);
 
@@ -1012,26 +1263,35 @@ impl BenchFS {
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found
-                                let meta = FileMetadata::new(response.inode, path.to_string(), response.size);
+                                let meta = FileMetadata::new(
+                                    response.inode,
+                                    path.to_string(),
+                                    response.size,
+                                );
                                 Ok(FileStat::from_file_metadata(&meta))
                             }
                             Ok(response) if response.is_success() && response.is_directory() => {
                                 // Directory found
-                                let dir_meta = DirectoryMetadata::new(response.inode, path.to_string());
+                                let dir_meta =
+                                    DirectoryMetadata::new(response.inode, path.to_string());
                                 Ok(FileStat::from_dir_metadata(&dir_meta))
                             }
                             Ok(_) => Err(ApiError::NotFound(path.to_string())),
-                            Err(e) => {
-                                Err(ApiError::Internal(format!("Remote stat RPC error: {:?}", e)))
-                            }
+                            Err(e) => Err(ApiError::Internal(format!(
+                                "Remote stat RPC error: {:?}",
+                                e
+                            ))),
                         }
                     }
-                    Err(e) => {
-                        Err(ApiError::Internal(format!("Failed to connect to metadata server {}: {:?}", metadata_node, e)))
-                    }
+                    Err(e) => Err(ApiError::Internal(format!(
+                        "Failed to connect to metadata server {}: {:?}",
+                        metadata_node, e
+                    ))),
                 }
             } else {
-                Err(ApiError::Internal("Distributed mode not enabled but metadata is remote".to_string()))
+                Err(ApiError::Internal(
+                    "Distributed mode not enabled but metadata is remote".to_string(),
+                ))
             }
         }
     }
@@ -1047,7 +1307,10 @@ impl BenchFS {
         let new_path_ref = Path::new(new_path);
 
         // Check if new path already exists
-        if self.metadata_manager.get_file_metadata(new_path_ref).is_ok()
+        if self
+            .metadata_manager
+            .get_file_metadata(new_path_ref)
+            .is_ok()
             || self.metadata_manager.get_dir_metadata(new_path_ref).is_ok()
         {
             return Err(ApiError::AlreadyExists(new_path.to_string()));
@@ -1058,13 +1321,17 @@ impl BenchFS {
             // Remove old metadata
             self.metadata_manager
                 .remove_file_metadata(old_path_ref)
-                .map_err(|e| ApiError::Internal(format!("Failed to remove old metadata: {:?}", e)))?;
+                .map_err(|e| {
+                    ApiError::Internal(format!("Failed to remove old metadata: {:?}", e))
+                })?;
 
             // Update path and store new metadata
             meta.path = new_path.to_string();
             self.metadata_manager
                 .store_file_metadata(meta)
-                .map_err(|e| ApiError::Internal(format!("Failed to store new metadata: {:?}", e)))?;
+                .map_err(|e| {
+                    ApiError::Internal(format!("Failed to store new metadata: {:?}", e))
+                })?;
 
             return Ok(());
         }
@@ -1074,13 +1341,17 @@ impl BenchFS {
             // Remove old metadata
             self.metadata_manager
                 .remove_dir_metadata(old_path_ref)
-                .map_err(|e| ApiError::Internal(format!("Failed to remove old metadata: {:?}", e)))?;
+                .map_err(|e| {
+                    ApiError::Internal(format!("Failed to remove old metadata: {:?}", e))
+                })?;
 
             // Update path and store new metadata
             meta.path = new_path.to_string();
             self.metadata_manager
                 .store_dir_metadata(meta)
-                .map_err(|e| ApiError::Internal(format!("Failed to store new metadata: {:?}", e)))?;
+                .map_err(|e| {
+                    ApiError::Internal(format!("Failed to store new metadata: {:?}", e))
+                })?;
 
             return Ok(());
         }
@@ -1147,7 +1418,11 @@ impl BenchFS {
                 self.chunk_cache.invalidate(&chunk_id);
 
                 // Delete from chunk store
-                if let Err(e) = self.chunk_store.delete_chunk(file_meta.inode, chunk_idx).await {
+                if let Err(e) = self
+                    .chunk_store
+                    .delete_chunk(file_meta.inode, chunk_idx)
+                    .await
+                {
                     tracing::warn!(
                         "Failed to delete chunk {} for inode {}: {:?}",
                         chunk_idx,
@@ -1169,7 +1444,8 @@ impl BenchFS {
                 if bytes_to_zero > 0 {
                     // Write zeros to the end of the last chunk
                     let zeros = vec![0u8; bytes_to_zero as usize];
-                    if let Err(e) = self.chunk_store
+                    if let Err(e) = self
+                        .chunk_store
                         .write_chunk(file_meta.inode, last_chunk_idx, last_chunk_offset, &zeros)
                         .await
                     {
@@ -1250,115 +1526,172 @@ impl BenchFS {
 mod tests {
     use super::*;
     use pluvio_runtime::executor::Runtime;
-    use std::rc::Rc;
+    use crate::storage::IOUringBackend;
+    use pluvio_uring::reactor::IoUringReactor;
+
+    fn create_test_chunk_store(runtime: &Runtime) -> Rc<IOUringChunkStore> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        // Create io_uring reactor
+        let uring_reactor = IoUringReactor::builder()
+            .queue_size(256)
+            .buffer_size(1 << 20)
+            .submit_depth(32)
+            .wait_submit_timeout(std::time::Duration::from_micros(10))
+            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .build();
+
+        let allocator = uring_reactor.allocator.clone();
+        runtime.register_reactor("io_uring", uring_reactor);
+
+        // Create IOUringBackend and chunk store with unique directory per test
+        let io_backend = Rc::new(IOUringBackend::new(allocator));
+        let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let temp_dir = format!("/tmp/benchfs_test_{}_{}", std::process::id(), test_id);
+        let chunk_store_dir = format!("{}/chunks", temp_dir);
+        std::fs::create_dir_all(&chunk_store_dir).unwrap();
+
+        Rc::new(IOUringChunkStore::new(&chunk_store_dir, io_backend).unwrap())
+    }
 
     fn run_test<F>(test: F)
     where
-        F: std::future::Future<Output = ()> + 'static,
+        F: FnOnce(Rc<Runtime>, Rc<IOUringChunkStore>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> + 'static,
     {
         let runtime = Runtime::new(256);
-        runtime.clone().run(test);
+        let chunk_store = create_test_chunk_store(&runtime);
+        let future = test(runtime.clone(), chunk_store);
+        runtime.run(future);
     }
 
     #[test]
     fn test_benbenchfs_creation() {
-        let fs = BenchFS::new("node1".to_string());
+        let runtime = Runtime::new(256);
+        let chunk_store = create_test_chunk_store(&runtime);
+        let fs = BenchFS::new("node1".to_string(), chunk_store);
         assert_eq!(fs.metadata_manager.self_node_id(), "node1");
     }
 
     #[test]
     fn test_create_and_open_file() {
-        let fs = BenchFS::new("node1".to_string());
+        run_test(|_runtime, chunk_store| {
+            Box::pin(async move {
+                let fs = BenchFS::new("node1".to_string(), chunk_store);
 
-        // Create and open a new file
-        let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
-        assert_eq!(handle.path, "/test.txt");
-        assert!(handle.flags.write);
+                // Create and open a new file
+                let handle = fs
+                    .benchfs_open("/test.txt", OpenFlags::create())
+                    .await
+                    .unwrap();
+                assert_eq!(handle.path, "/test.txt");
+                assert!(handle.flags.write);
 
-        fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).unwrap();
+            })
+        })
     }
 
     #[test]
     fn test_write_and_read_file() {
-        run_test(async {
-            let fs = BenchFS::new("node1".to_string());
+        run_test(|_runtime, chunk_store| {
+            Box::pin(async move {
+                let fs = BenchFS::new("node1".to_string(), chunk_store);
 
-            // Create file
-            let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
+                // Create file
+                let handle = fs
+                    .benchfs_open("/test.txt", OpenFlags::create())
+                    .await
+                    .unwrap();
 
-            // Write data
-            let data = b"Hello, BenchFS!";
-            let written = fs.benchfs_write(&handle, data).await.unwrap();
-            assert_eq!(written, data.len());
+                // Write data
+                let data = b"Hello, BenchFS!";
+                let written = fs.benchfs_write(&handle, data).await.unwrap();
+                assert_eq!(written, data.len());
 
-            fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).unwrap();
 
-            // Read data
-            let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).await.unwrap();
-            let mut buf = vec![0u8; 100];
-            let read = fs.benchfs_read(&handle, &mut buf).await.unwrap();
-            assert_eq!(read, data.len());
-            assert_eq!(&buf[..read], data);
+                // Read data
+                let handle = fs
+                    .benchfs_open("/test.txt", OpenFlags::read_only())
+                    .await
+                    .unwrap();
+                let mut buf = vec![0u8; 100];
+                let read = fs.benchfs_read(&handle, &mut buf).await.unwrap();
+                assert_eq!(read, data.len());
+                assert_eq!(&buf[..read], data);
 
-            fs.benchfs_close(&handle).unwrap();
-        });
+                fs.benchfs_close(&handle).unwrap();
+            })
+        })
     }
 
     #[test]
     fn test_unlink_file() {
-        run_test(async {
-            let fs = BenchFS::new("node1".to_string());
+        run_test(|_runtime, chunk_store| {
+            Box::pin(async move {
+                let fs = BenchFS::new("node1".to_string(), chunk_store);
 
-            // Create file
-            let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
-            fs.benchfs_close(&handle).unwrap();
+                // Create file
+                let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).await.unwrap();
+                fs.benchfs_close(&handle).unwrap();
 
-            // Delete file
-            fs.benchfs_unlink("/test.txt").await.unwrap();
+                // Delete file
+                fs.benchfs_unlink("/test.txt").await.unwrap();
 
-            // Try to open deleted file
-            let result = fs.benchfs_open("/test.txt", OpenFlags::read_only()).await;
-            assert!(result.is_err());
-        });
+                // Try to open deleted file
+                let result = fs.benchfs_open("/test.txt", OpenFlags::read_only()).await;
+                assert!(result.is_err());
+            })
+        })
     }
 
     #[test]
     fn test_mkdir_and_rmdir() {
-        let fs = BenchFS::new("node1".to_string());
+        run_test(|_runtime, chunk_store| {
+            Box::pin(async move {
+                let fs = BenchFS::new("node1".to_string(), chunk_store);
 
-        // Create directory
-        fs.benchfs_mkdir("/testdir", 0o755).unwrap();
+                // Create directory
+                fs.benchfs_mkdir("/testdir", 0o755).await.unwrap();
 
-        // Remove directory
-        fs.benchfs_rmdir("/testdir").unwrap();
+                // Remove directory
+                fs.benchfs_rmdir("/testdir").unwrap();
+            })
+        })
     }
 
     #[test]
     fn test_seek() {
-        run_test(async {
-            let fs = BenchFS::new("node1".to_string());
+        run_test(|_runtime, chunk_store| {
+            Box::pin(async move {
+                let fs = BenchFS::new("node1".to_string(), chunk_store);
 
-            // Create file with data
-            let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).unwrap();
-            fs.benchfs_write(&handle, b"0123456789").await.unwrap();
-            fs.benchfs_close(&handle).unwrap();
+                // Create file with data
+                let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).await.unwrap();
+                fs.benchfs_write(&handle, b"0123456789").await.unwrap();
+                fs.benchfs_close(&handle).unwrap();
 
-            // Open and seek
-            let handle = fs.benchfs_open("/test.txt", OpenFlags::read_only()).unwrap();
+                // Open and seek
+                let handle = fs
+                    .benchfs_open("/test.txt", OpenFlags::read_only())
+                    .await
+                    .unwrap();
 
-            // SEEK_SET
-            let pos = fs.benchfs_seek(&handle, 5, 0).unwrap();
-            assert_eq!(pos, 5);
+                // SEEK_SET
+                let pos = fs.benchfs_seek(&handle, 5, 0).unwrap();
+                assert_eq!(pos, 5);
 
-            // SEEK_CUR
-            let pos = fs.benchfs_seek(&handle, 2, 1).unwrap();
-            assert_eq!(pos, 7);
+                // SEEK_CUR
+                let pos = fs.benchfs_seek(&handle, 2, 1).unwrap();
+                assert_eq!(pos, 7);
 
-            // SEEK_END
-            let pos = fs.benchfs_seek(&handle, -3, 2).unwrap();
-            assert_eq!(pos, 7);
+                // SEEK_END
+                let pos = fs.benchfs_seek(&handle, -3, 2).unwrap();
+                assert_eq!(pos, 7);
 
-            fs.benchfs_close(&handle).unwrap();
-        });
+                fs.benchfs_close(&handle).unwrap();
+            })
+        })
     }
 }

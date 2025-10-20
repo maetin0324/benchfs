@@ -46,7 +46,9 @@ pub struct MetadataCache {
 impl MetadataCache {
     /// Create a new metadata cache with the given policy
     pub fn new(policy: CachePolicy) -> Self {
-        let capacity = NonZeroUsize::new(policy.max_entries).unwrap();
+        // Ensure capacity is at least 1 to avoid panic with NonZeroUsize
+        let capacity = NonZeroUsize::new(policy.max_entries.max(1))
+            .expect("Capacity must be non-zero (ensured by max(1))");
 
         Self {
             file_cache: RefCell::new(LruCache::new(capacity)),

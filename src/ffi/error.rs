@@ -19,6 +19,7 @@ pub const BENCHFS_EINVAL: i32 = -5;    // Invalid argument
 pub const BENCHFS_EEXIST: i32 = -6;    // File exists
 pub const BENCHFS_ENOTDIR: i32 = -20;  // Not a directory
 pub const BENCHFS_EISDIR: i32 = -21;   // Is a directory
+pub const BENCHFS_ENOSPC: i32 = -28;   // No space left on device
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
@@ -61,6 +62,8 @@ pub fn result_to_error_code<T>(result: Result<T, impl std::fmt::Display>) -> i32
                 BENCHFS_ENOENT
             } else if msg.contains("exists") {
                 BENCHFS_EEXIST
+            } else if msg.contains("Storage full") || msg.contains("No space") {
+                BENCHFS_ENOSPC
             } else if msg.contains("Invalid") || msg.contains("invalid") {
                 BENCHFS_EINVAL
             } else {

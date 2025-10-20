@@ -7,3 +7,4 @@ benchfs.toml
 *.perf
 *.folded
 *.data
+/jobs

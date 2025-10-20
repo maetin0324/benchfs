@@ -37,6 +37,7 @@ BenchFSは、[CHFS (Cached Hierarchical File System)](https://github.com/otatebe
 - **Consistent Hashing**: 150個の仮想ノードによる均等な負荷分散
 - **チャンキング**: 4MBデフォルトチャンクサイズ（設定可能）
 - **メタデータ管理**: 分散メタデータストアとLRUキャッシング
+- **ディレクトリ階層**: 親子関係の自動管理とreaddir一貫性保証
 - **レプリケーション**: 設定可能なレプリカ数
 
 ### 高性能I/O
@@ -44,15 +45,16 @@ BenchFSは、[CHFS (Cached Hierarchical File System)](https://github.com/otatebe
 - **io_uring統合**: 登録済みバッファによるゼロコピーI/O
 - **RDMA最適化**: 32KB閾値での自動RDMA/RPC切り替え（CHFSと同じ）
 - **非同期処理**: Pluvioランタイムによる効率的な非同期タスク管理
+- **メタデータキャッシング**: クライアント側でのメタデータキャッシュによる低レイテンシアクセス
 
 ### RPC通信システム
 
 - **UCX ActiveMessage**: 低レイテンシメッセージング
 - **ゼロコピー転送**: zerocopyクレートによる効率的なシリアライゼーション
 - **プロトコル自動選択**: Eager/Rendezvousの自動切り替え
-- **6種類のRPC操作**:
+- **7種類のRPC操作**:
   - ReadChunk / WriteChunk
-  - MetadataLookup / MetadataCreateFile / MetadataCreateDir / MetadataDelete
+  - MetadataLookup / MetadataCreateFile / MetadataCreateDir / MetadataUpdate / MetadataDelete
 
 ### ストレージバックエンド
 
@@ -60,6 +62,13 @@ BenchFSは、[CHFS (Cached Hierarchical File System)](https://github.com/otatebe
 - **FileChunkStore**: ファイルベース永続化ストレージ
 - **IOUringBackend**: io_uring統合の高性能バックエンド
 - **プラガブル設計**: StorageBackendトレイトで拡張可能
+
+### IOR統合
+
+- **C FFI層**: 完全なPOSIX-likeインターフェース
+- **MPI対応**: マルチプロセス並列I/Oベンチマーク
+- **分散モード**: 外部サーバープロセスとのRPC通信
+- **検証済み**: Write 176 MiB/s, Read 786 MiB/s (2プロセス, 8MiB総データ量)
 
 ## 🏗️ アーキテクチャ
 
@@ -135,7 +144,53 @@ cargo check
 
 ## 🎬 クイックスタート
 
-### 1. 設定ファイルの作成
+### オプション1: IORベンチマーク（推奨）
+
+#### 1. IORのビルド
+
+```bash
+# IORをビルド
+cd ior_integration/ior
+./bootstrap
+./configure
+make
+cd ../..
+
+# BenchFSをビルド
+cargo build --release
+```
+
+#### 2. サーバーの起動（別ターミナル）
+
+```bash
+# レジストリディレクトリを作成
+mkdir -p /tmp/benchfs_registry
+
+# サーバーを起動
+./target/release/deps/small-* --mode server \
+  --registry-dir /tmp/benchfs_registry \
+  --data-dir /tmp/benchfs_data
+```
+
+#### 3. IORベンチマーク実行
+
+```bash
+# シングルプロセス
+./ior_integration/ior/src/ior -a BENCHFS -t 1m -b 4m -w -r \
+  --benchfs.registry=/tmp/benchfs_registry \
+  --benchfs.datadir=/tmp/benchfs_data \
+  -o /tmp/benchfs_test/testfile
+
+# マルチプロセス（MPI）
+mpirun -n 2 ./ior_integration/ior/src/ior -a BENCHFS -t 1m -b 4m -w -r \
+  --benchfs.registry=/tmp/benchfs_registry \
+  --benchfs.datadir=/tmp/benchfs_data \
+  -o /tmp/benchfs_test/testfile
+```
+
+### オプション2: Rust API（開発用）
+
+#### 1. 設定ファイルの作成
 
 ```bash
 cp benchfs.toml.example benchfs.toml
@@ -162,7 +217,7 @@ metadata_cache_entries = 1000
 chunk_cache_mb = 100
 ```
 
-### 2. サーバーの起動
+#### 2. サーバーの起動
 
 ```bash
 # サーバーを起動
@@ -172,7 +227,7 @@ cargo run --release --bin benchfsd -- --config benchfs.toml
 cargo run --release --bin benchfsd
 ```
 
-### 3. ログ確認
+#### 3. ログ確認
 
 ```bash
 # サーバーログを確認
@@ -357,6 +412,20 @@ cargo doc --no-deps --open
 
 ## 📊 性能特性
 
+### IOR ベンチマーク結果（分散モード）
+
+**テスト環境**:
+- プロセス数: 2 (MPI)
+- チャンクサイズ: 4 MiB
+- 転送サイズ: 1 MiB
+- 総データ量: 8 MiB
+
+**結果**:
+- **Write**: 176.39 MiB/s (IOPS 499.53)
+- **Read**: 786.33 MiB/s (IOPS 787.26)
+
+詳細は `/tmp/ior_test_result.log` を参照してください。
+
 ### レイテンシ目標（CHFSベンチマーク）
 
 | 操作 | 目標レイテンシ |
@@ -393,72 +462,3 @@ cargo doc --no-deps --open
 # APIドキュメントを生成して開く
 cargo doc --no-deps --open
 ```
-
-## 🛣️ ロードマップ
-
-### 実装済み ✓
-
-- [x] RPC通信システム（UCX ActiveMessage）
-- [x] Consistent Hashingメタデータ管理
-- [x] プラガブルストレージバックエンド
-- [x] io_uring統合
-- [x] メタデータキャッシング（LRU）
-- [x] チャンキングとデータ分散
-- [x] RDMA閾値設定
-
-### 短期（1-2週間）
-
-- [ ] RDMA閾値による自動RPC/RDMA切り替え実装
-- [ ] チャンクサイズ違いでのベンチマーク
-- [ ] 設定バリデーション強化
-- [ ] クライアントライブラリの充実
-
-### 中期（1-2ヶ月）
-
-- [ ] 2層ストレージバックエンド（InMemory + File自動階層化）
-- [ ] クライアント側バッファリング
-- [ ] メタデータキャッシュTTL完全実装
-- [ ] FUSE統合（chfuse相当）
-
-### 長期（2-3ヶ月）
-
-- [ ] I/O認識型フラッシング機構
-- [ ] リング選択アルゴリズム（フォールトトレランス）
-- [ ] ノード参加/離脱プロトコル
-- [ ] CHFS vs BenchFS 包括的ベンチマーク
-
-## 🤝 貢献
-
-貢献を歓迎します！以下の手順で貢献してください：
-
-1. このリポジトリをフォーク
-2. フィーチャーブランチを作成（`git checkout -b feature/amazing-feature`）
-3. 変更をコミット（`git commit -m 'Add amazing feature'`）
-4. ブランチにプッシュ（`git push origin feature/amazing-feature`）
-5. プルリクエストを作成
-
-### コーディング規約
-
-- Rustの標準スタイル（`cargo fmt`）に従う
-- `cargo clippy`の警告をすべて解決
-- 新機能には必ずテストを追加
-- パブリックAPIにはドキュメントコメントを記載
-
-## 📝 ライセンス
-
-TBD
-
-## 🙏 謝辞
-
-- **[CHFS](https://github.com/otatebe/chfs)**: アーキテクチャとデザインパターンの多くを参考にしました
-- **UCXプロジェクト**: 高性能通信ライブラリ
-- **io_uringコミュニティ**: 高性能非同期I/Oインターフェース
-- **Rustコミュニティ**: 素晴らしいエコシステムとツール
-
-## 📧 お問い合わせ
-
-質問や提案がある場合は、Issueを作成してください。
-
----
-
-**Note**: このプロジェクトは開発中です。本番環境での使用は推奨されません。ベンチマークと研究目的での使用を想定しています。

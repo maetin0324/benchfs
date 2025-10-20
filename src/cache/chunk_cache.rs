@@ -70,7 +70,9 @@ impl ChunkCache {
     /// * `policy` - Cache policy
     /// * `max_memory_mb` - Maximum memory usage in megabytes
     pub fn new(policy: CachePolicy, max_memory_mb: usize) -> Self {
-        let capacity = NonZeroUsize::new(policy.max_entries).unwrap();
+        // Ensure capacity is at least 1 to avoid panic with NonZeroUsize
+        let capacity = NonZeroUsize::new(policy.max_entries.max(1))
+            .expect("Capacity must be non-zero (ensured by max(1))");
 
         Self {
             cache: RefCell::new(LruCache::new(capacity)),

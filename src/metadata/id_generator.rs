@@ -87,6 +87,11 @@ impl IdGenerator {
     ///
     /// # Returns
     /// ID生成器のインスタンス
+    ///
+    /// # Safety
+    /// This function is safe because the hash is always modulo (MAX_NODE_ID + 1),
+    /// ensuring the node_id is always in the valid range [0, 1023].
+    /// Therefore, Self::new() will never return an error.
     pub fn from_node_string(node_id_str: &str) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -98,7 +103,8 @@ impl IdGenerator {
         // ハッシュ値を0-1023の範囲に収める
         let node_id = hash % (MAX_NODE_ID + 1);
 
-        Self::new(node_id).expect("Node ID from hash should be valid")
+        // SAFETY: node_id is guaranteed to be in range [0, MAX_NODE_ID]
+        Self::new(node_id).unwrap()
     }
 
     /// 次のユニークなID（inode番号）を生成
