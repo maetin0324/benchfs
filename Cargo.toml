@@ -9,9 +9,9 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 # Async runtime (using local pluvio for development)
-pluvio_runtime = { path = "/home/rmaeda/workspace/rust/pluvio/pluvio_runtime" }
-pluvio_uring = { path = "/home/rmaeda/workspace/rust/pluvio/pluvio_uring" }
-pluvio_ucx = { path = "/home/rmaeda/workspace/rust/pluvio/pluvio_ucx" }
+pluvio_runtime = { git = "https://github.com/maetin0324/pluvio.git", package = "pluvio_runtime", branch = "main" }
+pluvio_uring = { git = "https://github.com/maetin0324/pluvio.git", package = "pluvio_uring", branch = "main" }
+pluvio_ucx = { git = "https://github.com/maetin0324/pluvio.git", package = "pluvio_ucx", branch = "main" }
 
 # Serialization
 zerocopy = { version = "0.8.27", features = ["std", "derive"] }
