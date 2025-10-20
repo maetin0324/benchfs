@@ -1,2 +1,10 @@
 /target
 *.bin
+*.addr
+benchfs.toml
+*.log
+*.old
+*.perf
+*.folded
+*.data
+/jobs

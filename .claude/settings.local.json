@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(git checkout:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Read(//tmp/**)",
+      "Bash(cargo build:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(cargo test:*)",
+      "Read(//home/rmaeda/.cargo/registry/src/**)",
+      "Bash(cargo doc:*)",
+      "Bash(cat:*)",
+      "Read(//home/rmaeda/.cargo/git/checkouts/pluvio-0fdcbbd51664b7d9/44e0521/pluvio_uring/src/**)",
+      "Read(//home/rmaeda/.cargo/git/checkouts/pluvio-0fdcbbd51664b7d9/44e0521/**)",
+      "Write(//home/rmaeda/workspace/rust/pluvio/**)",
+      "Read(//home/rmaeda/workspace/rust/pluvio/**)",
+      "Read(//home/rmaeda/workspace/rust/pluvio/pluvio_uring/src/**)",
+      "Read(//home/rmaeda/workspace/rust/**)",
+      "Bash(cargo check:*)",
+      "Read(//home/rmaeda/.cargo/git/checkouts/pluvio-0fdcbbd51664b7d9/**)",
+      "Read(//home/rmaeda/.cargo/git/checkouts/**)",
+      "Bash(cargo update:*)",
+      "Bash(ssh:*)",
+      "Bash(env RUST_LOG=debug ./target/release/deps/small-309151752e31de5f:*)",
+      "Bash(tee:*)",
+      "WebSearch",
+      "Bash(./src/ior:*)",
+      "Bash(if [ -f src/ior ])",
+      "Bash(then echo \"IOR binary exists\")",
+      "Bash(else echo \"IOR binary not found\")",
+      "Bash(fi)",
+      "Bash(make:*)",
+      "Bash(mpirun:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

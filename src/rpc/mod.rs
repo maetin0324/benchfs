@@ -4,13 +4,47 @@ use pluvio_ucx::{Worker, endpoint::Endpoint};
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::rpc::client::RpcClient;
+use crate::rpc::handlers::RpcHandlerContext;
 
 pub mod file_ops;
+pub mod data_ops;
+pub mod metadata_ops;
+pub mod handlers;
 pub mod server;
 pub mod client;
+pub mod connection;
+pub mod address_registry;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
+
+/// RDMA threshold in bytes (32KB, same as CHFS)
+/// Data transfers larger than this will use Rendezvous (RDMA) protocol
+/// Smaller transfers will use Eager protocol for lower latency
+pub const RDMA_THRESHOLD: u64 = 32768;
+
+/// Determine whether to use RDMA based on data size
+#[inline]
+pub fn should_use_rdma(data_size: u64) -> bool {
+    data_size >= RDMA_THRESHOLD
+}
+
+/// Unified server response structure
+/// Contains response header and optional data payload
+pub struct ServerResponse<H> {
+    pub header: H,
+    pub data: Option<Vec<u8>>,
+}
+
+impl<H> ServerResponse<H> {
+    pub fn new(header: H) -> Self {
+        Self { header, data: None }
+    }
+
+    pub fn with_data(header: H, data: Vec<u8>) -> Self {
+        Self { header, data: Some(data) }
+    }
+}
 
 pub trait Serializable:
     zerocopy::FromBytes
@@ -145,9 +179,19 @@ pub trait AmRpc {
 
     async fn call_no_reply(&self, client: &RpcClient) -> Result<(), RpcError>;
 
+    /// Server-side handler for this RPC
+    ///
+    /// This is called by RpcServer::listen() when a request is received.
+    /// Returns (ServerResponse, AmMsg) on success, or (RpcError, AmMsg) on failure.
+    /// The AmMsg must be returned so the server can send a reply.
     async fn server_handler(
+        ctx: Rc<RpcHandlerContext>,
         am_msg: AmMsg,
-    ) -> Result<Self::ResponseHeader, RpcError>;
+    ) -> Result<(ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)>;
+
+    /// Create an error response from an RpcError
+    /// This allows the server to send proper error responses to clients
+    fn error_response(error: &RpcError) -> Self::ResponseHeader;
 }
 
 
@@ -160,6 +204,7 @@ pub enum RpcError {
     InvalidHeader,
     TransportError(String),
     HandlerError(String),
+    ConnectionError(String),
     Timeout,
 }
 
@@ -169,6 +214,7 @@ impl std::fmt::Display for RpcError {
             RpcError::InvalidHeader => write!(f, "Invalid RPC header"),
             RpcError::TransportError(msg) => write!(f, "Transport error: {}", msg),
             RpcError::HandlerError(msg) => write!(f, "Handler error: {}", msg),
+            RpcError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
             RpcError::Timeout => write!(f, "RPC timeout"),
         }
     }

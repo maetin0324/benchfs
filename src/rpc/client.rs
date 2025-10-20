@@ -49,12 +49,17 @@ impl RpcClient {
         let need_reply = request.need_reply();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
+        tracing::debug!("RpcClient::execute: rpc_id={}, reply_stream_id={}, has_data={}",
+            rpc_id, reply_stream_id, !data.is_empty());
+
         let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
                 "Failed to create reply AM stream: {:?}",
                 e.to_string()
             ))
         })?;
+
+        tracing::debug!("RpcClient::execute: Created reply stream");
 
         if !need_reply {
             // No reply expected
@@ -64,6 +69,7 @@ impl RpcClient {
         }
 
         // Send the RPC request (proto is set to None for now)
+        tracing::debug!("RpcClient::execute: Sending AM request...");
         self.conn
             .endpoint()
             .am_send_vectorized(
@@ -76,24 +82,24 @@ impl RpcClient {
             .await
             .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;
 
-        // Wait for reply
-        // TODO: Implement proper reply reception
-        // This requires either:
-        // 1. pluvio_ucx to export AmStream publicly
-        // 2. A different API design where reply handling is done separately
-        // 3. Using a callback-based approach
+        tracing::debug!("RpcClient::execute: AM sent successfully, waiting for reply...");
 
+        // Wait for reply
         let mut msg = reply_stream
             .wait_msg()
             .await
             .ok_or_else(|| RpcError::Timeout)?;
 
+        tracing::debug!("RpcClient::execute: Received reply message");
+
+        // Deserialize the response header
         let response_header = msg
             .header()
             .get(..std::mem::size_of::<T::ResponseHeader>())
             .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
             .ok_or_else(|| RpcError::InvalidHeader)?;
 
+        // Receive response data if present
         let response_buffer = request.response_buffer();
         if !response_buffer.is_empty() && msg.contains_data() {
             msg.recv_data_vectored(response_buffer).await.map_err(|e| {
@@ -101,6 +107,8 @@ impl RpcClient {
             })?;
         }
 
+        // Note: The caller should check the status field in the response header
+        // to determine if the RPC succeeded or failed on the server side
         Ok(response_header)
     }
 
