@@ -1,9 +1,13 @@
 # IOR Setup Guide for BenchFS
 
 IORは独立したプロジェクトとして管理されており、BenchFSリポジトリには含まれていません。
-このガイドでは、IORのセットアップ方法を説明します。
+このガイドでは、IORのセットアップとBenchFSバックエンドの統合方法を説明します。
 
-## クイックスタート
+**重要**: IORにはBenchFS固有のバックエンド実装が含まれています。バニラのIORをクローンした後、BenchFS用の修正を適用する必要があります。
+
+## クイックスタート（自動セットアップ）
+
+### ローカル開発環境
 
 ```bash
 # BenchFSリポジトリのルートディレクトリで実行
@@ -12,63 +16,156 @@ cd /home/rmaeda/workspace/rust/benchfs/ior_integration
 # IORをクローン
 git clone https://github.com/hpc/ior.git
 
+# BenchFS修正を適用
+./scripts/apply_benchfs_modifications.sh
+
 # IORをビルド
 cd ior
 ./bootstrap
 ./configure
 make -j$(nproc)
 
-# 確認
-./src/ior --help
+# 確認: BENCHFSバックエンドが利用可能か確認
+./src/ior -h | grep BENCHFS
 ```
 
 ## スーパーコンピュータでのセットアップ
 
-### 1. リポジトリをクローン
+### 1. ローカル環境でBenchFS修正をエクスポート
 
 ```bash
-cd /work/NBB/your-username/
-git clone <your-benchfs-repo-url> benchfs
-cd benchfs
+# ローカル開発環境で実行
+cd /home/rmaeda/workspace/rust/benchfs/ior_integration
+
+# BenchFS固有の修正をエクスポート
+./scripts/export_benchfs_modifications.sh
 ```
 
-### 2. IORをセットアップ
+これにより、`benchfs_export/`ディレクトリが作成され、以下のファイルが含まれます：
+- `benchfs_ior.patch` - IORソースコードへの修正パッチ
+- `benchfs_backend.tar.gz` - BenchFSバックエンド実装
+- `apply_benchfs_modifications.sh` - 自動適用スクリプト
+- `README.txt` - 詳細な手順
+
+### 2. スパコンにファイルを転送
 
 ```bash
-cd ior_integration
+# benchfs_exportディレクトリ全体を転送
+scp -r benchfs_export/ <your-supercomputer>:/work/NBB/rmaeda/workspace/rust/benchfs/ior_integration/
+```
+
+### 3. スパコンでIORをセットアップ
+
+```bash
+# スパコンにログイン
+ssh <your-supercomputer>
+
+# プロジェクトディレクトリに移動
+cd /work/NBB/rmaeda/workspace/rust/benchfs/ior_integration
 
 # IORをクローン
 git clone https://github.com/hpc/ior.git
-cd ior
 
 # 必要なモジュールをロード（Pegasus の例）
 module purge
 module load openmpi/4.1.8/gcc11.4.0-cuda12.8.1
 
-# ビルド
+# BenchFS修正を適用
+cd benchfs_export
+./apply_benchfs_modifications.sh
+
+# IORをビルド
+cd ../ior
 ./bootstrap
 ./configure
 make -j$(nproc)
 
-# 確認
-ls -la src/ior
-./src/ior --help
+# 確認: BENCHFSバックエンドが利用可能か確認
+./src/ior -h | grep BENCHFS
 ```
 
-### 3. BenchFSをビルド
+### 4. BenchFSをビルド
 
 ```bash
 cd ../../  # benchfsのルートに戻る
 cargo build --release --features mpi-support --bin benchfsd_mpi
 ```
 
-## 自動セットアップスクリプト
+## 手動セットアップ（自動スクリプトが使えない場合）
 
-便利なセットアップスクリプトも用意されています：
+自動スクリプトが使えない場合、以下の手順で手動セットアップできます：
+
+### 1. BenchFSバックエンドファイルを配置
 
 ```bash
-cd /home/rmaeda/workspace/rust/benchfs
-./ior_integration/scripts/setup_ior.sh
+cd /work/NBB/rmaeda/workspace/rust/benchfs/ior_integration
+
+# benchfs_backend を展開
+tar xzf benchfs_export/benchfs_backend.tar.gz
+
+# aiori-BENCHFS.c をIORソースツリーにコピー
+cp benchfs_backend/src/aiori-BENCHFS.c ior/src/
+```
+
+### 2. IORソースコードを手動で修正
+
+#### configure.ac に追加:
+
+```bash
+cd ior
+
+# configure.ac の FINCHFS セクションの後に以下を追加
+cat >> configure.ac <<'EOF'
+
+# BENCHFS support
+PKG_CHECK_MODULES([BENCHFS], [benchfs],
+  [AC_DEFINE([USE_BENCHFS_AIORI], [], [Build BENCHFS backend AIORI])
+   BENCHFS_RPATH=$(pkg-config --libs-only-L benchfs | sed 's/-L/-Wl,-rpath=/g')
+   AC_SUBST(BENCHFS_RPATH)],
+  [with_benchfs=no])
+AM_CONDITIONAL([USE_BENCHFS_AIORI], [test x$with_benchfs != xno])
+EOF
+```
+
+#### src/Makefile.am に追加:
+
+```bash
+# FINCHFS セクションの後に以下を追加
+cat >> src/Makefile.am <<'EOF'
+
+if USE_BENCHFS_AIORI
+extraSOURCES += aiori-BENCHFS.c
+extraCPPFLAGS += @BENCHFS_CFLAGS@
+extraLDFLAGS += @BENCHFS_RPATH@
+extraLDADD += @BENCHFS_LIBS@
+endif
+EOF
+```
+
+#### src/aiori.c を編集:
+
+`available_aiori[]` 配列に以下を追加:
+
+```c
+#ifdef USE_BENCHFS_AIORI
+	&benchfs_aiori,
+#endif
+```
+
+#### src/aiori.h を編集:
+
+extern 宣言に以下を追加:
+
+```c
+extern ior_aiori_t benchfs_aiori;
+```
+
+### 3. ビルド
+
+```bash
+./bootstrap
+./configure
+make -j$(nproc)
 ```
 
 ## Git Submodule として管理する場合（オプション）
@@ -107,7 +204,59 @@ git submodule init
 git submodule update --recursive
 ```
 
+## ファイル転送の確認
+
+転送がうまくいったかを確認：
+
+```bash
+# スパコン側で確認
+cd /work/NBB/rmaeda/workspace/rust/benchfs/ior_integration
+
+# エクスポートディレクトリの内容を確認
+ls -lh benchfs_export/
+# 以下のファイルが存在することを確認:
+#   - benchfs_ior.patch
+#   - benchfs_backend.tar.gz
+#   - apply_benchfs_modifications.sh
+#   - README.txt
+
+# パッチの内容を確認
+head -20 benchfs_export/benchfs_ior.patch
+```
+
 ## トラブルシューティング
+
+### BenchFSバックエンドが見つからない
+
+```bash
+# IORが認識しているバックエンドを確認
+./ior/src/ior -h
+
+# BENCHFSが表示されない場合、以下を確認:
+# 1. aiori-BENCHFS.c がコピーされているか
+ls -la ior/src/aiori-BENCHFS.c
+
+# 2. パッチが適用されているか
+cd ior
+git status
+git diff configure.ac src/Makefile.am src/aiori.c src/aiori.h
+
+# 3. ビルドログを確認
+make 2>&1 | grep -i benchfs
+```
+
+### パッチ適用に失敗する
+
+```bash
+# パッチの内容を確認
+cat benchfs_export/benchfs_ior.patch
+
+# 手動で適用する場合は上記の「手動セットアップ」を参照
+
+# または、3-way mergeを試す
+cd ior
+git apply --3way ../benchfs_export/benchfs_ior.patch
+```
 
 ### bootstrap が失敗する
 

@@ -4,6 +4,7 @@ Cargo.lock
 
 # IOR (managed separately)
 ior_integration/ior/
+ior_integration/benchfs_export/
 
 # Build artifacts
 *.o
