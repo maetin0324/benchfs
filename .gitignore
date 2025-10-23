@@ -2,9 +2,6 @@
 /target/
 Cargo.lock
 
-# IOR (managed separately)
-ior_integration/ior/
-
 # Build artifacts
 *.o
 *.a
