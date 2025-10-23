@@ -24,7 +24,7 @@ impl RpcServer {
         &self.handler_context
     }
 
-    pub fn get_address(&self) -> Result<WorkerAddress, RpcError> {
+    pub fn get_address(&self) -> Result<WorkerAddress<'_>, RpcError> {
         self.worker.address().map_err(|e| {
             RpcError::TransportError(format!("Failed to get worker address: {:?}", e))
         })

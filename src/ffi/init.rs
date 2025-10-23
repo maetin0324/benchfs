@@ -260,7 +260,7 @@ pub extern "C" fn benchfs_init(
         tracing::info!("Waiting for server to register (timeout: 30 seconds)...");
         let pool_clone = connection_pool.clone();
         let connect_result = block_on(async move {
-            pool_clone.wait_and_connect("server", 30).await
+            pool_clone.wait_and_connect("node_0", 30).await
         });
 
         match connect_result {
