@@ -75,7 +75,12 @@ pkg-config --libs benchfs
 ### 4. IORのビルドとインストール
 
 ```bash
-cd ior_integration/ior
+cd ior_integration
+
+# BenchFSバックエンドファイルをIORにコピー
+./sync-benchfs.sh
+
+cd ior
 
 # configureスクリプトを生成
 ./bootstrap
@@ -88,6 +93,8 @@ cd ior_integration/ior
 make -j$(nproc)
 make install
 ```
+
+**注意**: BenchFSバックエンドの実装を更新した場合は、`sync-benchfs.sh`を再実行してIORディレクトリに変更を同期してください。
 
 ### 5. IORの動作確認
 

@@ -20,7 +20,12 @@ export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"
 ### 2. IORのビルド
 
 ```bash
-cd ior_integration/ior
+cd ior_integration
+
+# BenchFSバックエンドファイルをIORにコピー
+./sync-benchfs.sh
+
+cd ior
 
 # configureスクリプトを生成
 ./bootstrap
