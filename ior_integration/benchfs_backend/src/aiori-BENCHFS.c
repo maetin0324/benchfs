@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <mpi.h>
 
 #include "ior.h"
@@ -95,7 +96,12 @@ static void BENCHFS_Initialize(aiori_mod_opt_t *options) {
     if (benchfs_ctx == NULL) {
       ERRF("BENCHFS server initialization failed: %s", benchfs_get_error());
     }
-  } else {
+  }
+
+  /* Wait for server to be ready before clients connect */
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  if (benchfs_rank != 0) {
     WARNF("BENCHFS initialized (rank %d/%d) - CLIENT MODE", benchfs_rank, benchfs_size);
 
     /* Start client */
@@ -136,7 +142,7 @@ static aiori_fd_t *BENCHFS_Create(
     aiori_mod_opt_t *options
 ) {
   if (!benchfs_initialized) {
-    ERRF("BENCHFS not initialized in create");
+    ERR("BENCHFS not initialized in create\n");
   }
 
   if (verbose > 4) {
@@ -166,7 +172,7 @@ static aiori_fd_t *BENCHFS_Open(
     aiori_mod_opt_t *options
 ) {
   if (!benchfs_initialized) {
-    ERR("BENCHFS not initialized in open");
+    ERR("BENCHFS not initialized in open\n");
   }
 
   if (verbose > 4) {
@@ -246,7 +252,16 @@ static void BENCHFS_Delete(char *testFileName, aiori_mod_opt_t *options) {
   /* Call BenchFS C API */
   int ret = benchfs_remove(benchfs_ctx, testFileName);
   if (ret != BENCHFS_SUCCESS) {
-    ERRF("BENCHFS remove failed: %s", benchfs_get_error());
+    /* File may not exist - this is not necessarily an error in IOR context */
+    /* IOR sometimes tries to delete files before creating them */
+    const char *err_msg = benchfs_get_error();
+    if (strstr(err_msg, "File not found") || strstr(err_msg, "not found")) {
+      if (verbose >= 3) {
+        WARNF("BENCHFS remove: file not found (this may be expected): %s", testFileName);
+      }
+    } else {
+      WARNF("BENCHFS remove failed: %s", err_msg);
+    }
   }
 }
 
@@ -270,9 +285,6 @@ static void BENCHFS_Sync(aiori_mod_opt_t *options) {
   if (verbose > 4) {
     fprintf(out_logfile, "BENCHFS sync: rank=%d\n", benchfs_rank);
   }
-
-  /* Global sync - use MPI barrier */
-  MPI_Barrier(MPI_COMM_WORLD);
 }
 
 /************************** G E T _ F I L E _ S I Z E *****************************/
@@ -347,10 +359,16 @@ static int BENCHFS_stat(
     struct stat *buf,
     aiori_mod_opt_t *options
 ) {
-  /* Return dummy stat */
-  memset(buf, 0, sizeof(struct stat));
+  (void)options;
+  memset(buf, 0, sizeof(*buf));
+  off_t sz = benchfs_get_file_size(benchfs_ctx, (char*)path);
+  if (sz < 0) {
+    errno = ENOENT;
+    return -1;
+  }
   buf->st_mode = S_IFREG | 0644;
-  buf->st_size = 0;
+  buf->st_nlink = 1;
+  buf->st_size = (off_t)sz;
   return 0;
 }
 
@@ -380,7 +398,7 @@ static int BENCHFS_check_params(aiori_mod_opt_t *options) {
   benchfs_options_t *o = (benchfs_options_t*)options;
 
   if (o->registry_dir == NULL || strlen(o->registry_dir) == 0) {
-    ERR("BENCHFS: registry_dir must be specified");
+    ERR("BENCHFS: registry_dir must be specified\n");
     return 1;
   }
 
