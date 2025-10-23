@@ -27,9 +27,10 @@ JOBID=$(echo "$PBS_JOBID" | cut -d : -f 2)
 JOB_OUTPUT_DIR="${OUTPUT_DIR}/${JOB_START}-${JOBID}-${NNODES}"
 JOB_BACKEND_DIR="${BACKEND_DIR}/$(basename -- "${JOB_OUTPUT_DIR}")"
 BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
-BENCHFS_DATA_DIR="${JOB_BACKEND_DIR}/data"
+BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
+export LD_LIBRARY_PATH="/work/0/NBB/rmaeda/workspace/rust/benchfs/target/release:$LD_LIBRARY_PATH"
 
 IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
 
@@ -96,6 +97,8 @@ cmd_mpirun_common=(
   --mca btl "self,tcp"
   --mca btl_tcp_if_include eno1
   -x "UCX_TLS=self,tcp"
+  -x PATH
+  -x LD_LIBRARY_PATH     # ← これを追加
 )
 
 # Kill any previous benchfsd instances

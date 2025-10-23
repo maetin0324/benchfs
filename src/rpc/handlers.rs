@@ -3,7 +3,7 @@ use std::rc::Rc;
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
-use crate::storage::IOUringChunkStore;
+use crate::storage::ChunkStore;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 
 /// RPC Handler context
@@ -12,13 +12,13 @@ use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 /// that handlers need to access.
 pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
-    pub chunk_store: Rc<IOUringChunkStore>,
+    pub chunk_store: Rc<dyn ChunkStore>,
 }
 
 impl RpcHandlerContext {
     pub fn new(
         metadata_manager: Rc<MetadataManager>,
-        chunk_store: Rc<IOUringChunkStore>,
+        chunk_store: Rc<dyn ChunkStore>,
     ) -> Self {
         Self {
             metadata_manager,

@@ -1,7 +1,7 @@
 version: '3.8'
 
-# Explicitly set project name to avoid prefix issues
-name: benchfs
+# Note: Project name is set via COMPOSE_PROJECT_NAME in Makefile
+# to ensure consistent container naming across docker-compose versions
 
 services:
   # Server node 1 - isolated data directory

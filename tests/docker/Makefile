@@ -4,7 +4,11 @@
 
 # Default configuration
 COMPOSE_FILE ?= docker-compose.yml
+COMPOSE_PROJECT_NAME ?= benchfs
 NNODES ?= 4
+
+# Export for docker-compose
+export COMPOSE_PROJECT_NAME
 
 help:
 	@echo "BenchFS Docker Test Commands:"
@@ -26,32 +30,32 @@ help:
 	@echo ""
 
 build:
-	docker-compose -f docker-compose.yml build
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml build
 
 build-simple:
-	docker-compose -f docker-compose.yml build
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml build
 
 up:
 	@echo "Building BenchFS MPI binary first..."
 	cd ../.. && cargo build --release --features mpi-support --bin benchfsd_mpi
 	@echo "Starting 4-node cluster..."
-	docker-compose -f docker-compose.yml up -d --remove-orphans
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml up -d --remove-orphans
 	@echo "Waiting for services to be ready..."
 	sleep 5
-	docker-compose -f docker-compose.yml ps
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml ps
 
 up-small:
 	@echo "Building BenchFS MPI binary first..."
 	cd ../.. && cargo build --release --features mpi-support --bin benchfsd_mpi
 	@echo "Starting 2-node cluster..."
-	docker-compose -f docker-compose.small.yml up -d --remove-orphans
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.small.yml up -d --remove-orphans
 	@echo "Waiting for services to be ready..."
 	sleep 5
-	docker-compose -f docker-compose.small.yml ps
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.small.yml ps
 
 down:
-	docker-compose -f docker-compose.yml down --remove-orphans
-	docker-compose -f docker-compose.small.yml down --remove-orphans
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml down --remove-orphans
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.small.yml down --remove-orphans
 
 test: up
 	@echo "Running test on 4-node cluster..."
@@ -78,7 +82,7 @@ test-small: up-small
 	docker exec $$CONTAINER_NAME /scripts/test-cluster.sh basic 2
 
 logs:
-	docker-compose -f docker-compose.yml logs -f
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml logs -f
 
 logs-controller:
 	@CONTAINER_NAME=$$(docker ps --format '{{.Names}}' | grep controller | head -1); \

@@ -15,7 +15,7 @@ use benchfs::rpc::server::RpcServer;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::metadata::MetadataManager;
-use benchfs::storage::{IOUringChunkStore, IOUringBackend};
+use benchfs::storage::{ChunkStore, IOUringChunkStore, IOUringBackend, FileChunkStore};
 use benchfs::cache::CachePolicy;
 
 use pluvio_runtime::executor::Runtime;
@@ -172,18 +172,6 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Create pluvio runtime
     let runtime = Runtime::new(256);
 
-    // Create io_uring reactor
-    let uring_reactor = IoUringReactor::builder()
-        .queue_size(2048)
-        .buffer_size(1 << 20) // 1 MiB
-        .submit_depth(64)
-        .wait_submit_timeout(std::time::Duration::from_micros(10))
-        .wait_complete_timeout(std::time::Duration::from_micros(10))
-        .build();
-
-    let allocator = uring_reactor.allocator.clone();
-    runtime.register_reactor("io_uring", uring_reactor);
-
     // Create UCX context and reactor
     let ucx_context = Rc::new(UcxContext::new()?);
     let ucx_reactor = UCXReactor::current();
@@ -208,21 +196,39 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         cache_policy,
     ));
 
-    // Create IOUringBackend and chunk store
-    let io_backend = Rc::new(IOUringBackend::new(allocator));
+    // Create chunk store based on configuration
     let chunk_store_dir = config.node.data_dir.join("chunks");
     if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
         return Err(format!("Failed to create chunk store directory: {}", e).into());
     }
 
-    let chunk_store = Rc::new(
-        IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())?
-    );
+    let chunk_store: Rc<dyn ChunkStore> = if config.storage.use_iouring {
+        tracing::info!("Using io_uring for storage backend");
+
+        // Create io_uring reactor
+        let uring_reactor = IoUringReactor::builder()
+            .queue_size(2048)
+            .buffer_size(1 << 20) // 1 MiB
+            .submit_depth(64)
+            .wait_submit_timeout(std::time::Duration::from_micros(10))
+            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .build();
+
+        let allocator = uring_reactor.allocator.clone();
+        runtime.register_reactor("io_uring", uring_reactor);
+
+        // Create IOUringBackend and chunk store
+        let io_backend = Rc::new(IOUringBackend::new(allocator));
+        Rc::new(IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())?)
+    } else {
+        tracing::info!("io_uring disabled - using file-based storage backend");
+        Rc::new(FileChunkStore::new(&chunk_store_dir)?)
+    };
 
     // Create RPC handler context
     let handler_context = Rc::new(RpcHandlerContext::new(
         metadata_manager.clone(),
-        chunk_store.clone(),
+        chunk_store,
     ));
 
     // Create RPC server

@@ -6,6 +6,16 @@ use std::rc::Rc;
 use crate::metadata::CHUNK_SIZE;
 use super::{IOUringBackend, OpenFlags, FileHandle, StorageBackend};
 
+/// Chunk store trait for different storage backends
+#[async_trait::async_trait(?Send)]
+pub trait ChunkStore {
+    async fn write_chunk(&self, inode: u64, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize>;
+    async fn read_chunk(&self, inode: u64, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>>;
+    async fn delete_chunk(&self, inode: u64, chunk_index: u64) -> ChunkStoreResult<()>;
+    async fn delete_file_chunks(&self, inode: u64) -> ChunkStoreResult<usize>;
+    fn has_chunk(&self, inode: u64, chunk_index: u64) -> bool;
+}
+
 /// Chunk storage error types
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkStoreError {
@@ -239,6 +249,29 @@ impl Default for InMemoryChunkStore {
     }
 }
 
+#[async_trait::async_trait(?Send)]
+impl ChunkStore for InMemoryChunkStore {
+    async fn write_chunk(&self, inode: u64, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize> {
+        self.write_chunk(inode, chunk_index, offset, data).await
+    }
+
+    async fn read_chunk(&self, inode: u64, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>> {
+        self.read_chunk(inode, chunk_index, offset, length).await
+    }
+
+    async fn delete_chunk(&self, inode: u64, chunk_index: u64) -> ChunkStoreResult<()> {
+        self.delete_chunk(inode, chunk_index).await
+    }
+
+    async fn delete_file_chunks(&self, inode: u64) -> ChunkStoreResult<usize> {
+        self.delete_file_chunks(inode).await
+    }
+
+    fn has_chunk(&self, inode: u64, chunk_index: u64) -> bool {
+        self.has_chunk(inode, chunk_index)
+    }
+}
+
 /// File-based chunk storage
 ///
 /// Stores chunks in the local filesystem. Each chunk is stored as a separate file.
@@ -409,6 +442,29 @@ impl FileChunkStore {
     /// Check if a chunk exists
     pub fn has_chunk(&self, inode: u64, chunk_index: u64) -> bool {
         self.chunk_path(inode, chunk_index).exists()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ChunkStore for FileChunkStore {
+    async fn write_chunk(&self, inode: u64, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize> {
+        self.write_chunk(inode, chunk_index, offset, data).await
+    }
+
+    async fn read_chunk(&self, inode: u64, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>> {
+        self.read_chunk(inode, chunk_index, offset, length).await
+    }
+
+    async fn delete_chunk(&self, inode: u64, chunk_index: u64) -> ChunkStoreResult<()> {
+        self.delete_chunk(inode, chunk_index).await
+    }
+
+    async fn delete_file_chunks(&self, inode: u64) -> ChunkStoreResult<usize> {
+        self.delete_file_chunks(inode).await
+    }
+
+    fn has_chunk(&self, inode: u64, chunk_index: u64) -> bool {
+        self.has_chunk(inode, chunk_index)
     }
 }
 
@@ -730,6 +786,29 @@ impl IOUringChunkStore {
     /// Get chunk size
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ChunkStore for IOUringChunkStore {
+    async fn write_chunk(&self, inode: u64, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize> {
+        self.write_chunk(inode, chunk_index, offset, data).await
+    }
+
+    async fn read_chunk(&self, inode: u64, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>> {
+        self.read_chunk(inode, chunk_index, offset, length).await
+    }
+
+    async fn delete_chunk(&self, inode: u64, chunk_index: u64) -> ChunkStoreResult<()> {
+        self.delete_chunk(inode, chunk_index).await
+    }
+
+    async fn delete_file_chunks(&self, inode: u64) -> ChunkStoreResult<usize> {
+        self.delete_file_chunks(inode).await
+    }
+
+    fn has_chunk(&self, inode: u64, chunk_index: u64) -> bool {
+        self.has_chunk(inode, chunk_index)
     }
 }
 

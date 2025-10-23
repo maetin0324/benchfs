@@ -33,7 +33,9 @@
       "Bash(fi)",
       "Bash(make:*)",
       "Bash(mpirun:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(docker-compose:*)",
+      "Bash(docker network:*)"
     ],
     "deny": [],
     "ask": []

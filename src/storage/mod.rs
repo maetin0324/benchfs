@@ -7,7 +7,7 @@ pub mod chunk_store;
 pub use error::{StorageError, StorageResult};
 pub use iouring::IOUringBackend;
 pub use local::LocalFileSystem;
-pub use chunk_store::{InMemoryChunkStore, FileChunkStore, IOUringChunkStore, ChunkStoreError, ChunkStoreResult, ChunkKey};
+pub use chunk_store::{ChunkStore, InMemoryChunkStore, FileChunkStore, IOUringChunkStore, ChunkStoreError, ChunkStoreResult, ChunkKey};
 
 use std::path::Path;
 
