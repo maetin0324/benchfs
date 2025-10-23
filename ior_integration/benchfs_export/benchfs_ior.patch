@@ -1,35 +1,28 @@
 diff --git a/configure.ac b/configure.ac
-index 344b340..3f2d720 100644
+index 344b340..e1a8e17 100644
 --- a/configure.ac
 +++ b/configure.ac
-@@ -412,6 +412,14 @@ PKG_CHECK_MODULES([FINCHFS], [finchfs],
+@@ -412,6 +412,10 @@ PKG_CHECK_MODULES([FINCHFS], [finchfs],
    [with_finchfs=no])
  AM_CONDITIONAL([USE_FINCHFS_AIORI], [test x$with_finchfs != xno])
  
-+# BENCHFS support
-+PKG_CHECK_MODULES([BENCHFS], [benchfs],
-+  [AC_DEFINE([USE_BENCHFS_AIORI], [], [Build BENCHFS backend AIORI])
-+   BENCHFS_RPATH=$(pkg-config --libs-only-L benchfs | sed 's/-L/-Wl,-rpath=/g')
-+   AC_SUBST(BENCHFS_RPATH)],
-+  [with_benchfs=no])
-+AM_CONDITIONAL([USE_BENCHFS_AIORI], [test x$with_benchfs != xno])
++# BENCHFS support (always enabled, no pkg-config required)
++AC_DEFINE([USE_BENCHFS_AIORI], [], [Build BENCHFS backend AIORI])
++AM_CONDITIONAL([USE_BENCHFS_AIORI], [true])
 +
  # aws4c is needed for the S3 backend (see --with-S3, below).
  # Version 0.5.2 of aws4c is available at https://github.com/jti-lanl/aws4c.git
  # Install it something like this:
 diff --git a/src/Makefile.am b/src/Makefile.am
-index b60949a..a6b0b13 100755
+index b60949a..9425c56 100755
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
-@@ -128,6 +128,13 @@ extraLDFLAGS += @FINCHFS_RPATH@
+@@ -128,6 +128,10 @@ extraLDFLAGS += @FINCHFS_RPATH@
  extraLDADD += @FINCHFS_LIBS@
  endif
  
 +if USE_BENCHFS_AIORI
 +extraSOURCES += aiori-BENCHFS.c
-+extraCPPFLAGS += @BENCHFS_CFLAGS@
-+extraLDFLAGS += @BENCHFS_RPATH@
-+extraLDADD += @BENCHFS_LIBS@
 +endif
 +
  if USE_S3_4C_AIORI

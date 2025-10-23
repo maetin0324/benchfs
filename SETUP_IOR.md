@@ -5,6 +5,8 @@ IORは独立したプロジェクトとして管理されており、BenchFSリ�
 
 **重要**: IORにはBenchFS固有のバックエンド実装が含まれています。バニラのIORをクローンした後、BenchFS用の修正を適用する必要があります。
 
+**注意**: 2025年10月に、pkg-config依存の問題を修正した新しいパッチ(v2)をリリースしました。古いbenchfs_exportを使用している場合は、ローカル環境で`./scripts/export_benchfs_modifications.sh`を再実行して最新版を取得してください。
+
 ## クイックスタート（自動セットアップ）
 
 ### ローカル開発環境
@@ -226,36 +228,47 @@ head -20 benchfs_export/benchfs_ior.patch
 
 ## トラブルシューティング
 
-### BenchFSバックエンドが見つからない
+詳細なトラブルシューティング手順は [TROUBLESHOOTING.md](ior_integration/TROUBLESHOOTING.md) を参照してください。
 
+### よくある問題
+
+#### 問題1: IORでBENCHFSバックエンドが認識されない
+
+**症状:**
 ```bash
-# IORが認識しているバックエンドを確認
-./ior/src/ior -h
-
-# BENCHFSが表示されない場合、以下を確認:
-# 1. aiori-BENCHFS.c がコピーされているか
-ls -la ior/src/aiori-BENCHFS.c
-
-# 2. パッチが適用されているか
-cd ior
-git status
-git diff configure.ac src/Makefile.am src/aiori.c src/aiori.h
-
-# 3. ビルドログを確認
-make 2>&1 | grep -i benchfs
+Error invalid argument: --benchfs.registry
+Error invalid argument: --benchfs.datadir
 ```
 
-### パッチ適用に失敗する
+**原因:** BENCHFSバックエンドがビルドされていない（パッチ未適用またはビルドエラー）
 
+**解決方法:**
 ```bash
-# パッチの内容を確認
-cat benchfs_export/benchfs_ior.patch
+# 確認
+./ior/src/ior -h | grep -A 5 "Module BENCHFS"
 
-# 手動で適用する場合は上記の「手動セットアップ」を参照
+# 表示されない場合、ior_integration/TROUBLESHOOTING.md を参照
+```
 
-# または、3-way mergeを試す
-cd ior
-git apply --3way ../benchfs_export/benchfs_ior.patch
+#### 問題2: 古いパッチを使用している（pkg-config エラー）
+
+**症状:** configureがBENCHFSを検出せず、ビルドから除外される
+
+**解決方法:** 最新のbenchfs_exportを使用
+```bash
+# ローカル環境で最新版を再エクスポート
+cd /home/rmaeda/workspace/rust/benchfs/ior_integration
+./scripts/export_benchfs_modifications.sh
+
+# スパコンに転送
+scp -r benchfs_export/ <host>:/work/NBB/rmaeda/workspace/rust/benchfs/ior_integration/
+
+# スパコン側で再適用
+cd /work/NBB/rmaeda/workspace/rust/benchfs/ior_integration
+rm -rf ior
+git clone https://github.com/hpc/ior.git
+cd benchfs_export
+./apply_benchfs_modifications.sh
 ```
 
 ### bootstrap が失敗する
