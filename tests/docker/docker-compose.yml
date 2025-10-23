@@ -29,6 +29,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
   # Server node 2 - isolated data directory
@@ -56,6 +59,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
   # Server node 3 - isolated data directory
@@ -83,6 +89,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
   # Server node 4 - isolated data directory
@@ -110,6 +119,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
   # MPI controller node
@@ -142,6 +154,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
 volumes:

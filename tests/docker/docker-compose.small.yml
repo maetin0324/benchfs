@@ -30,6 +30,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
   server2:
@@ -56,6 +59,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
   controller:
@@ -85,6 +91,9 @@ services:
       - SYS_PTRACE
       - IPC_LOCK
       - SYS_RESOURCE  # Required for io_uring
+      - SYS_ADMIN     # Required for io_uring setup
+    security_opt:
+      - seccomp:unconfined  # Allow io_uring syscalls
     command: /usr/sbin/sshd -D
 
 volumes:

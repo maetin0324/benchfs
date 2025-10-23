@@ -1,6 +1,6 @@
 # BenchFS Docker Test Makefile
 
-.PHONY: help build build-simple up up-small down test test-small clean clean-all logs shell exec-controller debug check-env
+.PHONY: help build build-simple up up-small down test test-small test-ior test-ior-small clean clean-all logs shell exec-controller debug check-env
 
 # Default configuration
 COMPOSE_FILE ?= docker-compose.yml
@@ -20,6 +20,8 @@ help:
 	@echo "  make down           - Stop and remove containers"
 	@echo "  make test           - Run tests on 4-node cluster"
 	@echo "  make test-small     - Run tests on 2-node cluster"
+	@echo "  make test-ior       - Run IOR benchmark on 4-node cluster"
+	@echo "  make test-ior-small - Run IOR benchmark on 2-node cluster"
 	@echo "  make logs           - View container logs"
 	@echo "  make shell          - Open shell in controller"
 	@echo "  make exec-controller - Execute test script in controller"
@@ -80,6 +82,30 @@ test-small: up-small
 	fi; \
 	echo "Using container: $$CONTAINER_NAME"; \
 	docker exec $$CONTAINER_NAME /scripts/test-cluster.sh basic 2
+
+test-ior: up
+	@echo "Running IOR benchmark on 4-node cluster..."
+	@sleep 2
+	@CONTAINER_NAME=$$(docker ps --format '{{.Names}}' | grep controller | head -1); \
+	if [ -z "$$CONTAINER_NAME" ]; then \
+		echo "ERROR: Controller container not found"; \
+		docker ps -a; \
+		exit 1; \
+	fi; \
+	echo "Using container: $$CONTAINER_NAME"; \
+	docker exec $$CONTAINER_NAME /scripts/test-ior.sh basic 4
+
+test-ior-small: up-small
+	@echo "Running IOR benchmark on 2-node cluster..."
+	@sleep 2
+	@CONTAINER_NAME=$$(docker ps --format '{{.Names}}' | grep controller | head -1); \
+	if [ -z "$$CONTAINER_NAME" ]; then \
+		echo "ERROR: Controller container not found"; \
+		docker ps -a; \
+		exit 1; \
+	fi; \
+	echo "Using container: $$CONTAINER_NAME"; \
+	docker exec $$CONTAINER_NAME /scripts/test-ior.sh basic 2
 
 logs:
 	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml logs -f
