@@ -224,19 +224,110 @@ grep -i error build.log
    make -j$(nproc)
    ```
 
+## IORビルド時のリンクエラー
+
+### 症状
+
+```
+undefined reference to `benchfs_init'
+undefined reference to `benchfs_write'
+...
+```
+
+### 原因
+
+BenchFS共有ライブラリ(`libbenchfs.so`)が見つからない、または未ビルドです。
+
+### 解決方法
+
+#### ステップ1: BenchFS共有ライブラリをビルド
+
+```bash
+cd /work/NBB/rmaeda/workspace/rust/benchfs
+
+# 共有ライブラリをビルド
+cargo build --release
+
+# 生成を確認
+ls -lh target/release/libbenchfs.so
+```
+
+期待される出力:
+```
+-rwxr-xr-x 2 user group 1.5M Oct 23 04:50 target/release/libbenchfs.so
+```
+
+#### ステップ2: IORを再ビルド
+
+```bash
+cd ior_integration/ior
+make clean
+make -j$(nproc)
+```
+
+#### ステップ3: 共有ライブラリのパスを確認
+
+```bash
+# lddでライブラリの依存関係を確認
+ldd src/ior | grep benchfs
+```
+
+期待される出力:
+```
+    libbenchfs.so => /work/NBB/rmaeda/workspace/rust/benchfs/target/release/libbenchfs.so
+```
+
+### よくある問題
+
+#### 問題: `libbenchfs.so: cannot open shared object file`
+
+**原因**: LD_LIBRARY_PATHが設定されていない
+
+**解決方法**: Makefile.amのrpathで解決されるはずですが、失敗する場合:
+
+```bash
+export LD_LIBRARY_PATH=/work/NBB/rmaeda/workspace/rust/benchfs/target/release:$LD_LIBRARY_PATH
+```
+
+#### 問題: Rustがインストールされていない
+
+```bash
+# Rustをインストール
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# または、スパコンのモジュールを確認
+module avail rust
+module load rust
+```
+
 ## IOR実行時のエラー
 
-### "BENCHFS not initialized"
+### "BENCHFS not initialized" または segmentation fault
 
-BenchFS C APIが未実装のため、実行時エラーが発生します。
-現在の実装はスケルトンのみで、実際のBenchFS接続機能は未実装です。
+**原因**: BenchFS C FFI実装に問題がある、またはランタイム初期化に失敗
 
-### 次のステップ
+**解決方法**:
 
-BenchFS C APIの完全実装が必要です:
-- `src/c_api.rs` の実装
-- BenchFS Rust ライブラリとのFFI連携
-- 共有ライブラリのビルドとリンク
+1. **ログを確認**:
+   ```bash
+   # RUST_LOGを有効にして実行
+   export RUST_LOG=debug
+   mpirun -np 2 ./src/ior -a BENCHFS -t 1m -b 4m -w
+   ```
+
+2. **BenchFSバージョンを確認**:
+   ```bash
+   cd /work/NBB/rmaeda/workspace/rust/benchfs
+   git log --oneline -1
+   # FFI実装があるか確認
+   ls -la src/ffi/
+   ```
+
+3. **シンプルなテストを実行**:
+   ```bash
+   # 最小構成でテスト
+   mpirun -np 1 ./src/ior -a BENCHFS -t 1k -b 4k -w -v -v -v
+   ```
 
 ## パッチのバージョン履歴
 

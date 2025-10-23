@@ -14,15 +14,19 @@ index 344b340..e1a8e17 100644
  # Version 0.5.2 of aws4c is available at https://github.com/jti-lanl/aws4c.git
  # Install it something like this:
 diff --git a/src/Makefile.am b/src/Makefile.am
-index b60949a..9425c56 100755
+index b60949a..cd409f9 100755
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
-@@ -128,6 +128,10 @@ extraLDFLAGS += @FINCHFS_RPATH@
+@@ -128,6 +128,14 @@ extraLDFLAGS += @FINCHFS_RPATH@
  extraLDADD += @FINCHFS_LIBS@
  endif
  
 +if USE_BENCHFS_AIORI
 +extraSOURCES += aiori-BENCHFS.c
++extraCPPFLAGS += -I$(top_srcdir)/../benchfs_backend/include
++BENCHFS_LIB_PATH = $(top_srcdir)/../../target/release
++extraLDFLAGS += -L$(BENCHFS_LIB_PATH) -Wl,-rpath=$(BENCHFS_LIB_PATH)
++extraLDADD += -lbenchfs -lpthread -ldl -lm
 +endif
 +
  if USE_S3_4C_AIORI

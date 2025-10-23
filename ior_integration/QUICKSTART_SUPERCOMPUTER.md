@@ -121,8 +121,14 @@ cd /work/NBB/rmaeda/workspace/rust/benchfs
 # Rustモジュールをロード（必要に応じて）
 # module load rust
 
-# BenchFS MPI版をビルド
+# BenchFS共有ライブラリをビルド（IORとリンクするため）
+cargo build --release
+
+# BenchFS MPI版もビルド
 cargo build --release --features mpi-support --bin benchfsd_mpi
+
+# 共有ライブラリが生成されたことを確認
+ls -lh target/release/libbenchfs.so
 ```
 
 ## ステップ7: ベンチマークを実行
