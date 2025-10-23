@@ -7,7 +7,7 @@ log_level = "info"
 
 [storage]
 chunk_size = 4194304  # 4 MiB
-use_iouring = false  # Disabled for Docker environment
+use_iouring = true
 max_storage_gb = 0  # Unlimited
 
 [network]
