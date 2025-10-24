@@ -352,6 +352,17 @@ impl BenchFS {
                                 match request.call(&*client).await {
                                     Ok(response) if response.is_success() => {
                                         tracing::debug!("Remote truncate succeeded for {}", path);
+
+                                        // Update local cache after successful remote truncate
+                                        let mut truncated_meta = meta.clone();
+                                        truncated_meta.size = 0;
+                                        truncated_meta.chunk_count = 0;
+                                        truncated_meta.chunk_locations.clear();
+                                        if let Err(e) = self.metadata_manager.update_file_metadata(truncated_meta) {
+                                            tracing::warn!("Failed to update local cache after remote truncate: {:?}", e);
+                                        } else {
+                                            tracing::debug!("Updated local cache after remote truncate for {}", path);
+                                        }
                                     }
                                     Ok(response) => {
                                         return Err(ApiError::Internal(format!(
@@ -410,6 +421,15 @@ impl BenchFS {
                                         path,
                                         response.inode
                                     );
+
+                                    // Cache newly created file metadata locally
+                                    let file_meta = FileMetadata::new(response.inode, path.to_string(), 0);
+                                    if let Err(e) = self.metadata_manager.store_file_metadata(file_meta) {
+                                        tracing::warn!("Failed to cache metadata after remote create: {:?}", e);
+                                    } else {
+                                        tracing::debug!("Cached metadata for newly created file {} locally", path);
+                                    }
+
                                     response.inode
                                 }
                                 Ok(response) => {
@@ -861,60 +881,11 @@ impl BenchFS {
             file_meta.size = new_size;
             file_meta.chunk_count = file_meta.calculate_chunk_count();
 
-            // Update metadata (local or remote)
-            let metadata_node = self.get_metadata_node(&handle.path);
-            let is_local = self.is_local_metadata(&handle.path);
-
-            if is_local {
-                // Update local metadata
-                self.metadata_manager
-                    .update_file_metadata(file_meta)
-                    .map_err(|e| ApiError::Internal(format!("Failed to update metadata: {:?}", e)))?;
-            } else {
-                // Update remote metadata via RPC
-                if let Some(pool) = &self.connection_pool {
-                    match pool.get_or_connect(&metadata_node).await {
-                        Ok(client) => {
-                            use crate::rpc::metadata_ops::MetadataUpdateRequest;
-                            let request = MetadataUpdateRequest::new(handle.path.clone())
-                                .with_size(file_meta.size);
-                            // Note: chunk_locations are already tracked when chunks are written
-                            match request.call(&*client).await {
-                                Ok(response) if response.is_success() => {
-                                    tracing::debug!(
-                                        "Remote metadata updated for {} (size: {})",
-                                        handle.path,
-                                        file_meta.size
-                                    );
-                                }
-                                Ok(response) => {
-                                    return Err(ApiError::Internal(format!(
-                                        "Remote metadata update failed with status {}",
-                                        response.status
-                                    )));
-                                }
-                                Err(e) => {
-                                    return Err(ApiError::Internal(format!(
-                                        "Remote metadata update RPC error: {:?}",
-                                        e
-                                    )));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            return Err(ApiError::Internal(format!(
-                                "Failed to connect for metadata update: {:?}",
-                                e
-                            )));
-                        }
-                    }
-                }
-
-                // Also update local cache
-                if let Err(e) = self.metadata_manager.update_file_metadata(file_meta) {
-                    tracing::warn!("Failed to update local metadata cache: {:?}", e);
-                }
-            }
+            // Update local metadata only
+            // Remote metadata will be synchronized when file is closed
+            self.metadata_manager
+                .update_file_metadata(file_meta)
+                .map_err(|e| ApiError::Internal(format!("Failed to update metadata: {:?}", e)))?;
         }
 
         // Advance file position
@@ -927,7 +898,61 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `handle` - File handle
-    pub fn benchfs_close(&self, handle: &FileHandle) -> ApiResult<()> {
+    pub async fn benchfs_close(&self, handle: &FileHandle) -> ApiResult<()> {
+        use std::path::Path;
+        let path_ref = Path::new(&handle.path);
+
+        // Sync metadata to remote server if this is a remote file
+        if handle.flags.write {
+            let metadata_node = self.get_metadata_node(&handle.path);
+            let is_local = self.is_local_metadata(&handle.path);
+
+            if !is_local {
+                // Get final file metadata from local cache
+                if let Ok(file_meta) = self.metadata_manager.get_file_metadata(path_ref) {
+                    // Sync to remote metadata server
+                    if let Some(pool) = &self.connection_pool {
+                        match pool.get_or_connect(&metadata_node).await {
+                            Ok(client) => {
+                                use crate::rpc::metadata_ops::MetadataUpdateRequest;
+                                let request = MetadataUpdateRequest::new(handle.path.clone())
+                                    .with_size(file_meta.size);
+
+                                match request.call(&*client).await {
+                                    Ok(response) if response.is_success() => {
+                                        tracing::debug!(
+                                            "Synced metadata on close: {} (size: {})",
+                                            handle.path,
+                                            file_meta.size
+                                        );
+                                    }
+                                    Ok(response) => {
+                                        tracing::warn!(
+                                            "Failed to sync metadata on close: {} (status: {})",
+                                            handle.path,
+                                            response.status
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Metadata sync RPC error on close: {:?}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to connect for metadata sync on close: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.open_files.borrow_mut().remove(&handle.fd);
         Ok(())
     }
