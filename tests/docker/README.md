@@ -8,7 +8,7 @@ Docker環境でBenchFSクラスタをテストするための構成です。
 - **MPI統合**: OpenMPI 4.1.5を使用した分散実行
 - **UCX通信**: UCX 1.18.0によるRDMA対応通信
 - **io_uring対応**: 高性能非同期I/Oをサポート
-- **IORベンチマーク**: 標準的なI/Oベンチマークツールを統合
+- **IORベンチマーク**: BenchFSバックエンド (`-a BENCHFS`) を使用した分散ファイルシステムベンチマーク
 
 ## 必要条件
 
@@ -37,6 +37,13 @@ make test-ior-small
 # 4ノードでIORベンチマーク
 make test-ior
 ```
+
+**重要**: IORは `-a BENCHFS` オプションでBenchFS分散ファイルシステムに直接アクセスします。
+これは以下のように動作します：
+
+1. BenchFSサーバーが各ノードで起動（rank 0がメタデータサーバー兼ストレージサーバー、rank 1以降がクライアント）
+2. IORプロセスがBenchFS C APIを通じてファイルI/Oを実行
+3. 実際のデータは `/shared/data` に格納されますが、IORからは分散ファイルシステムとして透過的にアクセス
 
 ## 利用可能なコマンド
 
@@ -157,8 +164,18 @@ make debug      # デバッグスクリプトを実行
 ```bash
 case "$TEST_NAME" in
     "custom")
-        echo "Test: Custom IOR test"
-        mpirun ... ${IOR_BIN} [custom parameters]
+        echo "Test: Custom IOR test with BenchFS"
+        mpirun \
+            --hostfile ${HOSTFILE} \
+            -np ${NNODES} \
+            --mca btl tcp,self \
+            --mca btl_tcp_if_include eth0 \
+            ${IOR_BIN} \
+                -a BENCHFS \
+                --benchfs.registry ${REGISTRY_DIR} \
+                --benchfs.datadir ${DATA_DIR} \
+                [custom IOR parameters] \
+                -o /custom_testfile
         ;;
 esac
 ```

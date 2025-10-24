@@ -105,37 +105,31 @@ echo "=========================================="
 echo "Running IOR benchmark: $TEST_NAME"
 echo "=========================================="
 
-# Note: BenchFS does not yet support POSIX filesystem interface
-# IOR tests run on the local filesystem that BenchFS uses for storage
-# Each BenchFS server uses /shared/data/rank_X/ for its storage
-# This tests the underlying storage performance
+# IOR tests will use BenchFS backend (-a BENCHFS)
+# This tests the actual distributed filesystem performance
 
-# Create test directory on all nodes
-TEST_DIR="/tmp/ior_test"
-mkdir -p ${TEST_DIR}
-for host in $(awk '{print $1}' ${HOSTFILE}); do
-    ssh ${host} "mkdir -p ${TEST_DIR}" 2>/dev/null || true
-done
-echo "Created test directories on all nodes"
+echo "Using BenchFS backend with registry: ${REGISTRY_DIR}"
 echo ""
 
 case "$TEST_NAME" in
     "basic")
-        echo "Test: Basic IOR write/read test"
+        echo "Test: Basic IOR write/read test with BenchFS"
         echo "Transfer size: 1MB, Block size: 4MB, Total: 16MB"
-        echo "Note: Testing on local filesystem (BenchFS POSIX interface not yet implemented)"
         echo ""
 
-        # Run IOR with small test parameters on local filesystem
+        # Run IOR with BenchFS backend
         mpirun \
             --hostfile ${HOSTFILE} \
             -np ${NNODES} \
             --mca btl tcp,self \
             --mca btl_tcp_if_include eth0 \
             ${IOR_BIN} \
+                -a BENCHFS \
+                --benchfs.registry ${REGISTRY_DIR} \
+                --benchfs.datadir ${DATA_DIR} \
                 -w -r \
                 -t 1m -b 4m -s 4 \
-                -o ${TEST_DIR}/ior_testfile \
+                -o /testfile \
                 -O summaryFormat=JSON \
                 > ${RESULTS_DIR}/ior_output.txt 2>&1
 
@@ -153,9 +147,8 @@ case "$TEST_NAME" in
         ;;
 
     "write")
-        echo "Test: IOR write-only test"
+        echo "Test: IOR write-only test with BenchFS"
         echo "Transfer size: 1MB, Block size: 8MB, Total: 32MB"
-        echo "Note: Testing on local filesystem (BenchFS POSIX interface not yet implemented)"
         echo ""
 
         mpirun \
@@ -164,9 +157,12 @@ case "$TEST_NAME" in
             --mca btl tcp,self \
             --mca btl_tcp_if_include eth0 \
             ${IOR_BIN} \
+                -a BENCHFS \
+                --benchfs.registry ${REGISTRY_DIR} \
+                --benchfs.datadir ${DATA_DIR} \
                 -w \
                 -t 1m -b 8m -s 4 \
-                -o ${TEST_DIR}/ior_writefile \
+                -o /writefile \
                 -O summaryFormat=JSON \
                 > ${RESULTS_DIR}/ior_write_output.txt 2>&1
 
@@ -184,9 +180,8 @@ case "$TEST_NAME" in
         ;;
 
     "read")
-        echo "Test: IOR read-only test (requires existing file)"
+        echo "Test: IOR read-only test with BenchFS (requires existing file)"
         echo "Transfer size: 1MB, Block size: 8MB"
-        echo "Note: Testing on local filesystem (BenchFS POSIX interface not yet implemented)"
         echo ""
 
         # First create a file with write test
@@ -197,9 +192,12 @@ case "$TEST_NAME" in
             --mca btl tcp,self \
             --mca btl_tcp_if_include eth0 \
             ${IOR_BIN} \
+                -a BENCHFS \
+                --benchfs.registry ${REGISTRY_DIR} \
+                --benchfs.datadir ${DATA_DIR} \
                 -w \
                 -t 1m -b 8m -s 4 \
-                -o ${TEST_DIR}/ior_readfile \
+                -o /readfile \
                 > /dev/null 2>&1
 
         echo "Running read test..."
@@ -209,9 +207,12 @@ case "$TEST_NAME" in
             --mca btl tcp,self \
             --mca btl_tcp_if_include eth0 \
             ${IOR_BIN} \
+                -a BENCHFS \
+                --benchfs.registry ${REGISTRY_DIR} \
+                --benchfs.datadir ${DATA_DIR} \
                 -r \
                 -t 1m -b 8m -s 4 \
-                -o ${TEST_DIR}/ior_readfile \
+                -o /readfile \
                 -O summaryFormat=JSON \
                 > ${RESULTS_DIR}/ior_read_output.txt 2>&1
 

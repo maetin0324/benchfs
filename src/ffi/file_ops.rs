@@ -191,7 +191,7 @@ pub extern "C" fn benchfs_open(
 /// * `file` - File handle
 /// * `buffer` - Data to write
 /// * `size` - Number of bytes to write
-/// * `offset` - File offset (currently unused, position is managed by handle)
+/// * `offset` - File offset to write at
 ///
 /// # Returns
 /// Number of bytes written, or negative error code
@@ -200,10 +200,15 @@ pub extern "C" fn benchfs_write(
     file: *mut benchfs_file_t,
     buffer: *const u8,
     size: usize,
-    _offset: i64,
+    offset: i64,
 ) -> i64 {
     if file.is_null() || buffer.is_null() {
         set_error_message("file and buffer must not be null");
+        return BENCHFS_EINVAL as i64;
+    }
+
+    if offset < 0 {
+        set_error_message("offset must be non-negative");
         return BENCHFS_EINVAL as i64;
     }
 
@@ -220,7 +225,14 @@ pub extern "C" fn benchfs_write(
 
             // Execute block_on with the pointer
             let fs_ref = &*fs_ptr;
+
+            // Seek to the specified offset before writing
+            if let Err(e) = fs_ref.benchfs_seek(&handle_clone, offset, 0) {
+                return Err(format!("Seek failed: {:?}", e));
+            }
+
             block_on(async move { fs_ref.benchfs_write(&handle_clone, &buf).await })
+                .map_err(|e| e.to_string())
         });
 
         match result {
@@ -243,7 +255,7 @@ pub extern "C" fn benchfs_write(
 /// * `file` - File handle
 /// * `buffer` - Buffer to read into
 /// * `size` - Number of bytes to read
-/// * `offset` - File offset (currently unused, position is managed by handle)
+/// * `offset` - File offset to read from
 ///
 /// # Returns
 /// Number of bytes read, or negative error code
@@ -252,10 +264,15 @@ pub extern "C" fn benchfs_read(
     file: *mut benchfs_file_t,
     buffer: *mut u8,
     size: usize,
-    _offset: i64,
+    offset: i64,
 ) -> i64 {
     if file.is_null() || buffer.is_null() {
         set_error_message("file and buffer must not be null");
+        return BENCHFS_EINVAL as i64;
+    }
+
+    if offset < 0 {
+        set_error_message("offset must be non-negative");
         return BENCHFS_EINVAL as i64;
     }
 
@@ -274,6 +291,12 @@ pub extern "C" fn benchfs_read(
             let temp_buf_ptr = temp_buf.as_mut_ptr();
 
             let fs_ref = &*fs_ptr;
+
+            // Seek to the specified offset before reading
+            if let Err(e) = fs_ref.benchfs_seek(&handle_clone, offset, 0) {
+                return Err(format!("Seek failed: {:?}", e));
+            }
+
             let mut local_buf = std::slice::from_raw_parts_mut(temp_buf_ptr, buf_size);
 
             let n =
@@ -285,7 +308,7 @@ pub extern "C" fn benchfs_read(
                     std::ptr::copy_nonoverlapping(temp_buf_ptr, buf_ptr, bytes_read);
                     Ok(bytes_read)
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(e.to_string()),
             }
         });
 

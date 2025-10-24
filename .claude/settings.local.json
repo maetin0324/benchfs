@@ -22,7 +22,6 @@
       "Read(//home/rmaeda/.cargo/git/checkouts/pluvio-0fdcbbd51664b7d9/**)",
       "Read(//home/rmaeda/.cargo/git/checkouts/**)",
       "Bash(cargo update:*)",
-      "Bash(ssh:*)",
       "Bash(env RUST_LOG=debug ./target/release/deps/small-309151752e31de5f:*)",
       "Bash(tee:*)",
       "WebSearch",
@@ -35,7 +34,8 @@
       "Bash(mpirun:*)",
       "Bash(mkdir:*)",
       "Bash(docker-compose:*)",
-      "Bash(docker network:*)"
+      "Bash(docker network:*)",
+      "Bash(docker exec:*)"
     ],
     "deny": [],
     "ask": []

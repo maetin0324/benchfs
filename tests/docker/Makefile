@@ -1,6 +1,6 @@
 # BenchFS Docker Test Makefile
 
-.PHONY: help build build-simple up up-small down test test-small test-ior test-ior-small clean clean-all logs shell exec-controller debug check-env
+.PHONY: help build build-no-cache build-simple up up-small down test test-small test-ior test-ior-small clean clean-all logs shell exec-controller debug check-env
 
 # Default configuration
 COMPOSE_FILE ?= docker-compose.yml
@@ -33,6 +33,9 @@ help:
 
 build:
 	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml build
+
+build-no-cache:
+	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml build --no-cache
 
 build-simple:
 	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml build

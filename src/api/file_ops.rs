@@ -861,9 +861,60 @@ impl BenchFS {
             file_meta.size = new_size;
             file_meta.chunk_count = file_meta.calculate_chunk_count();
 
-            self.metadata_manager
-                .update_file_metadata(file_meta)
-                .map_err(|e| ApiError::Internal(format!("Failed to update metadata: {:?}", e)))?;
+            // Update metadata (local or remote)
+            let metadata_node = self.get_metadata_node(&handle.path);
+            let is_local = self.is_local_metadata(&handle.path);
+
+            if is_local {
+                // Update local metadata
+                self.metadata_manager
+                    .update_file_metadata(file_meta)
+                    .map_err(|e| ApiError::Internal(format!("Failed to update metadata: {:?}", e)))?;
+            } else {
+                // Update remote metadata via RPC
+                if let Some(pool) = &self.connection_pool {
+                    match pool.get_or_connect(&metadata_node).await {
+                        Ok(client) => {
+                            use crate::rpc::metadata_ops::MetadataUpdateRequest;
+                            let request = MetadataUpdateRequest::new(handle.path.clone())
+                                .with_size(file_meta.size);
+                            // Note: chunk_locations are already tracked when chunks are written
+                            match request.call(&*client).await {
+                                Ok(response) if response.is_success() => {
+                                    tracing::debug!(
+                                        "Remote metadata updated for {} (size: {})",
+                                        handle.path,
+                                        file_meta.size
+                                    );
+                                }
+                                Ok(response) => {
+                                    return Err(ApiError::Internal(format!(
+                                        "Remote metadata update failed with status {}",
+                                        response.status
+                                    )));
+                                }
+                                Err(e) => {
+                                    return Err(ApiError::Internal(format!(
+                                        "Remote metadata update RPC error: {:?}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(ApiError::Internal(format!(
+                                "Failed to connect for metadata update: {:?}",
+                                e
+                            )));
+                        }
+                    }
+                }
+
+                // Also update local cache
+                if let Err(e) = self.metadata_manager.update_file_metadata(file_meta) {
+                    tracing::warn!("Failed to update local metadata cache: {:?}", e);
+                }
+            }
         }
 
         // Advance file position

@@ -306,9 +306,16 @@ pub extern "C" fn benchfs_init(
         };
 
         // Create BenchFS instance with distributed metadata
-        // All metadata and data operations target the "server" node
-        let metadata_nodes = vec!["server".to_string()];
-        let data_nodes = vec!["server".to_string()];
+        // In MPI mode: node_0 is the metadata server, all nodes are data servers
+        // Discover available nodes from registry (for now, use node_0 as metadata server)
+        let metadata_nodes = vec!["node_0".to_string()];
+        // Use multiple data nodes for distributed storage
+        let data_nodes = vec![
+            "node_0".to_string(),
+            "node_1".to_string(),
+            "node_2".to_string(),
+            "node_3".to_string(),
+        ];
         let benchfs = Rc::new(BenchFS::with_distributed_metadata(
             node_id_str.to_string(),
             chunk_store,

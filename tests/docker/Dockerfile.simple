@@ -6,18 +6,32 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install runtime dependencies and IOR build dependencies
+# Note: We build UCX and OpenMPI from source to ensure version compatibility
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
+    curl \
     openssh-server \
     autoconf \
     automake \
     libtool \
     pkg-config \
     git \
+    libssl-dev \
+    ca-certificates \
+    clang \
+    libclang-dev \
+    llvm-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install UCX
+# Install Rust (required for BenchFS build)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set LIBCLANG_PATH for bindgen
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
+
+# Install UCX from source (required version: 1.18)
 WORKDIR /tmp
 RUN wget https://github.com/openucx/ucx/releases/download/v1.18.0/ucx-1.18.0.tar.gz && \
     tar xzf ucx-1.18.0.tar.gz && \
@@ -32,9 +46,9 @@ RUN wget https://github.com/openucx/ucx/releases/download/v1.18.0/ucx-1.18.0.tar
     make install && \
     ldconfig && \
     cd .. && \
-    rm -rf ucx-1.15.0*
+    rm -rf ucx-1.18.0*
 
-# Install OpenMPI
+# Install OpenMPI from source (with UCX support)
 RUN wget https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-4.1.5.tar.gz && \
     tar xzf openmpi-4.1.5.tar.gz && \
     cd openmpi-4.1.5 && \
@@ -47,17 +61,69 @@ RUN wget https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-4.1.5.tar.g
     cd .. && \
     rm -rf openmpi-4.1.5*
 
-# Build IOR
-RUN git clone https://github.com/hpc/ior.git && \
+# Copy BenchFS source for building library
+COPY . /build/benchfs
+WORKDIR /build/benchfs
+
+# Build BenchFS library and install (non-interactive)
+RUN set -x && \
+    echo "=== Building BenchFS library ===" && \
+    cargo build --release --lib && \
+    echo "=== Installing BenchFS library ===" && \
+    PREFIX=/usr/local && \
+    mkdir -p $PREFIX/lib $PREFIX/include $PREFIX/lib/pkgconfig && \
+    cp -v target/release/libbenchfs.so $PREFIX/lib/ && \
+    cp -rv ior_integration/benchfs_backend/include/* $PREFIX/include/ && \
+    echo "=== Creating pkg-config file ===" && \
+    printf '# BenchFS pkg-config file\nprefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: BenchFS\nDescription: BenchFS distributed filesystem library\nVersion: 0.1.0\nLibs: -L${libdir} -lbenchfs -lpthread -ldl -lm\nCflags: -I${includedir}\n' > $PREFIX/lib/pkgconfig/benchfs.pc && \
+    cat $PREFIX/lib/pkgconfig/benchfs.pc && \
+    ldconfig && \
+    echo "=== Verifying pkg-config ===" && \
+    pkg-config --modversion benchfs && \
+    pkg-config --cflags benchfs && \
+    pkg-config --libs benchfs
+
+# Set up pkg-config and library paths
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# Build IOR with BenchFS support
+WORKDIR /build/benchfs/ior_integration
+RUN set -x && \
+    echo "=== Syncing BenchFS files ===" && \
+    ./sync-benchfs.sh && \
+    echo "=== Checking synced files ===" && \
+    ls -la ior/src/aiori-BENCHFS.c && \
+    echo "=== Running IOR bootstrap ===" && \
     cd ior && \
-    git checkout 3.3.0 && \
     ./bootstrap && \
-    ./configure --prefix=/usr/local \
-                --with-mpiio && \
-    make -j$(nproc) && \
+    echo "=== Running IOR configure ===" && \
+    ./configure --prefix=/usr/local 2>&1 | tee /tmp/ior_configure.log && \
+    echo "=== Checking configure results ===" && \
+    grep -i benchfs /tmp/ior_configure.log || echo "WARNING: BENCHFS not mentioned in configure output" && \
+    echo "=== Building IOR ===" && \
+    make -j$(nproc) 2>&1 | tee /tmp/ior_build.log && \
+    echo "=== Checking if BENCHFS was built ===" && \
+    grep -i benchfs /tmp/ior_build.log || echo "WARNING: BENCHFS not mentioned in build output" && \
+    echo "=== Installing IOR ===" && \
     make install && \
-    cd .. && \
-    rm -rf ior
+    ldconfig
+
+# Verify BenchFS backend is available
+RUN echo "=== Verifying IOR with BenchFS ===" && \
+    ior -h 2>&1 | tee /tmp/ior_help.txt && \
+    if grep -i benchfs /tmp/ior_help.txt; then \
+        echo "SUCCESS: BenchFS backend found in IOR"; \
+    else \
+        echo "ERROR: BenchFS backend not found in IOR" && \
+        echo "=== IOR Help Output ===" && \
+        cat /tmp/ior_help.txt && \
+        echo "=== Configure Log ===" && \
+        cat /tmp/ior_configure.log && \
+        echo "=== Build Log ===" && \
+        cat /tmp/ior_build.log && \
+        exit 1; \
+    fi
 
 # Setup SSH for MPI
 RUN mkdir /var/run/sshd && \
@@ -76,7 +142,6 @@ RUN mkdir -p /shared/registry /shared/data /logs
 ENV UCX_TLS=tcp,sm,self
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
 
 WORKDIR /workspace
 

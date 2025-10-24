@@ -85,32 +85,26 @@ static void BENCHFS_Initialize(aiori_mod_opt_t *options) {
   MPI_Comm_rank(MPI_COMM_WORLD, &benchfs_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &benchfs_size);
 
-  /* Initialize BenchFS C API */
+  /* Initialize BenchFS C API in CLIENT MODE for all ranks
+   *
+   * NOTE: IOR connects to an existing BenchFS cluster that is already running
+   * (started separately via benchfsd_mpi). Therefore, all IOR ranks should
+   * initialize as clients, not servers.
+   */
+  WARNF("BENCHFS initialized (rank %d/%d) - CLIENT MODE (connecting to existing cluster)",
+        benchfs_rank, benchfs_size);
+
   if (benchfs_rank == 0) {
-    WARNF("BENCHFS initialized (rank %d/%d) - SERVER MODE", benchfs_rank, benchfs_size);
     fprintf(out_logfile, "BENCHFS: Registry dir: %s\n", o->registry_dir);
     fprintf(out_logfile, "BENCHFS: Data dir: %s\n", o->data_dir);
-
-    /* Start server */
-    benchfs_ctx = benchfs_init("server", o->registry_dir, o->data_dir, 1);
-    if (benchfs_ctx == NULL) {
-      ERRF("BENCHFS server initialization failed: %s", benchfs_get_error());
-    }
   }
 
-  /* Wait for server to be ready before clients connect */
-  MPI_Barrier(MPI_COMM_WORLD);
-
-  if (benchfs_rank != 0) {
-    WARNF("BENCHFS initialized (rank %d/%d) - CLIENT MODE", benchfs_rank, benchfs_size);
-
-    /* Start client */
-    char node_id[64];
-    snprintf(node_id, sizeof(node_id), "client_%d", benchfs_rank);
-    benchfs_ctx = benchfs_init(node_id, o->registry_dir, NULL, 0);
-    if (benchfs_ctx == NULL) {
-      ERRF("BENCHFS client initialization failed: %s", benchfs_get_error());
-    }
+  /* All ranks initialize as clients */
+  char node_id[64];
+  snprintf(node_id, sizeof(node_id), "ior_client_%d", benchfs_rank);
+  benchfs_ctx = benchfs_init(node_id, o->registry_dir, NULL, 0);
+  if (benchfs_ctx == NULL) {
+    ERRF("BENCHFS client initialization failed: %s", benchfs_get_error());
   }
 
   benchfs_initialized = 1;
