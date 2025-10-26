@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn test_file_cache_put_get() {
         let cache = MetadataCache::with_capacity(100);
-        let metadata = FileMetadata::new(1, "/test.txt".to_string(), 1024);
+        let metadata = FileMetadata::new("/test.txt".to_string(), 1024);
 
         cache.put_file("/test.txt".to_string(), metadata.clone());
 
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn test_cache_invalidation() {
         let cache = MetadataCache::with_capacity(100);
-        let metadata = FileMetadata::new(1, "/test.txt".to_string(), 1024);
+        let metadata = FileMetadata::new("/test.txt".to_string(), 1024);
 
         cache.put_file("/test.txt".to_string(), metadata);
         assert!(cache.get_file("/test.txt").is_some());
@@ -203,9 +203,9 @@ mod tests {
     fn test_cache_lru_eviction() {
         let cache = MetadataCache::with_capacity(2);
 
-        let meta1 = FileMetadata::new(1, "/file1.txt".to_string(), 100);
-        let meta2 = FileMetadata::new(2, "/file2.txt".to_string(), 200);
-        let meta3 = FileMetadata::new(3, "/file3.txt".to_string(), 300);
+        let meta1 = FileMetadata::new("/file1.txt".to_string(), 100);
+        let meta2 = FileMetadata::new("/file2.txt".to_string(), 200);
+        let meta3 = FileMetadata::new("/file3.txt".to_string(), 300);
 
         cache.put_file("/file1.txt".to_string(), meta1);
         cache.put_file("/file2.txt".to_string(), meta2);
@@ -224,7 +224,7 @@ mod tests {
         let policy = CachePolicy::lru_with_ttl(100, Duration::from_millis(100));
         let cache = MetadataCache::new(policy);
 
-        let metadata = FileMetadata::new(1, "/test.txt".to_string(), 1024);
+        let metadata = FileMetadata::new("/test.txt".to_string(), 1024);
         cache.put_file("/test.txt".to_string(), metadata);
 
         // Should be cached
@@ -241,7 +241,7 @@ mod tests {
     fn test_cache_clear() {
         let cache = MetadataCache::with_capacity(100);
 
-        cache.put_file("/file1.txt".to_string(), FileMetadata::new(1, "/file1.txt".to_string(), 100));
+        cache.put_file("/file1.txt".to_string(), FileMetadata::new("/file1.txt".to_string(), 100));
         cache.put_dir("/dir1".to_string(), DirectoryMetadata::new(2, "/dir1".to_string()));
 
         assert_eq!(cache.stats().file_entries, 1);

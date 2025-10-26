@@ -39,72 +39,22 @@ impl Default for FilePermissions {
     }
 }
 
-/// ファイルメタデータ
+/// ファイルメタデータ (simplified for path-based KV design)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
-    /// Inode番号
-    pub inode: InodeId,
-
-    /// ファイル名
-    pub name: String,
-
     /// フルパス
     pub path: String,
 
     /// ファイルサイズ (バイト)
     pub size: u64,
-
-    /// チャンク数
-    pub chunk_count: u64,
-
-    /// パーミッション
-    pub permissions: FilePermissions,
-
-    /// 作成時刻
-    pub created_at: SystemTime,
-
-    /// 最終更新時刻
-    pub modified_at: SystemTime,
-
-    /// 最終アクセス時刻
-    pub accessed_at: SystemTime,
-
-    /// 所有ノードID (メタデータを管理するノード)
-    pub owner_node: NodeId,
-
-    /// チャンク配置情報 (chunk_index -> node_id)
-    pub chunk_locations: Vec<NodeId>,
 }
 
 impl FileMetadata {
     /// 新しいファイルメタデータを作成
-    pub fn new(inode: InodeId, path: String, size: u64) -> Self {
-        let name = path
-            .split('/')
-            .last()
-            .unwrap_or("")
-            .to_string();
-
-        let chunk_count = if size == 0 {
-            0
-        } else {
-            (size + crate::metadata::CHUNK_SIZE as u64 - 1) / crate::metadata::CHUNK_SIZE as u64
-        };
-
-        let now = SystemTime::now();
-
+    pub fn new(path: String, size: u64) -> Self {
         Self {
-            inode,
-            name,
             path,
             size,
-            chunk_count,
-            permissions: FilePermissions::default(),
-            created_at: now,
-            modified_at: now,
-            accessed_at: now,
-            owner_node: String::new(),
-            chunk_locations: Vec::new(),
         }
     }
 
@@ -229,20 +179,20 @@ mod tests {
 
     #[test]
     fn test_file_metadata_chunk_count() {
-        let meta = FileMetadata::new(1, "/test/file.txt".to_string(), 0);
-        assert_eq!(meta.chunk_count, 0);
+        let meta = FileMetadata::new("/test/file.txt".to_string(), 0);
+        assert_eq!(meta.calculate_chunk_count(), 0);
 
-        let meta = FileMetadata::new(1, "/test/file.txt".to_string(), 1024);
-        assert_eq!(meta.chunk_count, 1);
+        let meta = FileMetadata::new("/test/file.txt".to_string(), 1024);
+        assert_eq!(meta.calculate_chunk_count(), 1);
 
-        let meta = FileMetadata::new(1, "/test/file.txt".to_string(), crate::metadata::CHUNK_SIZE as u64);
-        assert_eq!(meta.chunk_count, 1);
+        let meta = FileMetadata::new("/test/file.txt".to_string(), crate::metadata::CHUNK_SIZE as u64);
+        assert_eq!(meta.calculate_chunk_count(), 1);
 
-        let meta = FileMetadata::new(1, "/test/file.txt".to_string(), (crate::metadata::CHUNK_SIZE as u64) + 1);
-        assert_eq!(meta.chunk_count, 2);
+        let meta = FileMetadata::new("/test/file.txt".to_string(), (crate::metadata::CHUNK_SIZE as u64) + 1);
+        assert_eq!(meta.calculate_chunk_count(), 2);
 
-        let meta = FileMetadata::new(1, "/test/file.txt".to_string(), 10 * crate::metadata::CHUNK_SIZE as u64);
-        assert_eq!(meta.chunk_count, 10);
+        let meta = FileMetadata::new("/test/file.txt".to_string(), 10 * crate::metadata::CHUNK_SIZE as u64);
+        assert_eq!(meta.calculate_chunk_count(), 10);
     }
 
     #[test]
@@ -253,9 +203,9 @@ mod tests {
         // chunk 1: 4MB
         // chunk 2: 2MB + 1KB (最終チャンク)
         let size = 10 * 1024 * 1024 + 1024; // 10MB + 1KB
-        let meta = FileMetadata::new(1, "/test/file.txt".to_string(), size);
+        let meta = FileMetadata::new("/test/file.txt".to_string(), size);
 
-        assert_eq!(meta.chunk_count, 3); // 3チャンク必要
+        assert_eq!(meta.calculate_chunk_count(), 3); // 3チャンク必要
         assert_eq!(meta.chunk_size(0), crate::metadata::CHUNK_SIZE as u64);
         assert_eq!(meta.chunk_size(1), crate::metadata::CHUNK_SIZE as u64);
         assert_eq!(meta.chunk_size(2), 2 * 1024 * 1024 + 1024); // 2MB + 1KB

@@ -137,11 +137,7 @@ impl LocalFileSystem {
                 let inode = self.allocate_inode();
                 let stat = self.backend.stat(&physical_path).await?;
 
-                let mut metadata = FileMetadata::new(inode, path.display().to_string(), stat.size);
-                metadata.owner_node = "local".to_string();
-                metadata.permissions.mode = stat.mode;
-                metadata.permissions.uid = stat.uid;
-                metadata.permissions.gid = stat.gid;
+                let metadata = FileMetadata::new(path.display().to_string(), stat.size);
 
                 let mut path_to_inode = self.path_to_inode.borrow_mut();
                 path_to_inode.insert(path.to_path_buf(), inode);
@@ -177,9 +173,7 @@ impl LocalFileSystem {
 
         // メタデータを登録
         let inode = self.allocate_inode();
-        let mut metadata = FileMetadata::new(inode, path.display().to_string(), 0);
-        metadata.owner_node = "local".to_string();
-        metadata.permissions.mode = mode;
+        let metadata = FileMetadata::new(path.display().to_string(), 0);
 
         // 親ディレクトリのinodeを先に取得（borrowの競合を避けるため）
         let parent_inode_opt = path.parent().and_then(|p| self.get_inode(p));

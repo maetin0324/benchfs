@@ -8,16 +8,29 @@ use std::num::NonZeroUsize;
 use crate::metadata::types::InodeId;
 use crate::cache::policy::CachePolicy;
 
-/// Chunk identifier (inode, chunk_index)
+/// Chunk identifier (path_hash, chunk_index)
+/// In path-based KV design, chunks are identified by file path and chunk index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkId {
-    pub inode: InodeId,
+    pub path_hash: u64,  // Hash of file path for efficient lookup
     pub chunk_index: u64,
 }
 
 impl ChunkId {
     pub fn new(inode: InodeId, chunk_index: u64) -> Self {
-        Self { inode, chunk_index }
+        // Legacy method: treat inode as path_hash
+        Self { path_hash: inode, chunk_index }
+    }
+
+    pub fn from_path(path: &str, chunk_index: u64) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        let path_hash = hasher.finish();
+
+        Self { path_hash, chunk_index }
     }
 }
 
@@ -145,13 +158,36 @@ impl ChunkCache {
         }
     }
 
-    /// Invalidate all chunks for a given inode
+    /// Invalidate all chunks for a given inode (legacy method)
     pub fn invalidate_inode(&self, inode: InodeId) {
         let mut cache = self.cache.borrow_mut();
         let keys_to_remove: Vec<ChunkId> = cache
             .iter()
-            .filter(|(k, _)| k.inode == inode)
-            .map(|(k, _)| *k)
+            .filter(|(k, _)| k.path_hash == inode)  // Treat inode as path_hash for legacy compatibility
+            .map(|(k, _)| *k)  // Copy instead of clone (ChunkId is Copy)
+            .collect();
+
+        for key in keys_to_remove {
+            if let Some(entry) = cache.pop(&key) {
+                *self.current_memory_bytes.borrow_mut() -= entry.size();
+            }
+        }
+    }
+
+    /// Invalidate all chunks for a given file path
+    pub fn invalidate_path(&self, path: &str) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        let path_hash = hasher.finish();
+
+        let mut cache = self.cache.borrow_mut();
+        let keys_to_remove: Vec<ChunkId> = cache
+            .iter()
+            .filter(|(k, _)| k.path_hash == path_hash)
+            .map(|(k, _)| *k)  // Copy instead of clone (ChunkId is Copy)
             .collect();
 
         for key in keys_to_remove {

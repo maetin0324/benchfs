@@ -35,7 +35,9 @@
       "Bash(mkdir:*)",
       "Bash(docker-compose:*)",
       "Bash(docker network:*)",
-      "Bash(docker exec:*)"
+      "Bash(docker exec:*)",
+      "Bash(grep:*)",
+      "Bash(RUST_BACKTRACE=1 cargo test:*)"
     ],
     "deny": [],
     "ask": []

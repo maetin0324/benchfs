@@ -42,7 +42,7 @@ pub struct ReadChunkHandlerResponse {
 /// Reads chunk data from local storage and returns it to the client via RDMA.
 pub async fn handle_read_chunk(
     ctx: Rc<RpcHandlerContext>,
-    am_msg: AmMsg,
+    mut am_msg: AmMsg,
 ) -> Result<(ReadChunkHandlerResponse, AmMsg), (RpcError, AmMsg)> {
     // Parse request header
     let header: ReadChunkRequestHeader = match am_msg
@@ -54,9 +54,46 @@ pub async fn handle_read_chunk(
         None => return Err((RpcError::InvalidHeader, am_msg)),
     };
 
+    // Receive path from request data
+    let path = if header.path_len > 0 && am_msg.contains_data() {
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+            tracing::error!("Failed to receive path data: {:?}", e);
+            return Ok((
+                ReadChunkHandlerResponse {
+                    header: ReadChunkResponseHeader::error(-5), // EIO
+                    data: None,
+                },
+                am_msg
+            ));
+        }
+
+        match String::from_utf8(path_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to decode path: {:?}", e);
+                return Ok((
+                    ReadChunkHandlerResponse {
+                        header: ReadChunkResponseHeader::error(-22), // EINVAL
+                        data: None,
+                    },
+                    am_msg
+                ));
+            }
+        }
+    } else {
+        return Ok((
+            ReadChunkHandlerResponse {
+                header: ReadChunkResponseHeader::error(-22), // EINVAL
+                data: None,
+            },
+            am_msg
+        ));
+    };
+
     tracing::debug!(
-        "ReadChunk: inode={}, chunk={}, offset={}, length={}",
-        header.inode,
+        "ReadChunk: path={}, chunk={}, offset={}, length={}",
+        path,
         header.chunk_index,
         header.offset,
         header.length
@@ -65,16 +102,16 @@ pub async fn handle_read_chunk(
     // Read chunk from storage
     match ctx
         .chunk_store
-        .read_chunk(header.inode, header.chunk_index, header.offset, header.length)
+        .read_chunk(&path, header.chunk_index, header.offset, header.length)
         .await
     {
         Ok(data) => {
             let bytes_read = data.len() as u64;
 
             tracing::debug!(
-                "Read {} bytes from storage (inode={}, chunk={})",
+                "Read {} bytes from storage (path={}, chunk={})",
                 bytes_read,
-                header.inode,
+                path,
                 header.chunk_index
             );
 
@@ -116,18 +153,35 @@ pub async fn handle_write_chunk(
         None => return Err((RpcError::InvalidHeader, am_msg)),
     };
 
+    // Receive path and data from client via RDMA-read
+    // Data section layout: [path][chunk_data]
+    let path = if header.path_len > 0 && am_msg.contains_data() {
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+            tracing::error!("Failed to receive path data: {:?}", e);
+            return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
+        }
+
+        match String::from_utf8(path_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to decode path: {:?}", e);
+                return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
+            }
+        }
+    } else {
+        return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
+    };
+
     tracing::debug!(
-        "WriteChunk: inode={}, chunk={}, offset={}, length={}",
-        header.inode,
+        "WriteChunk: path={}, chunk={}, offset={}, length={}",
+        path,
         header.chunk_index,
         header.offset,
         header.length
     );
 
-    // Receive data from client via RDMA-read
-    // The client sends data in the AM message's data section, and UCX uses
-    // RDMA-read (because AmProto::Rndv was specified) to transfer it from
-    // the client's request_data buffer
+    // Receive chunk data from client
     let mut data = vec![0u8; header.length as usize];
 
     if am_msg.contains_data() {
@@ -137,9 +191,9 @@ pub async fn handle_write_chunk(
         }
 
         tracing::debug!(
-            "RDMA-read {} bytes from client (inode={}, chunk={})",
+            "RDMA-read {} bytes from client (path={}, chunk={})",
             header.length,
-            header.inode,
+            path,
             header.chunk_index
         );
     }
@@ -147,14 +201,14 @@ pub async fn handle_write_chunk(
     // Write chunk to storage
     match ctx
         .chunk_store
-        .write_chunk(header.inode, header.chunk_index, header.offset, &data)
+        .write_chunk(&path, header.chunk_index, header.offset, &data)
         .await
     {
         Ok(bytes_written) => {
             tracing::debug!(
-                "Wrote {} bytes to storage (inode={}, chunk={})",
+                "Wrote {} bytes to storage (path={}, chunk={})",
                 bytes_written,
-                header.inode,
+                path,
                 header.chunk_index
             );
             Ok((WriteChunkResponseHeader::success(bytes_written as u64), am_msg))
@@ -213,14 +267,14 @@ pub async fn handle_metadata_lookup(
 
     // Look up file metadata first
     if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path_ref) {
-        tracing::debug!("Found file: inode={}, size={}", file_meta.inode, file_meta.size);
-        return Ok((MetadataLookupResponseHeader::file(file_meta.inode, file_meta.size), am_msg));
+        tracing::debug!("Found file: path={}, size={}", file_meta.path, file_meta.size);
+        return Ok((MetadataLookupResponseHeader::file(file_meta.size), am_msg));
     }
 
-    // Look up directory metadata
+    // Look up directory metadata (dummy in path-based KV design)
     if let Ok(dir_meta) = ctx.metadata_manager.get_dir_metadata(path_ref) {
-        tracing::debug!("Found directory: inode={}", dir_meta.inode);
-        return Ok((MetadataLookupResponseHeader::directory(dir_meta.inode), am_msg));
+        tracing::debug!("Found directory: path={}", dir_meta.path);
+        return Ok((MetadataLookupResponseHeader::directory(), am_msg));
     }
 
     tracing::debug!("Path not found: {}", path);
@@ -271,16 +325,15 @@ pub async fn handle_metadata_create_file(
         header.mode
     );
 
-    // Create file metadata
+    // Create file metadata (no inode in path-based KV design)
     use crate::metadata::FileMetadata;
-    let inode = ctx.metadata_manager.generate_inode();
-    let file_meta = FileMetadata::new(inode, path.clone(), header.size);
+    let file_meta = FileMetadata::new(path.clone(), header.size);
 
     // Store file metadata
     match ctx.metadata_manager.store_file_metadata(file_meta) {
         Ok(()) => {
-            tracing::debug!("Created file metadata: path={}, inode={}", path, inode);
-            Ok((MetadataCreateFileResponseHeader::success(inode), am_msg))
+            tracing::debug!("Created file metadata: path={}", path);
+            Ok((MetadataCreateFileResponseHeader::success(0), am_msg))  // Dummy inode
         }
         Err(e) => {
             tracing::error!("Failed to store file metadata: {:?}", e);
@@ -483,7 +536,7 @@ pub async fn handle_metadata_update(
     if header.should_update_size() {
         let old_size = file_meta.size;
         file_meta.size = header.new_size;
-        file_meta.chunk_count = file_meta.calculate_chunk_count();
+        // chunk_count is calculated on demand via calculate_chunk_count()
 
         tracing::debug!(
             "Updated file size: {} -> {} (path={})",
@@ -492,12 +545,8 @@ pub async fn handle_metadata_update(
             path
         );
 
-        // If truncating to smaller size, update chunk_locations
-        if header.new_size < old_size {
-            let chunk_size = crate::metadata::CHUNK_SIZE as u64;
-            let new_chunk_count = (header.new_size + chunk_size - 1) / chunk_size;
-            file_meta.chunk_locations.truncate(new_chunk_count as usize);
-        }
+        // Note: In path-based KV design, chunk_locations are not tracked
+        // Chunks are identified directly by (path, chunk_index)
     }
 
     // Update mode if requested
