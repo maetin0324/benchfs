@@ -37,7 +37,7 @@ mkdir -p "${BACKEND_DIR}"
 nnodes_list=(
   # 1 2 4 8
   # 2
-  4 8
+  4
 )
 niter=1
 

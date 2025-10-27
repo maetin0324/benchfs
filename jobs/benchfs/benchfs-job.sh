@@ -114,9 +114,8 @@ echo "Kill any previous benchfsd instances"
 
 # Parameter lists for benchmarking
 transfer_size_list=(
-  1m    # 1 MiB
-  4m    # 4 MiB
   16m   # 16 MiB
+  16g   # 16 GiB
 )
 
 block_size_list=(
