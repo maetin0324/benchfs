@@ -434,32 +434,41 @@ impl AmRpc for WriteChunkRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
-        // Receive path from request data
-        let path = if header.path_len > 0 && am_msg.contains_data() {
-            let mut path_bytes = vec![0u8; header.path_len as usize];
-            if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
-                tracing::error!("Failed to receive path data: {:?}", e);
-                return Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
-                    am_msg
-                ));
-            }
-
-            match String::from_utf8(path_bytes) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("Failed to decode path: {:?}", e);
-                    return Ok((
-                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
-                        am_msg
-                    ));
-                }
-            }
-        } else {
+        // Receive path and data from client
+        // Data section layout: [path][chunk_data]
+        if !am_msg.contains_data() {
+            tracing::error!("WriteChunk request contains no data");
             return Ok((
                 crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
                 am_msg
             ));
+        }
+
+        // Allocate buffers for path and data
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        let mut data = vec![0u8; header.length as usize];
+
+        // Receive both path and data in one vectored call
+        if let Err(e) = am_msg.recv_data_vectored(&[
+            std::io::IoSliceMut::new(&mut path_bytes),
+            std::io::IoSliceMut::new(&mut data)
+        ]).await {
+            tracing::error!("Failed to receive path and data: {:?}", e);
+            return Ok((
+                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
+                am_msg
+            ));
+        }
+
+        let path = match String::from_utf8(path_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to decode path: {:?}", e);
+                return Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
+                    am_msg
+                ));
+            }
         };
 
         tracing::debug!(
@@ -469,25 +478,6 @@ impl AmRpc for WriteChunkRequest {
             header.offset,
             header.length
         );
-
-        // Receive chunk data from client
-        let mut data = vec![0u8; header.length as usize];
-        if am_msg.contains_data() {
-            let mut ioslices = vec![std::io::IoSliceMut::new(&mut data)];
-            if let Err(e) = am_msg.recv_data_vectored(&mut ioslices).await {
-                tracing::error!("Failed to receive data: {:?}", e);
-                return Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-2)),
-                    am_msg
-                ));
-            }
-        } else {
-            tracing::warn!("WriteChunk request contains no data");
-            return Ok((
-                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
-                am_msg
-            ));
-        }
 
         // Write chunk data to storage
         match ctx.chunk_store.write_chunk(&path, header.chunk_index, header.offset, &data).await {

@@ -155,22 +155,30 @@ pub async fn handle_write_chunk(
 
     // Receive path and data from client via RDMA-read
     // Data section layout: [path][chunk_data]
-    let path = if header.path_len > 0 && am_msg.contains_data() {
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
-            tracing::error!("Failed to receive path data: {:?}", e);
-            return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
-        }
-
-        match String::from_utf8(path_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("Failed to decode path: {:?}", e);
-                return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
-            }
-        }
-    } else {
+    if !am_msg.contains_data() {
+        tracing::error!("WriteChunk request contains no data");
         return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
+    }
+
+    // Allocate buffers for path and data
+    let mut path_bytes = vec![0u8; header.path_len as usize];
+    let mut data = vec![0u8; header.length as usize];
+
+    // Receive both path and data in one vectored call
+    if let Err(e) = am_msg.recv_data_vectored(&[
+        std::io::IoSliceMut::new(&mut path_bytes),
+        std::io::IoSliceMut::new(&mut data)
+    ]).await {
+        tracing::error!("Failed to receive path and data: {:?}", e);
+        return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
+    }
+
+    let path = match String::from_utf8(path_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Failed to decode path: {:?}", e);
+            return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
+        }
     };
 
     tracing::debug!(
@@ -180,23 +188,6 @@ pub async fn handle_write_chunk(
         header.offset,
         header.length
     );
-
-    // Receive chunk data from client
-    let mut data = vec![0u8; header.length as usize];
-
-    if am_msg.contains_data() {
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut data)]).await {
-            tracing::error!("Failed to RDMA-read chunk data from client: {:?}", e);
-            return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
-        }
-
-        tracing::debug!(
-            "RDMA-read {} bytes from client (path={}, chunk={})",
-            header.length,
-            path,
-            header.chunk_index
-        );
-    }
 
     // Write chunk to storage
     match ctx

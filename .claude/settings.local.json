@@ -37,7 +37,8 @@
       "Bash(docker network:*)",
       "Bash(docker exec:*)",
       "Bash(grep:*)",
-      "Bash(RUST_BACKTRACE=1 cargo test:*)"
+      "Bash(RUST_BACKTRACE=1 cargo test:*)",
+      "Bash(./scripts/run_ior_simple.sh:*)"
     ],
     "deny": [],
     "ask": []
