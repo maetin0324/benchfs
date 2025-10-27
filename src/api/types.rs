@@ -162,10 +162,10 @@ impl FileStat {
             .as_secs() as i64;
 
         Self {
-            inode: meta.inode,
+            inode: 0,  // Dummy inode in path-based KV design
             file_type: FileType::RegularFile,
             size: meta.size,
-            chunk_count: meta.chunk_count,
+            chunk_count: meta.calculate_chunk_count(),
             mode: 0o644, // Default file permissions
             atime: now,
             mtime: now,

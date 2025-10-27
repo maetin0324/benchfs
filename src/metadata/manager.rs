@@ -440,14 +440,14 @@ mod tests {
         let manager = MetadataManager::new("node1".to_string());
 
         let path = PathBuf::from("/foo/bar.txt");
-        let metadata = FileMetadata::new(123, path.to_str().unwrap().to_string(), 1024);
+        let metadata = FileMetadata::new(path.to_str().unwrap().to_string(), 1024);
 
         manager.store_file_metadata(metadata.clone()).unwrap();
         assert_eq!(manager.local_file_count(), 1);
 
         let retrieved = manager.get_file_metadata(&path).unwrap();
-        assert_eq!(retrieved.inode, 123);
         assert_eq!(retrieved.size, 1024);
+        assert_eq!(retrieved.path, path.to_str().unwrap());
     }
 
     #[test]
@@ -455,7 +455,7 @@ mod tests {
         let manager = MetadataManager::new("node1".to_string());
 
         let path = PathBuf::from("/foo/bar.txt");
-        let metadata = FileMetadata::new(123, path.to_str().unwrap().to_string(), 1024);
+        let metadata = FileMetadata::new(path.to_str().unwrap().to_string(), 1024);
 
         manager.store_file_metadata(metadata.clone()).unwrap();
 
@@ -470,7 +470,7 @@ mod tests {
         let manager = MetadataManager::new("node1".to_string());
 
         let path = PathBuf::from("/foo/bar.txt");
-        let mut metadata = FileMetadata::new(123, path.to_str().unwrap().to_string(), 1024);
+        let mut metadata = FileMetadata::new(path.to_str().unwrap().to_string(), 1024);
 
         manager.store_file_metadata(metadata.clone()).unwrap();
 
@@ -487,7 +487,7 @@ mod tests {
         let manager = MetadataManager::new("node1".to_string());
 
         let path = PathBuf::from("/foo/bar.txt");
-        let metadata = FileMetadata::new(123, path.to_str().unwrap().to_string(), 1024);
+        let metadata = FileMetadata::new(path.to_str().unwrap().to_string(), 1024);
 
         manager.store_file_metadata(metadata).unwrap();
         assert_eq!(manager.local_file_count(), 1);

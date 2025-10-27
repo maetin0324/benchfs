@@ -206,6 +206,15 @@ impl BenchFS {
         self.get_metadata_node(path) == self.node_id
     }
 
+    /// Get the node responsible for storing a chunk (using consistent hashing)
+    fn get_chunk_node(&self, chunk_key: &str) -> String {
+        if let Some(ring) = &self.metadata_ring {
+            ring.get_node(chunk_key).unwrap_or_else(|| self.node_id.clone())
+        } else {
+            self.node_id.clone()
+        }
+    }
+
     /// Get file metadata with automatic caching for distributed mode
     ///
     /// This helper function tries to get metadata locally first.
@@ -227,11 +236,8 @@ impl BenchFS {
                     let request = MetadataLookupRequest::new(path.to_string());
                     match request.call(&*client).await {
                         Ok(response) if response.is_success() && response.is_file() => {
-                            let meta =
-                                FileMetadata::new(response.inode, path.to_string(), response.size);
-                            // Restore chunk_locations from response if available
-                            // Note: MetadataLookupResponse might not have chunk_locations, so we start with empty
-                            // The chunk_locations will be populated during write operations
+                            let meta = FileMetadata::new(path.to_string(), response.size);
+                            // Note: In path-based KV design, chunk locations are not tracked in metadata
 
                             // Cache locally for future access
                             if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone())
@@ -285,11 +291,7 @@ impl BenchFS {
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found on remote server - create local cache entry
-                                let meta = FileMetadata::new(
-                                    response.inode,
-                                    path.to_string(),
-                                    response.size,
-                                );
+                                let meta = FileMetadata::new(path.to_string(), response.size);
                                 // Cache locally for future access
                                 if let Err(e) =
                                     self.metadata_manager.store_file_metadata(meta.clone())
@@ -336,8 +338,7 @@ impl BenchFS {
                     // Local truncate
                     let mut new_meta = meta.clone();
                     new_meta.size = 0;
-                    new_meta.chunk_count = 0;
-                    new_meta.chunk_locations.clear();
+                    // chunk_count and chunk_locations are not tracked in path-based KV design
                     self.metadata_manager
                         .update_file_metadata(new_meta)
                         .map_err(|e| ApiError::Internal(format!("Failed to truncate: {:?}", e)))?;
@@ -356,8 +357,7 @@ impl BenchFS {
                                         // Update local cache after successful remote truncate
                                         let mut truncated_meta = meta.clone();
                                         truncated_meta.size = 0;
-                                        truncated_meta.chunk_count = 0;
-                                        truncated_meta.chunk_locations.clear();
+                                        // chunk_count and chunk_locations are not tracked in path-based KV design
                                         if let Err(e) = self.metadata_manager.update_file_metadata(truncated_meta) {
                                             tracing::warn!("Failed to update local cache after remote truncate: {:?}", e);
                                         } else {
@@ -389,7 +389,7 @@ impl BenchFS {
                 }
             }
 
-            meta.inode
+            0  // Dummy inode in path-based KV design
         } else {
             // File doesn't exist
             if !flags.create {
@@ -399,14 +399,13 @@ impl BenchFS {
             // Create new file (local or remote)
             let created_inode = if is_local {
                 // Local file creation
-                let inode = self.metadata_manager.generate_inode();
-                let file_meta = FileMetadata::new(inode, path.to_string(), 0);
+                let file_meta = FileMetadata::new(path.to_string(), 0);
 
                 self.metadata_manager
                     .store_file_metadata(file_meta)
                     .map_err(|e| ApiError::Internal(format!("Failed to create file: {:?}", e)))?;
 
-                inode
+                0  // Dummy inode
             } else {
                 // Remote file creation via RPC
                 if let Some(pool) = &self.connection_pool {
@@ -416,21 +415,17 @@ impl BenchFS {
                                 MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
                             match request.call(&*client).await {
                                 Ok(response) if response.is_success() => {
-                                    tracing::debug!(
-                                        "Remote file created: {} with inode {}",
-                                        path,
-                                        response.inode
-                                    );
+                                    tracing::debug!("Remote file created: {}", path);
 
                                     // Cache newly created file metadata locally
-                                    let file_meta = FileMetadata::new(response.inode, path.to_string(), 0);
+                                    let file_meta = FileMetadata::new(path.to_string(), 0);
                                     if let Err(e) = self.metadata_manager.store_file_metadata(file_meta) {
                                         tracing::warn!("Failed to cache metadata after remote create: {:?}", e);
                                     } else {
                                         tracing::debug!("Cached metadata for newly created file {} locally", path);
                                     }
 
-                                    response.inode
+                                    0  // Dummy inode
                                 }
                                 Ok(response) => {
                                     return Err(ApiError::Internal(format!(
@@ -574,14 +569,14 @@ impl BenchFS {
         use futures::future::join_all;
 
         // Collect futures for reading all chunks
-        let inode = file_meta.inode;
-        let chunk_locations = file_meta.chunk_locations.clone();
+        let file_path = file_meta.path.clone();
+        // Note: In path-based KV design, chunk_locations are not tracked
         let chunk_futures: Vec<_> = chunks
             .iter()
             .map(|(chunk_index, _chunk_offset, _read_size)| {
-                let chunk_id = ChunkId::new(inode, *chunk_index);
+                let chunk_id = ChunkId::from_path(&file_path, *chunk_index);
                 let chunk_index = *chunk_index;
-                let chunk_locations = chunk_locations.clone();
+                let file_path = file_path.clone();
 
                 async move {
                     // Try to get full chunk from cache first
@@ -598,7 +593,7 @@ impl BenchFS {
                     match self
                         .chunk_store
                         .read_chunk(
-                            inode,
+                            &file_path,
                             chunk_index,
                             0, // Read full chunk for caching
                             self.chunk_manager.chunk_size() as u64,
@@ -613,27 +608,26 @@ impl BenchFS {
                         Err(_) => {
                             // Local read failed - try remote if distributed mode enabled
                             if let Some(pool) = &self.connection_pool {
-                                // Get chunk location from metadata
-                                if let Some(node_id) = crate::rpc::data_ops::get_chunk_node(
-                                    chunk_index,
-                                    &chunk_locations,
-                                ) {
-                                    tracing::debug!(
-                                        "Fetching chunk {} from remote node {}",
-                                        chunk_index,
-                                        node_id
-                                    );
+                                // Determine chunk node using consistent hashing
+                                let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                                let node_id = self.get_chunk_node(&chunk_key);
 
-                                    // Connect to remote node using node_id
-                                    match pool.get_or_connect(node_id).await {
-                                        Ok(client) => {
-                                            // Create RPC request
-                                            let request = ReadChunkRequest::new(
-                                                chunk_index,
-                                                0,
-                                                self.chunk_manager.chunk_size() as u64,
-                                                inode,
-                                            );
+                                tracing::debug!(
+                                    "Fetching chunk {} from remote node {}",
+                                    chunk_index,
+                                    node_id
+                                );
+
+                                // Connect to remote node using node_id
+                                match pool.get_or_connect(&node_id).await {
+                                    Ok(client) => {
+                                        // Create RPC request
+                                        let request = ReadChunkRequest::new(
+                                            chunk_index,
+                                            0,
+                                            self.chunk_manager.chunk_size() as u64,
+                                            file_path.clone(),
+                                        );
 
                                             // Execute RPC
                                             match request.call(&*client).await {
@@ -670,10 +664,6 @@ impl BenchFS {
                                             (chunk_index, None)
                                         }
                                     }
-                                } else {
-                                    // No location info for this chunk - treat as sparse
-                                    (chunk_index, None)
-                                }
                             } else {
                                 // Not in distributed mode - treat as sparse
                                 (chunk_index, None)
@@ -753,33 +743,10 @@ impl BenchFS {
             .calculate_read_chunks(offset, length, new_size)
             .map_err(|e| ApiError::Internal(format!("Failed to calculate chunks: {:?}", e)))?;
 
-        let mut chunk_locations_updated = false;
-
-        // First, determine chunk locations and invalidate cache (sequential preparation)
+        // Invalidate cache for all chunks (write-through)
         for (chunk_index, _chunk_offset, _write_size) in &chunks {
-            let chunk_index = *chunk_index;
-
-            // Invalidate cache for this chunk (write-through)
-            let chunk_id = ChunkId::new(file_meta.inode, chunk_index);
+            let chunk_id = ChunkId::from_path(&file_meta.path, *chunk_index);
             self.chunk_cache.invalidate(&chunk_id);
-
-            // Determine where to write this chunk
-            // First, ensure chunk_locations vector is large enough
-            while file_meta.chunk_locations.len() <= chunk_index as usize {
-                file_meta.chunk_locations.push(String::new());
-            }
-
-            // If chunk location is not set, determine it using placement strategy
-            if file_meta.chunk_locations[chunk_index as usize].is_empty() {
-                use std::path::Path;
-                let path_ref = Path::new(&file_meta.path);
-                let node_id = self
-                    .placement
-                    .place_chunk(path_ref, chunk_index)
-                    .unwrap_or_else(|| self.metadata_manager.self_node_id().to_string());
-                file_meta.chunk_locations[chunk_index as usize] = node_id;
-                chunk_locations_updated = true;
-            }
         }
 
         // Write all chunks concurrently
@@ -798,15 +765,16 @@ impl BenchFS {
                 let data_len = write_size as usize;
                 let chunk_data = data[data_offset..data_offset + data_len].to_vec();
 
-                let target_node = file_meta.chunk_locations[chunk_index as usize].clone();
+                let file_path = file_meta.path.clone();
+                let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                let target_node = self.get_chunk_node(&chunk_key);
                 let is_local = target_node == self.metadata_manager.self_node_id();
-                let inode = file_meta.inode;
 
                 async move {
                     if is_local {
                         // Write to local chunk store
                         self.chunk_store
-                            .write_chunk(inode, chunk_index, chunk_offset, &chunk_data)
+                            .write_chunk(&file_path, chunk_index, chunk_offset, &chunk_data)
                             .await
                             .map_err(|e| ApiError::IoError(format!("Failed to write chunk {}: {:?}", chunk_index, e)))?;
                         Ok::<usize, ApiError>(data_len)
@@ -825,7 +793,7 @@ impl BenchFS {
                                     chunk_index,
                                     chunk_offset,
                                     chunk_data,
-                                    inode,
+                                    file_path.clone(),
                                 );
 
                                 // Execute RPC
@@ -875,11 +843,11 @@ impl BenchFS {
             bytes_written += result?;
         }
 
-        // Update file size if we wrote past the end, or if chunk locations were updated
+        // Update file size if we wrote past the end
         let new_size = (offset + length).max(file_meta.size);
-        if new_size != file_meta.size || chunk_locations_updated {
+        if new_size != file_meta.size {
             file_meta.size = new_size;
-            file_meta.chunk_count = file_meta.calculate_chunk_count();
+            // chunk_count is calculated on demand via calculate_chunk_count()
 
             // Update local metadata only
             // Remote metadata will be synchronized when file is closed
@@ -971,11 +939,11 @@ impl BenchFS {
             .get_file_metadata(path_ref)
             .map_err(|_| ApiError::NotFound(path.to_string()))?;
 
-        // Invalidate all cached chunks for this inode
-        self.chunk_cache.invalidate_inode(file_meta.inode);
+        // Invalidate all cached chunks for this file
+        self.chunk_cache.invalidate_path(&file_meta.path);
 
         // Delete all chunks
-        let _ = self.chunk_store.delete_file_chunks(file_meta.inode).await;
+        let _ = self.chunk_store.delete_file_chunks(&file_meta.path).await;
 
         // Delete metadata
         self.metadata_manager
@@ -1021,191 +989,24 @@ impl BenchFS {
     /// # Arguments
     /// * `path` - Directory path
     /// * `mode` - Permissions (Unix-style)
-    pub async fn benchfs_mkdir(&self, path: &str, mode: u32) -> ApiResult<()> {
-        use std::path::Path;
-        let path_ref = Path::new(path);
-
-        // Determine metadata server for this path
-        let metadata_node = self.get_metadata_node(path);
-        let is_local = self.is_local_metadata(path);
-
-        let created_inode = if is_local {
-            // Local directory creation
-            // Check if already exists
-            if self.metadata_manager.get_dir_metadata(path_ref).is_ok() {
-                return Err(ApiError::AlreadyExists(path.to_string()));
-            }
-
-            // Create directory metadata
-            let inode = self.metadata_manager.generate_inode();
-            let dir_meta = DirectoryMetadata::new(inode, path.to_string());
-
-            self.metadata_manager
-                .store_dir_metadata(dir_meta)
-                .map_err(|e| ApiError::Internal(format!("Failed to create directory: {:?}", e)))?;
-
-            inode
-        } else {
-            // Remote directory creation via RPC
-            if let Some(pool) = &self.connection_pool {
-                // First check if directory already exists
-                match pool.get_or_connect(&metadata_node).await {
-                    Ok(client) => {
-                        let lookup_request = MetadataLookupRequest::new(path.to_string());
-                        match lookup_request.call(&*client).await {
-                            Ok(response) if response.is_success() => {
-                                // Directory already exists
-                                return Err(ApiError::AlreadyExists(path.to_string()));
-                            }
-                            Ok(_) => {
-                                // Not found, proceed with creation
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Remote metadata lookup failed during mkdir: {:?}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        return Err(ApiError::Internal(format!(
-                            "Failed to connect to metadata server {}: {:?}",
-                            metadata_node, e
-                        )));
-                    }
-                }
-
-                // Create directory on remote server
-                match pool.get_or_connect(&metadata_node).await {
-                    Ok(client) => {
-                        let request = MetadataCreateDirRequest::new(path.to_string(), mode);
-                        match request.call(&*client).await {
-                            Ok(response) if response.is_success() => {
-                                tracing::debug!(
-                                    "Remote directory created: {} with inode {}",
-                                    path,
-                                    response.inode
-                                );
-                                response.inode
-                            }
-                            Ok(response) => {
-                                return Err(ApiError::Internal(format!(
-                                    "Remote mkdir failed with status {}",
-                                    response.status
-                                )));
-                            }
-                            Err(e) => {
-                                return Err(ApiError::Internal(format!(
-                                    "Remote mkdir RPC error: {:?}",
-                                    e
-                                )));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        return Err(ApiError::Internal(format!(
-                            "Failed to connect for mkdir: {:?}",
-                            e
-                        )));
-                    }
-                }
-            } else {
-                return Err(ApiError::Internal(
-                    "Distributed mode not enabled but metadata is remote".to_string(),
-                ));
-            }
-        };
-
-        // Update parent directory's children list
-        if let (Some(parent_path), Some(dirname)) =
-            (Self::get_parent_path(path), Self::get_filename(path))
-        {
-            use std::path::Path;
-            let parent_path_ref = Path::new(&parent_path);
-
-            // Only update if parent directory is stored locally
-            if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
-                parent_meta.add_child(dirname, created_inode, InodeType::Directory);
-                if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
-                    tracing::warn!(
-                        "Failed to update parent directory {} after mkdir: {:?}",
-                        parent_path,
-                        e
-                    );
-                } else {
-                    tracing::debug!(
-                        "Updated parent directory {} with new directory {}",
-                        parent_path,
-                        path
-                    );
-                }
-            } else {
-                tracing::debug!(
-                    "Parent directory {} not found locally, skipping children update",
-                    parent_path
-                );
-            }
-        }
-
+    /// Create a directory (dummy implementation)
+    ///
+    /// In the new KV design, directories are not needed as we use full paths as keys.
+    /// This always succeeds to maintain API compatibility.
+    pub async fn benchfs_mkdir(&self, _path: &str, _mode: u32) -> ApiResult<()> {
+        // Dummy implementation: always succeed
+        // Directories are meaningless in full-path KV design
+        tracing::debug!("mkdir (dummy): path={}", _path);
         Ok(())
     }
 
-    /// Remove a directory
+    /// Remove a directory (dummy implementation)
     ///
-    /// # Arguments
-    /// * `path` - Directory path
-    pub fn benchfs_rmdir(&self, path: &str) -> ApiResult<()> {
-        use std::path::Path;
-        let path_ref = Path::new(path);
-
-        // Check if directory exists
-        let dir_meta = self
-            .metadata_manager
-            .get_dir_metadata(path_ref)
-            .map_err(|_| ApiError::NotFound(path.to_string()))?;
-
-        // Check if directory is empty
-        if !dir_meta.children.is_empty() {
-            return Err(ApiError::InvalidArgument("Directory not empty".to_string()));
-        }
-
-        // Delete directory
-        self.metadata_manager
-            .remove_dir_metadata(path_ref)
-            .map_err(|e| ApiError::Internal(format!("Failed to delete directory: {:?}", e)))?;
-
-        // Update parent directory's children list
-        if let (Some(parent_path), Some(dirname)) =
-            (Self::get_parent_path(path), Self::get_filename(path))
-        {
-            use std::path::Path;
-            let parent_path_ref = Path::new(&parent_path);
-
-            // Only update if parent directory is stored locally
-            if let Ok(mut parent_meta) = self.metadata_manager.get_dir_metadata(parent_path_ref) {
-                parent_meta.remove_child(&dirname);
-                if let Err(e) = self.metadata_manager.update_dir_metadata(parent_meta) {
-                    tracing::warn!(
-                        "Failed to update parent directory {} after rmdir: {:?}",
-                        parent_path,
-                        e
-                    );
-                } else {
-                    tracing::debug!(
-                        "Updated parent directory {} after deleting directory {}",
-                        parent_path,
-                        path
-                    );
-                }
-            } else {
-                tracing::debug!(
-                    "Parent directory {} not found locally, skipping children update",
-                    parent_path
-                );
-            }
-        }
-
+    /// In the new KV design, directories are not needed.
+    /// This always succeeds to maintain API compatibility.
+    pub fn benchfs_rmdir(&self, _path: &str) -> ApiResult<()> {
+        // Dummy implementation: always succeed
+        tracing::debug!("rmdir (dummy): path={}", _path);
         Ok(())
     }
 
@@ -1286,10 +1087,9 @@ impl BenchFS {
         // Note: InMemoryChunkStore doesn't need fsync, but IOUringChunkStore would
         // Since we can't call fsync on InMemoryChunkStore directly, we log the operation
         tracing::debug!(
-            "fsync called for file {} (inode {}) with {} chunks",
+            "fsync called for file {} with {} chunks",
             handle.path,
-            file_meta.inode,
-            file_meta.chunk_count
+            file_meta.calculate_chunk_count()
         );
 
         // In the future, when using IOUringChunkStore, we would call:
@@ -1339,11 +1139,7 @@ impl BenchFS {
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found
-                                let meta = FileMetadata::new(
-                                    response.inode,
-                                    path.to_string(),
-                                    response.size,
-                                );
+                                let meta = FileMetadata::new(path.to_string(), response.size);
                                 Ok(FileStat::from_file_metadata(&meta))
                             }
                             Ok(response) if response.is_success() && response.is_directory() => {
@@ -1442,18 +1238,10 @@ impl BenchFS {
     ///
     /// # Returns
     /// List of entry names in the directory
-    pub fn benchfs_readdir(&self, path: &str) -> ApiResult<Vec<String>> {
-        use std::path::Path;
-        let path_ref = Path::new(path);
-
-        let dir_meta = self
-            .metadata_manager
-            .get_dir_metadata(path_ref)
-            .map_err(|_| ApiError::NotFound(path.to_string()))?;
-
-        // Extract names from DirectoryEntry
-        let names = dir_meta.children.iter().map(|e| e.name.clone()).collect();
-        Ok(names)
+    pub fn benchfs_readdir(&self, _path: &str) -> ApiResult<Vec<String>> {
+        tracing::debug!("readdir (dummy): path={}", _path);
+        // Dummy implementation: directories are meaningless in path-based KV design
+        Ok(Vec::new())
     }
 
     /// Truncate a file to a specified size
@@ -1478,8 +1266,8 @@ impl BenchFS {
 
         // Update size
         file_meta.size = size;
-        let old_chunk_count = file_meta.chunk_count;
-        file_meta.chunk_count = file_meta.calculate_chunk_count();
+        let old_chunk_count = file_meta.calculate_chunk_count();
+        // chunk_count is calculated on demand
 
         // If truncating to smaller size, delete affected chunks
         if size < old_size {
@@ -1488,7 +1276,7 @@ impl BenchFS {
 
             // Delete chunks beyond the new size
             for chunk_idx in new_chunk_count..old_chunk_count {
-                let chunk_id = ChunkId::new(file_meta.inode, chunk_idx);
+                let chunk_id = ChunkId::from_path(&file_meta.path, chunk_idx);
 
                 // Invalidate cache
                 self.chunk_cache.invalidate(&chunk_id);
@@ -1496,20 +1284,19 @@ impl BenchFS {
                 // Delete from chunk store
                 if let Err(e) = self
                     .chunk_store
-                    .delete_chunk(file_meta.inode, chunk_idx)
+                    .delete_chunk(&file_meta.path, chunk_idx)
                     .await
                 {
                     tracing::warn!(
-                        "Failed to delete chunk {} for inode {}: {:?}",
+                        "Failed to delete chunk {} for path {}: {:?}",
                         chunk_idx,
-                        file_meta.inode,
+                        file_meta.path,
                         e
                     );
                 }
             }
 
-            // Truncate chunk_locations
-            file_meta.chunk_locations.truncate(new_chunk_count as usize);
+            // Note: chunk_locations are not tracked in path-based KV design
 
             // If truncating within a chunk, we need to zero out the remaining bytes
             if size % chunk_size != 0 {
@@ -1522,19 +1309,19 @@ impl BenchFS {
                     let zeros = vec![0u8; bytes_to_zero as usize];
                     if let Err(e) = self
                         .chunk_store
-                        .write_chunk(file_meta.inode, last_chunk_idx, last_chunk_offset, &zeros)
+                        .write_chunk(&file_meta.path, last_chunk_idx, last_chunk_offset, &zeros)
                         .await
                     {
                         tracing::warn!(
-                            "Failed to zero out last chunk {} for inode {}: {:?}",
+                            "Failed to zero out last chunk {} for path {}: {:?}",
                             last_chunk_idx,
-                            file_meta.inode,
+                            file_meta.path,
                             e
                         );
                     }
 
                     // Invalidate cache for the last chunk since we modified it
-                    let chunk_id = ChunkId::new(file_meta.inode, last_chunk_idx);
+                    let chunk_id = ChunkId::from_path(&file_meta.path, last_chunk_idx);
                     self.chunk_cache.invalidate(&chunk_id);
                 }
             }
@@ -1663,7 +1450,7 @@ mod tests {
                 assert_eq!(handle.path, "/test.txt");
                 assert!(handle.flags.write);
 
-                fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).await.unwrap();
             })
         })
     }
@@ -1685,7 +1472,7 @@ mod tests {
                 let written = fs.benchfs_write(&handle, data).await.unwrap();
                 assert_eq!(written, data.len());
 
-                fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).await.unwrap();
 
                 // Read data
                 let handle = fs
@@ -1697,7 +1484,7 @@ mod tests {
                 assert_eq!(read, data.len());
                 assert_eq!(&buf[..read], data);
 
-                fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).await.unwrap();
             })
         })
     }
@@ -1710,7 +1497,7 @@ mod tests {
 
                 // Create file
                 let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).await.unwrap();
-                fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).await.unwrap();
 
                 // Delete file
                 fs.benchfs_unlink("/test.txt").await.unwrap();
@@ -1746,7 +1533,7 @@ mod tests {
                 // Create file with data
                 let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).await.unwrap();
                 fs.benchfs_write(&handle, b"0123456789").await.unwrap();
-                fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).await.unwrap();
 
                 // Open and seek
                 let handle = fs
@@ -1766,7 +1553,7 @@ mod tests {
                 let pos = fs.benchfs_seek(&handle, -3, 2).unwrap();
                 assert_eq!(pos, 7);
 
-                fs.benchfs_close(&handle).unwrap();
+                fs.benchfs_close(&handle).await.unwrap();
             })
         })
     }

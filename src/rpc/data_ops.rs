@@ -29,17 +29,17 @@ pub struct ReadChunkRequestHeader {
     /// Length to read
     pub length: u64,
 
-    /// File inode (for identification)
-    pub inode: u64,
+    /// Path length (path is sent in data section)
+    pub path_len: u64,
 }
 
 impl ReadChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, inode: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
         Self {
             chunk_index,
             offset,
             length,
-            inode,
+            path_len,
         }
     }
 }
@@ -83,6 +83,8 @@ impl ReadChunkResponseHeader {
 /// ReadChunk RPC request
 pub struct ReadChunkRequest {
     header: ReadChunkRequestHeader,
+    path: String,
+    request_ioslice: UnsafeCell<IoSlice<'static>>,
     /// Buffer to receive data (RDMA target)
     response_buffer: UnsafeCell<Vec<u8>>,
     /// IoSliceMut for the response buffer
@@ -93,7 +95,16 @@ pub struct ReadChunkRequest {
 unsafe impl Send for ReadChunkRequest {}
 
 impl ReadChunkRequest {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, inode: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path: String) -> Self {
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len() as u64;
+
+        // SAFETY: We're creating a 'static IoSlice by transmuting the lifetime.
+        let request_ioslice = unsafe {
+            let slice: &'static [u8] = std::mem::transmute(path_bytes);
+            IoSlice::new(slice)
+        };
+
         let mut buffer = vec![0u8; length as usize];
         // SAFETY: We're creating a 'static IoSliceMut by transmuting the lifetime.
         // This is safe because:
@@ -106,7 +117,9 @@ impl ReadChunkRequest {
         };
 
         Self {
-            header: ReadChunkRequestHeader::new(chunk_index, offset, length, inode),
+            header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len),
+            path,
+            request_ioslice: UnsafeCell::new(request_ioslice),
             response_buffer: UnsafeCell::new(buffer),
             response_ioslice: UnsafeCell::new(ioslice),
         }
@@ -141,6 +154,11 @@ impl AmRpc for ReadChunkRequest {
         &self.header
     }
 
+    fn request_data(&self) -> &[std::io::IoSlice<'_>] {
+        // Send path in request data section
+        unsafe { std::slice::from_ref(&*self.request_ioslice.get()) }
+    }
+
     fn response_buffer(&self) -> &[IoSliceMut<'_>] {
         // SAFETY: We're returning a slice containing the IoSliceMut we created in new()
         // This is safe because the IoSliceMut lifetime is tied to self
@@ -167,7 +185,7 @@ impl AmRpc for ReadChunkRequest {
 
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
-        am_msg: AmMsg,
+        mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
         let header = match am_msg
@@ -179,19 +197,38 @@ impl AmRpc for ReadChunkRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
+        // Receive path from request data
+        let path = if header.path_len > 0 && am_msg.contains_data() {
+            let mut path_bytes = vec![0u8; header.path_len as usize];
+            if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+                tracing::error!("Failed to receive path data: {:?}", e);
+                return Err((RpcError::InvalidHeader, am_msg));
+            }
+
+            match String::from_utf8(path_bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("Failed to decode path: {:?}", e);
+                    return Err((RpcError::InvalidHeader, am_msg));
+                }
+            }
+        } else {
+            return Err((RpcError::InvalidHeader, am_msg));
+        };
+
         tracing::debug!(
-            "ReadChunk request: inode={}, chunk={}, offset={}, length={}",
-            header.inode,
+            "ReadChunk request: path={}, chunk={}, offset={}, length={}",
+            path,
             header.chunk_index,
             header.offset,
             header.length
         );
 
         // Read chunk data from storage
-        match ctx.chunk_store.read_chunk(header.inode, header.chunk_index, header.offset, header.length).await {
+        match ctx.chunk_store.read_chunk(&path, header.chunk_index, header.offset, header.length).await {
             Ok(data) => {
                 let bytes_read = data.len() as u64;
-                tracing::debug!("Read {} bytes from storage (inode={}, chunk={})", bytes_read, header.inode, header.chunk_index);
+                tracing::debug!("Read {} bytes from storage (path={}, chunk={})", bytes_read, path, header.chunk_index);
 
                 Ok((
                     crate::rpc::ServerResponse::with_data(
@@ -240,17 +277,17 @@ pub struct WriteChunkRequestHeader {
     /// Length to write
     pub length: u64,
 
-    /// File inode (for identification)
-    pub inode: u64,
+    /// Path length (path is sent before data in data section)
+    pub path_len: u64,
 }
 
 impl WriteChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, inode: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
         Self {
             chunk_index,
             offset,
             length,
-            inode,
+            path_len,
         }
     }
 }
@@ -294,8 +331,12 @@ impl WriteChunkResponseHeader {
 /// WriteChunk RPC request
 pub struct WriteChunkRequest {
     header: WriteChunkRequestHeader,
+    /// File path
+    path: String,
     /// Data to write
     data: Vec<u8>,
+    /// Combined buffer (path + data) for RDMA
+    combined_data: Vec<u8>,
     /// IoSlice for the request data
     request_ioslice: UnsafeCell<IoSlice<'static>>,
 }
@@ -304,22 +345,30 @@ pub struct WriteChunkRequest {
 unsafe impl Send for WriteChunkRequest {}
 
 impl WriteChunkRequest {
-    pub fn new(chunk_index: u64, offset: u64, data: Vec<u8>, inode: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, data: Vec<u8>, path: String) -> Self {
         let length = data.len() as u64;
+        let path_len = path.len() as u64;
+
+        // Create combined buffer: [path][data]
+        let mut combined_data = Vec::with_capacity(path.len() + data.len());
+        combined_data.extend_from_slice(path.as_bytes());
+        combined_data.extend_from_slice(&data);
 
         // SAFETY: We're creating a 'static IoSlice by transmuting the lifetime.
         // This is safe because:
-        // 1. The data buffer lives as long as the WriteChunkRequest
+        // 1. The combined_data buffer lives as long as the WriteChunkRequest
         // 2. The IoSlice is only accessed through request_data()
         // 3. The RPC client will only use it during the RPC call
         let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(data.as_slice());
+            let slice: &'static [u8] = std::mem::transmute(combined_data.as_slice());
             IoSlice::new(slice)
         };
 
         Self {
-            header: WriteChunkRequestHeader::new(chunk_index, offset, length, inode),
+            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
+            path,
             data,
+            combined_data,
             request_ioslice: UnsafeCell::new(ioslice),
         }
     }
@@ -385,37 +434,55 @@ impl AmRpc for WriteChunkRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
-        tracing::debug!(
-            "WriteChunk request: inode={}, chunk={}, offset={}, length={}",
-            header.inode,
-            header.chunk_index,
-            header.offset,
-            header.length
-        );
-
-        // Receive data from client if present
-        let mut data = vec![0u8; header.length as usize];
-        if am_msg.contains_data() {
-            let mut ioslices = vec![std::io::IoSliceMut::new(&mut data)];
-            if let Err(e) = am_msg.recv_data_vectored(&mut ioslices).await {
-                tracing::error!("Failed to receive data: {:?}", e);
-                return Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-2)),
-                    am_msg
-                ));
-            }
-        } else {
-            tracing::warn!("WriteChunk request contains no data");
+        // Receive path and data from client
+        // Data section layout: [path][chunk_data]
+        if !am_msg.contains_data() {
+            tracing::error!("WriteChunk request contains no data");
             return Ok((
                 crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
                 am_msg
             ));
         }
 
+        // Allocate buffers for path and data
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        let mut data = vec![0u8; header.length as usize];
+
+        // Receive both path and data in one vectored call
+        if let Err(e) = am_msg.recv_data_vectored(&[
+            std::io::IoSliceMut::new(&mut path_bytes),
+            std::io::IoSliceMut::new(&mut data)
+        ]).await {
+            tracing::error!("Failed to receive path and data: {:?}", e);
+            return Ok((
+                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
+                am_msg
+            ));
+        }
+
+        let path = match String::from_utf8(path_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to decode path: {:?}", e);
+                return Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
+                    am_msg
+                ));
+            }
+        };
+
+        tracing::debug!(
+            "WriteChunk request: path={}, chunk={}, offset={}, length={}",
+            path,
+            header.chunk_index,
+            header.offset,
+            header.length
+        );
+
         // Write chunk data to storage
-        match ctx.chunk_store.write_chunk(header.inode, header.chunk_index, header.offset, &data).await {
+        match ctx.chunk_store.write_chunk(&path, header.chunk_index, header.offset, &data).await {
             Ok(_bytes_written) => {
-                tracing::debug!("Wrote {} bytes to storage (inode={}, chunk={})", data.len(), header.inode, header.chunk_index);
+                tracing::debug!("Wrote {} bytes to storage (path={}, chunk={})", data.len(), path, header.chunk_index);
                 Ok((
                     crate::rpc::ServerResponse::new(WriteChunkResponseHeader::success(header.length)),
                     am_msg
@@ -465,7 +532,7 @@ mod tests {
         assert_eq!(header.chunk_index, 5);
         assert_eq!(header.offset, 1024);
         assert_eq!(header.length, 4096);
-        assert_eq!(header.inode, 42);
+        assert_eq!(header.path_len, 42);
 
         // Verify it can be serialized
         let bytes = zerocopy::IntoBytes::as_bytes(&header);
@@ -490,9 +557,10 @@ mod tests {
 
     #[test]
     fn test_read_chunk_request() {
-        let request = ReadChunkRequest::new(0, 0, 1024, 1);
+        let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string());
         assert_eq!(request.header.chunk_index, 0);
         assert_eq!(request.header.length, 1024);
+        assert_eq!(request.header.path_len, 14);  // "/test/file.txt".len()
 
         // Buffer should be allocated
         assert_eq!(request.data().len(), 1024);
@@ -504,7 +572,7 @@ mod tests {
         assert_eq!(header.chunk_index, 3);
         assert_eq!(header.offset, 512);
         assert_eq!(header.length, 2048);
-        assert_eq!(header.inode, 99);
+        assert_eq!(header.path_len, 99);
     }
 
     #[test]
@@ -521,10 +589,11 @@ mod tests {
     #[test]
     fn test_write_chunk_request() {
         let data = vec![0xAA; 512];
-        let request = WriteChunkRequest::new(1, 0, data.clone(), 10);
+        let request = WriteChunkRequest::new(1, 0, data.clone(), "/test/file.txt".to_string());
 
         assert_eq!(request.header.chunk_index, 1);
         assert_eq!(request.header.length, 512);
+        assert_eq!(request.header.path_len, 14);  // "/test/file.txt".len()
         assert_eq!(request.data(), &data[..]);
     }
 

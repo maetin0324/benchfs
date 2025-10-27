@@ -64,9 +64,9 @@ pub struct MetadataLookupResponseHeader {
 }
 
 impl MetadataLookupResponseHeader {
-    pub fn file(inode: u64, size: u64) -> Self {
+    pub fn file(size: u64) -> Self {
         Self {
-            inode,
+            inode: 0,  // Dummy value for path-based KV design
             size,
             entry_type: 1,
             status: 0,
@@ -74,9 +74,9 @@ impl MetadataLookupResponseHeader {
         }
     }
 
-    pub fn directory(inode: u64) -> Self {
+    pub fn directory() -> Self {
         Self {
-            inode,
+            inode: 0,  // Dummy value for path-based KV design
             size: 0,
             entry_type: 2,
             status: 0,
@@ -215,15 +215,15 @@ impl AmRpc for MetadataLookupRequest {
         // Try to find file metadata first
         if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path) {
             return Ok((
-                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::file(file_meta.inode, file_meta.size)),
+                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::file(file_meta.size)),
                 am_msg
             ));
         }
 
-        // Try to find directory metadata
-        if let Ok(dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
+        // Try to find directory metadata (dummy in path-based KV design)
+        if let Ok(_dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
             return Ok((
-                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::directory(dir_meta.inode)),
+                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::directory()),
                 am_msg
             ));
         }
@@ -399,14 +399,13 @@ impl AmRpc for MetadataCreateFileRequest {
         }
         let path_str = String::from_utf8_lossy(&path_bytes);
 
-        // Generate inode and create file metadata
-        let inode = ctx.metadata_manager.generate_inode();
-        let file_meta = FileMetadata::new(inode, path_str.to_string(), header.size);
+        // Create file metadata (no inode in path-based KV design)
+        let file_meta = FileMetadata::new(path_str.to_string(), header.size);
 
         // Store file metadata
         match ctx.metadata_manager.store_file_metadata(file_meta) {
             Ok(()) => Ok((
-                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::success(inode)),
+                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::success(0)),  // Dummy inode
                 am_msg
             )),
             Err(_e) => Ok((
@@ -992,7 +991,7 @@ impl AmRpc for MetadataUpdateRequest {
         // Update size if requested
         if header.should_update_size() {
             file_meta.size = header.new_size;
-            file_meta.chunk_count = file_meta.calculate_chunk_count();
+            // chunk_count is calculated on demand via calculate_chunk_count()
         }
 
         // Note: Mode update would be handled here if FileMetadata supported it
@@ -1028,12 +1027,12 @@ impl AmRpc for MetadataUpdateRequest {
 
 /// Convert FileMetadata to lookup response
 pub fn file_metadata_to_lookup_response(metadata: &FileMetadata) -> MetadataLookupResponseHeader {
-    MetadataLookupResponseHeader::file(metadata.inode, metadata.size)
+    MetadataLookupResponseHeader::file(metadata.size)
 }
 
 /// Convert DirectoryMetadata to lookup response
-pub fn dir_metadata_to_lookup_response(metadata: &DirectoryMetadata) -> MetadataLookupResponseHeader {
-    MetadataLookupResponseHeader::directory(metadata.inode)
+pub fn dir_metadata_to_lookup_response(_metadata: &DirectoryMetadata) -> MetadataLookupResponseHeader {
+    MetadataLookupResponseHeader::directory()
 }
 
 #[cfg(test)]
@@ -1052,18 +1051,18 @@ mod tests {
 
     #[test]
     fn test_metadata_lookup_response_header() {
-        let file_resp = MetadataLookupResponseHeader::file(42, 1024);
+        let file_resp = MetadataLookupResponseHeader::file(1024);
         assert!(file_resp.is_success());
         assert!(file_resp.is_file());
         assert!(!file_resp.is_directory());
-        assert_eq!(file_resp.inode, 42);
         assert_eq!(file_resp.size, 1024);
+        // inode is dummy value in path-based KV design
 
-        let dir_resp = MetadataLookupResponseHeader::directory(99);
+        let dir_resp = MetadataLookupResponseHeader::directory();
         assert!(dir_resp.is_success());
         assert!(!dir_resp.is_file());
         assert!(dir_resp.is_directory());
-        assert_eq!(dir_resp.inode, 99);
+        // inode is dummy value in path-based KV design
 
         let not_found = MetadataLookupResponseHeader::not_found();
         assert!(!not_found.is_success());
@@ -1088,9 +1087,9 @@ mod tests {
 
     #[test]
     fn test_metadata_create_file_response() {
-        let success = MetadataCreateFileResponseHeader::success(123);
+        let success = MetadataCreateFileResponseHeader::success(0);  // Dummy inode in path-based KV
         assert!(success.is_success());
-        assert_eq!(success.inode, 123);
+        // inode is dummy value in path-based KV design
 
         let error = MetadataCreateFileResponseHeader::error(-1);
         assert!(!error.is_success());
@@ -1137,15 +1136,15 @@ mod tests {
 
     #[test]
     fn test_helper_functions() {
-        let file_meta = FileMetadata::new(1, "/test.txt".to_string(), 2048);
+        let file_meta = FileMetadata::new("/test.txt".to_string(), 2048);
         let resp = file_metadata_to_lookup_response(&file_meta);
         assert!(resp.is_file());
-        assert_eq!(resp.inode, 1);
         assert_eq!(resp.size, 2048);
+        // inode is dummy value in path-based KV design
 
         let dir_meta = DirectoryMetadata::new(2, "/testdir".to_string());
         let resp = dir_metadata_to_lookup_response(&dir_meta);
         assert!(resp.is_directory());
-        assert_eq!(resp.inode, 2);
+        // inode is dummy value in path-based KV design
     }
 }

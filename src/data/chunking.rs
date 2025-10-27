@@ -167,13 +167,9 @@ impl ChunkManager {
                     .chunk_size_at(index, metadata.size)
                     .expect("Valid chunk index");
 
-                let mut chunk_info = ChunkInfo::new(index, offset, size);
-
-                // メタデータからノードIDを取得
-                if let Some(node_id) = metadata.chunk_locations.get(index as usize) {
-                    chunk_info.node_id = Some(node_id.clone());
-                }
-
+                let chunk_info = ChunkInfo::new(index, offset, size);
+                // Note: In path-based KV design, node_id is determined via consistent hashing
+                // chunk_locations are not tracked in metadata
                 chunk_info
             })
             .collect()
@@ -396,7 +392,7 @@ mod tests {
     #[test]
     fn test_chunks_from_metadata() {
         let manager = ChunkManager::new();
-        let metadata = FileMetadata::new(1, "/test.txt".to_string(), 8 * 1024 * 1024); // 8MB
+        let metadata = FileMetadata::new("/test.txt".to_string(), 8 * 1024 * 1024); // 8MB
 
         let chunks = manager.chunks_from_metadata(&metadata);
         assert_eq!(chunks.len(), 2); // 2チャンク

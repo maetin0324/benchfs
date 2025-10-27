@@ -204,14 +204,14 @@ mod tests {
         let cache = MetadataCache::new();
 
         let path_str = "/foo/bar.txt".to_string();
-        let metadata = FileMetadata::new(123, path_str.clone(), 1024);
+        let metadata = FileMetadata::new(path_str.clone(), 1024);
 
         cache.put_file(metadata.clone());
         assert_eq!(cache.len(), 1);
 
         let path = Path::new(&path_str);
         let retrieved = cache.get_file(path).unwrap();
-        assert_eq!(retrieved.inode, 123);
+        assert_eq!(retrieved.path, path_str);
         assert_eq!(retrieved.size, 1024);
     }
 
@@ -244,7 +244,7 @@ mod tests {
         let cache = MetadataCache::new();
 
         let path_str = "/foo/bar.txt".to_string();
-        let metadata = FileMetadata::new(123, path_str.clone(), 1024);
+        let metadata = FileMetadata::new(path_str.clone(), 1024);
 
         cache.put_file(metadata.clone());
         assert_eq!(cache.len(), 1);
@@ -262,7 +262,7 @@ mod tests {
 
         for i in 0..10 {
             let path = format!("/file{}.txt", i);
-            let metadata = FileMetadata::new(i, path, 1024);
+            let metadata = FileMetadata::new(path, 1024);
             cache.put_file(metadata);
         }
 
@@ -280,7 +280,7 @@ mod tests {
         // 3つのエントリを追加
         for i in 0..3 {
             let path = format!("/file{}.txt", i);
-            let metadata = FileMetadata::new(i, path, 1024);
+            let metadata = FileMetadata::new(path, 1024);
             cache.put_file(metadata);
         }
 
@@ -288,7 +288,7 @@ mod tests {
 
         // 4つ目を追加すると、最も古いエントリ (file0) がエビクトされる
         let path3 = "/file3.txt".to_string();
-        let metadata3 = FileMetadata::new(3, path3.clone(), 1024);
+        let metadata3 = FileMetadata::new(path3.clone(), 1024);
         cache.put_file(metadata3);
 
         assert_eq!(cache.len(), 3);
@@ -310,7 +310,7 @@ mod tests {
         // 3つのエントリを追加
         for i in 0..3 {
             let path = format!("/file{}.txt", i);
-            let metadata = FileMetadata::new(i, path, 1024);
+            let metadata = FileMetadata::new(path, 1024);
             cache.put_file(metadata);
         }
 
@@ -320,7 +320,7 @@ mod tests {
 
         // 4つ目を追加すると、file1 がエビクトされる (file0は最近アクセスされたため残る)
         let path3 = "/file3.txt".to_string();
-        let metadata3 = FileMetadata::new(3, path3.clone(), 1024);
+        let metadata3 = FileMetadata::new(path3.clone(), 1024);
         cache.put_file(metadata3);
 
         assert_eq!(cache.len(), 3);
@@ -340,7 +340,7 @@ mod tests {
 
         for i in 0..50 {
             let path = format!("/file{}.txt", i);
-            let metadata = FileMetadata::new(i, path, 1024);
+            let metadata = FileMetadata::new(path, 1024);
             cache.put_file(metadata);
         }
 
@@ -355,11 +355,11 @@ mod tests {
         let cache = MetadataCache::new();
 
         let path_str = "/foo/bar.txt".to_string();
-        let metadata1 = FileMetadata::new(123, path_str.clone(), 1024);
+        let metadata1 = FileMetadata::new(path_str.clone(), 1024);
         cache.put_file(metadata1);
 
         // 同じパスで異なるメタデータを追加 (上書き)
-        let metadata2 = FileMetadata::new(123, path_str.clone(), 2048);
+        let metadata2 = FileMetadata::new(path_str.clone(), 2048);
         cache.put_file(metadata2);
 
         assert_eq!(cache.len(), 1); // エントリ数は変わらない
