@@ -10,19 +10,19 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 
-use super::runtime::{block_on, with_benchfs_ctx};
 use super::error::*;
+use super::runtime::{block_on, with_benchfs_ctx};
 
 // C-compatible stat structure
 // This matches the basic fields of Unix struct stat
 #[repr(C)]
 pub struct benchfs_stat_t {
-    pub st_ino: u64,      // Inode number
-    pub st_mode: u32,     // File mode
-    pub st_nlink: u64,    // Number of hard links
-    pub st_size: i64,     // File size in bytes
-    pub st_blocks: i64,   // Number of 512B blocks allocated
-    pub st_blksize: i64,  // Preferred I/O block size
+    pub st_ino: u64,     // Inode number
+    pub st_mode: u32,    // File mode
+    pub st_nlink: u64,   // Number of hard links
+    pub st_size: i64,    // File size in bytes
+    pub st_blocks: i64,  // Number of 512B blocks allocated
+    pub st_blksize: i64, // Preferred I/O block size
 }
 
 impl Default for benchfs_stat_t {
@@ -72,9 +72,7 @@ pub extern "C" fn benchfs_stat(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move {
-                fs_ref.benchfs_stat(path_str).await
-            })
+            block_on(async move { fs_ref.benchfs_stat(path_str).await })
         }
     });
 
@@ -137,9 +135,7 @@ pub extern "C" fn benchfs_get_file_size(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move {
-                fs_ref.benchfs_stat(path_str).await
-            })
+            block_on(async move { fs_ref.benchfs_stat(path_str).await })
         }
     });
 
@@ -191,7 +187,10 @@ pub extern "C" fn benchfs_mkdir(
         unsafe {
             let fs_ref = &*fs_ptr;
             block_on(async move {
-                fs_ref.benchfs_mkdir(path_str, mode).await.map_err(|e| e.to_string())
+                fs_ref
+                    .benchfs_mkdir(path_str, mode)
+                    .await
+                    .map_err(|e| e.to_string())
             })
         }
     });
@@ -227,9 +226,7 @@ pub extern "C" fn benchfs_rmdir(
         }
     };
 
-    let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_rmdir(path_str).map_err(|e| e.to_string())
-    });
+    let result = with_benchfs_ctx(|fs| fs.benchfs_rmdir(path_str).map_err(|e| e.to_string()));
 
     result_to_error_code(result.and_then(|r| r))
 }
@@ -275,7 +272,8 @@ pub extern "C" fn benchfs_rename(
     };
 
     let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_rename(oldpath_str, newpath_str).map_err(|e| e.to_string())
+        fs.benchfs_rename(oldpath_str, newpath_str)
+            .map_err(|e| e.to_string())
     });
 
     result_to_error_code(result.and_then(|r| r))
@@ -321,7 +319,10 @@ pub extern "C" fn benchfs_truncate(
         unsafe {
             let fs_ref = &*fs_ptr;
             block_on(async move {
-                fs_ref.benchfs_truncate(path_str, size as u64).await.map_err(|e| e.to_string())
+                fs_ref
+                    .benchfs_truncate(path_str, size as u64)
+                    .await
+                    .map_err(|e| e.to_string())
             })
         }
     });
@@ -364,9 +365,7 @@ pub extern "C" fn benchfs_access(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move {
-                fs_ref.benchfs_stat(path_str).await
-            })
+            block_on(async move { fs_ref.benchfs_stat(path_str).await })
         }
     });
 

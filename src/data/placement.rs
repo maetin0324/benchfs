@@ -24,12 +24,7 @@ pub trait PlacementStrategy {
     ///
     /// # Returns
     /// 配置先のノードIDリスト
-    fn place_chunk_replicas(
-        &self,
-        path: &Path,
-        chunk_index: u64,
-        count: usize,
-    ) -> Vec<NodeId>;
+    fn place_chunk_replicas(&self, path: &Path, chunk_index: u64, count: usize) -> Vec<NodeId>;
 }
 
 /// ラウンドロビン配置戦略
@@ -62,12 +57,7 @@ impl PlacementStrategy for RoundRobinPlacement {
         Some(self.nodes[node_index].clone())
     }
 
-    fn place_chunk_replicas(
-        &self,
-        _path: &Path,
-        chunk_index: u64,
-        count: usize,
-    ) -> Vec<NodeId> {
+    fn place_chunk_replicas(&self, _path: &Path, chunk_index: u64, count: usize) -> Vec<NodeId> {
         if self.nodes.is_empty() {
             return Vec::new();
         }
@@ -120,12 +110,7 @@ impl PlacementStrategy for ConsistentHashPlacement {
         self.ring.get_node(&key)
     }
 
-    fn place_chunk_replicas(
-        &self,
-        path: &Path,
-        chunk_index: u64,
-        count: usize,
-    ) -> Vec<NodeId> {
+    fn place_chunk_replicas(&self, path: &Path, chunk_index: u64, count: usize) -> Vec<NodeId> {
         let key = Self::chunk_key(path, chunk_index);
         self.ring.get_nodes(&key, count)
     }
@@ -138,7 +123,11 @@ mod tests {
 
     #[test]
     fn test_round_robin_placement() {
-        let nodes = vec!["node1".to_string(), "node2".to_string(), "node3".to_string()];
+        let nodes = vec![
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+        ];
         let strategy = RoundRobinPlacement::new(nodes.clone());
 
         assert_eq!(strategy.node_count(), 3);
@@ -171,7 +160,12 @@ mod tests {
 
     #[test]
     fn test_round_robin_replicas() {
-        let nodes = vec!["node1".to_string(), "node2".to_string(), "node3".to_string(), "node4".to_string()];
+        let nodes = vec![
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+            "node4".to_string(),
+        ];
         let strategy = RoundRobinPlacement::new(nodes);
 
         let path = Path::new("/test/file.txt");
@@ -198,7 +192,11 @@ mod tests {
 
     #[test]
     fn test_round_robin_replicas_exceed_nodes() {
-        let nodes = vec!["node1".to_string(), "node2".to_string(), "node3".to_string()];
+        let nodes = vec![
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+        ];
         let strategy = RoundRobinPlacement::new(nodes);
 
         let path = Path::new("/test/file.txt");
@@ -284,7 +282,11 @@ mod tests {
     #[test]
     fn test_placement_distribution() {
         // ラウンドロビンの分散をテスト
-        let nodes = vec!["node1".to_string(), "node2".to_string(), "node3".to_string()];
+        let nodes = vec![
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+        ];
         let strategy = RoundRobinPlacement::new(nodes);
 
         let path = Path::new("/test/file.txt");
@@ -322,7 +324,11 @@ mod tests {
         }
 
         // 各ノードが少なくとも10チャンク以上担当していることを確認
-        for node_id in &["node1".to_string(), "node2".to_string(), "node3".to_string()] {
+        for node_id in &[
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+        ] {
             let count = distribution.get(node_id).unwrap_or(&0);
             assert!(
                 *count >= 10,

@@ -15,9 +15,7 @@ use crate::metadata::{
 use crate::rpc::AmRpc;
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
-use crate::rpc::metadata_ops::{
-    MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataLookupRequest,
-};
+use crate::rpc::metadata_ops::{MetadataCreateFileRequest, MetadataLookupRequest};
 use crate::storage::IOUringChunkStore;
 
 /// BenchFS Filesystem Client
@@ -209,7 +207,8 @@ impl BenchFS {
     /// Get the node responsible for storing a chunk (using consistent hashing)
     fn get_chunk_node(&self, chunk_key: &str) -> String {
         if let Some(ring) = &self.metadata_ring {
-            ring.get_node(chunk_key).unwrap_or_else(|| self.node_id.clone())
+            ring.get_node(chunk_key)
+                .unwrap_or_else(|| self.node_id.clone())
         } else {
             self.node_id.clone()
         }
@@ -358,10 +357,19 @@ impl BenchFS {
                                         let mut truncated_meta = meta.clone();
                                         truncated_meta.size = 0;
                                         // chunk_count and chunk_locations are not tracked in path-based KV design
-                                        if let Err(e) = self.metadata_manager.update_file_metadata(truncated_meta) {
-                                            tracing::warn!("Failed to update local cache after remote truncate: {:?}", e);
+                                        if let Err(e) = self
+                                            .metadata_manager
+                                            .update_file_metadata(truncated_meta)
+                                        {
+                                            tracing::warn!(
+                                                "Failed to update local cache after remote truncate: {:?}",
+                                                e
+                                            );
                                         } else {
-                                            tracing::debug!("Updated local cache after remote truncate for {}", path);
+                                            tracing::debug!(
+                                                "Updated local cache after remote truncate for {}",
+                                                path
+                                            );
                                         }
                                     }
                                     Ok(response) => {
@@ -389,7 +397,7 @@ impl BenchFS {
                 }
             }
 
-            0  // Dummy inode in path-based KV design
+            0 // Dummy inode in path-based KV design
         } else {
             // File doesn't exist
             if !flags.create {
@@ -405,7 +413,7 @@ impl BenchFS {
                     .store_file_metadata(file_meta)
                     .map_err(|e| ApiError::Internal(format!("Failed to create file: {:?}", e)))?;
 
-                0  // Dummy inode
+                0 // Dummy inode
             } else {
                 // Remote file creation via RPC
                 if let Some(pool) = &self.connection_pool {
@@ -419,13 +427,21 @@ impl BenchFS {
 
                                     // Cache newly created file metadata locally
                                     let file_meta = FileMetadata::new(path.to_string(), 0);
-                                    if let Err(e) = self.metadata_manager.store_file_metadata(file_meta) {
-                                        tracing::warn!("Failed to cache metadata after remote create: {:?}", e);
+                                    if let Err(e) =
+                                        self.metadata_manager.store_file_metadata(file_meta)
+                                    {
+                                        tracing::warn!(
+                                            "Failed to cache metadata after remote create: {:?}",
+                                            e
+                                        );
                                     } else {
-                                        tracing::debug!("Cached metadata for newly created file {} locally", path);
+                                        tracing::debug!(
+                                            "Cached metadata for newly created file {} locally",
+                                            path
+                                        );
                                     }
 
-                                    0  // Dummy inode
+                                    0 // Dummy inode
                                 }
                                 Ok(response) => {
                                     return Err(ApiError::Internal(format!(
@@ -776,7 +792,12 @@ impl BenchFS {
                         self.chunk_store
                             .write_chunk(&file_path, chunk_index, chunk_offset, &chunk_data)
                             .await
-                            .map_err(|e| ApiError::IoError(format!("Failed to write chunk {}: {:?}", chunk_index, e)))?;
+                            .map_err(|e| {
+                                ApiError::IoError(format!(
+                                    "Failed to write chunk {}: {:?}",
+                                    chunk_index, e
+                                ))
+                            })?;
                         Ok::<usize, ApiError>(data_len)
                     } else if let Some(pool) = &self.connection_pool {
                         // Write to remote node using node_id
@@ -805,23 +826,17 @@ impl BenchFS {
                                         );
                                         Ok(data_len)
                                     }
-                                    Ok(response) => {
-                                        Err(ApiError::IoError(format!(
-                                            "Remote write failed with status {}",
-                                            response.status
-                                        )))
-                                    }
-                                    Err(e) => {
-                                        Err(ApiError::IoError(format!("RPC error: {:?}", e)))
-                                    }
+                                    Ok(response) => Err(ApiError::IoError(format!(
+                                        "Remote write failed with status {}",
+                                        response.status
+                                    ))),
+                                    Err(e) => Err(ApiError::IoError(format!("RPC error: {:?}", e))),
                                 }
                             }
-                            Err(e) => {
-                                Err(ApiError::IoError(format!(
-                                    "Failed to connect to {}: {:?}",
-                                    target_node, e
-                                )))
-                            }
+                            Err(e) => Err(ApiError::IoError(format!(
+                                "Failed to connect to {}: {:?}",
+                                target_node, e
+                            ))),
                         }
                     } else {
                         // Not in distributed mode but chunk should be on a different node
@@ -902,10 +917,7 @@ impl BenchFS {
                                         );
                                     }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            "Metadata sync RPC error on close: {:?}",
-                                            e
-                                        );
+                                        tracing::warn!("Metadata sync RPC error on close: {:?}", e);
                                     }
                                 }
                             }
@@ -1388,8 +1400,8 @@ impl BenchFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pluvio_runtime::executor::Runtime;
     use crate::storage::IOUringBackend;
+    use pluvio_runtime::executor::Runtime;
     use pluvio_uring::reactor::IoUringReactor;
 
     fn create_test_chunk_store(runtime: &Runtime) -> Rc<IOUringChunkStore> {
@@ -1420,7 +1432,11 @@ mod tests {
 
     fn run_test<F>(test: F)
     where
-        F: FnOnce(Rc<Runtime>, Rc<IOUringChunkStore>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> + 'static,
+        F: FnOnce(
+                Rc<Runtime>,
+                Rc<IOUringChunkStore>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+            + 'static,
     {
         let runtime = Runtime::new(256);
         let chunk_store = create_test_chunk_store(&runtime);
@@ -1496,7 +1512,10 @@ mod tests {
                 let fs = BenchFS::new("node1".to_string(), chunk_store);
 
                 // Create file
-                let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).await.unwrap();
+                let handle = fs
+                    .benchfs_open("/test.txt", OpenFlags::create())
+                    .await
+                    .unwrap();
                 fs.benchfs_close(&handle).await.unwrap();
 
                 // Delete file
@@ -1531,7 +1550,10 @@ mod tests {
                 let fs = BenchFS::new("node1".to_string(), chunk_store);
 
                 // Create file with data
-                let handle = fs.benchfs_open("/test.txt", OpenFlags::create()).await.unwrap();
+                let handle = fs
+                    .benchfs_open("/test.txt", OpenFlags::create())
+                    .await
+                    .unwrap();
                 fs.benchfs_write(&handle, b"0123456789").await.unwrap();
                 fs.benchfs_close(&handle).await.unwrap();
 

@@ -3,13 +3,13 @@
 //! This module provides WorkerAddress-based connection management to avoid
 //! the epoll_wait overhead of socket_bind when ucp_worker_progress is called frequently.
 
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use pluvio_ucx::Worker;
-use crate::rpc::{RpcError, RpcClient};
 use crate::rpc::address_registry::WorkerAddressRegistry;
+use crate::rpc::{RpcClient, RpcError};
+use pluvio_ucx::Worker;
 
 /// Connection pool for managing RPC client connections to remote nodes
 ///
@@ -26,7 +26,10 @@ impl ConnectionPool {
     /// # Arguments
     /// * `worker` - UCX worker for creating connections
     /// * `registry_dir` - Shared filesystem directory for WorkerAddress exchange
-    pub fn new<P: AsRef<std::path::Path>>(worker: Rc<Worker>, registry_dir: P) -> Result<Self, RpcError> {
+    pub fn new<P: AsRef<std::path::Path>>(
+        worker: Rc<Worker>,
+        registry_dir: P,
+    ) -> Result<Self, RpcError> {
         let registry = WorkerAddressRegistry::new(registry_dir)?;
 
         Ok(Self {
@@ -70,7 +73,10 @@ impl ConnectionPool {
         }
 
         // Lookup worker address
-        tracing::info!("Creating new connection to node {} using WorkerAddress", node_id);
+        tracing::info!(
+            "Creating new connection to node {} using WorkerAddress",
+            node_id
+        );
 
         let worker_address_bytes = self.registry.lookup(node_id)?;
 
@@ -79,10 +85,7 @@ impl ConnectionPool {
 
         // Create endpoint from WorkerAddress
         let endpoint = self.worker.connect_addr(&worker_address).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "Failed to connect to {}: {:?}",
-                node_id, e
-            ))
+            RpcError::ConnectionError(format!("Failed to connect to {}: {:?}", node_id, e))
         })?;
 
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
@@ -94,7 +97,9 @@ impl ConnectionPool {
         }
 
         // Store in cache
-        self.connections.borrow_mut().insert(node_id.to_string(), client.clone());
+        self.connections
+            .borrow_mut()
+            .insert(node_id.to_string(), client.clone());
 
         Ok(client)
     }
@@ -104,7 +109,11 @@ impl ConnectionPool {
     /// # Arguments
     /// * `node_id` - Node identifier to wait for
     /// * `timeout_secs` - Maximum time to wait in seconds (0 = no timeout)
-    pub async fn wait_and_connect(&self, node_id: &str, timeout_secs: u64) -> Result<Rc<RpcClient>, RpcError> {
+    pub async fn wait_and_connect(
+        &self,
+        node_id: &str,
+        timeout_secs: u64,
+    ) -> Result<Rc<RpcClient>, RpcError> {
         // Wait for address to be available
         let worker_address_bytes = self.registry.wait_for(node_id, timeout_secs).await?;
 
@@ -122,10 +131,7 @@ impl ConnectionPool {
 
         // Create endpoint from WorkerAddress
         let endpoint = self.worker.connect_addr(&worker_address).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "Failed to connect to {}: {:?}",
-                node_id, e
-            ))
+            RpcError::ConnectionError(format!("Failed to connect to {}: {:?}", node_id, e))
         })?;
 
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
@@ -137,7 +143,9 @@ impl ConnectionPool {
         }
 
         // Store in cache
-        self.connections.borrow_mut().insert(node_id.to_string(), client.clone());
+        self.connections
+            .borrow_mut()
+            .insert(node_id.to_string(), client.clone());
 
         Ok(client)
     }

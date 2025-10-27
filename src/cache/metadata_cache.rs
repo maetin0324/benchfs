@@ -1,12 +1,12 @@
 //! Metadata caching for file and directory metadata
 
-use std::cell::RefCell;
-use std::time::{Duration, Instant};
 use lru::LruCache;
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
 
-use crate::metadata::{FileMetadata, DirectoryMetadata};
 use crate::cache::policy::CachePolicy;
+use crate::metadata::{DirectoryMetadata, FileMetadata};
 
 /// Cache entry with timestamp for TTL support
 #[derive(Clone)]
@@ -241,8 +241,14 @@ mod tests {
     fn test_cache_clear() {
         let cache = MetadataCache::with_capacity(100);
 
-        cache.put_file("/file1.txt".to_string(), FileMetadata::new("/file1.txt".to_string(), 100));
-        cache.put_dir("/dir1".to_string(), DirectoryMetadata::new(2, "/dir1".to_string()));
+        cache.put_file(
+            "/file1.txt".to_string(),
+            FileMetadata::new("/file1.txt".to_string(), 100),
+        );
+        cache.put_dir(
+            "/dir1".to_string(),
+            DirectoryMetadata::new(2, "/dir1".to_string()),
+        );
 
         assert_eq!(cache.stats().file_entries, 1);
         assert_eq!(cache.stats().dir_entries, 1);

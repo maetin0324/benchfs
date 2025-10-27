@@ -176,8 +176,9 @@ impl ServerConfig {
 
     /// Save configuration to TOML file
     pub fn to_file(&self, path: &str) -> Result<(), ConfigError> {
-        let contents = toml::to_string_pretty(self)
-            .map_err(|e| ConfigError::SerializeError(format!("Failed to serialize config: {}", e)))?;
+        let contents = toml::to_string_pretty(self).map_err(|e| {
+            ConfigError::SerializeError(format!("Failed to serialize config: {}", e))
+        })?;
 
         std::fs::write(path, contents)
             .map_err(|e| ConfigError::WriteError(format!("Failed to write config file: {}", e)))?;
@@ -189,27 +190,34 @@ impl ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         // Validate node ID
         if self.node.node_id.is_empty() {
-            return Err(ConfigError::ValidationError("Node ID cannot be empty".to_string()));
+            return Err(ConfigError::ValidationError(
+                "Node ID cannot be empty".to_string(),
+            ));
         }
 
         // Validate chunk size (must be > 0 and <= 128MB)
         if self.storage.chunk_size == 0 || self.storage.chunk_size > 128 * 1024 * 1024 {
             return Err(ConfigError::ValidationError(
-                "Chunk size must be between 1 and 128MB".to_string()
+                "Chunk size must be between 1 and 128MB".to_string(),
             ));
         }
 
         // Validate bind address
         if self.network.bind_addr.is_empty() {
-            return Err(ConfigError::ValidationError("Bind address cannot be empty".to_string()));
+            return Err(ConfigError::ValidationError(
+                "Bind address cannot be empty".to_string(),
+            ));
         }
 
         // Validate log level
         match self.node.log_level.as_str() {
-            "trace" | "debug" | "info" | "warn" | "error" => {},
-            _ => return Err(ConfigError::ValidationError(
-                format!("Invalid log level: {}", self.node.log_level)
-            )),
+            "trace" | "debug" | "info" | "warn" | "error" => {}
+            _ => {
+                return Err(ConfigError::ValidationError(format!(
+                    "Invalid log level: {}",
+                    self.node.log_level
+                )));
+            }
         }
 
         Ok(())

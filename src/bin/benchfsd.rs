@@ -3,20 +3,20 @@
 //! This is the main server binary for BenchFS distributed file system.
 //! It initializes the RPC server, storage backend, and handles incoming requests.
 
-use benchfs::config::ServerConfig;
-use benchfs::rpc::server::RpcServer;
-use benchfs::rpc::handlers::RpcHandlerContext;
-use benchfs::metadata::MetadataManager;
-use benchfs::storage::{IOUringChunkStore, IOUringBackend};
 use benchfs::cache::CachePolicy;
+use benchfs::config::ServerConfig;
+use benchfs::metadata::MetadataManager;
+use benchfs::rpc::handlers::RpcHandlerContext;
+use benchfs::rpc::server::RpcServer;
+use benchfs::storage::{IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
-use pluvio_uring::reactor::IoUringReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
+use pluvio_uring::reactor::IoUringReactor;
 
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Server state
 struct ServerState {
@@ -142,7 +142,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let chunk_store_dir = config.node.data_dir.join("chunks");
     let chunk_store = Rc::new(
         IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())
-            .expect("Failed to create chunk store")
+            .expect("Failed to create chunk store"),
     );
 
     // Create RPC handler context
@@ -169,7 +169,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                 tracing::info!("RPC server listening for requests");
 
                 // Register all RPC handlers
-                if let Err(e) = rpc_server_clone.register_all_handlers(runtime_clone.clone()).await {
+                if let Err(e) = rpc_server_clone
+                    .register_all_handlers(runtime_clone.clone())
+                    .await
+                {
                     tracing::error!("Failed to register RPC handlers: {:?}", e);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -214,11 +217,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 fn setup_logging(level: &str) {
-    use tracing_subscriber::fmt;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     fmt()
         .with_env_filter(filter)

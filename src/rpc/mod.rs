@@ -1,19 +1,19 @@
 use std::rc::Rc;
 
-use pluvio_ucx::{Worker, endpoint::Endpoint};
 use pluvio_ucx::async_ucx::ucp::AmMsg;
+use pluvio_ucx::{Worker, endpoint::Endpoint};
 
 use crate::rpc::client::RpcClient;
 use crate::rpc::handlers::RpcHandlerContext;
 
-pub mod file_ops;
-pub mod data_ops;
-pub mod metadata_ops;
-pub mod handlers;
-pub mod server;
+pub mod address_registry;
 pub mod client;
 pub mod connection;
-pub mod address_registry;
+pub mod data_ops;
+pub mod file_ops;
+pub mod handlers;
+pub mod metadata_ops;
+pub mod server;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
@@ -42,7 +42,10 @@ impl<H> ServerResponse<H> {
     }
 
     pub fn with_data(header: H, data: Vec<u8>) -> Self {
-        Self { header, data: Some(data) }
+        Self {
+            header,
+            data: Some(data),
+        }
     }
 }
 
@@ -193,10 +196,6 @@ pub trait AmRpc {
     /// This allows the server to send proper error responses to clients
     fn error_response(error: &RpcError) -> Self::ResponseHeader;
 }
-
-
-
-
 
 /// RPC error types
 #[derive(Debug)]

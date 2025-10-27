@@ -6,7 +6,7 @@ use std::rc::Rc;
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 use zerocopy::FromBytes;
 
-use crate::metadata::{FileMetadata, DirectoryMetadata};
+use crate::metadata::{DirectoryMetadata, FileMetadata};
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId};
 
 /// RPC IDs for metadata operations
@@ -25,7 +25,15 @@ const _MAX_PATH_LEN: usize = 256;
 
 /// MetadataLookup request header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataLookupRequestHeader {
     /// Path length
     pub path_len: u32,
@@ -45,7 +53,15 @@ impl MetadataLookupRequestHeader {
 
 /// MetadataLookup response header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataLookupResponseHeader {
     /// Inode number
     pub inode: u64,
@@ -66,7 +82,7 @@ pub struct MetadataLookupResponseHeader {
 impl MetadataLookupResponseHeader {
     pub fn file(size: u64) -> Self {
         Self {
-            inode: 0,  // Dummy value for path-based KV design
+            inode: 0, // Dummy value for path-based KV design
             size,
             entry_type: 1,
             status: 0,
@@ -76,7 +92,7 @@ impl MetadataLookupResponseHeader {
 
     pub fn directory() -> Self {
         Self {
-            inode: 0,  // Dummy value for path-based KV design
+            inode: 0, // Dummy value for path-based KV design
             size: 0,
             entry_type: 2,
             status: 0,
@@ -192,8 +208,11 @@ impl AmRpc for MetadataLookupRequest {
         let header = match am_msg
             .header()
             .get(..std::mem::size_of::<MetadataLookupRequestHeader>())
-            .and_then(|bytes| MetadataLookupRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        {
+            .and_then(|bytes| {
+                MetadataLookupRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
@@ -205,7 +224,7 @@ impl AmRpc for MetadataLookupRequest {
             if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::error(-2)),
-                    am_msg
+                    am_msg,
                 ));
             }
         }
@@ -216,7 +235,7 @@ impl AmRpc for MetadataLookupRequest {
         if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path) {
             return Ok((
                 crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::file(file_meta.size)),
-                am_msg
+                am_msg,
             ));
         }
 
@@ -224,14 +243,14 @@ impl AmRpc for MetadataLookupRequest {
         if let Ok(_dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
             return Ok((
                 crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::directory()),
-                am_msg
+                am_msg,
             ));
         }
 
         // Not found
         Ok((
             crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::not_found()),
-            am_msg
+            am_msg,
         ))
     }
 
@@ -253,7 +272,15 @@ impl AmRpc for MetadataLookupRequest {
 
 /// MetadataCreateFile request header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataCreateFileRequestHeader {
     /// Initial file size
     pub size: u64,
@@ -277,7 +304,15 @@ impl MetadataCreateFileRequestHeader {
 
 /// MetadataCreateFile response header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataCreateFileResponseHeader {
     /// Assigned inode number
     pub inode: u64,
@@ -380,8 +415,11 @@ impl AmRpc for MetadataCreateFileRequest {
         let header = match am_msg
             .header()
             .get(..std::mem::size_of::<MetadataCreateFileRequestHeader>())
-            .and_then(|bytes| MetadataCreateFileRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        {
+            .and_then(|bytes| {
+                MetadataCreateFileRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
@@ -393,7 +431,7 @@ impl AmRpc for MetadataCreateFileRequest {
             if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::error(-2)),
-                    am_msg
+                    am_msg,
                 ));
             }
         }
@@ -405,12 +443,12 @@ impl AmRpc for MetadataCreateFileRequest {
         // Store file metadata
         match ctx.metadata_manager.store_file_metadata(file_meta) {
             Ok(()) => Ok((
-                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::success(0)),  // Dummy inode
-                am_msg
+                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::success(0)), // Dummy inode
+                am_msg,
             )),
             Err(_e) => Ok((
                 crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::error(-5)),
-                am_msg
+                am_msg,
             )),
         }
     }
@@ -433,7 +471,15 @@ impl AmRpc for MetadataCreateFileRequest {
 
 /// MetadataCreateDir request header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataCreateDirRequestHeader {
     /// Directory mode (permissions)
     pub mode: u32,
@@ -523,8 +569,11 @@ impl AmRpc for MetadataCreateDirRequest {
         let header = match am_msg
             .header()
             .get(..std::mem::size_of::<MetadataCreateDirRequestHeader>())
-            .and_then(|bytes| MetadataCreateDirRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        {
+            .and_then(|bytes| {
+                MetadataCreateDirRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
@@ -536,7 +585,7 @@ impl AmRpc for MetadataCreateDirRequest {
             if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::error(-2)),
-                    am_msg
+                    am_msg,
                 ));
             }
         }
@@ -550,11 +599,11 @@ impl AmRpc for MetadataCreateDirRequest {
         match ctx.metadata_manager.store_dir_metadata(dir_meta) {
             Ok(()) => Ok((
                 crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::success(inode)),
-                am_msg
+                am_msg,
             )),
             Err(_e) => Ok((
                 crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::error(-5)),
-                am_msg
+                am_msg,
             )),
         }
     }
@@ -577,7 +626,15 @@ impl AmRpc for MetadataCreateDirRequest {
 
 /// MetadataDelete request header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataDeleteRequestHeader {
     /// Path length
     pub path_len: u32,
@@ -609,7 +666,15 @@ impl MetadataDeleteRequestHeader {
 
 /// MetadataDelete response header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataDeleteResponseHeader {
     /// Status code (0 = success, non-zero = error)
     pub status: i32,
@@ -729,8 +794,11 @@ impl AmRpc for MetadataDeleteRequest {
         let header = match am_msg
             .header()
             .get(..std::mem::size_of::<MetadataDeleteRequestHeader>())
-            .and_then(|bytes| MetadataDeleteRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        {
+            .and_then(|bytes| {
+                MetadataDeleteRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
@@ -742,7 +810,7 @@ impl AmRpc for MetadataDeleteRequest {
             if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-2)),
-                    am_msg
+                    am_msg,
                 ));
             }
         }
@@ -759,18 +827,18 @@ impl AmRpc for MetadataDeleteRequest {
         } else {
             return Ok((
                 crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-22)), // EINVAL
-                am_msg
+                am_msg,
             ));
         };
 
         match result {
             Ok(()) => Ok((
                 crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::success()),
-                am_msg
+                am_msg,
             )),
             Err(_e) => Ok((
                 crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-2)), // ENOENT
-                am_msg
+                am_msg,
             )),
         }
     }
@@ -792,12 +860,20 @@ impl AmRpc for MetadataDeleteRequest {
 // ============================================================================
 
 /// Update mask bits for MetadataUpdate
-const UPDATE_SIZE: u8 = 1 << 0;  // Update file size
-const UPDATE_MODE: u8 = 1 << 1;  // Update file mode/permissions
+const UPDATE_SIZE: u8 = 1 << 0; // Update file size
+const UPDATE_MODE: u8 = 1 << 1; // Update file mode/permissions
 
 /// MetadataUpdate request header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataUpdateRequestHeader {
     /// New file size (if UPDATE_SIZE is set)
     pub new_size: u64,
@@ -849,7 +925,15 @@ impl MetadataUpdateRequestHeader {
 
 /// MetadataUpdate response header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MetadataUpdateResponseHeader {
     /// Status code (0 = success, non-zero = error)
     pub status: i32,
@@ -957,8 +1041,11 @@ impl AmRpc for MetadataUpdateRequest {
         let header = match am_msg
             .header()
             .get(..std::mem::size_of::<MetadataUpdateRequestHeader>())
-            .and_then(|bytes| MetadataUpdateRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        {
+            .and_then(|bytes| {
+                MetadataUpdateRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
@@ -970,7 +1057,7 @@ impl AmRpc for MetadataUpdateRequest {
             if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-2)),
-                    am_msg
+                    am_msg,
                 ));
             }
         }
@@ -983,7 +1070,7 @@ impl AmRpc for MetadataUpdateRequest {
             Err(_) => {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-2)), // ENOENT
-                    am_msg
+                    am_msg,
                 ));
             }
         };
@@ -1000,11 +1087,11 @@ impl AmRpc for MetadataUpdateRequest {
         match ctx.metadata_manager.update_file_metadata(file_meta) {
             Ok(()) => Ok((
                 crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::success()),
-                am_msg
+                am_msg,
             )),
             Err(_e) => Ok((
                 crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-5)), // EIO
-                am_msg
+                am_msg,
             )),
         }
     }
@@ -1031,7 +1118,9 @@ pub fn file_metadata_to_lookup_response(metadata: &FileMetadata) -> MetadataLook
 }
 
 /// Convert DirectoryMetadata to lookup response
-pub fn dir_metadata_to_lookup_response(_metadata: &DirectoryMetadata) -> MetadataLookupResponseHeader {
+pub fn dir_metadata_to_lookup_response(
+    _metadata: &DirectoryMetadata,
+) -> MetadataLookupResponseHeader {
     MetadataLookupResponseHeader::directory()
 }
 
@@ -1046,7 +1135,10 @@ mod tests {
 
         // Verify it can be serialized
         let bytes = zerocopy::IntoBytes::as_bytes(&header);
-        assert_eq!(bytes.len(), std::mem::size_of::<MetadataLookupRequestHeader>());
+        assert_eq!(
+            bytes.len(),
+            std::mem::size_of::<MetadataLookupRequestHeader>()
+        );
     }
 
     #[test]
@@ -1087,7 +1179,7 @@ mod tests {
 
     #[test]
     fn test_metadata_create_file_response() {
-        let success = MetadataCreateFileResponseHeader::success(0);  // Dummy inode in path-based KV
+        let success = MetadataCreateFileResponseHeader::success(0); // Dummy inode in path-based KV
         assert!(success.is_success());
         // inode is dummy value in path-based KV design
 
@@ -1129,7 +1221,10 @@ mod tests {
     #[test]
     fn test_rpc_ids() {
         assert_eq!(MetadataLookupRequest::rpc_id(), RPC_METADATA_LOOKUP);
-        assert_eq!(MetadataCreateFileRequest::rpc_id(), RPC_METADATA_CREATE_FILE);
+        assert_eq!(
+            MetadataCreateFileRequest::rpc_id(),
+            RPC_METADATA_CREATE_FILE
+        );
         assert_eq!(MetadataCreateDirRequest::rpc_id(), RPC_METADATA_CREATE_DIR);
         assert_eq!(MetadataDeleteRequest::rpc_id(), RPC_METADATA_DELETE);
     }

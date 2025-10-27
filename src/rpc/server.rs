@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 use pluvio_runtime::executor::Runtime;
-use pluvio_ucx::{async_ucx::ucp::WorkerAddress, Worker};
+use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress};
 
-use crate::rpc::{AmRpc, RpcError, Serializable};
 use crate::rpc::handlers::RpcHandlerContext;
+use crate::rpc::{AmRpc, RpcError, Serializable};
 
 /// RPC server that receives and dispatches ActiveMessages
 pub struct RpcServer {
@@ -25,11 +25,10 @@ impl RpcServer {
     }
 
     pub fn get_address(&self) -> Result<WorkerAddress<'_>, RpcError> {
-        self.worker.address().map_err(|e| {
-            RpcError::TransportError(format!("Failed to get worker address: {:?}", e))
-        })
+        self.worker
+            .address()
+            .map_err(|e| RpcError::TransportError(format!("Failed to get worker address: {:?}", e)))
     }
-
 
     /// Start listening for RPC requests on the given AM stream ID
     ///
@@ -42,10 +41,7 @@ impl RpcServer {
     ///
     /// server.listen::<ReadChunkRequest, _, _>(runtime.clone()).await?;
     /// ```
-    pub async fn listen<Rpc, ReqH, ResH>(
-        &self,
-        _runtime: Rc<Runtime>,
-    ) -> Result<(), RpcError>
+    pub async fn listen<Rpc, ReqH, ResH>(&self, _runtime: Rc<Runtime>) -> Result<(), RpcError>
     where
         ResH: Serializable + 'static,
         ReqH: Serializable + 'static,
@@ -70,7 +66,10 @@ impl RpcServer {
             let am_msg = msg
                 .ok_or_else(|| RpcError::TransportError("Failed to receive message".to_string()))?;
 
-            tracing::debug!("RpcServer: Received message on RPC ID {}, calling server_handler", Rpc::rpc_id());
+            tracing::debug!(
+                "RpcServer: Received message on RPC ID {}, calling server_handler",
+                Rpc::rpc_id()
+            );
 
             let ctx_clone = ctx.clone();
 
@@ -178,7 +177,6 @@ impl RpcServer {
         Ok(())
     }
 
-
     /// Register and start all standard RPC handlers
     ///
     /// This is a convenience method that starts listeners for all standard RPC types:
@@ -202,9 +200,8 @@ impl RpcServer {
     pub async fn register_all_handlers(&self, runtime: Rc<Runtime>) -> Result<(), RpcError> {
         use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
         use crate::rpc::metadata_ops::{
-            MetadataLookupRequest, MetadataCreateFileRequest,
-            MetadataCreateDirRequest, MetadataDeleteRequest,
-            MetadataUpdateRequest,
+            MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
+            MetadataLookupRequest, MetadataUpdateRequest,
         };
 
         tracing::info!("Registering all RPC handlers...");

@@ -18,17 +18,17 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use benchfs::rpc::server::RpcServer;
-use benchfs::rpc::handlers::RpcHandlerContext;
-use benchfs::rpc::connection::ConnectionPool;
-use benchfs::metadata::MetadataManager;
-use benchfs::storage::{IOUringBackend, IOUringChunkStore};
 use benchfs::api::file_ops::BenchFS;
 use benchfs::api::types::OpenFlags;
+use benchfs::metadata::MetadataManager;
+use benchfs::rpc::connection::ConnectionPool;
+use benchfs::rpc::handlers::RpcHandlerContext;
+use benchfs::rpc::server::RpcServer;
+use benchfs::storage::{IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
-use pluvio_uring::reactor::IoUringReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
+use pluvio_uring::reactor::IoUringReactor;
 
 /// Benchmark configuration
 struct BenchConfig {
@@ -85,8 +85,10 @@ impl BenchResult {
         println!("    Average:    {:?}", self.avg);
         println!("    Min:        {:?}", self.min);
         println!("    Max:        {:?}", self.max);
-        println!("    Throughput: {:.2} ops/sec",
-                 self.iterations as f64 / self.total_duration.as_secs_f64());
+        println!(
+            "    Throughput: {:.2} ops/sec",
+            self.iterations as f64 / self.total_duration.as_secs_f64()
+        );
     }
 }
 
@@ -122,7 +124,12 @@ impl Args {
                     mode = Some(match args[i + 1].as_str() {
                         "server" => Mode::Server,
                         "client" => Mode::Client,
-                        _ => return Err(format!("Invalid mode: {}. Use 'server' or 'client'", args[i + 1])),
+                        _ => {
+                            return Err(format!(
+                                "Invalid mode: {}. Use 'server' or 'client'",
+                                args[i + 1]
+                            ));
+                        }
                     });
                     i += 2;
                 }
@@ -160,7 +167,9 @@ impl Args {
     fn print_usage() {
         eprintln!("Usage:");
         eprintln!("  Server mode:");
-        eprintln!("    cargo bench --bench small -- --mode server --registry-dir <path> --data-dir <path>");
+        eprintln!(
+            "    cargo bench --bench small -- --mode server --registry-dir <path> --data-dir <path>"
+        );
         eprintln!();
         eprintln!("  Client mode:");
         eprintln!("    cargo bench --bench small -- --mode client --registry-dir <path>");
@@ -194,7 +203,9 @@ fn setup_server(runtime: &Runtime, data_dir: &str, registry_dir: &str) -> Rc<Rpc
     runtime.register_reactor("ucx", ucx_reactor.clone());
 
     // Create UCX worker
-    let worker = ucx_context.create_worker().expect("Failed to create worker");
+    let worker = ucx_context
+        .create_worker()
+        .expect("Failed to create worker");
 
     ucx_reactor.register_worker(worker.clone());
 
@@ -209,7 +220,7 @@ fn setup_server(runtime: &Runtime, data_dir: &str, registry_dir: &str) -> Rc<Rpc
     std::fs::create_dir_all(&chunk_store_dir).expect("Failed to create chunk store dir");
     let chunk_store = Rc::new(
         IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())
-            .expect("Failed to create chunk store")
+            .expect("Failed to create chunk store"),
     );
 
     // Create RPC handler context
@@ -221,11 +232,13 @@ fn setup_server(runtime: &Runtime, data_dir: &str, registry_dir: &str) -> Rc<Rpc
     // Create connection pool for server to register its address
     let server_pool = Rc::new(
         ConnectionPool::new(worker.clone(), registry_dir)
-            .expect("Failed to create server connection pool")
+            .expect("Failed to create server connection pool"),
     );
 
     // Register server's worker address
-    server_pool.register_self("server").expect("Failed to register server address");
+    server_pool
+        .register_self("server")
+        .expect("Failed to register server address");
     println!("Server worker address registered to {}", registry_dir);
 
     // Create RPC server
@@ -254,7 +267,9 @@ async fn setup_client(runtime: &Runtime, registry_dir: &str) -> Rc<BenchFS> {
     runtime.register_reactor("ucx", ucx_reactor.clone());
 
     // Create UCX worker
-    let worker = ucx_context.create_worker().expect("Failed to create worker");
+    let worker = ucx_context
+        .create_worker()
+        .expect("Failed to create worker");
 
     ucx_reactor.register_worker(worker.clone());
 
@@ -265,13 +280,12 @@ async fn setup_client(runtime: &Runtime, registry_dir: &str) -> Rc<BenchFS> {
     std::fs::create_dir_all(&chunk_store_dir).expect("Failed to create client chunk store dir");
     let chunk_store = Rc::new(
         IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())
-            .expect("Failed to create client chunk store")
+            .expect("Failed to create client chunk store"),
     );
 
     // Create connection pool
     let connection_pool = Rc::new(
-        ConnectionPool::new(worker, registry_dir)
-            .expect("Failed to create connection pool")
+        ConnectionPool::new(worker, registry_dir).expect("Failed to create connection pool"),
     );
 
     // Wait for server to register and establish connection
@@ -353,10 +367,7 @@ async fn bench_small_write(fs: &BenchFS, config: &BenchConfig, size: usize) -> B
         fs.benchfs_unlink(&path).await.unwrap();
     }
 
-    BenchResult::new(
-        format!("Small Write ({} bytes)", size),
-        durations
-    )
+    BenchResult::new(format!("Small Write ({} bytes)", size), durations)
 }
 
 /// Run small file read benchmark
@@ -401,10 +412,7 @@ async fn bench_small_read(fs: &BenchFS, config: &BenchConfig, size: usize) -> Be
         fs.benchfs_unlink(&path).await.unwrap();
     }
 
-    BenchResult::new(
-        format!("Small Read ({} bytes)", size),
-        durations
-    )
+    BenchResult::new(format!("Small Read ({} bytes)", size), durations)
 }
 
 /// Run all benchmarks
@@ -447,7 +455,9 @@ async fn run_benchmarks(fs: Rc<BenchFS>) {
 
 /// Run server mode
 fn run_server(args: &Args) {
-    let data_dir = args.data_dir.as_ref()
+    let data_dir = args
+        .data_dir
+        .as_ref()
         .expect("--data-dir is required for server mode");
 
     // Create data and registry directories
@@ -498,7 +508,10 @@ fn run_server(args: &Args) {
 fn run_client(args: &Args) {
     // Ensure registry directory exists
     if !std::path::Path::new(&args.registry_dir).exists() {
-        eprintln!("Error: Registry directory does not exist: {}", args.registry_dir);
+        eprintln!(
+            "Error: Registry directory does not exist: {}",
+            args.registry_dir
+        );
         eprintln!("Make sure the server is running and has created the registry.");
         std::process::exit(1);
     }

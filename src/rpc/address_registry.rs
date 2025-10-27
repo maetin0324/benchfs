@@ -1,12 +1,11 @@
+use crate::rpc::RpcError;
 ///! WorkerAddress registry using shared filesystem
 ///!
 ///! This module provides a mechanism to exchange UCX WorkerAddresses between nodes
 ///! using a shared filesystem. This approach avoids the epoll_wait overhead of
 ///! socket_bind-based connections when ucp_worker_progress is called frequently.
-
 use std::fs;
 use std::path::{Path, PathBuf};
-use crate::rpc::RpcError;
 
 /// Registry for storing and retrieving UCX WorkerAddresses via shared filesystem
 pub struct WorkerAddressRegistry {
@@ -107,10 +106,7 @@ impl WorkerAddressRegistry {
     /// List all registered node IDs
     pub fn list_nodes(&self) -> Result<Vec<String>, RpcError> {
         let entries = fs::read_dir(&self.registry_dir).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "Failed to read registry directory: {}",
-                e
-            ))
+            RpcError::ConnectionError(format!("Failed to read registry directory: {}", e))
         })?;
 
         let mut nodes = Vec::new();
@@ -200,10 +196,7 @@ impl WorkerAddressRegistry {
     /// Clear all worker address registrations
     pub fn clear_all(&self) -> Result<(), RpcError> {
         let entries = fs::read_dir(&self.registry_dir).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "Failed to read registry directory: {}",
-                e
-            ))
+            RpcError::ConnectionError(format!("Failed to read registry directory: {}", e))
         })?;
 
         for entry in entries {

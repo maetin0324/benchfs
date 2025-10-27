@@ -3,16 +3,28 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use super::{FileHandle, IOUringBackend, OpenFlags, StorageBackend};
 use crate::metadata::CHUNK_SIZE;
-use super::{IOUringBackend, OpenFlags, FileHandle, StorageBackend};
 
 /// Chunk store trait for different storage backends
 ///
 /// In the new design, all operations use full path instead of inode.
 #[async_trait::async_trait(?Send)]
 pub trait ChunkStore {
-    async fn write_chunk(&self, path: &str, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize>;
-    async fn read_chunk(&self, path: &str, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>>;
+    async fn write_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize>;
+    async fn read_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>>;
     async fn delete_chunk(&self, path: &str, chunk_index: u64) -> ChunkStoreResult<()>;
     async fn delete_file_chunks(&self, path: &str) -> ChunkStoreResult<usize>;
     fn has_chunk(&self, path: &str, chunk_index: u64) -> bool;
@@ -57,10 +69,7 @@ pub struct ChunkKey {
 
 impl ChunkKey {
     pub fn new(path: String, chunk_index: u64) -> Self {
-        Self {
-            path,
-            chunk_index,
-        }
+        Self { path, chunk_index }
     }
 }
 
@@ -194,15 +203,12 @@ impl InMemoryChunkStore {
         let key = ChunkKey::new(path.to_string(), chunk_index);
         let mut chunks = self.chunks.borrow_mut();
 
-        chunks
-            .remove(&key)
-            .ok_or(ChunkStoreError::ChunkNotFound { path: path.to_string(), chunk_index })?;
+        chunks.remove(&key).ok_or(ChunkStoreError::ChunkNotFound {
+            path: path.to_string(),
+            chunk_index,
+        })?;
 
-        tracing::debug!(
-            "Deleted chunk (path={}, chunk_index={})",
-            path,
-            chunk_index
-        );
+        tracing::debug!("Deleted chunk (path={}, chunk_index={})", path, chunk_index);
 
         Ok(())
     }
@@ -257,11 +263,23 @@ impl Default for InMemoryChunkStore {
 
 #[async_trait::async_trait(?Send)]
 impl ChunkStore for InMemoryChunkStore {
-    async fn write_chunk(&self, path: &str, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize> {
+    async fn write_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize> {
         self.write_chunk(path, chunk_index, offset, data).await
     }
 
-    async fn read_chunk(&self, path: &str, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>> {
+    async fn read_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>> {
         self.read_chunk(path, chunk_index, offset, length).await
     }
 
@@ -398,7 +416,10 @@ impl FileChunkStore {
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
         if !chunk_file_path.exists() {
-            return Err(ChunkStoreError::ChunkNotFound { path: file_path.to_string(), chunk_index });
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
         }
 
         let chunk_data = std::fs::read(&chunk_file_path)?;
@@ -417,7 +438,10 @@ impl FileChunkStore {
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
         if !chunk_file_path.exists() {
-            return Err(ChunkStoreError::ChunkNotFound { path: file_path.to_string(), chunk_index });
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
         }
 
         std::fs::remove_file(&chunk_file_path)?;
@@ -454,7 +478,11 @@ impl FileChunkStore {
         // Remove the directory
         std::fs::remove_dir(&dir)?;
 
-        tracing::debug!("Deleted {} chunk files for path {}", deleted_count, file_path);
+        tracing::debug!(
+            "Deleted {} chunk files for path {}",
+            deleted_count,
+            file_path
+        );
 
         Ok(deleted_count)
     }
@@ -467,11 +495,23 @@ impl FileChunkStore {
 
 #[async_trait::async_trait(?Send)]
 impl ChunkStore for FileChunkStore {
-    async fn write_chunk(&self, path: &str, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize> {
+    async fn write_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize> {
         self.write_chunk(path, chunk_index, offset, data).await
     }
 
-    async fn read_chunk(&self, path: &str, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>> {
+    async fn read_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>> {
         self.read_chunk(path, chunk_index, offset, length).await
     }
 
@@ -666,7 +706,9 @@ impl IOUringChunkStore {
         } else {
             // Full chunk write - can write directly
             let bytes_to_write = data.len().min(self.chunk_size);
-            self.backend.write(handle, offset, &data[..bytes_to_write]).await?
+            self.backend
+                .write(handle, offset, &data[..bytes_to_write])
+                .await?
         };
 
         // NOTE: fsync is disabled for performance. Data is cached by OS and written
@@ -700,7 +742,10 @@ impl IOUringChunkStore {
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
         if !chunk_file_path.exists() {
-            return Err(ChunkStoreError::ChunkNotFound { path: file_path.to_string(), chunk_index });
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
         }
 
         // Open the chunk file
@@ -731,7 +776,10 @@ impl IOUringChunkStore {
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
         if !chunk_file_path.exists() {
-            return Err(ChunkStoreError::ChunkNotFound { path: file_path.to_string(), chunk_index });
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
         }
 
         // Delete using io_uring backend
@@ -825,11 +873,23 @@ impl IOUringChunkStore {
 
 #[async_trait::async_trait(?Send)]
 impl ChunkStore for IOUringChunkStore {
-    async fn write_chunk(&self, path: &str, chunk_index: u64, offset: u64, data: &[u8]) -> ChunkStoreResult<usize> {
+    async fn write_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize> {
         self.write_chunk(path, chunk_index, offset, data).await
     }
 
-    async fn read_chunk(&self, path: &str, chunk_index: u64, offset: u64, length: u64) -> ChunkStoreResult<Vec<u8>> {
+    async fn read_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>> {
         self.read_chunk(path, chunk_index, offset, length).await
     }
 
@@ -959,7 +1019,10 @@ mod tests {
             // Third chunk should fail
             let result = store.write_chunk("/file1", 2, 0, &data).await;
             assert!(result.is_err());
-            assert!(matches!(result.unwrap_err(), ChunkStoreError::StorageFull(_)));
+            assert!(matches!(
+                result.unwrap_err(),
+                ChunkStoreError::StorageFull(_)
+            ));
         });
     }
 
@@ -969,9 +1032,14 @@ mod tests {
             let store = InMemoryChunkStore::new();
 
             let data = vec![0xFF; 512];
-            let result = store.write_chunk("/file1", 0, CHUNK_SIZE as u64 + 100, &data).await;
+            let result = store
+                .write_chunk("/file1", 0, CHUNK_SIZE as u64 + 100, &data)
+                .await;
             assert!(result.is_err());
-            assert!(matches!(result.unwrap_err(), ChunkStoreError::InvalidOffset(_)));
+            assert!(matches!(
+                result.unwrap_err(),
+                ChunkStoreError::InvalidOffset(_)
+            ));
         });
     }
 

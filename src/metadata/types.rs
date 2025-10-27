@@ -24,15 +24,15 @@ pub enum InodeType {
 /// ファイルパーミッション (Unix風)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FilePermissions {
-    pub mode: u32,  // Unix mode (例: 0o644)
-    pub uid: u32,   // User ID
-    pub gid: u32,   // Group ID
+    pub mode: u32, // Unix mode (例: 0o644)
+    pub uid: u32,  // User ID
+    pub gid: u32,  // Group ID
 }
 
 impl Default for FilePermissions {
     fn default() -> Self {
         Self {
-            mode: 0o644,  // rw-r--r--
+            mode: 0o644, // rw-r--r--
             uid: 0,
             gid: 0,
         }
@@ -52,10 +52,7 @@ pub struct FileMetadata {
 impl FileMetadata {
     /// 新しいファイルメタデータを作成
     pub fn new(path: String, size: u64) -> Self {
-        Self {
-            path,
-            size,
-        }
+        Self { path, size }
     }
 
     /// チャンク数を計算
@@ -63,7 +60,8 @@ impl FileMetadata {
         if self.size == 0 {
             0
         } else {
-            (self.size + crate::metadata::CHUNK_SIZE as u64 - 1) / crate::metadata::CHUNK_SIZE as u64
+            (self.size + crate::metadata::CHUNK_SIZE as u64 - 1)
+                / crate::metadata::CHUNK_SIZE as u64
         }
     }
 
@@ -123,11 +121,7 @@ pub struct DirectoryEntry {
 impl DirectoryMetadata {
     /// 新しいディレクトリメタデータを作成
     pub fn new(inode: InodeId, path: String) -> Self {
-        let name = path
-            .split('/')
-            .last()
-            .unwrap_or("")
-            .to_string();
+        let name = path.split('/').last().unwrap_or("").to_string();
 
         let now = SystemTime::now();
 
@@ -136,7 +130,7 @@ impl DirectoryMetadata {
             name,
             path,
             permissions: FilePermissions {
-                mode: 0o755,  // rwxr-xr-x
+                mode: 0o755, // rwxr-xr-x
                 uid: 0,
                 gid: 0,
             },
@@ -185,13 +179,22 @@ mod tests {
         let meta = FileMetadata::new("/test/file.txt".to_string(), 1024);
         assert_eq!(meta.calculate_chunk_count(), 1);
 
-        let meta = FileMetadata::new("/test/file.txt".to_string(), crate::metadata::CHUNK_SIZE as u64);
+        let meta = FileMetadata::new(
+            "/test/file.txt".to_string(),
+            crate::metadata::CHUNK_SIZE as u64,
+        );
         assert_eq!(meta.calculate_chunk_count(), 1);
 
-        let meta = FileMetadata::new("/test/file.txt".to_string(), (crate::metadata::CHUNK_SIZE as u64) + 1);
+        let meta = FileMetadata::new(
+            "/test/file.txt".to_string(),
+            (crate::metadata::CHUNK_SIZE as u64) + 1,
+        );
         assert_eq!(meta.calculate_chunk_count(), 2);
 
-        let meta = FileMetadata::new("/test/file.txt".to_string(), 10 * crate::metadata::CHUNK_SIZE as u64);
+        let meta = FileMetadata::new(
+            "/test/file.txt".to_string(),
+            10 * crate::metadata::CHUNK_SIZE as u64,
+        );
         assert_eq!(meta.calculate_chunk_count(), 10);
     }
 

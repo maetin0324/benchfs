@@ -1,5 +1,4 @@
 /// API types for BenchFS filesystem operations
-
 use std::rc::Rc;
 
 /// File handle for open files
@@ -162,7 +161,7 @@ impl FileStat {
             .as_secs() as i64;
 
         Self {
-            inode: 0,  // Dummy inode in path-based KV design
+            inode: 0, // Dummy inode in path-based KV design
             file_type: FileType::RegularFile,
             size: meta.size,
             chunk_count: meta.calculate_chunk_count(),

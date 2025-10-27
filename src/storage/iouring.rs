@@ -1,9 +1,9 @@
 use super::{
-    error::{StorageError, StorageResult},
     FileHandle, FileStat, OpenFlags, StorageBackend,
+    error::{StorageError, StorageResult},
 };
-use pluvio_uring::file::DmaFile;
 use pluvio_uring::allocator::FixedBufferAllocator;
+use pluvio_uring::file::DmaFile;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -72,20 +72,16 @@ impl StorageBackend for IOUringBackend {
     async fn open(&self, path: &Path, flags: OpenFlags) -> StorageResult<FileHandle> {
         let opts = Self::flags_to_open_options(flags);
 
-        let file = opts
-            .open(path)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    StorageError::NotFound(path.display().to_string())
-                }
-                std::io::ErrorKind::PermissionDenied => {
-                    StorageError::PermissionDenied(path.display().to_string())
-                }
-                std::io::ErrorKind::AlreadyExists => {
-                    StorageError::AlreadyExists(path.display().to_string())
-                }
-                _ => StorageError::IoError(e),
-            })?;
+        let file = opts.open(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => StorageError::NotFound(path.display().to_string()),
+            std::io::ErrorKind::PermissionDenied => {
+                StorageError::PermissionDenied(path.display().to_string())
+            }
+            std::io::ErrorKind::AlreadyExists => {
+                StorageError::AlreadyExists(path.display().to_string())
+            }
+            _ => StorageError::IoError(e),
+        })?;
 
         let dma_file = DmaFile::new(file);
         let fd = self.allocate_fd();
@@ -157,12 +153,7 @@ impl StorageBackend for IOUringBackend {
         Ok(actual_size)
     }
 
-    async fn write(
-        &self,
-        handle: FileHandle,
-        offset: u64,
-        buffer: &[u8],
-    ) -> StorageResult<usize> {
+    async fn write(&self, handle: FileHandle, offset: u64, buffer: &[u8]) -> StorageResult<usize> {
         let files = self.files.borrow();
         let dma_file = files
             .get(&handle.0)
@@ -208,9 +199,7 @@ impl StorageBackend for IOUringBackend {
 
     async fn create(&self, path: &Path, mode: u32) -> StorageResult<FileHandle> {
         let mut opts = OpenOptions::new();
-        opts.write(true)
-            .create(true)
-            .truncate(false);
+        opts.write(true).create(true).truncate(false);
 
         // Unix パーミッション設定
         #[cfg(unix)]
@@ -349,10 +338,7 @@ impl StorageBackend for IOUringBackend {
             .ok_or(StorageError::InvalidHandle(handle))?;
 
         // Use DmaFile's fsync which uses io_uring's Fsync operation
-        dma_file
-            .fsync()
-            .await
-            .map_err(StorageError::IoError)?;
+        dma_file.fsync().await.map_err(StorageError::IoError)?;
 
         tracing::debug!("Synced file with fd={}", handle.0);
 

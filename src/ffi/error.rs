@@ -12,14 +12,14 @@ use std::os::raw::c_char;
 // Error code definitions (following POSIX conventions)
 pub const BENCHFS_SUCCESS: i32 = 0;
 pub const BENCHFS_ERROR: i32 = -1;
-pub const BENCHFS_ENOENT: i32 = -2;   // No such file or directory
-pub const BENCHFS_EIO: i32 = -3;       // I/O error
-pub const BENCHFS_ENOMEM: i32 = -4;    // Out of memory
-pub const BENCHFS_EINVAL: i32 = -5;    // Invalid argument
-pub const BENCHFS_EEXIST: i32 = -6;    // File exists
-pub const BENCHFS_ENOTDIR: i32 = -20;  // Not a directory
-pub const BENCHFS_EISDIR: i32 = -21;   // Is a directory
-pub const BENCHFS_ENOSPC: i32 = -28;   // No space left on device
+pub const BENCHFS_ENOENT: i32 = -2; // No such file or directory
+pub const BENCHFS_EIO: i32 = -3; // I/O error
+pub const BENCHFS_ENOMEM: i32 = -4; // Out of memory
+pub const BENCHFS_EINVAL: i32 = -5; // Invalid argument
+pub const BENCHFS_EEXIST: i32 = -6; // File exists
+pub const BENCHFS_ENOTDIR: i32 = -20; // Not a directory
+pub const BENCHFS_EISDIR: i32 = -21; // Is a directory
+pub const BENCHFS_ENOSPC: i32 = -28; // No space left on device
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);

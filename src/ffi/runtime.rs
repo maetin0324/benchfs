@@ -6,12 +6,12 @@
 // - Thread-local RPC server and connection pool storage for distributed mode
 // - block_on() helper for async→sync conversion
 
+use crate::api::file_ops::BenchFS;
+use crate::rpc::connection::ConnectionPool;
+use crate::rpc::server::RpcServer;
+use pluvio_runtime::executor::Runtime;
 use std::cell::RefCell;
 use std::rc::Rc;
-use pluvio_runtime::executor::Runtime;
-use crate::api::file_ops::BenchFS;
-use crate::rpc::server::RpcServer;
-use crate::rpc::connection::ConnectionPool;
 
 // Thread-local runtime
 //
@@ -100,7 +100,7 @@ where
             // Fallback: create a basic runtime if not initialized
             // This should only happen in local mode
             drop(runtime);
-            let new_runtime_rc: Rc<Runtime> = Runtime::new(256);  // Runtime::new() returns Rc<Runtime>
+            let new_runtime_rc: Rc<Runtime> = Runtime::new(256); // Runtime::new() returns Rc<Runtime>
             *runtime_cell.borrow_mut() = Some(new_runtime_rc.clone());
             new_runtime_rc
         };
@@ -118,6 +118,9 @@ where
         rt.run(wrapped_future);
 
         // Extract the result
-        result_holder.borrow_mut().take().expect("Future did not complete")
+        result_holder
+            .borrow_mut()
+            .take()
+            .expect("Future did not complete")
     })
 }

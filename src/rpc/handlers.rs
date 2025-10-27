@@ -3,8 +3,8 @@ use std::rc::Rc;
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
-use crate::storage::ChunkStore;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
+use crate::storage::ChunkStore;
 
 /// RPC Handler context
 ///
@@ -16,10 +16,7 @@ pub struct RpcHandlerContext {
 }
 
 impl RpcHandlerContext {
-    pub fn new(
-        metadata_manager: Rc<MetadataManager>,
-        chunk_store: Rc<dyn ChunkStore>,
-    ) -> Self {
+    pub fn new(metadata_manager: Rc<MetadataManager>, chunk_store: Rc<dyn ChunkStore>) -> Self {
         Self {
             metadata_manager,
             chunk_store,
@@ -57,14 +54,17 @@ pub async fn handle_read_chunk(
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+            .await
+        {
             tracing::error!("Failed to receive path data: {:?}", e);
             return Ok((
                 ReadChunkHandlerResponse {
                     header: ReadChunkResponseHeader::error(-5), // EIO
                     data: None,
                 },
-                am_msg
+                am_msg,
             ));
         }
 
@@ -77,7 +77,7 @@ pub async fn handle_read_chunk(
                         header: ReadChunkResponseHeader::error(-22), // EINVAL
                         data: None,
                     },
-                    am_msg
+                    am_msg,
                 ));
             }
         }
@@ -87,7 +87,7 @@ pub async fn handle_read_chunk(
                 header: ReadChunkResponseHeader::error(-22), // EINVAL
                 data: None,
             },
-            am_msg
+            am_msg,
         ));
     };
 
@@ -120,7 +120,7 @@ pub async fn handle_read_chunk(
                     header: ReadChunkResponseHeader::success(bytes_read),
                     data: Some(data),
                 },
-                am_msg
+                am_msg,
             ))
         }
         Err(e) => {
@@ -130,7 +130,7 @@ pub async fn handle_read_chunk(
                     header: ReadChunkResponseHeader::error(-2), // ENOENT
                     data: None,
                 },
-                am_msg
+                am_msg,
             ))
         }
     }
@@ -165,10 +165,13 @@ pub async fn handle_write_chunk(
     let mut data = vec![0u8; header.length as usize];
 
     // Receive both path and data in one vectored call
-    if let Err(e) = am_msg.recv_data_vectored(&[
-        std::io::IoSliceMut::new(&mut path_bytes),
-        std::io::IoSliceMut::new(&mut data)
-    ]).await {
+    if let Err(e) = am_msg
+        .recv_data_vectored(&[
+            std::io::IoSliceMut::new(&mut path_bytes),
+            std::io::IoSliceMut::new(&mut data),
+        ])
+        .await
+    {
         tracing::error!("Failed to receive path and data: {:?}", e);
         return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
     }
@@ -202,7 +205,10 @@ pub async fn handle_write_chunk(
                 path,
                 header.chunk_index
             );
-            Ok((WriteChunkResponseHeader::success(bytes_written as u64), am_msg))
+            Ok((
+                WriteChunkResponseHeader::success(bytes_written as u64),
+                am_msg,
+            ))
         }
         Err(e) => {
             tracing::error!("Failed to write chunk: {:?}", e);
@@ -235,7 +241,10 @@ pub async fn handle_metadata_lookup(
     // Receive path from request data if available
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+            .await
+        {
             tracing::error!("Failed to receive path data: {:?}", e);
             return Ok((MetadataLookupResponseHeader::error(-5), am_msg)); // EIO
         }
@@ -258,7 +267,11 @@ pub async fn handle_metadata_lookup(
 
     // Look up file metadata first
     if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path_ref) {
-        tracing::debug!("Found file: path={}, size={}", file_meta.path, file_meta.size);
+        tracing::debug!(
+            "Found file: path={}, size={}",
+            file_meta.path,
+            file_meta.size
+        );
         return Ok((MetadataLookupResponseHeader::file(file_meta.size), am_msg));
     }
 
@@ -292,7 +305,10 @@ pub async fn handle_metadata_create_file(
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+            .await
+        {
             tracing::error!("Failed to receive path data: {:?}", e);
             return Ok((MetadataCreateFileResponseHeader::error(-5), am_msg)); // EIO
         }
@@ -324,7 +340,7 @@ pub async fn handle_metadata_create_file(
     match ctx.metadata_manager.store_file_metadata(file_meta) {
         Ok(()) => {
             tracing::debug!("Created file metadata: path={}", path);
-            Ok((MetadataCreateFileResponseHeader::success(0), am_msg))  // Dummy inode
+            Ok((MetadataCreateFileResponseHeader::success(0), am_msg)) // Dummy inode
         }
         Err(e) => {
             tracing::error!("Failed to store file metadata: {:?}", e);
@@ -353,7 +369,10 @@ pub async fn handle_metadata_create_dir(
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+            .await
+        {
             tracing::error!("Failed to receive path data: {:?}", e);
             return Ok((MetadataCreateDirResponseHeader::error(-5), am_msg)); // EIO
         }
@@ -370,18 +389,11 @@ pub async fn handle_metadata_create_dir(
         return Ok((MetadataCreateDirResponseHeader::error(-22), am_msg)); // EINVAL
     };
 
-    tracing::debug!(
-        "MetadataCreateDir: path={}, mode={:#o}",
-        path,
-        header.mode
-    );
+    tracing::debug!("MetadataCreateDir: path={}, mode={:#o}", path, header.mode);
 
     // Create directory metadata
     use crate::metadata::DirectoryMetadata;
-    let dir_meta = DirectoryMetadata::new(
-        ctx.metadata_manager.generate_inode(),
-        path.clone(),
-    );
+    let dir_meta = DirectoryMetadata::new(ctx.metadata_manager.generate_inode(), path.clone());
 
     let inode = dir_meta.inode;
 
@@ -418,7 +430,10 @@ pub async fn handle_metadata_delete(
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+            .await
+        {
             tracing::error!("Failed to receive path data: {:?}", e);
             return Ok((MetadataDeleteResponseHeader::error(-5), am_msg)); // EIO
         }
@@ -488,7 +503,10 @@ pub async fn handle_metadata_update(
     // Receive path from request data
     let path = if header.path_len > 0 && am_msg.contains_data() {
         let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+            .await
+        {
             tracing::error!("Failed to receive path data: {:?}", e);
             return Ok((MetadataUpdateResponseHeader::error(-5), am_msg)); // EIO
         }
@@ -544,11 +562,7 @@ pub async fn handle_metadata_update(
     // Note: BenchFS doesn't currently use mode field in FileMetadata,
     // so we just log it for now
     if header.should_update_mode() {
-        tracing::debug!(
-            "Updated file mode: {:#o} (path={})",
-            header.new_mode,
-            path
-        );
+        tracing::debug!("Updated file mode: {:#o} (path={})", header.new_mode, path);
         // In the future, store mode in FileMetadata
     }
 

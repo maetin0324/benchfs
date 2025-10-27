@@ -3,7 +3,7 @@ use super::{
     id_generator::IdGenerator,
     types::{DirectoryMetadata, FileMetadata, InodeId, NodeId},
 };
-use crate::cache::{MetadataCache, CachePolicy};
+use crate::cache::{CachePolicy, MetadataCache};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -162,9 +162,9 @@ impl MetadataManager {
     /// # Arguments
     /// * `path` - ファイルパス
     pub fn get_file_metadata(&self, path: &Path) -> MetadataResult<FileMetadata> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path)))?;
+        let path_str = path.to_str().ok_or_else(|| {
+            MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
+        })?;
 
         // Check cache first
         if let Some(cached) = self.cache.get_file(path_str) {
@@ -173,7 +173,8 @@ impl MetadataManager {
         }
 
         // Cache miss, get from local storage
-        let metadata = self.local_file_metadata
+        let metadata = self
+            .local_file_metadata
             .borrow()
             .get(path_str)
             .cloned()
@@ -207,9 +208,9 @@ impl MetadataManager {
 
     /// ファイルメタデータをローカルから削除
     pub fn remove_file_metadata(&self, path: &Path) -> MetadataResult<()> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path)))?;
+        let path_str = path.to_str().ok_or_else(|| {
+            MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
+        })?;
 
         let mut local_metadata = self.local_file_metadata.borrow_mut();
 
@@ -243,9 +244,9 @@ impl MetadataManager {
 
     /// ディレクトリメタデータをローカルから取得
     pub fn get_dir_metadata(&self, path: &Path) -> MetadataResult<DirectoryMetadata> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path)))?;
+        let path_str = path.to_str().ok_or_else(|| {
+            MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
+        })?;
 
         // Check cache first
         if let Some(cached) = self.cache.get_dir(path_str) {
@@ -254,7 +255,8 @@ impl MetadataManager {
         }
 
         // Cache miss, get from local storage
-        let metadata = self.local_dir_metadata
+        let metadata = self
+            .local_dir_metadata
             .borrow()
             .get(path_str)
             .cloned()
@@ -288,9 +290,9 @@ impl MetadataManager {
 
     /// ディレクトリメタデータをローカルから削除
     pub fn remove_dir_metadata(&self, path: &Path) -> MetadataResult<()> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path)))?;
+        let path_str = path.to_str().ok_or_else(|| {
+            MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
+        })?;
 
         let mut local_metadata = self.local_dir_metadata.borrow_mut();
 
@@ -462,7 +464,10 @@ mod tests {
         // 重複エラー
         let result = manager.store_file_metadata(metadata.clone());
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), MetadataError::AlreadyExists(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            MetadataError::AlreadyExists(_)
+        ));
     }
 
     #[test]

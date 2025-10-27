@@ -1,16 +1,16 @@
 use super::{
+    FileHandle, OpenFlags, StorageBackend,
     error::{StorageError, StorageResult},
     iouring::IOUringBackend,
-    FileHandle, OpenFlags, StorageBackend,
 };
 use crate::metadata::{
-    types::{InodeId, InodeType},
     DirectoryMetadata, FileMetadata,
+    types::{InodeId, InodeType},
 };
 use pluvio_uring::allocator::FixedBufferAllocator;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::cell::RefCell;
 use std::rc::Rc;
 
 /// ローカルファイルシステム
@@ -241,10 +241,7 @@ impl LocalFileSystem {
         if let Some(parent_inode) = parent_inode_opt {
             let mut dir_metadata = self.dir_metadata.borrow_mut();
             if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
-                let filename = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 parent_meta.remove_child(filename);
             }
         }
@@ -321,9 +318,7 @@ impl LocalFileSystem {
             let dir_metadata = self.dir_metadata.borrow();
             if let Some(metadata) = dir_metadata.get(&inode) {
                 if !metadata.children.is_empty() {
-                    return Err(StorageError::Internal(
-                        "Directory not empty".to_string(),
-                    ));
+                    return Err(StorageError::Internal("Directory not empty".to_string()));
                 }
             }
         }
@@ -347,10 +342,7 @@ impl LocalFileSystem {
             // 親ディレクトリのメタデータを更新
             if let Some(parent_inode) = parent_inode_opt {
                 if let Some(parent_meta) = dir_metadata.get_mut(&parent_inode) {
-                    let dirname = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
+                    let dirname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                     parent_meta.remove_child(dirname);
                 }
             }

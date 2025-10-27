@@ -1,25 +1,28 @@
 //! Chunk data caching
 
-use std::cell::RefCell;
-use std::time::{Duration, Instant};
 use lru::LruCache;
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
 
-use crate::metadata::types::InodeId;
 use crate::cache::policy::CachePolicy;
+use crate::metadata::types::InodeId;
 
 /// Chunk identifier (path_hash, chunk_index)
 /// In path-based KV design, chunks are identified by file path and chunk index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkId {
-    pub path_hash: u64,  // Hash of file path for efficient lookup
+    pub path_hash: u64, // Hash of file path for efficient lookup
     pub chunk_index: u64,
 }
 
 impl ChunkId {
     pub fn new(inode: InodeId, chunk_index: u64) -> Self {
         // Legacy method: treat inode as path_hash
-        Self { path_hash: inode, chunk_index }
+        Self {
+            path_hash: inode,
+            chunk_index,
+        }
     }
 
     pub fn from_path(path: &str, chunk_index: u64) -> Self {
@@ -30,7 +33,10 @@ impl ChunkId {
         path.hash(&mut hasher);
         let path_hash = hasher.finish();
 
-        Self { path_hash, chunk_index }
+        Self {
+            path_hash,
+            chunk_index,
+        }
     }
 }
 
@@ -163,8 +169,8 @@ impl ChunkCache {
         let mut cache = self.cache.borrow_mut();
         let keys_to_remove: Vec<ChunkId> = cache
             .iter()
-            .filter(|(k, _)| k.path_hash == inode)  // Treat inode as path_hash for legacy compatibility
-            .map(|(k, _)| *k)  // Copy instead of clone (ChunkId is Copy)
+            .filter(|(k, _)| k.path_hash == inode) // Treat inode as path_hash for legacy compatibility
+            .map(|(k, _)| *k) // Copy instead of clone (ChunkId is Copy)
             .collect();
 
         for key in keys_to_remove {
@@ -187,7 +193,7 @@ impl ChunkCache {
         let keys_to_remove: Vec<ChunkId> = cache
             .iter()
             .filter(|(k, _)| k.path_hash == path_hash)
-            .map(|(k, _)| *k)  // Copy instead of clone (ChunkId is Copy)
+            .map(|(k, _)| *k) // Copy instead of clone (ChunkId is Copy)
             .collect();
 
         for key in keys_to_remove {

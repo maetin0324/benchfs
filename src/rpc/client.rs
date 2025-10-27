@@ -49,8 +49,12 @@ impl RpcClient {
         let need_reply = request.need_reply();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        tracing::debug!("RpcClient::execute: rpc_id={}, reply_stream_id={}, has_data={}",
-            rpc_id, reply_stream_id, !data.is_empty());
+        tracing::debug!(
+            "RpcClient::execute: rpc_id={}, reply_stream_id={}, has_data={}",
+            rpc_id,
+            reply_stream_id,
+            !data.is_empty()
+        );
 
         let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
@@ -127,7 +131,7 @@ impl RpcClient {
                 zerocopy::IntoBytes::as_bytes(header),
                 &data,
                 false, // need_reply = false
-                proto,  // proto - TODO: pass actual proto when available
+                proto, // proto - TODO: pass actual proto when available
             )
             .await
             .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;

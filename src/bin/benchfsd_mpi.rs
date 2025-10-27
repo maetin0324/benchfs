@@ -10,24 +10,24 @@
 //! - Rank 0: Primary metadata server
 //! - Other ranks: Storage servers and secondary metadata servers
 
-use benchfs::config::ServerConfig;
-use benchfs::rpc::server::RpcServer;
-use benchfs::rpc::handlers::RpcHandlerContext;
-use benchfs::rpc::connection::ConnectionPool;
-use benchfs::metadata::MetadataManager;
-use benchfs::storage::{ChunkStore, IOUringChunkStore, IOUringBackend, FileChunkStore};
 use benchfs::cache::CachePolicy;
+use benchfs::config::ServerConfig;
+use benchfs::metadata::MetadataManager;
+use benchfs::rpc::connection::ConnectionPool;
+use benchfs::rpc::handlers::RpcHandlerContext;
+use benchfs::rpc::server::RpcServer;
+use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
-use pluvio_uring::reactor::IoUringReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
+use pluvio_uring::reactor::IoUringReactor;
 
 use mpi::traits::*;
 
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Server state
 struct ServerState {
@@ -74,7 +74,10 @@ fn main() {
 
     if args.len() < 2 {
         if mpi_rank == 0 {
-            eprintln!("Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file]", args[0]);
+            eprintln!(
+                "Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file]",
+                args[0]
+            );
             eprintln!("  registry_dir: Shared directory for service discovery (required)");
             eprintln!("  config_file:  Configuration file (optional, default: benchfs.toml)");
         }
@@ -143,7 +146,12 @@ fn main() {
     }
 
     // Create server state
-    let state = Rc::new(ServerState::new(config.clone(), mpi_rank, mpi_size, registry_dir));
+    let state = Rc::new(ServerState::new(
+        config.clone(),
+        mpi_rank,
+        mpi_size,
+        registry_dir,
+    ));
 
     // Setup signal handlers
     setup_signal_handlers(state.running.clone());
@@ -166,7 +174,9 @@ fn main() {
 fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
     let config = &state.config;
     let node_id = state.node_id();
-    let registry_dir = state.registry_dir.to_str()
+    let registry_dir = state
+        .registry_dir
+        .to_str()
         .ok_or("Registry directory path is not valid UTF-8")?;
 
     // Create pluvio runtime
@@ -219,7 +229,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
         // Create IOUringBackend and chunk store
         let io_backend = Rc::new(IOUringBackend::new(allocator));
-        Rc::new(IOUringChunkStore::new(&chunk_store_dir, io_backend.clone())?)
+        Rc::new(IOUringChunkStore::new(
+            &chunk_store_dir,
+            io_backend.clone(),
+        )?)
     } else {
         tracing::info!("io_uring disabled - using file-based storage backend");
         Rc::new(FileChunkStore::new(&chunk_store_dir)?)
@@ -235,9 +248,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
 
     // Create connection pool for inter-node communication
-    let connection_pool = Rc::new(
-        ConnectionPool::new(worker.clone(), registry_dir)?
-    );
+    let connection_pool = Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?);
 
     // Register this node's worker address
     if let Err(e) = connection_pool.register_self(&node_id) {
@@ -258,8 +269,8 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
             if rank != state.mpi_rank {
                 let other_node_id = format!("node_{}", rank);
                 // Try to check if node is registered by attempting to read its address
-                let registry_file = PathBuf::from(registry_dir)
-                    .join(format!("{}.addr", other_node_id));
+                let registry_file =
+                    PathBuf::from(registry_dir).join(format!("{}.addr", other_node_id));
                 if registry_file.exists() {
                     if rank + 1 > registered_count {
                         registered_count = rank + 1;
@@ -277,8 +288,12 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     if registered_count < state.mpi_size {
-        tracing::warn!("Only {}/{} nodes registered after {} seconds",
-                      registered_count, state.mpi_size, max_wait_secs);
+        tracing::warn!(
+            "Only {}/{} nodes registered after {} seconds",
+            registered_count,
+            state.mpi_size,
+            max_wait_secs
+        );
     } else {
         tracing::info!("All {} nodes registered successfully", state.mpi_size);
     }
@@ -340,11 +355,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 fn setup_logging(level: &str) {
-    use tracing_subscriber::fmt;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     fmt()
         .with_env_filter(filter)

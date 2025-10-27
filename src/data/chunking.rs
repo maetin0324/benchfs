@@ -1,4 +1,4 @@
-use crate::metadata::{FileMetadata, NodeId, CHUNK_SIZE};
+use crate::metadata::{CHUNK_SIZE, FileMetadata, NodeId};
 
 /// チャンク情報
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,7 +369,9 @@ mod tests {
         assert_eq!(reads[0], (0, 0, 1024)); // (chunk_index, chunk_offset, read_size)
 
         // チャンクの中間から読み込み
-        let reads = manager.calculate_read_chunks(1024, 2048, file_size).unwrap();
+        let reads = manager
+            .calculate_read_chunks(1024, 2048, file_size)
+            .unwrap();
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0], (0, 1024, 2048));
 

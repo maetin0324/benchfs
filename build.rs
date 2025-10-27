@@ -32,8 +32,8 @@ fn generate_pkg_config() {
 
     // Get target directory for library path
     let profile = env::var("PROFILE").unwrap();
-    let target_dir = env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_| format!("{}/target", manifest_dir));
+    let target_dir =
+        env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| format!("{}/target", manifest_dir));
     let lib_dir = format!("{}/{}", target_dir, profile);
 
     // Include directory points to our header location
@@ -65,7 +65,13 @@ Cflags: -I${{includedir}}
     file.write_all(pc_content.as_bytes())
         .expect("Failed to write benchfs.pc");
 
-    println!("cargo:warning=Generated pkg-config file at: {}", dest_path.display());
+    println!(
+        "cargo:warning=Generated pkg-config file at: {}",
+        dest_path.display()
+    );
     println!("cargo:warning=To install:");
-    println!("cargo:warning=  sudo cp {} /usr/local/lib/pkgconfig/", dest_path.display());
+    println!(
+        "cargo:warning=  sudo cp {} /usr/local/lib/pkgconfig/",
+        dest_path.display()
+    );
 }

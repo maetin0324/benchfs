@@ -1,13 +1,16 @@
 // ストレージ層モジュール
+pub mod chunk_store;
 pub mod error;
 pub mod iouring;
 pub mod local;
-pub mod chunk_store;
 
+pub use chunk_store::{
+    ChunkKey, ChunkStore, ChunkStoreError, ChunkStoreResult, FileChunkStore, IOUringChunkStore,
+    InMemoryChunkStore,
+};
 pub use error::{StorageError, StorageResult};
 pub use iouring::IOUringBackend;
 pub use local::LocalFileSystem;
-pub use chunk_store::{ChunkStore, InMemoryChunkStore, FileChunkStore, IOUringChunkStore, ChunkStoreError, ChunkStoreResult, ChunkKey};
 
 use std::path::Path;
 
@@ -34,12 +37,7 @@ pub trait StorageBackend {
     ) -> StorageResult<usize>;
 
     /// データを書き込む
-    async fn write(
-        &self,
-        handle: FileHandle,
-        offset: u64,
-        buffer: &[u8],
-    ) -> StorageResult<usize>;
+    async fn write(&self, handle: FileHandle, offset: u64, buffer: &[u8]) -> StorageResult<usize>;
 
     /// ファイルを作成
     async fn create(&self, path: &Path, mode: u32) -> StorageResult<FileHandle>;
@@ -72,7 +70,7 @@ pub struct OpenFlags {
     pub create: bool,
     pub truncate: bool,
     pub append: bool,
-    pub direct: bool,  // Direct I/O (O_DIRECT)
+    pub direct: bool, // Direct I/O (O_DIRECT)
 }
 
 impl OpenFlags {

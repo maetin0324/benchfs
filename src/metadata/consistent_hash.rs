@@ -115,7 +115,10 @@ impl ConsistentHashRing {
         }
 
         // 見つからない場合は、リングの先頭 (最小値) に戻る
-        self.ring.iter().next().map(|(_pos, node_id)| node_id.clone())
+        self.ring
+            .iter()
+            .next()
+            .map(|(_pos, node_id)| node_id.clone())
     }
 
     /// 指定されたキーに対応する複数のノードを取得 (レプリケーション用)

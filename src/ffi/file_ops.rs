@@ -346,8 +346,7 @@ pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
             let fs_ref = &*fs_ptr;
-            block_on(async move { fs_ref.benchfs_close(&handle).await })
-                .map_err(|e| e.to_string())
+            block_on(async move { fs_ref.benchfs_close(&handle).await }).map_err(|e| e.to_string())
         });
 
         result_to_error_code(result.and_then(|r| r))

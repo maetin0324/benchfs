@@ -18,7 +18,15 @@ pub const RPC_WRITE_CHUNK: RpcId = 11;
 
 /// ReadChunk request header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct ReadChunkRequestHeader {
     /// Chunk index to read
     pub chunk_index: u64,
@@ -46,7 +54,15 @@ impl ReadChunkRequestHeader {
 
 /// ReadChunk response header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct ReadChunkResponseHeader {
     /// Number of bytes actually read
     pub bytes_read: u64,
@@ -191,8 +207,11 @@ impl AmRpc for ReadChunkRequest {
         let header = match am_msg
             .header()
             .get(..std::mem::size_of::<ReadChunkRequestHeader>())
-            .and_then(|bytes| ReadChunkRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        {
+            .and_then(|bytes| {
+                ReadChunkRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
@@ -200,7 +219,10 @@ impl AmRpc for ReadChunkRequest {
         // Receive path from request data
         let path = if header.path_len > 0 && am_msg.contains_data() {
             let mut path_bytes = vec![0u8; header.path_len as usize];
-            if let Err(e) = am_msg.recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)]).await {
+            if let Err(e) = am_msg
+                .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+                .await
+            {
                 tracing::error!("Failed to receive path data: {:?}", e);
                 return Err((RpcError::InvalidHeader, am_msg));
             }
@@ -225,24 +247,33 @@ impl AmRpc for ReadChunkRequest {
         );
 
         // Read chunk data from storage
-        match ctx.chunk_store.read_chunk(&path, header.chunk_index, header.offset, header.length).await {
+        match ctx
+            .chunk_store
+            .read_chunk(&path, header.chunk_index, header.offset, header.length)
+            .await
+        {
             Ok(data) => {
                 let bytes_read = data.len() as u64;
-                tracing::debug!("Read {} bytes from storage (path={}, chunk={})", bytes_read, path, header.chunk_index);
+                tracing::debug!(
+                    "Read {} bytes from storage (path={}, chunk={})",
+                    bytes_read,
+                    path,
+                    header.chunk_index
+                );
 
                 Ok((
                     crate::rpc::ServerResponse::with_data(
                         ReadChunkResponseHeader::success(bytes_read),
-                        data
+                        data,
                     ),
-                    am_msg
+                    am_msg,
                 ))
             }
             Err(e) => {
                 tracing::error!("Failed to read chunk: {:?}", e);
                 Ok((
                     crate::rpc::ServerResponse::new(ReadChunkResponseHeader::error(-2)),
-                    am_msg
+                    am_msg,
                 ))
             }
         }
@@ -266,7 +297,15 @@ impl AmRpc for ReadChunkRequest {
 
 /// WriteChunk request header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct WriteChunkRequestHeader {
     /// Chunk index to write
     pub chunk_index: u64,
@@ -294,7 +333,15 @@ impl WriteChunkRequestHeader {
 
 /// WriteChunk response header
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct WriteChunkResponseHeader {
     /// Number of bytes actually written
     pub bytes_written: u64,
@@ -428,8 +475,11 @@ impl AmRpc for WriteChunkRequest {
         let header = match am_msg
             .header()
             .get(..std::mem::size_of::<WriteChunkRequestHeader>())
-            .and_then(|bytes| WriteChunkRequestHeader::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        {
+            .and_then(|bytes| {
+                WriteChunkRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
@@ -440,7 +490,7 @@ impl AmRpc for WriteChunkRequest {
             tracing::error!("WriteChunk request contains no data");
             return Ok((
                 crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
-                am_msg
+                am_msg,
             ));
         }
 
@@ -449,14 +499,17 @@ impl AmRpc for WriteChunkRequest {
         let mut data = vec![0u8; header.length as usize];
 
         // Receive both path and data in one vectored call
-        if let Err(e) = am_msg.recv_data_vectored(&[
-            std::io::IoSliceMut::new(&mut path_bytes),
-            std::io::IoSliceMut::new(&mut data)
-        ]).await {
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut path_bytes),
+                std::io::IoSliceMut::new(&mut data),
+            ])
+            .await
+        {
             tracing::error!("Failed to receive path and data: {:?}", e);
             return Ok((
                 crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
-                am_msg
+                am_msg,
             ));
         }
 
@@ -466,7 +519,7 @@ impl AmRpc for WriteChunkRequest {
                 tracing::error!("Failed to decode path: {:?}", e);
                 return Ok((
                     crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
-                    am_msg
+                    am_msg,
                 ));
             }
         };
@@ -480,19 +533,30 @@ impl AmRpc for WriteChunkRequest {
         );
 
         // Write chunk data to storage
-        match ctx.chunk_store.write_chunk(&path, header.chunk_index, header.offset, &data).await {
+        match ctx
+            .chunk_store
+            .write_chunk(&path, header.chunk_index, header.offset, &data)
+            .await
+        {
             Ok(_bytes_written) => {
-                tracing::debug!("Wrote {} bytes to storage (path={}, chunk={})", data.len(), path, header.chunk_index);
+                tracing::debug!(
+                    "Wrote {} bytes to storage (path={}, chunk={})",
+                    data.len(),
+                    path,
+                    header.chunk_index
+                );
                 Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::success(header.length)),
-                    am_msg
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::success(
+                        header.length,
+                    )),
+                    am_msg,
                 ))
             }
             Err(e) => {
                 tracing::error!("Failed to write chunk: {:?}", e);
                 Ok((
                     crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
-                    am_msg
+                    am_msg,
                 ))
             }
         }
@@ -515,10 +579,7 @@ impl AmRpc for WriteChunkRequest {
 // ============================================================================
 
 /// Query which node stores a specific chunk
-pub fn get_chunk_node(
-    chunk_index: u64,
-    chunk_locations: &[NodeId],
-) -> Option<&NodeId> {
+pub fn get_chunk_node(chunk_index: u64, chunk_locations: &[NodeId]) -> Option<&NodeId> {
     chunk_locations.get(chunk_index as usize)
 }
 
@@ -560,7 +621,7 @@ mod tests {
         let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string());
         assert_eq!(request.header.chunk_index, 0);
         assert_eq!(request.header.length, 1024);
-        assert_eq!(request.header.path_len, 14);  // "/test/file.txt".len()
+        assert_eq!(request.header.path_len, 14); // "/test/file.txt".len()
 
         // Buffer should be allocated
         assert_eq!(request.data().len(), 1024);
@@ -593,7 +654,7 @@ mod tests {
 
         assert_eq!(request.header.chunk_index, 1);
         assert_eq!(request.header.length, 512);
-        assert_eq!(request.header.path_len, 14);  // "/test/file.txt".len()
+        assert_eq!(request.header.path_len, 14); // "/test/file.txt".len()
         assert_eq!(request.data(), &data[..]);
     }
 

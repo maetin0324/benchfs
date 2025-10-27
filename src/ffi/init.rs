@@ -7,18 +7,18 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::rc::Rc;
 
-use super::runtime::{set_benchfs_ctx, set_runtime, set_rpc_server, set_connection_pool, block_on};
 use super::error::*;
+use super::runtime::{block_on, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime};
 use crate::api::file_ops::BenchFS;
-use crate::rpc::server::RpcServer;
-use crate::rpc::handlers::RpcHandlerContext;
-use crate::rpc::connection::ConnectionPool;
 use crate::metadata::MetadataManager;
+use crate::rpc::connection::ConnectionPool;
+use crate::rpc::handlers::RpcHandlerContext;
+use crate::rpc::server::RpcServer;
 use crate::storage::{IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
-use pluvio_uring::reactor::IoUringReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
+use pluvio_uring::reactor::IoUringReactor;
 
 // Opaque type for BenchFS context
 // This prevents C code from accessing internal structure
@@ -92,8 +92,12 @@ pub extern "C" fn benchfs_init(
     // Create BenchFS instance based on mode
     let benchfs = if is_server != 0 {
         // ===== SERVER MODE =====
-        tracing::info!("Initializing BenchFS server: node_id={}, registry_dir={}, data_dir={:?}",
-                      node_id_str, registry_dir_str, data_dir_str);
+        tracing::info!(
+            "Initializing BenchFS server: node_id={}, registry_dir={}, data_dir={:?}",
+            node_id_str,
+            registry_dir_str,
+            data_dir_str
+        );
 
         // Require data_dir for server
         let data_dir = match data_dir_str {
@@ -218,8 +222,11 @@ pub extern "C" fn benchfs_init(
         benchfs
     } else {
         // ===== CLIENT MODE =====
-        tracing::info!("Initializing BenchFS client: node_id={}, registry_dir={}",
-                      node_id_str, registry_dir_str);
+        tracing::info!(
+            "Initializing BenchFS client: node_id={}, registry_dir={}",
+            node_id_str,
+            registry_dir_str
+        );
 
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
@@ -259,9 +266,8 @@ pub extern "C" fn benchfs_init(
         // Wait for server to register and connect
         tracing::info!("Waiting for server to register (timeout: 30 seconds)...");
         let pool_clone = connection_pool.clone();
-        let connect_result = block_on(async move {
-            pool_clone.wait_and_connect("node_0", 30).await
-        });
+        let connect_result =
+            block_on(async move { pool_clone.wait_and_connect("node_0", 30).await });
 
         match connect_result {
             Ok(_) => tracing::info!("Successfully connected to server"),
@@ -293,7 +299,10 @@ pub extern "C" fn benchfs_init(
         let io_backend = Rc::new(IOUringBackend::new(allocator));
         let chunk_store_dir = format!("{}/chunks", client_data_dir);
         if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
-            set_error_message(&format!("Failed to create client chunk store directory: {}", e));
+            set_error_message(&format!(
+                "Failed to create client chunk store directory: {}",
+                e
+            ));
             return std::ptr::null_mut();
         }
 
