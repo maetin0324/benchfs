@@ -229,6 +229,7 @@ EOF
             -x PATH
             -x "RUST_LOG=debug"
             -x "RUST_BACKTRACE=1"
+            -x "UCX_TLS=tcp,sm,self"
             "${BENCHFS_PREFIX}/benchfsd_mpi"
             "${BENCHFS_REGISTRY_DIR}"
             "${config_file}"
@@ -279,6 +280,7 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
+            -x "UCX_TLS=tcp,sm,self"
             -x PATH
             "${IOR_PREFIX}/src/ior"
             -a BENCHFS

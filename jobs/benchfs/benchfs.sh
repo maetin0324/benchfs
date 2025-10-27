@@ -5,7 +5,7 @@ source "${SCRIPT_DIR}/common.sh"
 TIMESTAMP="$(timestamp)"
 
 # default params
-: ${ELAPSTIM_REQ:="0:30:00"}
+: ${ELAPSTIM_REQ:="0:20:00"}
 : ${LABEL:=default}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
@@ -36,7 +36,8 @@ mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
   # 1 2 4 8
-  2
+  # 2
+  4 8
 )
 niter=1
 
