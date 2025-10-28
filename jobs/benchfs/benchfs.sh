@@ -37,7 +37,8 @@ mkdir -p "${BACKEND_DIR}"
 nnodes_list=(
   # 1 2 4 8
   # 2
-  4
+  # 2 4 8 16
+  32
 )
 niter=1
 
@@ -55,7 +56,8 @@ for nnodes in "${nnodes_list[@]}"; do
       cmd_qsub=(
         qsub
         -A NBBG
-        -q gen_S
+        # -q gen_S
+        -q gen_M
         -l elapstim_req="${ELAPSTIM_REQ}"
         -T openmpi
         -v NQSV_MPI_VER="${NQSV_MPI_VER}"
