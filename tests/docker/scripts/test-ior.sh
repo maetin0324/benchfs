@@ -279,6 +279,65 @@ case "$TEST_NAME" in
         fi
         ;;
 
+    "8gib-ssf")
+        echo "Test: 8GiB Shared Single File (SSF) I/O test"
+        echo "Transfer size: 2MB, Block size: 64MB, Segments: 128, Total: 8GiB per rank (32GiB total)"
+        echo "Mode: SSF (Shared Single File) - all ranks write to same file"
+        echo "Nodes: 4 (4 MPI ranks)"
+        echo ""
+
+        # Verify we have 4 nodes
+        if [ "$NNODES" -ne 4 ]; then
+            echo "ERROR: 8gib-ssf test requires exactly 4 nodes (got $NNODES)"
+            TEST_RESULT="FAIL"
+            exit 1
+        fi
+
+        # SSF (Shared Single File) mode: no -F flag
+        # 8GiB per rank calculation: 64MB (block size) × 128 (segments) = 8192MB = 8GiB per rank
+        # Total across 4 ranks in SSF mode: 8GiB × 4 = 32GiB aggregate
+        # Transfer size 2MB provides good I/O granularity for network and storage
+
+        echo "Starting 8GiB SSF benchmark (this may take several minutes)..."
+        echo "Each rank will write/read 8GiB (64MB × 128 segments)"
+
+        mpirun \
+            --hostfile ${HOSTFILE} \
+            -np ${NNODES} \
+            --mca btl tcp,self \
+            --mca btl_tcp_if_include eth0 \
+            ${IOR_BIN} \
+                -a BENCHFS \
+                --benchfs.registry ${REGISTRY_DIR} \
+                --benchfs.datadir ${DATA_DIR} \
+                -w -r \
+                -t 2m -b 64m -s 128 \
+                -o /8gib_ssf_testfile \
+                -O summaryFormat=JSON \
+                > ${RESULTS_DIR}/ior_8gib_ssf_output.txt 2>&1
+
+        IOR_EXIT_CODE=$?
+
+        echo
+        echo "IOR 8GiB SSF Results:"
+        cat ${RESULTS_DIR}/ior_8gib_ssf_output.txt
+
+        # Display key metrics
+        echo
+        echo "Key Performance Metrics:"
+        grep -E "write|read|Max Write|Max Read|bandwidth" ${RESULTS_DIR}/ior_8gib_ssf_output.txt || true
+
+        if [ $IOR_EXIT_CODE -eq 0 ]; then
+            TEST_RESULT="PASS"
+            echo
+            echo "SUCCESS: 8GiB SSF benchmark completed"
+        else
+            TEST_RESULT="FAIL"
+            echo
+            echo "FAILURE: 8GiB SSF benchmark failed with exit code $IOR_EXIT_CODE"
+        fi
+        ;;
+
     *)
         echo "ERROR: Unknown test: $TEST_NAME"
         TEST_RESULT="FAIL"

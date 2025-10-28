@@ -216,12 +216,18 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         tracing::info!("Using io_uring for storage backend");
 
         // Create io_uring reactor
+        // Buffer size must be at least as large as the maximum transfer size used by IOR
+        // IOR typically uses 2MB-4MB transfer sizes, so we use 4MB to be safe
+        // Optimized parameters for high-throughput workloads:
+        // - queue_size: 4096 (up from 2048) to handle more concurrent operations
+        // - submit_depth: 128 (up from 64) for better batching and throughput
+        // - Aggressive timeouts (1μs) to minimize latency in polling mode
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(2048)
-            .buffer_size(1 << 20) // 1 MiB
-            .submit_depth(64)
-            .wait_submit_timeout(std::time::Duration::from_micros(10))
-            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .queue_size(4096)
+            .buffer_size(4 << 20) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
+            .submit_depth(128)
+            .wait_submit_timeout(std::time::Duration::from_micros(1))
+            .wait_complete_timeout(std::time::Duration::from_micros(1))
             .build();
 
         let allocator = uring_reactor.allocator.clone();
@@ -264,53 +270,68 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Create connection pool for inter-node communication
     let connection_pool = Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?);
 
-    // Register this node's worker address
-    if let Err(e) = connection_pool.register_self(&node_id) {
-        return Err(format!("Failed to register node address: {:?}", e).into());
-    }
-    tracing::info!("Node {} registered to registry", node_id);
+    // Registration will be done after runtime starts (moved to async task below)
 
-    // Wait for all nodes to register (blocking with timeout)
-    let mut registered_count = 1; // This node is already registered
-    let max_wait_secs = 60;
-    let start_time = std::time::Instant::now();
+    // Spawn node registration task (must run after runtime starts for UCX reactor to progress)
+    let pool_clone = connection_pool.clone();
+    let node_id_clone = node_id.clone();
+    let registry_dir_clone = PathBuf::from(registry_dir);
+    let mpi_rank_clone = state.mpi_rank;
+    let mpi_size_clone = state.mpi_size;
 
-    tracing::info!("Waiting for {} nodes to register...", state.mpi_size);
+    let registration_handle = runtime.spawn_with_name(
+        async move {
+            // Register this node's worker address
+            if let Err(e) = pool_clone.register_self(&node_id_clone) {
+                tracing::error!("Failed to register node address: {:?}", e);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Registration failed: {:?}", e)));
+            }
+            tracing::info!("Node {} registered to registry", node_id_clone);
 
-    while registered_count < state.mpi_size && start_time.elapsed().as_secs() < max_wait_secs {
-        // Check how many nodes are registered
-        for rank in 0..state.mpi_size {
-            if rank != state.mpi_rank {
-                let other_node_id = format!("node_{}", rank);
-                // Try to check if node is registered by attempting to read its address
-                let registry_file =
-                    PathBuf::from(registry_dir).join(format!("{}.addr", other_node_id));
-                if registry_file.exists() {
-                    if rank + 1 > registered_count {
-                        registered_count = rank + 1;
-                        tracing::debug!("Detected {} registered", other_node_id);
+            // Wait for all nodes to register
+            let mut registered_count = 1; // This node is already registered
+            let max_wait_secs = 60;
+            let start_time = std::time::Instant::now();
+
+            tracing::info!("Waiting for {} nodes to register...", mpi_size_clone);
+
+            while registered_count < mpi_size_clone && start_time.elapsed().as_secs() < max_wait_secs {
+                // Check how many nodes are registered
+                for rank in 0..mpi_size_clone {
+                    if rank != mpi_rank_clone {
+                        let other_node_id = format!("node_{}", rank);
+                        let registry_file = registry_dir_clone.join(format!("{}.addr", other_node_id));
+                        if registry_file.exists() {
+                            if rank + 1 > registered_count {
+                                registered_count = rank + 1;
+                                tracing::debug!("Detected {} registered", other_node_id);
+                            }
+                        }
                     }
                 }
+
+                if registered_count >= mpi_size_clone {
+                    break;
+                }
+
+                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
             }
-        }
 
-        if registered_count >= state.mpi_size {
-            break;
-        }
+            if registered_count < mpi_size_clone {
+                tracing::warn!(
+                    "Only {}/{} nodes registered after {} seconds",
+                    registered_count,
+                    mpi_size_clone,
+                    max_wait_secs
+                );
+            } else {
+                tracing::info!("All {} nodes registered successfully", mpi_size_clone);
+            }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    if registered_count < state.mpi_size {
-        tracing::warn!(
-            "Only {}/{} nodes registered after {} seconds",
-            registered_count,
-            state.mpi_size,
-            max_wait_secs
-        );
-    } else {
-        tracing::info!("All {} nodes registered successfully", state.mpi_size);
-    }
+            Ok::<(), std::io::Error>(())
+        },
+        "node_registration".to_string(),
+    );
 
     // Register all RPC handlers (spawn in background)
     let server_clone = rpc_server.clone();
@@ -355,6 +376,12 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     runtime.clone().run(async move {
+        // Wait for registration to complete first
+        if let Err(e) = registration_handle.await {
+            tracing::error!("Node registration failed: {:?}", e);
+        }
+
+        // Then wait for server to complete
         match server_handle.await {
             Ok(_) => {
                 tracing::info!("Server shutdown complete");

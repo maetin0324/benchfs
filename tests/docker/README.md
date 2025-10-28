@@ -58,6 +58,7 @@ make test-ior
 | `make test-small` | 2ノードクラスタでテスト実行 |
 | `make test-ior` | 4ノードでIORベンチマーク実行 |
 | `make test-ior-small` | 2ノードでIORベンチマーク実行 |
+| `make test-ior-8gib-ssf` | 4ノードで8GiB SSFベンチマーク実行 |
 | `make logs` | コンテナログを表示 |
 | `make shell` | コントローラコンテナにシェル接続 |
 | `make clean` | すべてのコンテナ、ボリューム、イメージを削除 |
@@ -156,6 +157,34 @@ make debug      # デバッグスクリプトを実行
 2. スクリプトを実行可能にする: `chmod +x scripts/test-name.sh`
 3. `Makefile`に新しいターゲットを追加
 4. Docker compose設定にスクリプトをマウント
+
+### IORテストケース
+
+利用可能なIORテストケース：
+
+1. **basic**: 基本的なwrite/readテスト (16MB, 2ノード, FPP)
+2. **write**: 書き込み専用テスト (32MB, 4ノード, SSF)
+3. **read**: 読み込み専用テスト (32MB, 4ノード, SSF)
+4. **large-perf**: 大規模パフォーマンステスト (4GB, 4ノード, FPP)
+5. **8gib-ssf**: 8GiB Shared Single Fileテスト (32GB total, 4ノード, SSF)
+
+8GiB SSFテストの特徴：
+- **データサイズ**: 各ランクが8GiB、合計32GiB
+- **モード**: SSF (Shared Single File) - 全ランクが同じファイルに書き込み/読み込み
+- **パラメータ**: transfer size=2MB, block size=64MB, segments=128
+- **実行時間**: 数分かかる場合があります
+- **計算**: 64MB × 128 segments = 8GiB per rank
+
+実行方法：
+```bash
+make test-ior-8gib-ssf
+```
+
+または、直接実行：
+```bash
+make up
+docker exec benchfs_controller /scripts/test-ior.sh 8gib-ssf 4
+```
 
 ### IORカスタムテスト
 

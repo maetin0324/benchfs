@@ -1,6 +1,6 @@
 # BenchFS Docker Test Makefile
 
-.PHONY: help build build-no-cache build-simple up up-small down test test-small test-ior test-ior-small clean clean-all logs shell exec-controller debug check-env
+.PHONY: help build build-no-cache build-simple build-optimized build-base up up-small down test test-small test-ior test-ior-small test-ior-8gib-ssf clean clean-all logs shell exec-controller debug check-env
 
 # Default configuration
 COMPOSE_FILE ?= docker-compose.yml
@@ -13,15 +13,25 @@ export COMPOSE_PROJECT_NAME
 help:
 	@echo "BenchFS Docker Test Commands:"
 	@echo ""
-	@echo "  make build          - Build Docker images (full build)"
+	@echo "Build Commands:"
+	@echo "  make build          - Build Docker images (full build, 15-20 min)"
+	@echo "  make build-base     - Build UCX/MPI base image (once, 10-15 min)"
+	@echo "  make build-optimized - Build using cached base (fast, 2-3 min) ⚡"
 	@echo "  make build-simple   - Build simple Docker images (using host binaries)"
+	@echo ""
+	@echo "Cluster Commands:"
 	@echo "  make up             - Start 4-node cluster"
 	@echo "  make up-small       - Start 2-node cluster"
 	@echo "  make down           - Stop and remove containers"
+	@echo ""
+	@echo "Test Commands:"
 	@echo "  make test           - Run tests on 4-node cluster"
 	@echo "  make test-small     - Run tests on 2-node cluster"
 	@echo "  make test-ior       - Run IOR benchmark on 4-node cluster"
 	@echo "  make test-ior-small - Run IOR benchmark on 2-node cluster"
+	@echo "  make test-ior-8gib-ssf - Run 8GiB SSF benchmark on 4-node cluster"
+	@echo ""
+	@echo "Utility Commands:"
 	@echo "  make logs           - View container logs"
 	@echo "  make shell          - Open shell in controller"
 	@echo "  make exec-controller - Execute test script in controller"
@@ -29,6 +39,13 @@ help:
 	@echo "  make check-env      - Check environment on all nodes"
 	@echo "  make clean          - Remove all containers, volumes, and images"
 	@echo "  make clean-all      - Deep clean including Docker cache"
+	@echo ""
+	@echo "Optimized Build Workflow (Recommended):"
+	@echo "  1. make build-base         # First time only (10-15 min)"
+	@echo "  2. make build-optimized    # After code changes (2-3 min)"
+	@echo "  3. make up                 # Start cluster"
+	@echo ""
+	@echo "See UCX_MPI_BASE_IMAGE.md for details on optimized builds"
 	@echo ""
 
 build:
@@ -39,6 +56,27 @@ build-no-cache:
 
 build-simple:
 	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml build
+
+# Optimized build using cached UCX/MPI base image
+build-base:
+	@echo "Building UCX/MPI base image (this takes 10-15 minutes but only needed once)..."
+	@echo "See UCX_MPI_BASE_IMAGE.md for more information"
+	docker build -f Dockerfile.ucx-mpi-base -t benchfs/ucx-mpi-base:1.0 ../../..
+	@echo ""
+	@echo "✓ Base image built successfully!"
+	@echo "Now you can build BenchFS quickly with: make build-optimized"
+
+build-optimized:
+	@echo "Checking if base image exists..."
+	@if ! docker image inspect benchfs/ucx-mpi-base:1.0 > /dev/null 2>&1; then \
+		echo "ERROR: Base image not found: benchfs/ucx-mpi-base:1.0"; \
+		echo "Please build it first: make build-base"; \
+		exit 1; \
+	fi
+	@echo "Building BenchFS using cached UCX/MPI base (fast build)..."
+	docker build -f Dockerfile.optimized -t benchfs:latest ../../..
+	@echo ""
+	@echo "✓ BenchFS image built successfully in 2-3 minutes!"
 
 up:
 	@echo "Building BenchFS MPI binary first..."
@@ -109,6 +147,19 @@ test-ior-small: up-small
 	fi; \
 	echo "Using container: $$CONTAINER_NAME"; \
 	docker exec $$CONTAINER_NAME /scripts/test-ior.sh basic 2
+
+test-ior-8gib-ssf: up
+	@echo "Running 8GiB SSF IOR benchmark on 4-node cluster..."
+	@echo "This test will write/read 32GiB total (8GiB per node) and may take several minutes..."
+	@sleep 2
+	@CONTAINER_NAME=$$(docker ps --format '{{.Names}}' | grep controller | head -1); \
+	if [ -z "$$CONTAINER_NAME" ]; then \
+		echo "ERROR: Controller container not found"; \
+		docker ps -a; \
+		exit 1; \
+	fi; \
+	echo "Using container: $$CONTAINER_NAME"; \
+	docker exec $$CONTAINER_NAME /scripts/test-ior.sh 8gib-ssf 4
 
 logs:
 	docker-compose -p $(COMPOSE_PROJECT_NAME) -f docker-compose.yml logs -f

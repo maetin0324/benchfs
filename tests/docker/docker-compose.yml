@@ -6,9 +6,7 @@ version: '3.8'
 services:
   # Server node 1 - isolated data directory
   server1:
-    build:
-      context: ../..
-      dockerfile: tests/docker/Dockerfile.simple
+    image: benchfs:latest  # Use pre-built optimized image
     container_name: benchfs_server1
     hostname: server1
     networks:
@@ -21,7 +19,7 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - UCX_TLS=tcp,sm,self
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
@@ -32,13 +30,17 @@ services:
       - SYS_ADMIN     # Required for io_uring setup
     security_opt:
       - seccomp:unconfined  # Allow io_uring syscalls
+    deploy:
+      resources:
+        limits:
+          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+        reservations:
+          memory: 4G
     command: /usr/sbin/sshd -D
 
   # Server node 2 - isolated data directory
   server2:
-    build:
-      context: ../..
-      dockerfile: tests/docker/Dockerfile.simple
+    image: benchfs:latest  # Use pre-built optimized image
     container_name: benchfs_server2
     hostname: server2
     networks:
@@ -51,7 +53,7 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - UCX_TLS=tcp,sm,self
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
@@ -62,13 +64,17 @@ services:
       - SYS_ADMIN     # Required for io_uring setup
     security_opt:
       - seccomp:unconfined  # Allow io_uring syscalls
+    deploy:
+      resources:
+        limits:
+          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+        reservations:
+          memory: 4G
     command: /usr/sbin/sshd -D
 
   # Server node 3 - isolated data directory
   server3:
-    build:
-      context: ../..
-      dockerfile: tests/docker/Dockerfile.simple
+    image: benchfs:latest  # Use pre-built optimized image
     container_name: benchfs_server3
     hostname: server3
     networks:
@@ -81,7 +87,7 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - UCX_TLS=tcp,sm,self
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
@@ -92,13 +98,17 @@ services:
       - SYS_ADMIN     # Required for io_uring setup
     security_opt:
       - seccomp:unconfined  # Allow io_uring syscalls
+    deploy:
+      resources:
+        limits:
+          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+        reservations:
+          memory: 4G
     command: /usr/sbin/sshd -D
 
   # Server node 4 - isolated data directory
   server4:
-    build:
-      context: ../..
-      dockerfile: tests/docker/Dockerfile.simple
+    image: benchfs:latest  # Use pre-built optimized image
     container_name: benchfs_server4
     hostname: server4
     networks:
@@ -111,7 +121,7 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - UCX_TLS=tcp,sm,self
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
@@ -122,13 +132,17 @@ services:
       - SYS_ADMIN     # Required for io_uring setup
     security_opt:
       - seccomp:unconfined  # Allow io_uring syscalls
+    deploy:
+      resources:
+        limits:
+          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+        reservations:
+          memory: 4G
     command: /usr/sbin/sshd -D
 
   # MPI controller node
   controller:
-    build:
-      context: ../..
-      dockerfile: tests/docker/Dockerfile.simple
+    image: benchfs:latest  # Use pre-built optimized image
     container_name: benchfs_controller
     hostname: controller
     networks:
@@ -141,7 +155,7 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug
       - UCX_TLS=tcp,sm,self
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
@@ -157,6 +171,12 @@ services:
       - SYS_ADMIN     # Required for io_uring setup
     security_opt:
       - seccomp:unconfined  # Allow io_uring syscalls
+    deploy:
+      resources:
+        limits:
+          memory: 8G  # Controller needs less memory than servers
+        reservations:
+          memory: 2G
     command: /usr/sbin/sshd -D
 
 volumes:

@@ -1,0 +1,119 @@
+# Makefile for building UCX/MPI base image and optimized BenchFS image
+#
+# Usage:
+#   make -f Makefile.ucx-mpi build-base    # Build UCX/MPI base image (once)
+#   make -f Makefile.ucx-mpi build         # Build BenchFS using cached base
+#   make -f Makefile.ucx-mpi build-all     # Build both base and BenchFS
+#   make -f Makefile.ucx-mpi push-base     # Push base image to registry
+#   make -f Makefile.ucx-mpi clean         # Remove images
+
+# Configuration
+BASE_IMAGE_NAME := benchfs/ucx-mpi-base
+BASE_IMAGE_TAG := 1.0
+BASE_IMAGE := $(BASE_IMAGE_NAME):$(BASE_IMAGE_TAG)
+
+BENCHFS_IMAGE_NAME := benchfs
+BENCHFS_IMAGE_TAG := latest
+BENCHFS_IMAGE := $(BENCHFS_IMAGE_NAME):$(BENCHFS_IMAGE_TAG)
+
+# Registry configuration (optional, for sharing the base image)
+REGISTRY ?=
+REGISTRY_BASE_IMAGE := $(if $(REGISTRY),$(REGISTRY)/$(BASE_IMAGE),$(BASE_IMAGE))
+
+.PHONY: help build-base build build-all push-base pull-base clean info
+
+help:
+	@echo "UCX/MPI Base Image Management"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  build-base    Build UCX/MPI base image (needed only once)"
+	@echo "  build         Build BenchFS image using cached base"
+	@echo "  build-all     Build both base and BenchFS images"
+	@echo "  push-base     Push base image to registry"
+	@echo "  pull-base     Pull base image from registry"
+	@echo "  clean         Remove local images"
+	@echo "  info          Show image information"
+	@echo ""
+	@echo "Configuration:"
+	@echo "  BASE_IMAGE:    $(BASE_IMAGE)"
+	@echo "  BENCHFS_IMAGE: $(BENCHFS_IMAGE)"
+	@echo "  REGISTRY:      $(if $(REGISTRY),$(REGISTRY),<not set>)"
+	@echo ""
+	@echo "Example with registry:"
+	@echo "  make -f Makefile.ucx-mpi build-base REGISTRY=docker.io/username"
+	@echo "  make -f Makefile.ucx-mpi push-base REGISTRY=docker.io/username"
+
+# Build UCX/MPI base image (only needed once or when UCX/MPI versions change)
+build-base:
+	@echo "Building UCX/MPI base image: $(BASE_IMAGE)"
+	@echo "This will take 10-15 minutes but only needs to be done once..."
+	docker build -f Dockerfile.ucx-mpi-base -t $(BASE_IMAGE) ../../..
+	@echo ""
+	@echo "Base image built successfully: $(BASE_IMAGE)"
+	@echo "You can now build BenchFS much faster with: make -f Makefile.ucx-mpi build"
+
+# Build BenchFS using the cached base image (fast)
+build:
+	@echo "Checking if base image exists..."
+	@docker image inspect $(BASE_IMAGE) > /dev/null 2>&1 || \
+		(echo "ERROR: Base image not found: $(BASE_IMAGE)" && \
+		 echo "Please build it first: make -f Makefile.ucx-mpi build-base" && \
+		 exit 1)
+	@echo "Building BenchFS image using cached base: $(BASE_IMAGE)"
+	docker build -f Dockerfile.optimized -t $(BENCHFS_IMAGE) ../../..
+	@echo ""
+	@echo "BenchFS image built successfully: $(BENCHFS_IMAGE)"
+
+# Build both images
+build-all: build-base build
+
+# Push base image to registry (optional)
+push-base:
+	@if [ -z "$(REGISTRY)" ]; then \
+		echo "ERROR: REGISTRY is not set"; \
+		echo "Usage: make -f Makefile.ucx-mpi push-base REGISTRY=docker.io/username"; \
+		exit 1; \
+	fi
+	@echo "Tagging base image for registry..."
+	docker tag $(BASE_IMAGE) $(REGISTRY_BASE_IMAGE)
+	@echo "Pushing to registry: $(REGISTRY_BASE_IMAGE)"
+	docker push $(REGISTRY_BASE_IMAGE)
+	@echo "Base image pushed successfully"
+
+# Pull base image from registry (optional)
+pull-base:
+	@if [ -z "$(REGISTRY)" ]; then \
+		echo "ERROR: REGISTRY is not set"; \
+		echo "Usage: make -f Makefile.ucx-mpi pull-base REGISTRY=docker.io/username"; \
+		exit 1; \
+	fi
+	@echo "Pulling base image from registry: $(REGISTRY_BASE_IMAGE)"
+	docker pull $(REGISTRY_BASE_IMAGE)
+	docker tag $(REGISTRY_BASE_IMAGE) $(BASE_IMAGE)
+	@echo "Base image pulled and tagged as: $(BASE_IMAGE)"
+
+# Remove local images
+clean:
+	@echo "Removing BenchFS image: $(BENCHFS_IMAGE)"
+	-docker rmi $(BENCHFS_IMAGE)
+	@echo "Removing base image: $(BASE_IMAGE)"
+	-docker rmi $(BASE_IMAGE)
+	@echo "Images removed"
+
+# Show image information
+info:
+	@echo "=== Image Information ==="
+	@echo ""
+	@echo "Base Image:"
+	@docker image inspect $(BASE_IMAGE) --format \
+		"  Name: {{.RepoTags}}\n  ID: {{.Id}}\n  Created: {{.Created}}\n  Size: {{.Size}} bytes" \
+		2>/dev/null || echo "  Not found: $(BASE_IMAGE)"
+	@echo ""
+	@echo "BenchFS Image:"
+	@docker image inspect $(BENCHFS_IMAGE) --format \
+		"  Name: {{.RepoTags}}\n  ID: {{.Id}}\n  Created: {{.Created}}\n  Size: {{.Size}} bytes" \
+		2>/dev/null || echo "  Not found: $(BENCHFS_IMAGE)"
+	@echo ""
+	@echo "Build time comparison:"
+	@echo "  With cached base: ~2-3 minutes (Rust build only)"
+	@echo "  Without cache:    ~15-20 minutes (UCX + MPI + Rust)"
