@@ -57,7 +57,10 @@
       "Bash(docker ps:*)",
       "Bash(for container in benchfs_controller benchfs_server1 benchfs_server3 benchfs_server4)",
       "Bash(do docker exec $container bash -c \"mv /usr/local/bin/benchfsd_mpi.new /usr/local/bin/benchfsd_mpi\")",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(xargs:*)",
+      "Bash(chmod:*)",
+      "Bash(cargo clean:*)"
     ],
     "deny": [],
     "ask": []

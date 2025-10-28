@@ -120,8 +120,9 @@ else
     echo "WARNING: Parameter file not found: $PARAM_FILE"
     echo "Using built-in default parameters"
     # Fallback default values
-    transfer_size_list=(16m 16g)
-    block_size_list=(4m 16m 64m)
+    # NOTE: block_size must be a multiple of transfer_size
+    transfer_size_list=(4m 16m)
+    block_size_list=(64m 128m 256m)
     ppn_list=(1 2 4)
     ior_flags_list=("-w -r -F" "-w -r")
     benchfs_chunk_size_list=(4194304)
