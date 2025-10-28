@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/statvfs.h>
 #include <mpi.h>
 
 #include "ior.h"
@@ -308,13 +309,39 @@ static int BENCHFS_statfs(
     ior_aiori_statfs_t *stat,
     aiori_mod_opt_t *options
 ) {
-  /* Return dummy filesystem statistics */
-  stat->f_bsize = 4096;
-  stat->f_blocks = 1000000;
-  stat->f_bfree = 900000;
-  stat->f_bavail = 900000;
-  stat->f_files = 1000000;
-  stat->f_ffree = 999000;
+  benchfs_options_t *o = (benchfs_options_t *)options;
+
+  /* Get actual filesystem statistics from the data directory */
+  struct statvfs fs_stat;
+  const char *stat_path = (o && o->data_dir) ? o->data_dir : "/tmp";
+
+  if (statvfs(stat_path, &fs_stat) != 0) {
+    WARNF("Failed to get filesystem stats for %s: %s", stat_path, strerror(errno));
+    /* Fallback to large default values (1TB filesystem) */
+    stat->f_bsize = 4096;
+    stat->f_blocks = 268435456;  /* 1TB / 4KB */
+    stat->f_bfree = 268435456;
+    stat->f_bavail = 268435456;
+    stat->f_files = 10000000;
+    stat->f_ffree = 9990000;
+    return 0;
+  }
+
+  /* Copy actual filesystem statistics */
+  stat->f_bsize = fs_stat.f_bsize;
+  stat->f_blocks = fs_stat.f_blocks;
+  stat->f_bfree = fs_stat.f_bfree;
+  stat->f_bavail = fs_stat.f_bavail;
+  stat->f_files = fs_stat.f_files;
+  stat->f_ffree = fs_stat.f_ffree;
+
+  if (verbose > 4) {
+    fprintf(out_logfile, "BENCHFS statfs: path=%s, total=%llu GB, free=%llu GB\n",
+            stat_path,
+            (unsigned long long)(fs_stat.f_blocks * fs_stat.f_bsize) / (1024*1024*1024),
+            (unsigned long long)(fs_stat.f_bfree * fs_stat.f_bsize) / (1024*1024*1024));
+  }
+
   return 0;
 }
 

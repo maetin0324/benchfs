@@ -681,26 +681,29 @@ impl IOUringChunkStore {
         // Insert into LRU cache. If cache is full, this will evict the least-recently-used entry.
         let mut cache = self.open_handles.borrow_mut();
         if let Some((evicted_key, evicted_handle)) = cache.push(key, handle) {
-            // A file handle was evicted from the cache.
-            // NOTE: We intentionally do NOT close the evicted handle here to avoid blocking.
-            // This is a performance trade-off: we sacrifice immediate resource cleanup
-            // for much better write throughput. File descriptors will be reclaimed when:
-            // 1. The cache size is large enough (8192) that evictions are rare
-            // 2. The process exits (OS reclaims all descriptors)
-            // 3. close_all() is explicitly called
+            // A file handle was evicted from the cache - close it to prevent fd leaks
+            // This is critical for long-running jobs with many iterations where we can
+            // accumulate thousands of open file handles across multiple test runs.
             //
-            // This design is inspired by high-performance filesystems that defer cleanup
-            // to background threads. The 8192 handle limit is well below typical ulimit
-            // values (often 65536+), so we won't exhaust system resources.
+            // While this adds some overhead, it prevents system-wide file descriptor
+            // exhaustion that would cause subsequent operations to fail with EMFILE errors.
             tracing::debug!(
-                "Evicting file handle from LRU cache (path={}, chunk={}), fd={:?} (deferred close)",
+                "Evicting file handle from LRU cache (path={}, chunk={}), fd={:?} - closing immediately",
                 evicted_key.path,
                 evicted_key.chunk_index,
                 evicted_handle
             );
-            // Intentionally not closing to avoid blocking: self.backend.close(evicted_handle).await
-            // Suppress unused variable warning since we're deliberately not using it
-            let _ = evicted_handle;
+            drop(cache); // Release the borrow before awaiting
+            if let Err(e) = self.backend.close(evicted_handle).await {
+                tracing::warn!(
+                    "Failed to close evicted file handle (path={}, chunk={}): {:?}",
+                    evicted_key.path,
+                    evicted_key.chunk_index,
+                    e
+                );
+            }
+        } else {
+            drop(cache); // Release the borrow even if no eviction occurred
         }
 
         Ok(handle)
