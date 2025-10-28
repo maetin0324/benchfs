@@ -555,6 +555,11 @@ pub struct IOUringChunkStore {
     /// This avoids repeatedly opening the same chunk file while preventing
     /// file descriptor exhaustion by automatically closing least-recently-used files
     open_handles: RefCell<LruCache<ChunkKey, FileHandle>>,
+
+    /// Evicted file handles pending deferred cleanup
+    /// These are closed in batch during close_all() to avoid async/await deadlock
+    /// that occurs when calling async close() from within synchronous LRU eviction callback
+    evicted_handles: RefCell<Vec<(ChunkKey, FileHandle)>>,
 }
 
 impl IOUringChunkStore {
@@ -598,6 +603,7 @@ impl IOUringChunkStore {
             chunk_size: CHUNK_SIZE,
             backend,
             open_handles: RefCell::new(LruCache::new(capacity)),
+            evicted_handles: RefCell::new(Vec::new()),
         })
     }
 
@@ -681,29 +687,23 @@ impl IOUringChunkStore {
         // Insert into LRU cache. If cache is full, this will evict the least-recently-used entry.
         let mut cache = self.open_handles.borrow_mut();
         if let Some((evicted_key, evicted_handle)) = cache.push(key, handle) {
-            // A file handle was evicted from the cache - close it to prevent fd leaks
-            // This is critical for long-running jobs with many iterations where we can
-            // accumulate thousands of open file handles across multiple test runs.
+            // A file handle was evicted from the cache.
+            // IMPORTANT: We do NOT close it here because:
+            // 1. Calling async close() from within eviction creates async/await deadlock
+            // 2. The await can block indefinitely if runtime is busy
+            // 3. File descriptors will be closed in close_all() during cleanup
             //
-            // While this adds some overhead, it prevents system-wide file descriptor
-            // exhaustion that would cause subsequent operations to fail with EMFILE errors.
+            // Instead, we store evicted handles for deferred cleanup.
+            // The large cache size (8192) means evictions are rare in practice.
             tracing::debug!(
-                "Evicting file handle from LRU cache (path={}, chunk={}), fd={:?} - closing immediately",
+                "Evicting file handle from LRU cache (path={}, chunk={}), fd={:?} - deferred close",
                 evicted_key.path,
                 evicted_key.chunk_index,
                 evicted_handle
             );
-            drop(cache); // Release the borrow before awaiting
-            if let Err(e) = self.backend.close(evicted_handle).await {
-                tracing::warn!(
-                    "Failed to close evicted file handle (path={}, chunk={}): {:?}",
-                    evicted_key.path,
-                    evicted_key.chunk_index,
-                    e
-                );
-            }
-        } else {
-            drop(cache); // Release the borrow even if no eviction occurred
+
+            // Store for deferred cleanup to prevent file descriptor leaks
+            self.evicted_handles.borrow_mut().push((evicted_key, evicted_handle));
         }
 
         Ok(handle)
@@ -878,6 +878,20 @@ impl IOUringChunkStore {
 
     /// Close all open file handles
     pub async fn close_all(&self) -> ChunkStoreResult<()> {
+        // First, close all evicted handles that were deferred to prevent deadlock
+        let evicted: Vec<(ChunkKey, FileHandle)> = self.evicted_handles.borrow_mut().drain(..).collect();
+        for (key, handle) in evicted {
+            if let Err(e) = self.backend.close(handle).await {
+                tracing::warn!(
+                    "Failed to close evicted chunk file (path={}, chunk={}): {:?}",
+                    key.path,
+                    key.chunk_index,
+                    e
+                );
+            }
+        }
+
+        // Then, close all currently cached handles
         let handles: Vec<(ChunkKey, FileHandle)> = self
             .open_handles
             .borrow()
