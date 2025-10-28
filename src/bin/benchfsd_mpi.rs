@@ -212,7 +212,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         return Err(format!("Failed to create chunk store directory: {}", e).into());
     }
 
-    let chunk_store: Rc<dyn ChunkStore> = if config.storage.use_iouring {
+    let (chunk_store, allocator): (Rc<dyn ChunkStore>, Rc<pluvio_uring::allocator::FixedBufferAllocator>) = if config.storage.use_iouring {
         tracing::info!("Using io_uring for storage backend");
 
         // Create io_uring reactor
@@ -228,20 +228,34 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         runtime.register_reactor("io_uring", uring_reactor);
 
         // Create IOUringBackend and chunk store
-        let io_backend = Rc::new(IOUringBackend::new(allocator));
-        Rc::new(IOUringChunkStore::new(
+        let io_backend = Rc::new(IOUringBackend::new(allocator.clone()));
+        let chunk_store = Rc::new(IOUringChunkStore::new(
             &chunk_store_dir,
             io_backend.clone(),
-        )?)
+        )?);
+        (chunk_store, allocator)
     } else {
         tracing::info!("io_uring disabled - using file-based storage backend");
-        Rc::new(FileChunkStore::new(&chunk_store_dir)?)
+
+        // Create a minimal io_uring reactor just for allocator
+        let uring_reactor = IoUringReactor::builder()
+            .queue_size(32)
+            .buffer_size(1 << 16) // 64 KiB - minimal size
+            .submit_depth(4)
+            .wait_submit_timeout(std::time::Duration::from_micros(10))
+            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .build();
+
+        let allocator = uring_reactor.allocator.clone();
+        let chunk_store = Rc::new(FileChunkStore::new(&chunk_store_dir)?);
+        (chunk_store, allocator)
     };
 
     // Create RPC handler context
     let handler_context = Rc::new(RpcHandlerContext::new(
         metadata_manager.clone(),
         chunk_store,
+        allocator,
     ));
 
     // Create RPC server

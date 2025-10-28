@@ -63,6 +63,57 @@ impl IOUringBackend {
 
         opts
     }
+
+    /// Write data directly from a registered buffer (zero-copy DMA)
+    ///
+    /// This method takes ownership of a FixedBuffer and writes it directly to disk
+    /// using DMA, avoiding the intermediate copy that `write()` performs.
+    ///
+    /// # Arguments
+    /// * `handle` - File handle
+    /// * `offset` - Offset within the file
+    /// * `fixed_buffer` - Pre-populated registered buffer
+    /// * `data_len` - Actual data length in the buffer
+    pub async fn write_fixed_direct(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        fixed_buffer: pluvio_uring::allocator::FixedBuffer,
+        data_len: usize,
+    ) -> StorageResult<usize> {
+        let files = self.files.borrow();
+        let dma_file = files
+            .get(&handle.0)
+            .ok_or(StorageError::InvalidHandle(handle))?;
+
+        // Write data using write_fixed with registered buffer (zero-copy DMA)
+        let (bytes_written_raw, _fixed_buffer) = dma_file
+            .write_fixed(fixed_buffer, offset)
+            .await
+            .map_err(StorageError::IoError)?;
+
+        if bytes_written_raw < 0 {
+            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                -bytes_written_raw,
+            )));
+        }
+
+        let bytes_written = data_len.min(bytes_written_raw as usize);
+
+        tracing::trace!(
+            "Wrote {} bytes (zero-copy) to fd={} at offset={}",
+            bytes_written,
+            handle.0,
+            offset
+        );
+
+        Ok(bytes_written)
+    }
+
+    /// Get the allocator for acquiring registered buffers
+    pub fn allocator(&self) -> &Rc<FixedBufferAllocator> {
+        &self.allocator
+    }
 }
 
 // Default implementation removed - allocator must be provided

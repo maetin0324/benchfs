@@ -150,7 +150,7 @@ pub extern "C" fn benchfs_init(
         let metadata_manager = Rc::new(MetadataManager::new(node_id_str.to_string()));
 
         // Create IOUringBackend and ChunkStore
-        let io_backend = Rc::new(IOUringBackend::new(allocator));
+        let io_backend = Rc::new(IOUringBackend::new(allocator.clone()));
         let chunk_store_dir = format!("{}/chunks", data_dir);
         if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
             set_error_message(&format!("Failed to create chunk store directory: {}", e));
@@ -169,6 +169,7 @@ pub extern "C" fn benchfs_init(
         let handler_context = Rc::new(RpcHandlerContext::new(
             metadata_manager.clone(),
             chunk_store.clone(),
+            allocator.clone(),
         ));
 
         // Create RPC server

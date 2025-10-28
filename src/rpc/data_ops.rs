@@ -494,11 +494,102 @@ impl AmRpc for WriteChunkRequest {
             ));
         }
 
-        // Allocate buffers for path and data
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-        let mut data = vec![0u8; header.length as usize];
+        // Check if chunk_store is IOUringChunkStore to use zero-copy path
+        use crate::storage::chunk_store::IOUringChunkStore;
+        use std::any::Any;
 
-        // Receive both path and data in one vectored call
+        let data_len = header.length as usize;
+        let chunk_store_any = &*ctx.chunk_store as &dyn Any;
+
+        if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
+            tracing::debug!("Using zero-copy path for WriteChunk");
+            // Zero-copy path: Use registered buffer
+            let mut fixed_buffer = ctx.allocator.acquire().await;
+
+            // Ensure the data fits in the registered buffer
+            if data_len > fixed_buffer.len() {
+                tracing::error!(
+                    "Data size {} exceeds registered buffer size {}",
+                    data_len,
+                    fixed_buffer.len()
+                );
+                return Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
+                    am_msg,
+                ));
+            }
+
+            // Receive path and chunk data in one vectored call (zero-copy RDMA)
+            let mut path_bytes = vec![0u8; header.path_len as usize];
+            let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
+
+            if let Err(e) = am_msg
+                .recv_data_vectored(&[
+                    std::io::IoSliceMut::new(&mut path_bytes),
+                    std::io::IoSliceMut::new(buffer_slice),
+                ])
+                .await
+            {
+                tracing::error!("Failed to receive path and data: {:?}", e);
+                return Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
+                    am_msg,
+                ));
+            }
+
+            let path = match String::from_utf8(path_bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("Failed to decode path: {:?}", e);
+                    return Ok((
+                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
+                        am_msg,
+                    ));
+                }
+            };
+
+            tracing::debug!(
+                "WriteChunk request (zero-copy): path={}, chunk={}, offset={}, length={}",
+                path,
+                header.chunk_index,
+                header.offset,
+                header.length
+            );
+
+            // Use zero-copy write with registered buffer
+            match io_uring_store
+                .write_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer, data_len)
+                .await
+            {
+                Ok(bytes_written) => {
+                    tracing::debug!(
+                        "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
+                        bytes_written,
+                        path,
+                        header.chunk_index
+                    );
+                    return Ok((
+                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::success(
+                            header.length,
+                        )),
+                        am_msg,
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
+                    return Ok((
+                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
+                        am_msg,
+                    ));
+                }
+            }
+        }
+
+        // Fallback path: Use Vec<u8> for non-IOUring backends
+        tracing::debug!("Using fallback path for WriteChunk (chunk_store is not IOUringChunkStore)");
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+        let mut data = vec![0u8; data_len];
+
         if let Err(e) = am_msg
             .recv_data_vectored(&[
                 std::io::IoSliceMut::new(&mut path_bytes),
@@ -532,7 +623,6 @@ impl AmRpc for WriteChunkRequest {
             header.length
         );
 
-        // Write chunk data to storage
         match ctx
             .chunk_store
             .write_chunk(&path, header.chunk_index, header.offset, &data)

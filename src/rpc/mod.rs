@@ -10,7 +10,6 @@ pub mod address_registry;
 pub mod client;
 pub mod connection;
 pub mod data_ops;
-pub mod file_ops;
 pub mod handlers;
 pub mod metadata_ops;
 pub mod server;

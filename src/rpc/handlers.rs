@@ -13,13 +13,19 @@ use crate::storage::ChunkStore;
 pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
     pub chunk_store: Rc<dyn ChunkStore>,
+    pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
 }
 
 impl RpcHandlerContext {
-    pub fn new(metadata_manager: Rc<MetadataManager>, chunk_store: Rc<dyn ChunkStore>) -> Self {
+    pub fn new(
+        metadata_manager: Rc<MetadataManager>,
+        chunk_store: Rc<dyn ChunkStore>,
+        allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+    ) -> Self {
         Self {
             metadata_manager,
             chunk_store,
+            allocator,
         }
     }
 }
@@ -139,6 +145,7 @@ pub async fn handle_read_chunk(
 /// Handle WriteChunk RPC request
 ///
 /// Receives chunk data from the client via RDMA and writes it to local storage.
+/// Uses registered buffers for zero-copy DMA writes.
 pub async fn handle_write_chunk(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
@@ -160,19 +167,13 @@ pub async fn handle_write_chunk(
         return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
     }
 
-    // Allocate buffers for path and data
+    // Receive path first (small buffer)
     let mut path_bytes = vec![0u8; header.path_len as usize];
-    let mut data = vec![0u8; header.length as usize];
-
-    // Receive both path and data in one vectored call
     if let Err(e) = am_msg
-        .recv_data_vectored(&[
-            std::io::IoSliceMut::new(&mut path_bytes),
-            std::io::IoSliceMut::new(&mut data),
-        ])
+        .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
         .await
     {
-        tracing::error!("Failed to receive path and data: {:?}", e);
+        tracing::error!("Failed to receive path: {:?}", e);
         return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
     }
 
@@ -184,15 +185,71 @@ pub async fn handle_write_chunk(
         }
     };
 
+    // Acquire a registered buffer for zero-copy DMA write
+    let mut fixed_buffer = ctx.allocator.acquire().await;
+    let data_len = header.length as usize;
+
+    // Ensure the data fits in the registered buffer
+    if data_len > fixed_buffer.len() {
+        tracing::error!(
+            "Data size {} exceeds registered buffer size {}",
+            data_len,
+            fixed_buffer.len()
+        );
+        return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
+    }
+
+    // Receive chunk data directly into registered buffer
+    let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
+    if let Err(e) = am_msg
+        .recv_data_vectored(&[std::io::IoSliceMut::new(buffer_slice)])
+        .await
+    {
+        tracing::error!("Failed to receive chunk data: {:?}", e);
+        return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
+    }
+
     tracing::debug!(
-        "WriteChunk: path={}, chunk={}, offset={}, length={}",
+        "WriteChunk (zero-copy): path={}, chunk={}, offset={}, length={}",
         path,
         header.chunk_index,
         header.offset,
         header.length
     );
 
-    // Write chunk to storage
+    // Check if chunk_store supports zero-copy write
+    // Try downcasting to IOUringChunkStore to use write_chunk_fixed
+    use crate::storage::chunk_store::IOUringChunkStore;
+    use std::any::Any;
+
+    let chunk_store_any = &*ctx.chunk_store as &dyn Any;
+    if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
+        // Use zero-copy write with registered buffer
+        match io_uring_store
+            .write_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer, data_len)
+            .await
+        {
+            Ok(bytes_written) => {
+                tracing::debug!(
+                    "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
+                    bytes_written,
+                    path,
+                    header.chunk_index
+                );
+                return Ok((
+                    WriteChunkResponseHeader::success(bytes_written as u64),
+                    am_msg,
+                ));
+            }
+            Err(e) => {
+                tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
+                return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
+            }
+        }
+    }
+
+    // Fallback: copy to Vec<u8> and use normal write
+    let data = fixed_buffer.as_mut_slice()[..data_len].to_vec();
     match ctx
         .chunk_store
         .write_chunk(&path, header.chunk_index, header.offset, &data)

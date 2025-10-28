@@ -69,7 +69,7 @@ mpirun \
     --mca btl tcp,self \
     --mca btl_tcp_if_include eth0 \
     -x UCX_TLS=tcp,sm,self \
-    -x RUST_LOG=info \
+    -x RUST_LOG=debug \
     benchfsd_mpi ${REGISTRY_DIR} ${CONFIG_FILE} \
     > ${RESULTS_DIR}/server_stdout.log 2> ${RESULTS_DIR}/server_stderr.log &
 
@@ -221,6 +221,56 @@ case "$TEST_NAME" in
         echo
         echo "IOR Read Results:"
         cat ${RESULTS_DIR}/ior_read_output.txt
+
+        if [ $IOR_EXIT_CODE -eq 0 ]; then
+            TEST_RESULT="PASS"
+        else
+            TEST_RESULT="FAIL"
+        fi
+        ;;
+
+    "large-perf")
+        echo "Test: Large IOR test with perf profiling"
+        echo "Transfer size: 1MB, Block size: 32MB, Segments: 32, Total: 4GB"
+        echo ""
+
+        # Start perf on server1
+        echo "Starting perf profiling on server1..."
+        ssh server1 "perf record -a -g -F 99 -o /shared/results/perf-server1.data -- sleep 45" > /dev/null 2>&1 &
+        PERF_PID=$!
+
+        sleep 2
+
+        # Run IOR with dataset that runs for ~30 seconds
+        mpirun \
+            --hostfile ${HOSTFILE} \
+            -np ${NNODES} \
+            --mca btl tcp,self \
+            --mca btl_tcp_if_include eth0 \
+            ${IOR_BIN} \
+                -a BENCHFS \
+                --benchfs.registry ${REGISTRY_DIR} \
+                --benchfs.datadir ${DATA_DIR} \
+                -w -r \
+                -t 1m -b 32m -s 32 \
+                -o /largefile \
+                -O summaryFormat=JSON \
+                > ${RESULTS_DIR}/ior_large_output.txt 2>&1
+
+        IOR_EXIT_CODE=$?
+
+        # Stop perf
+        kill $PERF_PID 2>/dev/null || true
+        wait $PERF_PID 2>/dev/null || true
+
+        echo
+        echo "IOR Large Results:"
+        cat ${RESULTS_DIR}/ior_large_output.txt
+
+        # Generate perf report
+        echo
+        echo "Generating perf report..."
+        ssh server1 "cd /shared/results && perf report -i perf-server1.data --stdio > perf-report.txt 2>&1" || true
 
         if [ $IOR_EXIT_CODE -eq 0 ]; then
             TEST_RESULT="PASS"

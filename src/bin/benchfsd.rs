@@ -136,7 +136,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     ));
 
     // Create IOUringBackend for chunk storage
-    let io_backend = Rc::new(IOUringBackend::new(allocator));
+    let io_backend = Rc::new(IOUringBackend::new(allocator.clone()));
 
     // Create chunk store with io_uring backend
     let chunk_store_dir = config.node.data_dir.join("chunks");
@@ -149,6 +149,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let handler_context = Rc::new(RpcHandlerContext::new(
         metadata_manager.clone(),
         chunk_store.clone(),
+        allocator.clone(),
     ));
 
     // Create RPC server

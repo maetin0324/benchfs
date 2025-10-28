@@ -38,7 +38,11 @@
       "Bash(docker exec:*)",
       "Bash(grep:*)",
       "Bash(RUST_BACKTRACE=1 cargo test:*)",
-      "Bash(./scripts/run_ior_simple.sh:*)"
+      "Bash(./scripts/run_ior_simple.sh:*)",
+      "Bash(docker cp:*)",
+      "Bash(docker inspect:*)",
+      "Bash(docker top:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []

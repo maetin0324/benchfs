@@ -10,7 +10,7 @@ use crate::metadata::CHUNK_SIZE;
 ///
 /// In the new design, all operations use full path instead of inode.
 #[async_trait::async_trait(?Send)]
-pub trait ChunkStore {
+pub trait ChunkStore: std::any::Any {
     async fn write_chunk(
         &self,
         path: &str,
@@ -670,46 +670,13 @@ impl IOUringChunkStore {
 
         // Open the chunk file
         let handle = self.open_chunk_file(file_path, chunk_index, true).await?;
-        let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
-        // For partial writes, we need to read-modify-write
-        let bytes_to_write = if offset > 0 || data.len() < self.chunk_size {
-            // Read existing chunk if it exists and has data
-            let mut chunk_data = if chunk_file_path.exists() {
-                let stat = self.backend.stat(&chunk_file_path).await?;
-                if stat.size > 0 {
-                    let mut buf = vec![0u8; self.chunk_size];
-                    let bytes_read = self.backend.read(handle, 0, &mut buf).await?;
-                    buf.truncate(bytes_read.max(self.chunk_size));
-                    if buf.len() < self.chunk_size {
-                        buf.resize(self.chunk_size, 0);
-                    }
-                    buf
-                } else {
-                    vec![0u8; self.chunk_size]
-                }
-            } else {
-                vec![0u8; self.chunk_size]
-            };
-
-            // Write data to buffer
-            let offset_usize = offset as usize;
-            let end = (offset_usize + data.len()).min(self.chunk_size);
-            let bytes_to_write = end - offset_usize;
-
-            chunk_data[offset_usize..end].copy_from_slice(&data[..bytes_to_write]);
-
-            // Write entire chunk back
-            self.backend.write(handle, 0, &chunk_data).await?;
-
-            bytes_to_write
-        } else {
-            // Full chunk write - can write directly
-            let bytes_to_write = data.len().min(self.chunk_size);
-            self.backend
-                .write(handle, offset, &data[..bytes_to_write])
-                .await?
-        };
+        // Write data directly at the specified offset
+        // io_uring's pwrite handles sparse files efficiently - no need for read-modify-write
+        let bytes_to_write = data.len().min(self.chunk_size - offset as usize);
+        self.backend
+            .write(handle, offset, &data[..bytes_to_write])
+            .await?;
 
         // NOTE: fsync is disabled for performance. Data is cached by OS and written
         // asynchronously. For durability guarantees, users should explicitly call fsync.
@@ -868,6 +835,55 @@ impl IOUringChunkStore {
     /// Get chunk size
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
+    }
+
+    /// Write a chunk using a registered buffer (zero-copy DMA)
+    ///
+    /// This method writes data directly from a FixedBuffer to disk without
+    /// an intermediate copy, maximizing write performance.
+    ///
+    /// # Arguments
+    /// * `file_path` - File path
+    /// * `chunk_index` - Chunk index
+    /// * `offset` - Offset within the chunk
+    /// * `fixed_buffer` - Pre-populated registered buffer
+    /// * `data_len` - Actual data length in the buffer
+    pub async fn write_chunk_fixed(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        fixed_buffer: pluvio_uring::allocator::FixedBuffer,
+        data_len: usize,
+    ) -> ChunkStoreResult<usize> {
+        if offset >= self.chunk_size as u64 {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+
+        // Open the chunk file
+        let handle = self.open_chunk_file(file_path, chunk_index, true).await?;
+
+        // Write data directly from registered buffer using DMA (zero-copy)
+        let bytes_to_write = data_len.min(self.chunk_size - offset as usize);
+        let bytes_written = self
+            .backend
+            .write_fixed_direct(handle, offset, fixed_buffer, bytes_to_write)
+            .await?;
+
+        tracing::debug!(
+            "Wrote {} bytes (zero-copy) to chunk (path={}, chunk_index={}, offset={})",
+            bytes_written,
+            file_path,
+            chunk_index,
+            offset
+        );
+
+        Ok(bytes_written)
+    }
+
+    /// Get the buffer allocator for acquiring registered buffers
+    pub fn allocator(&self) -> &std::rc::Rc<pluvio_uring::allocator::FixedBufferAllocator> {
+        self.backend.allocator()
     }
 }
 
