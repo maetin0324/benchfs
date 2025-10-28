@@ -154,7 +154,7 @@ fn main() {
     ));
 
     // Setup signal handlers
-    setup_signal_handlers(state.running.clone());
+    benchfs::server::signals::setup_signal_handlers(state.running.clone());
 
     // Synchronize all ranks before starting servers
     world.barrier();
@@ -384,33 +384,4 @@ fn setup_logging(level: &str) {
         .init();
 }
 
-fn setup_signal_handlers(running: Arc<AtomicBool>) {
-    use std::sync::Mutex;
-
-    // Store the running flag in a static for signal handler access
-    static RUNNING_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
-    *RUNNING_FLAG.lock().unwrap() = Some(running);
-
-    // Setup SIGINT handler (Ctrl+C)
-    #[cfg(unix)]
-    {
-        use libc::{SIGINT, SIGTERM};
-
-        unsafe {
-            libc::signal(SIGINT, signal_handler as libc::sighandler_t);
-            libc::signal(SIGTERM, signal_handler as libc::sighandler_t);
-        }
-    }
-
-    #[cfg(unix)]
-    extern "C" fn signal_handler(_: libc::c_int) {
-        use std::sync::Mutex;
-
-        static RUNNING_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
-
-        if let Some(flag) = RUNNING_FLAG.lock().unwrap().as_ref() {
-            eprintln!("\nReceived shutdown signal, stopping server...");
-            flag.store(false, Ordering::Relaxed);
-        }
-    }
-}
+// Signal handlers moved to benchfs::server::signals module

@@ -30,7 +30,10 @@ BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
-export LD_LIBRARY_PATH="/work/0/NBB/rmaeda/workspace/rust/benchfs/target/release:$LD_LIBRARY_PATH"
+
+# Calculate project root from SCRIPT_DIR and set LD_LIBRARY_PATH dynamically
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:${LD_LIBRARY_PATH:-}"
 
 IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
 
@@ -75,18 +78,14 @@ mkdir -p "${BENCHFSD_LOG_BASE_DIR}"
 echo "prepare ior output dir: ${IOR_OUTPUT_DIR}"
 mkdir -p "${IOR_OUTPUT_DIR}"
 
-save_job_params() {
-  cat <<EOS >"${JOB_OUTPUT_DIR}"/job_params_${runid}.json
+save_job_metadata() {
+  cat <<EOS >"${JOB_OUTPUT_DIR}"/job_metadata_${runid}.json
 {
-  "nnodes": ${NNODES},
-  "ppn": ${ppn},
-  "np": ${np},
   "jobid": "$JOBID",
   "runid": ${runid},
-  "transfer_size": "${transfer_size}",
-  "block_size": "${block_size}",
-  "ior_flags": "${ior_flags}",
-  "benchfs_chunk_size": ${benchfs_chunk_size}
+  "benchfs_chunk_size": ${benchfs_chunk_size},
+  "job_start_time": "${JOB_START}",
+  "nnodes": ${NNODES}
 }
 EOS
 }
@@ -112,33 +111,33 @@ cmd_mpirun_kill=(
 echo "Kill any previous benchfsd instances"
 "${cmd_mpirun_kill[@]}" || true
 
-# Parameter lists for benchmarking
-transfer_size_list=(
-  16m   # 16 MiB
-  16g   # 16 GiB
-)
+# Load benchmark parameters from configuration file
+PARAM_FILE="${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}"
+if [ -f "$PARAM_FILE" ]; then
+    echo "Loading parameters from: $PARAM_FILE"
+    source "$PARAM_FILE"
+else
+    echo "WARNING: Parameter file not found: $PARAM_FILE"
+    echo "Using built-in default parameters"
+    # Fallback default values
+    transfer_size_list=(16m 16g)
+    block_size_list=(4m 16m 64m)
+    ppn_list=(1 2 4)
+    ior_flags_list=("-w -r -F" "-w -r")
+    benchfs_chunk_size_list=(4194304)
+fi
 
-block_size_list=(
-  4m    # 4 MiB
-  16m   # 16 MiB
-  64m   # 64 MiB
-)
-
-ppn_list=(
-  1
-  2
-  4
-)
-
-# IOR flags: -w (write), -r (read), -F (file per process)
-ior_flags_list=(
-  "-w -r -F"
-  "-w -r"
-)
-
-benchfs_chunk_size_list=(
-  4194304  # 4 MiB (default)
-)
+# Save parameter configuration for reproducibility
+cat > "${JOB_OUTPUT_DIR}/parameters.json" <<EOF
+{
+  "parameter_file": "$PARAM_FILE",
+  "transfer_sizes": [$(printf '"%s",' "${transfer_size_list[@]}" | sed 's/,$//; s/,$//')],
+  "block_sizes": [$(printf '"%s",' "${block_size_list[@]}" | sed 's/,$//; s/,$//')],
+  "ppn_values": [$(printf '%s,' "${ppn_list[@]}" | sed 's/,$//; s/,$//')],
+  "ior_flags": [$(printf '"%s",' "${ior_flags_list[@]}" | sed 's/,$//; s/,$//')],
+  "chunk_sizes": [$(printf '%s,' "${benchfs_chunk_size_list[@]}" | sed 's/,$//; s/,$//')]
+}
+EOF
 
 check_server_ready() {
   local max_attempts=60
@@ -271,7 +270,8 @@ EOF
 
           # Run IOR benchmark
           echo "Running IOR benchmark..."
-          ior_output_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.txt"
+          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
+          ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.txt"
 
           cmd_ior=(
             time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
@@ -289,13 +289,15 @@ EOF
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"
             -o "${BENCHFS_DATA_DIR}/testfile"
+            -O summaryFormat=JSON
+            -O summaryFile="${ior_json_file}"
           )
 
-          save_job_params
+          save_job_metadata
 
           echo "${cmd_ior[@]}"
           "${cmd_ior[@]}" \
-            > >(tee "${ior_output_file}") \
+            > >(tee "${ior_stdout_file}") \
             2> >(tee "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.txt" >&2) || true
 
           # Stop BenchFS servers

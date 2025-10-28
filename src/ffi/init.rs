@@ -1,7 +1,11 @@
-// Initialization and finalization for C FFI
-//
-// This module provides benchfs_init() and benchfs_finalize() functions
-// that are called from IOR to setup and teardown BenchFS instances.
+//! Initialization and finalization for C FFI
+//!
+//! This module provides the lifecycle management functions for BenchFS:
+//! - [`benchfs_init`]: Initialize a BenchFS instance (client or server)
+//! - [`benchfs_finalize`]: Clean up and destroy a BenchFS instance
+//!
+//! These functions are the entry and exit points for C applications (like IOR)
+//! using BenchFS.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -20,27 +24,111 @@ use pluvio_runtime::executor::Runtime;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
 
-// Opaque type for BenchFS context
-// This prevents C code from accessing internal structure
+/// Opaque BenchFS context type for C code
+///
+/// This type prevents C code from accessing the internal Rust structure.
+/// It is a zero-sized type that acts as an opaque handle.
 #[repr(C)]
 pub struct benchfs_context_t {
     _private: [u8; 0],
 }
 
-/// Initialize BenchFS instance
+/// Initialize a BenchFS instance (client or server mode)
+///
+/// This is the primary entry point for C applications using BenchFS. It creates
+/// and initializes all necessary components including:
+///
+/// - Async runtime with io_uring and UCX reactors
+/// - Metadata manager for file/directory tracking
+/// - Chunk store for local data storage
+/// - RPC server (server mode) or connection pool (distributed mode)
+/// - BenchFS filesystem instance
+///
+/// The function operates in two modes:
+///
+/// ## Server Mode (`is_server = 1`)
+///
+/// Creates a BenchFS server that:
+/// - Listens for incoming RPC requests from clients
+/// - Stores metadata and data chunks locally
+/// - Registers its worker address in the registry directory
+/// - Requires `data_dir` to be specified
+///
+/// ## Client Mode (`is_server = 0`)
+///
+/// Creates a BenchFS client that:
+/// - Connects to remote servers for metadata and data operations
+/// - Uses the registry directory for service discovery
+/// - Waits for server to be available (30 second timeout)
+/// - Uses temporary directory if `data_dir` is NULL
 ///
 /// # Arguments
-/// * `node_id` - Node identifier (e.g., "client_1", "server")
-/// * `registry_dir` - Shared directory for service discovery (required)
-/// * `data_dir` - Data directory for server nodes (optional for clients)
-/// * `is_server` - 1 if this is a server node, 0 for client
+///
+/// * `node_id` - Unique identifier for this node (e.g., "client_1", "node_0")
+///   - Must be valid UTF-8
+///   - Used for consistent hashing and service discovery
+/// * `registry_dir` - Path to shared directory for worker address registry
+///   - Must be accessible by all nodes (e.g., on a shared filesystem)
+///   - Required for distributed mode service discovery
+/// * `data_dir` - Path to local data storage directory
+///   - Required for server mode
+///   - Optional for client mode (defaults to `/tmp/benchfs_client_{node_id}`)
+///   - Used for storing chunk data and metadata
+/// * `is_server` - Mode flag: 1 for server, 0 for client
 ///
 /// # Returns
-/// Opaque pointer to BenchFS context, or NULL on error
+///
+/// * Pointer to opaque `benchfs_context_t` on success
+/// * `NULL` on error (call [`benchfs_get_error`] for details)
 ///
 /// # Safety
-/// - `node_id` and `registry_dir` must be valid C strings
-/// - The returned pointer must be freed with benchfs_finalize()
+///
+/// - `node_id` and `registry_dir` must be valid, null-terminated C strings
+/// - `data_dir` may be `NULL` (only for clients)
+/// - All string pointers must point to valid UTF-8 data
+/// - The returned pointer must be freed with [`benchfs_finalize`]
+/// - Do not use the returned pointer after calling [`benchfs_finalize`]
+///
+/// # Example (C)
+///
+/// ```c
+/// // Initialize server
+/// benchfs_context_t* server = benchfs_init(
+///     "node_0",
+///     "/tmp/benchfs_registry",
+///     "/mnt/storage/benchfs",
+///     1  // is_server = 1
+/// );
+///
+/// if (!server) {
+///     fprintf(stderr, "Server init failed: %s\n", benchfs_get_error());
+///     return -1;
+/// }
+///
+/// // Initialize client
+/// benchfs_context_t* client = benchfs_init(
+///     "client_1",
+///     "/tmp/benchfs_registry",
+///     NULL,  // Use default temp directory
+///     0      // is_server = 0
+/// );
+///
+/// if (!client) {
+///     fprintf(stderr, "Client init failed: %s\n", benchfs_get_error());
+///     return -1;
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Returns `NULL` and sets error message if:
+/// - `node_id` or `registry_dir` is `NULL`
+/// - String parameters contain invalid UTF-8
+/// - `data_dir` is `NULL` in server mode
+/// - UCX context or worker creation fails
+/// - Chunk store directory creation fails
+/// - Server registration fails
+/// - Client cannot connect to server (timeout after 30 seconds)
 #[unsafe(no_mangle)]
 pub extern "C" fn benchfs_init(
     node_id: *const c_char,
@@ -350,14 +438,45 @@ pub extern "C" fn benchfs_init(
     Box::into_raw(boxed) as *mut benchfs_context_t
 }
 
-/// Finalize BenchFS instance
+/// Finalize and destroy a BenchFS instance
+///
+/// This function performs cleanup and destroys the BenchFS instance created
+/// by [`benchfs_init`]. It:
+///
+/// - Closes all open file handles
+/// - Flushes pending I/O operations
+/// - Releases RPC server resources (server mode)
+/// - Disconnects from remote servers (client mode)
+/// - Frees all allocated memory
+///
+/// After calling this function, the `ctx` pointer becomes invalid and must
+/// not be used.
 ///
 /// # Arguments
-/// * `ctx` - BenchFS context from benchfs_init()
+///
+/// * `ctx` - BenchFS context pointer returned by [`benchfs_init`]
 ///
 /// # Safety
-/// - `ctx` must be a valid pointer from benchfs_init()
+///
+/// - `ctx` must be a valid pointer from [`benchfs_init`]
+/// - `ctx` must not be `NULL` (but `NULL` is safely handled as a no-op)
 /// - `ctx` must not be used after this call
+/// - Do not call this function multiple times with the same `ctx`
+///
+/// # Example (C)
+///
+/// ```c
+/// benchfs_context_t* ctx = benchfs_init("client", "/tmp/registry", NULL, 0);
+///
+/// // ... use BenchFS ...
+///
+/// benchfs_finalize(ctx);
+/// // ctx is now invalid - do not use it again
+/// ```
+///
+/// # Note
+///
+/// This function logs "BenchFS finalized" at INFO level before returning.
 #[unsafe(no_mangle)]
 pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     if ctx.is_null() {
@@ -365,6 +484,7 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     }
 
     // Convert back to Rc<BenchFS> and drop it
+    // This will automatically trigger Drop implementations for all components
     unsafe {
         let _ = Box::from_raw(ctx as *mut Rc<BenchFS>);
     }

@@ -1,7 +1,61 @@
-// File operations FFI
-//
-// This module provides C-compatible file operation functions that wrap
-// BenchFS async operations with sync conversion.
+//! C-compatible file operations
+//!
+//! This module provides POSIX-like file operation functions for C code.
+//! All async BenchFS operations are wrapped with synchronous FFI functions
+//! using the [`block_on`] helper.
+//!
+//! # Available Operations
+//!
+//! - [`benchfs_create`]: Create a new file
+//! - [`benchfs_open`]: Open an existing file
+//! - [`benchfs_read`]: Read data from a file
+//! - [`benchfs_write`]: Write data to a file
+//! - [`benchfs_close`]: Close a file handle
+//! - [`benchfs_remove`]: Delete a file
+//! - [`benchfs_lseek`]: Seek to a position in a file
+//! - [`benchfs_fsync`]: Synchronize file data to storage
+//!
+//! # File Open Flags
+//!
+//! The module provides POSIX-compatible flags for file operations:
+//!
+//! - `BENCHFS_O_RDONLY`: Open for reading only
+//! - `BENCHFS_O_WRONLY`: Open for writing only
+//! - `BENCHFS_O_RDWR`: Open for reading and writing
+//! - `BENCHFS_O_CREAT`: Create file if it doesn't exist
+//! - `BENCHFS_O_EXCL`: Fail if file already exists (with O_CREAT)
+//! - `BENCHFS_O_TRUNC`: Truncate file to zero length
+//! - `BENCHFS_O_APPEND`: Append mode (writes go to end of file)
+//!
+//! # Input Validation
+//!
+//! All functions perform input validation to prevent:
+//! - Buffer overflows (paths limited to 4096 bytes)
+//! - Excessive memory allocation (transfers limited to 1GB)
+//! - Invalid UTF-8 in file paths
+//! - Null pointer dereferences
+//!
+//! # Example (C)
+//!
+//! ```c
+//! // Create and write to a file
+//! benchfs_file_t* file = benchfs_create(
+//!     ctx,
+//!     "/test.txt",
+//!     BENCHFS_O_CREAT | BENCHFS_O_WRONLY,
+//!     0644
+//! );
+//!
+//! char data[] = "Hello, BenchFS!";
+//! ssize_t written = benchfs_write(file, data, strlen(data), 0);
+//! benchfs_close(file);
+//!
+//! // Read from the file
+//! file = benchfs_open(ctx, "/test.txt", BENCHFS_O_RDONLY);
+//! char buffer[1024];
+//! ssize_t read = benchfs_read(file, buffer, sizeof(buffer), 0);
+//! benchfs_close(file);
+//! ```
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -12,21 +66,95 @@ use super::runtime::{block_on, with_benchfs_ctx};
 use crate::api::file_ops::BenchFS;
 use crate::api::types::{FileHandle, OpenFlags};
 
-// Opaque type for file handle
+/// Opaque file handle type for C code
+///
+/// This type prevents C code from accessing the internal Rust `FileHandle` structure.
 #[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct benchfs_file_t {
     _private: [u8; 0],
 }
 
-// File open flags (matching Linux O_* flags)
+/// Open for reading only
 pub const BENCHFS_O_RDONLY: i32 = 0x0000;
+
+/// Open for writing only
 pub const BENCHFS_O_WRONLY: i32 = 0x0001;
+
+/// Open for reading and writing
 pub const BENCHFS_O_RDWR: i32 = 0x0002;
+
+/// Create file if it doesn't exist
 pub const BENCHFS_O_CREAT: i32 = 0x0040;
+
+/// Fail if file exists (used with BENCHFS_O_CREAT)
 pub const BENCHFS_O_EXCL: i32 = 0x0080;
+
+/// Truncate file to zero length
 pub const BENCHFS_O_TRUNC: i32 = 0x0200;
+
+/// Append mode - writes go to end of file
 pub const BENCHFS_O_APPEND: i32 = 0x0400;
+
+/// Maximum allowed path length in bytes
+const MAX_PATH_LENGTH: usize = 4096;
+
+/// Maximum allowed transfer size per operation (1 GB)
+const MAX_TRANSFER_SIZE: usize = 1 << 30;
+
+/// Helper function to validate and convert C string to Rust string
+///
+/// # Safety
+/// This function safely handles null pointers and invalid UTF-8.
+///
+/// # Returns
+/// Returns Some(&str) if the pointer is valid and contains valid UTF-8,
+/// None otherwise (and sets an appropriate error message).
+fn validate_c_str<'a>(ptr: *const c_char, param_name: &str) -> Option<&'a str> {
+    if ptr.is_null() {
+        set_error_message(&format!("{} must not be null", param_name));
+        return None;
+    }
+
+    unsafe {
+        let cstr = CStr::from_ptr(ptr);
+
+        // Length check
+        if cstr.to_bytes().len() > MAX_PATH_LENGTH {
+            set_error_message(&format!(
+                "{} too long (max: {} bytes)",
+                param_name, MAX_PATH_LENGTH
+            ));
+            return None;
+        }
+
+        match cstr.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                set_error_message(&format!("Invalid UTF-8 in {}", param_name));
+                None
+            }
+        }
+    }
+}
+
+/// Helper function to validate transfer size
+fn validate_transfer_size(size: usize, param_name: &str) -> Option<usize> {
+    if size == 0 {
+        set_error_message(&format!("{} must be greater than 0", param_name));
+        return None;
+    }
+
+    if size > MAX_TRANSFER_SIZE {
+        set_error_message(&format!(
+            "{} too large (max: {} bytes)",
+            param_name, MAX_TRANSFER_SIZE
+        ));
+        return None;
+    }
+
+    Some(size)
+}
 
 /// Convert C flags to OpenFlags
 fn c_flags_to_open_flags(flags: i32) -> OpenFlags {
@@ -88,19 +216,9 @@ pub extern "C" fn benchfs_create(
     flags: i32,
     _mode: u32,
 ) -> *mut benchfs_file_t {
-    if path.is_null() {
-        set_error_message("path must not be null");
-        return std::ptr::null_mut();
-    }
-
-    let path_str = unsafe {
-        match CStr::from_ptr(path).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_error_message("Invalid UTF-8 in path");
-                return std::ptr::null_mut();
-            }
-        }
+    let path_str = match validate_c_str(path, "path") {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
     };
 
     // Convert flags to OpenFlags
@@ -147,19 +265,9 @@ pub extern "C" fn benchfs_open(
     path: *const c_char,
     flags: i32,
 ) -> *mut benchfs_file_t {
-    if path.is_null() {
-        set_error_message("path must not be null");
-        return std::ptr::null_mut();
-    }
-
-    let path_str = unsafe {
-        match CStr::from_ptr(path).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_error_message("Invalid UTF-8 in path");
-                return std::ptr::null_mut();
-            }
-        }
+    let path_str = match validate_c_str(path, "path") {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
     };
 
     let open_flags = c_flags_to_open_flags(flags);
@@ -209,6 +317,11 @@ pub extern "C" fn benchfs_write(
 
     if offset < 0 {
         set_error_message("offset must be non-negative");
+        return BENCHFS_EINVAL as i64;
+    }
+
+    // Validate transfer size
+    if validate_transfer_size(size, "size").is_none() {
         return BENCHFS_EINVAL as i64;
     }
 
@@ -273,6 +386,11 @@ pub extern "C" fn benchfs_read(
 
     if offset < 0 {
         set_error_message("offset must be non-negative");
+        return BENCHFS_EINVAL as i64;
+    }
+
+    // Validate transfer size
+    if validate_transfer_size(size, "size").is_none() {
         return BENCHFS_EINVAL as i64;
     }
 
@@ -397,19 +515,9 @@ pub extern "C" fn benchfs_remove(
     _ctx: *mut super::init::benchfs_context_t,
     path: *const c_char,
 ) -> i32 {
-    if path.is_null() {
-        set_error_message("path must not be null");
-        return BENCHFS_EINVAL;
-    }
-
-    let path_str = unsafe {
-        match CStr::from_ptr(path).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_error_message("Invalid UTF-8 in path");
-                return BENCHFS_EINVAL;
-            }
-        }
+    let path_str = match validate_c_str(path, "path") {
+        Some(s) => s,
+        None => return BENCHFS_EINVAL,
     };
 
     let result = with_benchfs_ctx(|fs| {

@@ -42,7 +42,10 @@
       "Bash(docker cp:*)",
       "Bash(docker inspect:*)",
       "Bash(docker top:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(shellcheck:*)",
+      "Bash(awk:*)"
     ],
     "deny": [],
     "ask": []

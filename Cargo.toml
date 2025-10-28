@@ -66,6 +66,7 @@ name = "benchfsd_mpi"
 path = "src/bin/benchfsd_mpi.rs"
 required-features = ["mpi-support"]
 
-[[bench]]
-name = "small"
-harness = false
+# Benchmark configuration - currently disabled as benches/small.rs does not exist
+# [[bench]]
+# name = "small"
+# harness = false

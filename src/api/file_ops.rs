@@ -61,23 +61,7 @@ impl BenchFS {
     /// * `node_id` - Node identifier
     /// * `chunk_store` - Chunk store for local data storage (using io_uring)
     pub fn new(node_id: String, chunk_store: Rc<IOUringChunkStore>) -> Self {
-        let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_cache = ChunkCache::with_memory_limit(100); // 100 MB cache
-        let chunk_manager = ChunkManager::new();
-        let placement = Rc::new(RoundRobinPlacement::new(vec![node_id.clone()]));
-
-        Self {
-            node_id,
-            metadata_manager,
-            metadata_ring: None,
-            chunk_store,
-            chunk_cache,
-            chunk_manager,
-            placement,
-            open_files: RefCell::new(HashMap::new()),
-            next_fd: RefCell::new(3), // Start from 3 (0, 1, 2 are reserved for stdin, stdout, stderr)
-            connection_pool: None,
-        }
+        BenchFSBuilder::new(node_id, chunk_store).build()
     }
 
     /// Create a new BenchFS client with connection pool (distributed mode)
@@ -91,23 +75,9 @@ impl BenchFS {
         chunk_store: Rc<IOUringChunkStore>,
         connection_pool: Rc<ConnectionPool>,
     ) -> Self {
-        let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_cache = ChunkCache::with_memory_limit(100);
-        let chunk_manager = ChunkManager::new();
-        let placement = Rc::new(RoundRobinPlacement::new(vec![node_id.clone()]));
-
-        Self {
-            node_id,
-            metadata_manager,
-            metadata_ring: None,
-            chunk_store,
-            chunk_cache,
-            chunk_manager,
-            placement,
-            open_files: RefCell::new(HashMap::new()),
-            next_fd: RefCell::new(3),
-            connection_pool: Some(connection_pool),
-        }
+        BenchFSBuilder::new(node_id, chunk_store)
+            .with_connection_pool(connection_pool)
+            .build()
     }
 
     /// Create a new BenchFS client with connection pool and custom target nodes (distributed mode)
@@ -123,23 +93,10 @@ impl BenchFS {
         connection_pool: Rc<ConnectionPool>,
         target_nodes: Vec<String>,
     ) -> Self {
-        let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_cache = ChunkCache::with_memory_limit(100);
-        let chunk_manager = ChunkManager::new();
-        let placement = Rc::new(RoundRobinPlacement::new(target_nodes));
-
-        Self {
-            node_id,
-            metadata_manager,
-            metadata_ring: None,
-            chunk_store,
-            chunk_cache,
-            chunk_manager,
-            placement,
-            open_files: RefCell::new(HashMap::new()),
-            next_fd: RefCell::new(3),
-            connection_pool: Some(connection_pool),
-        }
+        BenchFSBuilder::new(node_id, chunk_store)
+            .with_connection_pool(connection_pool)
+            .with_data_nodes(target_nodes)
+            .build()
     }
 
     /// Create a new BenchFS client with distributed metadata support
@@ -157,29 +114,11 @@ impl BenchFS {
         data_nodes: Vec<String>,
         metadata_nodes: Vec<String>,
     ) -> Self {
-        let metadata_manager = Rc::new(MetadataManager::new(node_id.clone()));
-        let chunk_cache = ChunkCache::with_memory_limit(100);
-        let chunk_manager = ChunkManager::new();
-        let placement = Rc::new(RoundRobinPlacement::new(data_nodes));
-
-        // Create metadata consistent hash ring
-        let mut ring = ConsistentHashRing::new();
-        for node in &metadata_nodes {
-            ring.add_node(node.clone());
-        }
-
-        Self {
-            node_id,
-            metadata_manager,
-            metadata_ring: Some(Rc::new(ring)),
-            chunk_store,
-            chunk_cache,
-            chunk_manager,
-            placement,
-            open_files: RefCell::new(HashMap::new()),
-            next_fd: RefCell::new(3),
-            connection_pool: Some(connection_pool),
-        }
+        BenchFSBuilder::new(node_id, chunk_store)
+            .with_connection_pool(connection_pool)
+            .with_data_nodes(data_nodes)
+            .with_metadata_nodes(metadata_nodes)
+            .build()
     }
 
     /// Check if distributed mode is enabled
@@ -1393,6 +1332,110 @@ impl BenchFS {
             Some(path[last_slash + 1..].to_string())
         } else {
             Some(path.to_string())
+        }
+    }
+}
+
+/// Builder for BenchFS client
+///
+/// This builder provides a flexible way to construct a BenchFS client
+/// with various configuration options. It replaces the multiple constructor
+/// methods with a single, consistent interface.
+///
+/// # Example
+///
+/// ```ignore
+/// use benchfs::api::file_ops::BenchFSBuilder;
+///
+/// let benchfs = BenchFSBuilder::new("node1".to_string(), chunk_store)
+///     .with_connection_pool(pool)
+///     .with_data_nodes(vec!["node1".to_string(), "node2".to_string()])
+///     .with_metadata_nodes(vec!["meta1".to_string(), "meta2".to_string()])
+///     .with_cache_size(200)
+///     .build();
+/// ```
+pub struct BenchFSBuilder {
+    node_id: String,
+    chunk_store: Rc<IOUringChunkStore>,
+    connection_pool: Option<Rc<ConnectionPool>>,
+    data_nodes: Option<Vec<String>>,
+    metadata_nodes: Option<Vec<String>>,
+    chunk_cache_mb: usize,
+}
+
+impl BenchFSBuilder {
+    /// Create a new BenchFS builder
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier
+    /// * `chunk_store` - Chunk store for local data storage
+    pub fn new(node_id: String, chunk_store: Rc<IOUringChunkStore>) -> Self {
+        Self {
+            node_id,
+            chunk_store,
+            connection_pool: None,
+            data_nodes: None,
+            metadata_nodes: None,
+            chunk_cache_mb: crate::config::defaults::CHUNK_CACHE_MB,
+        }
+    }
+
+    /// Set the connection pool for distributed mode
+    pub fn with_connection_pool(mut self, pool: Rc<ConnectionPool>) -> Self {
+        self.connection_pool = Some(pool);
+        self
+    }
+
+    /// Set the data nodes for chunk placement
+    pub fn with_data_nodes(mut self, nodes: Vec<String>) -> Self {
+        self.data_nodes = Some(nodes);
+        self
+    }
+
+    /// Set the metadata server nodes for distributed metadata
+    pub fn with_metadata_nodes(mut self, nodes: Vec<String>) -> Self {
+        self.metadata_nodes = Some(nodes);
+        self
+    }
+
+    /// Set the chunk cache size in MB
+    pub fn with_cache_size(mut self, mb: usize) -> Self {
+        self.chunk_cache_mb = mb;
+        self
+    }
+
+    /// Build the BenchFS client
+    pub fn build(self) -> BenchFS {
+        let metadata_manager = Rc::new(MetadataManager::new(self.node_id.clone()));
+        let chunk_cache = ChunkCache::with_memory_limit(self.chunk_cache_mb);
+        let chunk_manager = ChunkManager::new();
+
+        // Determine placement nodes
+        let placement_nodes = self
+            .data_nodes
+            .unwrap_or_else(|| vec![self.node_id.clone()]);
+        let placement = Rc::new(RoundRobinPlacement::new(placement_nodes));
+
+        // Create metadata ring if metadata nodes are specified
+        let metadata_ring = self.metadata_nodes.map(|nodes| {
+            let mut ring = ConsistentHashRing::new();
+            for node in nodes {
+                ring.add_node(node);
+            }
+            Rc::new(ring)
+        });
+
+        BenchFS {
+            node_id: self.node_id,
+            metadata_manager,
+            metadata_ring,
+            chunk_store: self.chunk_store,
+            chunk_cache,
+            chunk_manager,
+            placement,
+            open_files: RefCell::new(HashMap::new()),
+            next_fd: RefCell::new(3),
+            connection_pool: self.connection_pool,
         }
     }
 }

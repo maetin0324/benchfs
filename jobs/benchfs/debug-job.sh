@@ -34,11 +34,20 @@ else
     echo "No benchfsd_logs directory found"
 fi
 
-# Check job parameters
-if [ -f "$LATEST_JOB/job_params_0.json" ]; then
-    echo "Job Parameters:"
+# Check job metadata
+if [ -f "$LATEST_JOB/job_metadata_0.json" ]; then
+    echo "Job Metadata:"
     echo "=========================================="
-    cat "$LATEST_JOB/job_params_0.json"
+    cat "$LATEST_JOB/job_metadata_0.json"
+    echo ""
+fi
+
+# Check IOR results
+IOR_RESULT=$(find "$LATEST_JOB/ior_results" -name "ior_result_0.json" -type f 2>/dev/null | head -1)
+if [ -n "$IOR_RESULT" ]; then
+    echo "IOR Benchmark Results (JSON):"
+    echo "=========================================="
+    cat "$IOR_RESULT" | head -50
     echo ""
 fi
 

@@ -3,6 +3,57 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Default configuration constants
+///
+/// This module centralizes all default values used throughout BenchFS.
+/// By collecting these constants in one place, we ensure consistency
+/// and make it easier to adjust defaults for different deployment scenarios.
+pub mod defaults {
+
+    // Storage defaults
+    /// Default chunk size: 4MB
+    /// Larger than CHFS's 64KB for better RDMA performance with large sequential I/O
+    pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB
+
+    /// Alternative chunk size for CHFS compatibility: 64KB
+    pub const CHUNK_SIZE_CHFS_COMPAT: usize = 64 * 1024; // 64 KB
+
+    /// Enable io_uring by default for optimal I/O performance
+    pub const USE_IOURING: bool = true;
+
+    /// Maximum storage size in GB (0 = unlimited)
+    pub const MAX_STORAGE_GB: usize = 0;
+
+    // Network defaults
+    /// Connection timeout: 30 seconds
+    pub const TIMEOUT_SECS: u64 = 30;
+
+    /// RDMA threshold: 32KB (same as CHFS)
+    /// Transfers larger than this use RDMA, smaller use regular RPC
+    pub const RDMA_THRESHOLD_BYTES: usize = 32 * 1024; // 32 KB
+
+    /// Default registry directory for worker address management
+    pub const fn default_registry_dir() -> &'static str {
+        "/tmp/benchfs/worker_addrs"
+    }
+
+    // Cache defaults
+    /// Metadata cache entries: 1000
+    pub const METADATA_CACHE_ENTRIES: usize = 1000;
+
+    /// Chunk cache size: 100MB
+    pub const CHUNK_CACHE_MB: usize = 100;
+
+    /// Cache TTL in seconds (0 = no TTL/expiration)
+    pub const CACHE_TTL_SECS: u64 = 0;
+
+    // Log level
+    /// Default log level
+    pub const fn default_log_level() -> &'static str {
+        "info"
+    }
+}
+
 /// BenchFS server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -34,7 +85,7 @@ pub struct NodeConfig {
 }
 
 fn default_log_level() -> String {
-    "info".to_string()
+    defaults::default_log_level().to_string()
 }
 
 /// Storage configuration
@@ -62,11 +113,11 @@ pub struct StorageConfig {
 }
 
 fn default_chunk_size() -> usize {
-    4 * 1024 * 1024 // 4MB (larger than CHFS's 64KB for better RDMA performance)
+    defaults::CHUNK_SIZE
 }
 
 fn default_use_iouring() -> bool {
-    true
+    defaults::USE_IOURING
 }
 
 /// Network configuration
@@ -96,15 +147,15 @@ pub struct NetworkConfig {
 }
 
 fn default_timeout() -> u64 {
-    30
+    defaults::TIMEOUT_SECS
 }
 
 fn default_rdma_threshold() -> usize {
-    32 * 1024 // 32 KB (same as CHFS)
+    defaults::RDMA_THRESHOLD_BYTES
 }
 
 fn default_registry_dir() -> PathBuf {
-    PathBuf::from("/tmp/benchfs/worker_addrs")
+    PathBuf::from(defaults::default_registry_dir())
 }
 
 /// Cache configuration
@@ -124,11 +175,11 @@ pub struct CacheConfig {
 }
 
 fn default_metadata_cache_entries() -> usize {
-    1000
+    defaults::METADATA_CACHE_ENTRIES
 }
 
 fn default_chunk_cache_mb() -> usize {
-    100
+    defaults::CHUNK_CACHE_MB
 }
 
 impl Default for ServerConfig {
