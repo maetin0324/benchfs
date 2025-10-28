@@ -54,8 +54,8 @@ for nnodes in "${nnodes_list[@]}"; do
 
       cmd_qsub=(
         qsub
-        -A NBB
-        -q gpu
+        -A NBBG
+        -q gen_S
         -l elapstim_req="${ELAPSTIM_REQ}"
         -T openmpi
         -v NQSV_MPI_VER="${NQSV_MPI_VER}"
