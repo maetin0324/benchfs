@@ -40,62 +40,89 @@ use pluvio_uring::reactor::IoUringReactor;
 fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
     use std::fs;
     use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
 
     let registry_path = Path::new(registry_dir);
     if !registry_path.exists() {
         return Err(format!("Registry directory does not exist: {}", registry_dir));
     }
 
-    let entries = match fs::read_dir(registry_path) {
-        Ok(e) => e,
-        Err(err) => {
-            return Err(format!(
-                "Failed to read registry directory {}: {}",
-                registry_dir, err
-            ))
-        }
-    };
+    // Retry logic to handle race conditions when 256 clients simultaneously scan directory
+    const MAX_RETRIES: u32 = 5;
+    const RETRY_DELAY_MS: u64 = 100;
 
-    let mut node_ids = Vec::new();
-
-    for entry in entries {
-        let entry = match entry {
+    for attempt in 0..MAX_RETRIES {
+        let entries = match fs::read_dir(registry_path) {
             Ok(e) => e,
-            Err(_) => continue, // Skip unreadable entries
+            Err(err) => {
+                if attempt < MAX_RETRIES - 1 {
+                    tracing::debug!(
+                        "Failed to read registry (attempt {}): {}. Retrying...",
+                        attempt + 1,
+                        err
+                    );
+                    thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+                    continue;
+                }
+                return Err(format!(
+                    "Failed to read registry directory {} after {} retries: {}",
+                    registry_dir, MAX_RETRIES, err
+                ));
+            }
         };
 
-        let filename = entry.file_name();
-        let filename_str = match filename.to_str() {
-            Some(s) => s,
-            None => continue, // Skip non-UTF8 filenames
-        };
+        let mut node_ids = Vec::new();
 
-        // Match pattern: node_*.addr
-        if filename_str.starts_with("node_") && filename_str.ends_with(".addr") {
-            // Extract node ID: "node_0.addr" -> "node_0"
-            let node_id = &filename_str[..filename_str.len() - 5]; // Remove ".addr" suffix
-            node_ids.push(node_id.to_string());
-            tracing::debug!("Discovered data node: {}", node_id);
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue, // Skip unreadable entries
+            };
+
+            let filename = entry.file_name();
+            let filename_str = match filename.to_str() {
+                Some(s) => s,
+                None => continue, // Skip non-UTF8 filenames
+            };
+
+            // Match pattern: node_*.addr
+            if filename_str.starts_with("node_") && filename_str.ends_with(".addr") {
+                // Extract node ID: "node_0.addr" -> "node_0"
+                let node_id = &filename_str[..filename_str.len() - 5]; // Remove ".addr" suffix
+                node_ids.push(node_id.to_string());
+                tracing::debug!("Discovered data node: {}", node_id);
+            }
+        }
+
+        if !node_ids.is_empty() {
+            // Sort node IDs for deterministic ordering
+            node_ids.sort();
+
+            tracing::info!(
+                "Discovered {} data nodes: {:?} (attempt {})",
+                node_ids.len(),
+                node_ids,
+                attempt + 1
+            );
+
+            return Ok(node_ids);
+        }
+
+        // No nodes found, retry
+        if attempt < MAX_RETRIES - 1 {
+            tracing::debug!(
+                "No nodes found in attempt {}, retrying...",
+                attempt + 1
+            );
+            thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
         }
     }
 
-    if node_ids.is_empty() {
-        return Err(format!(
-            "No data nodes found in registry directory: {}",
-            registry_dir
-        ));
-    }
-
-    // Sort node IDs for deterministic ordering
-    node_ids.sort();
-
-    tracing::info!(
-        "Discovered {} data nodes: {:?}",
-        node_ids.len(),
-        node_ids
-    );
-
-    Ok(node_ids)
+    Err(format!(
+        "No data nodes found in registry directory: {} after {} retries",
+        registry_dir, MAX_RETRIES
+    ))
 }
 
 /// Opaque BenchFS context type for C code
@@ -426,16 +453,57 @@ pub extern "C" fn benchfs_init(
             }
         };
 
-        // Wait for server to register and connect
-        tracing::info!("Waiting for server to register (timeout: 30 seconds)...");
+        // Discover data nodes BEFORE connecting (critical for load distribution)
+        tracing::info!("Discovering data nodes from registry...");
+        let discovered_nodes = match discover_data_nodes(registry_dir_str) {
+            Ok(nodes) => {
+                tracing::info!(
+                    "Discovered {} data nodes for distributed connections",
+                    nodes.len()
+                );
+                nodes
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to discover data nodes: {}. Falling back to node_0 only",
+                    e
+                );
+                vec!["node_0".to_string()]
+            }
+        };
+
+        // Distribute initial connections across nodes using client node_id hash
+        // This prevents all 256 clients from connecting to node_0 simultaneously
+        let target_node = if discovered_nodes.len() > 1 {
+            // Hash the node_id to select a target node
+            let hash = node_id_str.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+            let index = (hash as usize) % discovered_nodes.len();
+            &discovered_nodes[index]
+        } else {
+            &discovered_nodes[0]
+        };
+
+        tracing::info!(
+            "Connecting to distributed node: {} (selected from {} nodes)",
+            target_node,
+            discovered_nodes.len()
+        );
+
         let pool_clone = connection_pool.clone();
-        let connect_result =
-            block_on(async move { pool_clone.wait_and_connect("node_0", 30).await });
+        let target_node_owned = target_node.to_string();
+        let connect_result = block_on(async move {
+            pool_clone
+                .wait_and_connect(&target_node_owned, 30)
+                .await
+        });
 
         match connect_result {
-            Ok(_) => tracing::info!("Successfully connected to server"),
+            Ok(_) => tracing::info!("Successfully connected to server: {}", target_node),
             Err(e) => {
-                set_error_message(&format!("Failed to connect to server: {:?}", e));
+                set_error_message(&format!(
+                    "Failed to connect to server {}: {:?}",
+                    target_node, e
+                ));
                 return std::ptr::null_mut();
             }
         }
@@ -479,27 +547,14 @@ pub extern "C" fn benchfs_init(
 
         // Create BenchFS instance with distributed metadata
         // In MPI mode: node_0 is the metadata server, all nodes are data servers
-        // Discover available nodes from registry
+        // Use the nodes discovered earlier during connection setup
         let metadata_nodes = vec!["node_0".to_string()];
+        let data_nodes = discovered_nodes; // Reuse nodes discovered earlier
 
-        // Dynamically discover all data nodes from registry directory
-        let data_nodes = match discover_data_nodes(registry_dir_str) {
-            Ok(nodes) => {
-                tracing::info!(
-                    "Client will use {} data nodes for distributed storage",
-                    nodes.len()
-                );
-                nodes
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to discover data nodes: {}. Falling back to node_0 only",
-                    e
-                );
-                // Fallback to single node if discovery fails
-                vec!["node_0".to_string()]
-            }
-        };
+        tracing::info!(
+            "Creating BenchFS client with {} data nodes for distributed storage",
+            data_nodes.len()
+        );
 
         let benchfs = Rc::new(BenchFS::with_distributed_metadata(
             node_id_str.to_string(),

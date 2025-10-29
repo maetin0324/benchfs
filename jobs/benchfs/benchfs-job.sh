@@ -182,7 +182,16 @@ check_server_ready() {
     local ready_count=$(find "${BENCHFS_REGISTRY_DIR}" -name "node_*.addr" -type f 2>/dev/null | wc -l)
 
     if [ "$ready_count" -eq "$NNODES" ]; then
-      echo "BenchFS servers are ready: $ready_count/$NNODES nodes registered"
+      echo "BenchFS servers registered: $ready_count/$NNODES nodes"
+
+      # Additional wait for RPC handler initialization
+      # All nodes have registered, but their RPC handlers may still be initializing
+      # This prevents "connection refused" errors when 256 clients connect simultaneously
+      local rpc_wait_time=10
+      echo "Waiting ${rpc_wait_time}s for RPC handler initialization..."
+      sleep $rpc_wait_time
+
+      echo "BenchFS servers are fully ready"
       return 0
     fi
 
