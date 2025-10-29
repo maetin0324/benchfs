@@ -91,15 +91,42 @@ save_job_metadata() {
 EOS
 }
 
+# RDMA Configuration for High-Performance Networking
+# ==================================================
+# IMPORTANT: Before running, verify InfiniBand device with:
+#   ibv_devices        # List InfiniBand devices
+#   ucx_info -d        # List UCX-compatible devices
+#
+# Common device names:
+#   mlx5_0  - Mellanox ConnectX-5/6/7
+#   mlx4_0  - Mellanox ConnectX-3/4
+#   hfi1_0  - Intel Omni-Path
+#
+# If InfiniBand is not available, comment out RDMA lines and use TCP fallback
+
+# Option 1: RDMA-enabled configuration (RECOMMENDED for InfiniBand systems)
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
-  --mca btl "self,tcp"
-  --mca btl_tcp_if_include eno1
-  -x "UCX_TLS=self,tcp"
+  --mca btl "self,vader,openib"           # Enable shared memory + InfiniBand
+  --mca btl_openib_if_include mlx5_0      # InfiniBand device (ADJUST IF NEEDED)
+  --mca btl_openib_want_fork_support 0    # Disable fork for performance
+  -x "UCX_TLS=rc,ud,sm,self"              # RDMA RC/UD + shared memory
+  -x "UCX_NET_DEVICES=mlx5_0:1"           # UCX device (ADJUST IF NEEDED)
   -x PATH
-  -x LD_LIBRARY_PATH     # ← これを追加
+  -x LD_LIBRARY_PATH
 )
+
+# Option 2: TCP fallback (if InfiniBand is unavailable, uncomment below and comment out Option 1)
+# cmd_mpirun_common=(
+#   mpirun
+#   "${nqsii_mpiopts_array[@]}"
+#   --mca btl "self,tcp"
+#   --mca btl_tcp_if_include eno1
+#   -x "UCX_TLS=self,tcp"
+#   -x PATH
+#   -x LD_LIBRARY_PATH
+# )
 
 # Kill any previous benchfsd instances
 cmd_mpirun_kill=(
