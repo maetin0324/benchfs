@@ -18,8 +18,9 @@ module load "openmpi/$NQSV_MPI_VER"
 # - IOR_PREFIX
 
 source "$SCRIPT_DIR/common.sh"
-exec 1> >(addtimestamp)
-exec 2> >(addtimestamp >&2)
+# NOTE: Disabled process substitution to avoid FD leak
+# exec 1> >(addtimestamp)
+# exec 2> >(addtimestamp >&2)
 
 JOB_START=$(timestamp)
 NNODES=$(wc --lines "${PBS_NODEFILE}" | awk '{print $1}')
@@ -297,9 +298,10 @@ EOF
           save_job_metadata
 
           echo "${cmd_ior[@]}"
+          # NOTE: Use simple redirection instead of process substitution to avoid FD leak
           "${cmd_ior[@]}" \
-            > >(tee "${ior_stdout_file}") \
-            2> >(tee "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.txt" >&2) || true
+            > "${ior_stdout_file}" \
+            2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.txt" || true
 
           # Stop BenchFS servers
           echo "Stopping BenchFS servers..."
