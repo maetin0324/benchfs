@@ -29,6 +29,9 @@ pub struct BenchFS {
     /// Metadata manager (for local metadata)
     metadata_manager: Rc<MetadataManager>,
 
+    /// Data node consistent hash ring (for chunk distribution across storage nodes)
+    data_ring: Option<Rc<ConsistentHashRing>>,
+
     /// Metadata consistent hash ring (for distributed metadata)
     metadata_ring: Option<Rc<ConsistentHashRing>>,
 
@@ -144,13 +147,25 @@ impl BenchFS {
     }
 
     /// Get the node responsible for storing a chunk (using consistent hashing)
+    ///
+    /// This method uses the data_ring (if available) to distribute chunks across storage nodes.
+    /// If data_ring is not available, it falls back to metadata_ring for backward compatibility,
+    /// and ultimately to the local node ID.
     fn get_chunk_node(&self, chunk_key: &str) -> String {
-        if let Some(ring) = &self.metadata_ring {
-            ring.get_node(chunk_key)
-                .unwrap_or_else(|| self.node_id.clone())
-        } else {
-            self.node_id.clone()
+        // Priority 1: Use data node ring for chunk distribution
+        if let Some(ring) = &self.data_ring {
+            return ring.get_node(chunk_key)
+                .unwrap_or_else(|| self.node_id.clone());
         }
+
+        // Priority 2: Fall back to metadata ring (backward compatibility)
+        if let Some(ring) = &self.metadata_ring {
+            return ring.get_node(chunk_key)
+                .unwrap_or_else(|| self.node_id.clone());
+        }
+
+        // Priority 3: Default to local node
+        self.node_id.clone()
     }
 
     /// Get file metadata with automatic caching for distributed mode
@@ -1413,8 +1428,24 @@ impl BenchFSBuilder {
         // Determine placement nodes
         let placement_nodes = self
             .data_nodes
+            .clone()
             .unwrap_or_else(|| vec![self.node_id.clone()]);
         let placement = Rc::new(RoundRobinPlacement::new(placement_nodes));
+
+        // Create data node ring if data nodes are specified
+        // This ring is used for distributing chunks across storage nodes
+        let data_ring = self.data_nodes.as_ref().and_then(|nodes| {
+            if nodes.len() > 1 {
+                let mut ring = ConsistentHashRing::new();
+                for node in nodes {
+                    ring.add_node(node.clone());
+                }
+                Some(Rc::new(ring))
+            } else {
+                // Don't create ring for single node (no distribution needed)
+                None
+            }
+        });
 
         // Create metadata ring if metadata nodes are specified
         let metadata_ring = self.metadata_nodes.map(|nodes| {
@@ -1428,6 +1459,7 @@ impl BenchFSBuilder {
         BenchFS {
             node_id: self.node_id,
             metadata_manager,
+            data_ring,
             metadata_ring,
             chunk_store: self.chunk_store,
             chunk_cache,

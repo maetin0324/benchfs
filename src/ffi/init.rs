@@ -24,6 +24,80 @@ use pluvio_runtime::executor::Runtime;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
 
+/// Discover available nodes from registry directory
+///
+/// This function scans the registry directory for `node_*.addr` files
+/// and extracts the node IDs from the filenames.
+///
+/// # Arguments
+///
+/// * `registry_dir` - Path to the registry directory
+///
+/// # Returns
+///
+/// * `Ok(Vec<String>)` - List of discovered node IDs (e.g., ["node_0", "node_1", ...])
+/// * `Err(String)` - Error message if discovery fails
+fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
+    use std::fs;
+    use std::path::Path;
+
+    let registry_path = Path::new(registry_dir);
+    if !registry_path.exists() {
+        return Err(format!("Registry directory does not exist: {}", registry_dir));
+    }
+
+    let entries = match fs::read_dir(registry_path) {
+        Ok(e) => e,
+        Err(err) => {
+            return Err(format!(
+                "Failed to read registry directory {}: {}",
+                registry_dir, err
+            ))
+        }
+    };
+
+    let mut node_ids = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue, // Skip unreadable entries
+        };
+
+        let filename = entry.file_name();
+        let filename_str = match filename.to_str() {
+            Some(s) => s,
+            None => continue, // Skip non-UTF8 filenames
+        };
+
+        // Match pattern: node_*.addr
+        if filename_str.starts_with("node_") && filename_str.ends_with(".addr") {
+            // Extract node ID: "node_0.addr" -> "node_0"
+            let node_id = &filename_str[..filename_str.len() - 5]; // Remove ".addr" suffix
+            node_ids.push(node_id.to_string());
+            tracing::debug!("Discovered data node: {}", node_id);
+        }
+    }
+
+    if node_ids.is_empty() {
+        return Err(format!(
+            "No data nodes found in registry directory: {}",
+            registry_dir
+        ));
+    }
+
+    // Sort node IDs for deterministic ordering
+    node_ids.sort();
+
+    tracing::info!(
+        "Discovered {} data nodes: {:?}",
+        node_ids.len(),
+        node_ids
+    );
+
+    Ok(node_ids)
+}
+
 /// Opaque BenchFS context type for C code
 ///
 /// This type prevents C code from accessing the internal Rust structure.
@@ -405,15 +479,28 @@ pub extern "C" fn benchfs_init(
 
         // Create BenchFS instance with distributed metadata
         // In MPI mode: node_0 is the metadata server, all nodes are data servers
-        // Discover available nodes from registry (for now, use node_0 as metadata server)
+        // Discover available nodes from registry
         let metadata_nodes = vec!["node_0".to_string()];
-        // Use multiple data nodes for distributed storage
-        let data_nodes = vec![
-            "node_0".to_string(),
-            "node_1".to_string(),
-            "node_2".to_string(),
-            "node_3".to_string(),
-        ];
+
+        // Dynamically discover all data nodes from registry directory
+        let data_nodes = match discover_data_nodes(registry_dir_str) {
+            Ok(nodes) => {
+                tracing::info!(
+                    "Client will use {} data nodes for distributed storage",
+                    nodes.len()
+                );
+                nodes
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to discover data nodes: {}. Falling back to node_0 only",
+                    e
+                );
+                // Fallback to single node if discovery fails
+                vec!["node_0".to_string()]
+            }
+        };
+
         let benchfs = Rc::new(BenchFS::with_distributed_metadata(
             node_id_str.to_string(),
             chunk_store,
