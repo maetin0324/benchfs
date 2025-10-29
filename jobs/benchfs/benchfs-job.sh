@@ -7,6 +7,10 @@
 #------- Program execution -----------
 set -euo pipefail
 
+# Increase file descriptor limit for large-scale MPI jobs
+# This prevents FD exhaustion when running with high ppn values
+ulimit -n 65536
+
 module purge
 module load "openmpi/$NQSV_MPI_VER"
 
@@ -91,39 +95,41 @@ save_job_metadata() {
 EOS
 }
 
-# RDMA Configuration for High-Performance Networking
+# Network Configuration
 # ==================================================
-# IMPORTANT: Before running, verify InfiniBand device with:
-#   ibv_devices        # List InfiniBand devices
-#   ucx_info -d        # List UCX-compatible devices
+# TEMPORARY FIX: Using TCP fallback to resolve UCX/openib BTL conflict
 #
-# Common device names:
-#   mlx5_0  - Mellanox ConnectX-5/6/7
-#   mlx4_0  - Mellanox ConnectX-3/4
-#   hfi1_0  - Intel Omni-Path
+# ISSUE: Open MPI 4.1.8 has a conflict between openib BTL and UCX when both
+# are enabled simultaneously. This causes OpenFabrics initialization errors
+# and leads to MPI communication deadlocks during IOR result gathering.
 #
-# If InfiniBand is not available, comment out RDMA lines and use TCP fallback
+# ERROR: "WARNING: There was an error initializing an OpenFabrics device."
+# SYMPTOM: Hangs during JSON output (MPI_Gather/MPI_Allreduce)
+#
+# SOLUTION: Temporarily use TCP-only transport to ensure stability.
+# After verifying operation, will migrate to UCX-only configuration for RDMA.
 
-# Option 1: RDMA-enabled configuration (RECOMMENDED for InfiniBand systems)
+# CURRENT: TCP fallback configuration (STABLE)
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
-  --mca btl "self,vader,openib"           # Enable shared memory + InfiniBand
-  --mca btl_openib_if_include mlx5_0      # InfiniBand device (ADJUST IF NEEDED)
-  --mca btl_openib_want_fork_support 0    # Disable fork for performance
-  -x "UCX_TLS=rc,ud,sm,self"              # RDMA RC/UD + shared memory
-  -x "UCX_NET_DEVICES=mlx5_0:1"           # UCX device (ADJUST IF NEEDED)
+  --mca btl self,vader,tcp                # Shared memory + TCP
+  --mca btl_tcp_if_include eno1           # Network interface
+  -x "UCX_TLS=tcp,sm,self"                # UCX also uses TCP
   -x PATH
   -x LD_LIBRARY_PATH
 )
 
-# Option 2: TCP fallback (if InfiniBand is unavailable, uncomment below and comment out Option 1)
+# FUTURE: UCX-only configuration for RDMA (after TCP validation)
 # cmd_mpirun_common=(
 #   mpirun
 #   "${nqsii_mpiopts_array[@]}"
-#   --mca btl "self,tcp"
-#   --mca btl_tcp_if_include eno1
-#   -x "UCX_TLS=self,tcp"
+#   --mca pml ucx                         # Use UCX for MPI communication
+#   --mca btl ^openib                     # Disable openib BTL to avoid conflict
+#   --mca btl ^tcp                        # Disable TCP BTL (let UCX handle it)
+#   -x "UCX_TLS=rc_mlx5,sm,self"         # RDMA RC transport + shared memory
+#   -x "UCX_NET_DEVICES=mlx5_0:1"        # InfiniBand device
+#   -x "UCX_WARN_UNUSED_ENV_VARS=n"      # Suppress warnings
 #   -x PATH
 #   -x LD_LIBRARY_PATH
 # )
@@ -333,8 +339,14 @@ EOF
           kill $BENCHFSD_PID 2>/dev/null || true
           wait $BENCHFSD_PID 2>/dev/null || true
 
-          # Wait for cleanup
-          sleep 2
+          # Force cleanup of any orphaned processes
+          # This is critical when running with high ppn values to prevent
+          # resource exhaustion across multiple benchmark runs
+          echo "Force cleanup of orphaned processes..."
+          pkill -9 benchfsd_mpi || true
+
+          # Wait for cleanup and FD release
+          sleep 5
 
           runid=$((runid + 1))
         done

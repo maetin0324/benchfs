@@ -61,7 +61,8 @@
       "Bash(xargs:*)",
       "Bash(chmod:*)",
       "Bash(cargo clean:*)",
-      "Bash(./configure:*)"
+      "Bash(./configure:*)",
+      "Bash(bash:*)"
     ],
     "deny": [],
     "ask": []
