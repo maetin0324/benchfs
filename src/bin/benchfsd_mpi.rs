@@ -60,6 +60,10 @@ impl ServerState {
     fn is_primary(&self) -> bool {
         self.mpi_rank == 0
     }
+
+    fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
 }
 
 fn main() {
@@ -398,7 +402,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         tracing::info!("Storage server {} is running", node_id);
     }
 
-    let runtime_result = runtime.clone().run(async move {
+    runtime.clone().run(async move {
         // Wait for registration to complete first
         if let Err(e) = registration_handle.await {
             tracing::error!("Node registration failed: {:?}", e);
@@ -423,7 +427,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     });
 
     // Convert runtime result to Box<dyn Error>
-    runtime_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    Ok(())
 }
 
 fn setup_logging(level: &str) {
