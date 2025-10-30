@@ -45,8 +45,8 @@ use crate::rpc::server::RpcServer;
 use pluvio_runtime::executor::Runtime;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use futures::{select, FutureExt};
+use futures_timer::Delay;
 
 thread_local! {
     /// Thread-local async runtime
@@ -225,50 +225,41 @@ where
             new_runtime_rc
         };
 
-        // Create a holder for the result
-        let result_holder = Rc::new(RefCell::new(None));
-        let result_holder_clone = result_holder.clone();
-        let completed = Arc::new(AtomicBool::new(false));
-        let completed_clone = completed.clone();
-
-        // Wrap the future to store its result
-        let wrapped_future = async move {
-            let result = future.await;
-            *result_holder_clone.borrow_mut() = Some(result);
-            completed_clone.store(true, Ordering::Relaxed);
-        };
-
         // Get timeout from environment or use default of 120 seconds
         let timeout_secs = std::env::var("BENCHFS_OPERATION_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(120);
 
-        // Start a timeout monitor thread
-        let timeout_monitor = {
-            let completed = completed.clone();
-            std::thread::spawn(move || {
-                let timeout = std::time::Duration::from_secs(timeout_secs);
-                std::thread::sleep(timeout);
+        // Create a holder for the result
+        let result_holder = Rc::new(RefCell::new(None));
+        let result_holder_clone = result_holder.clone();
 
-                if !completed.load(Ordering::Relaxed) {
+        // Create timeout future
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+
+        // Combine the original future with timeout using select!
+        let combined_future = async move {
+            // Pin the future to make it work with select!
+            futures::pin_mut!(future);
+            let mut user_future = future.fuse();
+            let mut timeout_future = Delay::new(timeout_duration).fuse();
+
+            select! {
+                result = user_future => {
+                    *result_holder_clone.borrow_mut() = Some(result);
+                },
+                _ = timeout_future => {
                     eprintln!(
                         "ERROR: Operation timed out after {} seconds. Aborting to prevent hang.",
                         timeout_secs
                     );
-                    // Force abort to prevent infinite loop
                     std::process::abort();
                 }
-            })
+            }
         };
 
-        rt.run(wrapped_future);
-
-        // Mark as completed to cancel timeout
-        completed.store(true, Ordering::Relaxed);
-
-        // Clean up the timeout thread (it will exit naturally)
-        let _ = timeout_monitor.join();
+        rt.run(combined_future);
 
         // Extract the result
         result_holder

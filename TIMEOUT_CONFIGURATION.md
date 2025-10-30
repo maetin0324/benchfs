@@ -78,6 +78,7 @@ The system will log warnings when:
 
 4. `/home/rmaeda/workspace/rust/benchfs/src/ffi/runtime.rs`
    - Added global operation timeout in `block_on()` function
+   - **UPDATE**: Changed to thread-less implementation using `futures::select!` to avoid join() hang
 
 ## Testing
 
