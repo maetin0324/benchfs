@@ -63,7 +63,8 @@
       "Bash(cargo clean:*)",
       "Bash(./configure:*)",
       "Bash(bash:*)",
-      "Read(//home/rmaeda/**)"
+      "Read(//home/rmaeda/**)",
+      "Bash(ls:*)"
     ],
     "deny": [],
     "ask": []

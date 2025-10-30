@@ -120,19 +120,15 @@ EOS
 # SOLUTION: Temporarily use TCP-only transport to ensure stability.
 # After verifying operation, will migrate to UCX-only configuration for RDMA.
 
-# CURRENT: UCX-only configuration (BTL and InfiniBand completely disabled)
-# This eliminates UCX/BTL conflict and InfiniBand initialization errors
+# CURRENT: Standard ob1 PML with TCP transport (reliable and widely supported)
+# This avoids UCX PML initialization issues and InfiniBand conflicts
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
-  --mca pml ucx                           # Use UCX for MPI communication
-  --mca btl ^all                          # Disable ALL BTL transports
-  --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
-  --mca osc ucx                           # One-sided communication also uses UCX
-  -x "UCX_TLS=tcp,sm,self"                # TCP only (no InfiniBand)
-  -x "UCX_NET_DEVICES=eno1"               # Explicitly use TCP interface (prevent mlx5_0 selection)
-  -x "UCX_IB_ENABLE=n"                    # Disable InfiniBand in UCX
-  -x "UCX_WARN_UNUSED_ENV_VARS=n"         # Suppress warnings
+  --mca pml ob1                           # Use standard ob1 PML (reliable)
+  --mca btl tcp,vader,self                # TCP + shared memory + loopback
+  --mca btl_tcp_if_include eno1           # Use TCP interface explicitly
+  --mca btl_openib_allow_ib 0             # Disable openib BTL
   -x PATH
   -x LD_LIBRARY_PATH
 )
