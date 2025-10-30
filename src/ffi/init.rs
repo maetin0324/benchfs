@@ -12,7 +12,7 @@ use std::os::raw::c_char;
 use std::rc::Rc;
 
 use super::error::*;
-use super::runtime::{block_on, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime};
+use super::runtime::{block_on_with_name, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime};
 use crate::api::file_ops::BenchFS;
 use crate::metadata::MetadataManager;
 use crate::rpc::connection::ConnectionPool;
@@ -491,7 +491,7 @@ pub extern "C" fn benchfs_init(
 
         let pool_clone = connection_pool.clone();
         let target_node_owned = target_node.to_string();
-        let connect_result = block_on(async move {
+        let connect_result = block_on_with_name("connect_to_server", async move {
             pool_clone
                 .wait_and_connect(&target_node_owned, 30)
                 .await

@@ -47,6 +47,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use futures::{select, FutureExt};
 use futures_timer::Delay;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     /// Thread-local async runtime
@@ -210,6 +211,40 @@ where
     F: std::future::Future + 'static,
     F::Output: 'static,
 {
+    block_on_with_name("unnamed", future)
+}
+
+/// Execute an async function synchronously with operation name for debugging
+///
+/// This is similar to [`block_on`] but includes an operation name for better
+/// debugging and timeout tracking. When a timeout occurs, the operation name
+/// is included in the error message to help identify which operation failed.
+///
+/// # Arguments
+///
+/// * `operation_name` - Name of the operation (e.g., "open", "write", "read")
+/// * `future` - Async function to execute
+///
+/// # Returns
+///
+/// The output of the future once it completes
+///
+/// # Panics
+///
+/// Exits the process if the operation times out
+///
+/// # Example
+///
+/// ```ignore
+/// let result = block_on_with_name("open", async move {
+///     fs.benchfs_open("/test.txt", OpenFlags::read_only()).await
+/// });
+/// ```
+pub fn block_on_with_name<F>(operation_name: &str, future: F) -> F::Output
+where
+    F: std::future::Future + 'static,
+    F::Output: 'static,
+{
     LOCAL_RUNTIME.with(|runtime_cell| {
         let runtime = runtime_cell.borrow();
 
@@ -231,12 +266,22 @@ where
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(120);
 
-        // Create a holder for the result
+        // Debug logging if enabled
+        let debug_enabled = std::env::var("BENCHFS_DEBUG").unwrap_or_default() == "1";
+        if debug_enabled {
+            eprintln!("[BENCHFS] Starting operation '{}' with {}s timeout",
+                     operation_name, timeout_secs);
+        }
+
+        // Create a holder for the result and timeout flag
         let result_holder = Rc::new(RefCell::new(None));
         let result_holder_clone = result_holder.clone();
+        let timed_out = std::sync::Arc::new(AtomicBool::new(false));
+        let timed_out_clone = timed_out.clone();
 
         // Create timeout future
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+        let op_name = operation_name.to_string();
 
         // Combine the original future with timeout using select!
         let combined_future = async move {
@@ -247,24 +292,36 @@ where
 
             select! {
                 result = user_future => {
+                    if debug_enabled {
+                        eprintln!("[BENCHFS] Operation '{}' completed successfully", op_name);
+                    }
                     *result_holder_clone.borrow_mut() = Some(result);
                 },
                 _ = timeout_future => {
                     eprintln!(
-                        "ERROR: Operation timed out after {} seconds. Aborting to prevent hang.",
-                        timeout_secs
+                        "ERROR: Operation '{}' timed out after {} seconds. Aborting to prevent hang.",
+                        op_name, timeout_secs
                     );
-                    std::process::abort();
+                    timed_out_clone.store(true, Ordering::Relaxed);
+                    // Don't abort immediately, let runtime finish cleanly
                 }
             }
         };
 
         rt.run(combined_future);
 
+        // Check if timeout occurred
+        if timed_out.load(Ordering::Relaxed) {
+            eprintln!("ERROR: Exiting due to timeout in operation '{}'", operation_name);
+            std::process::exit(1);
+        }
+
         // Extract the result
         result_holder
             .borrow_mut()
             .take()
-            .expect("Future did not complete")
+            .unwrap_or_else(|| {
+                panic!("Future for operation '{}' did not complete", operation_name)
+            })
     })
 }

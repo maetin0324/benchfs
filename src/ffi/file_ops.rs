@@ -62,7 +62,7 @@ use std::os::raw::c_char;
 use std::slice;
 
 use super::error::*;
-use super::runtime::{block_on, with_benchfs_ctx};
+use super::runtime::{block_on_with_name, with_benchfs_ctx};
 use crate::api::file_ops::BenchFS;
 use crate::api::types::{FileHandle, OpenFlags};
 
@@ -230,7 +230,7 @@ pub extern "C" fn benchfs_create(
         let fs_ptr = fs as *const BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move { fs_ref.benchfs_open(path_str, open_flags).await })
+            block_on_with_name("create", async move { fs_ref.benchfs_open(path_str, open_flags).await })
         }
     });
 
@@ -276,7 +276,7 @@ pub extern "C" fn benchfs_open(
         let fs_ptr = fs as *const BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move { fs_ref.benchfs_open(path_str, open_flags).await })
+            block_on_with_name("open", async move { fs_ref.benchfs_open(path_str, open_flags).await })
         }
     });
 
@@ -344,7 +344,7 @@ pub extern "C" fn benchfs_write(
                 return Err(format!("Seek failed: {:?}", e));
             }
 
-            block_on(async move { fs_ref.benchfs_write(&handle_clone, &buf).await })
+            block_on_with_name("write", async move { fs_ref.benchfs_write(&handle_clone, &buf).await })
                 .map_err(|e| e.to_string())
         });
 
@@ -418,7 +418,7 @@ pub extern "C" fn benchfs_read(
             let mut local_buf = std::slice::from_raw_parts_mut(temp_buf_ptr, buf_size);
 
             let n =
-                block_on(async move { fs_ref.benchfs_read(&handle_clone, &mut local_buf).await });
+                block_on_with_name("read", async move { fs_ref.benchfs_read(&handle_clone, &mut local_buf).await });
 
             match n {
                 Ok(bytes_read) => {
@@ -464,7 +464,7 @@ pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
             let fs_ref = &*fs_ptr;
-            block_on(async move { fs_ref.benchfs_close(&handle).await }).map_err(|e| e.to_string())
+            block_on_with_name("close", async move { fs_ref.benchfs_close(&handle).await }).map_err(|e| e.to_string())
         });
 
         result_to_error_code(result.and_then(|r| r))
@@ -490,7 +490,7 @@ pub extern "C" fn benchfs_fsync(file: *mut benchfs_file_t) -> i32 {
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
             let fs_ref = &*fs_ptr;
-            block_on(async move {
+            block_on_with_name("fsync", async move {
                 fs_ref
                     .benchfs_fsync(handle)
                     .await
@@ -524,7 +524,7 @@ pub extern "C" fn benchfs_remove(
         let fs_ptr = fs as *const BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move {
+            block_on_with_name("remove", async move {
                 fs_ref
                     .benchfs_unlink(path_str)
                     .await

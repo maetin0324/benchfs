@@ -11,7 +11,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 
 use super::error::*;
-use super::runtime::{block_on, with_benchfs_ctx};
+use super::runtime::{block_on_with_name, with_benchfs_ctx};
 
 // C-compatible stat structure
 // This matches the basic fields of Unix struct stat
@@ -72,7 +72,7 @@ pub extern "C" fn benchfs_stat(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move { fs_ref.benchfs_stat(path_str).await })
+            block_on_with_name("stat", async move { fs_ref.benchfs_stat(path_str).await })
         }
     });
 
@@ -135,7 +135,7 @@ pub extern "C" fn benchfs_get_file_size(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move { fs_ref.benchfs_stat(path_str).await })
+            block_on_with_name("stat", async move { fs_ref.benchfs_stat(path_str).await })
         }
     });
 
@@ -186,7 +186,7 @@ pub extern "C" fn benchfs_mkdir(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move {
+            block_on_with_name("mkdir", async move {
                 fs_ref
                     .benchfs_mkdir(path_str, mode)
                     .await
@@ -318,7 +318,7 @@ pub extern "C" fn benchfs_truncate(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move {
+            block_on_with_name("truncate", async move {
                 fs_ref
                     .benchfs_truncate(path_str, size as u64)
                     .await
@@ -365,7 +365,7 @@ pub extern "C" fn benchfs_access(
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on(async move { fs_ref.benchfs_stat(path_str).await })
+            block_on_with_name("stat", async move { fs_ref.benchfs_stat(path_str).await })
         }
     });
 
