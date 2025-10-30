@@ -45,6 +45,8 @@ use crate::rpc::server::RpcServer;
 use pluvio_runtime::executor::Runtime;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 thread_local! {
     /// Thread-local async runtime
@@ -226,14 +228,47 @@ where
         // Create a holder for the result
         let result_holder = Rc::new(RefCell::new(None));
         let result_holder_clone = result_holder.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
 
         // Wrap the future to store its result
         let wrapped_future = async move {
             let result = future.await;
             *result_holder_clone.borrow_mut() = Some(result);
+            completed_clone.store(true, Ordering::Relaxed);
+        };
+
+        // Get timeout from environment or use default of 120 seconds
+        let timeout_secs = std::env::var("BENCHFS_OPERATION_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120);
+
+        // Start a timeout monitor thread
+        let timeout_monitor = {
+            let completed = completed.clone();
+            std::thread::spawn(move || {
+                let timeout = std::time::Duration::from_secs(timeout_secs);
+                std::thread::sleep(timeout);
+
+                if !completed.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "ERROR: Operation timed out after {} seconds. Aborting to prevent hang.",
+                        timeout_secs
+                    );
+                    // Force abort to prevent infinite loop
+                    std::process::abort();
+                }
+            })
         };
 
         rt.run(wrapped_future);
+
+        // Mark as completed to cancel timeout
+        completed.store(true, Ordering::Relaxed);
+
+        // Clean up the timeout thread (it will exit naturally)
+        let _ = timeout_monitor.join();
 
         // Extract the result
         result_holder
