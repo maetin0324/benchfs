@@ -108,7 +108,7 @@ EOS
 
 # Network Configuration
 # ==================================================
-# TEMPORARY FIX: Using TCP fallback to resolve UCX/openib BTL conflict
+# FIX for IOR JSON output hang issue:
 #
 # ISSUE: Open MPI 4.1.8 has a conflict between openib BTL and UCX when both
 # are enabled simultaneously. This causes OpenFabrics initialization errors
@@ -117,32 +117,38 @@ EOS
 # ERROR: "WARNING: There was an error initializing an OpenFabrics device."
 # SYMPTOM: Hangs during JSON output (MPI_Gather/MPI_Allreduce)
 #
-# SOLUTION: Temporarily use TCP-only transport to ensure stability.
-# After verifying operation, will migrate to UCX-only configuration for RDMA.
+# SOLUTION: Use optimized MPI settings with immediate mitigation variables.
 
-# CURRENT: Standard ob1 PML with TCP transport (reliable and widely supported)
-# This avoids UCX PML initialization issues and InfiniBand conflicts
+# Immediate mitigation environment variables
+export OMPI_MCA_mpi_yield_when_idle=1
+export OMPI_MCA_btl_base_warn_component_unused=0
+export OMPI_MCA_mpi_show_handle_leaks=0
+
+# Optimized MPI configuration for IOR JSON hang fix
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
-  --mca pml ob1                           # Use standard ob1 PML (reliable)
-  --mca btl tcp,vader,self                # TCP + shared memory + loopback
-  --mca btl_tcp_if_include eno1           # Use TCP interface explicitly
-  --mca btl_openib_allow_ib 0             # Disable openib BTL
+  --mca pml ucx                           # UCX for MPI communication
+  --mca btl ^openib,^tcp                  # Disable openib and TCP BTL
+  --mca osc ucx                            # OSC also uses UCX
+  -x "UCX_TLS=rc_mlx5,sm,self"           # RDMA RC + shared memory
+  -x "UCX_NET_DEVICES=mlx5_0:1"          # InfiniBand device
+  -x "UCX_RC_TIMEOUT=10s"                 # Set timeout to prevent infinite hang
+  -x "UCX_RC_RETRY_COUNT=7"                # Retry count for RC transport
+  -x "UCX_LOG_LEVEL=error"                # Only show error logs
+  -x "UCX_WARN_UNUSED_ENV_VARS=n"
   -x PATH
   -x LD_LIBRARY_PATH
 )
 
-# FUTURE: UCX-only configuration for RDMA (after TCP validation)
+# Fallback: TCP-only transport if UCX continues to have issues
 # cmd_mpirun_common=(
 #   mpirun
 #   "${nqsii_mpiopts_array[@]}"
-#   --mca pml ucx                         # Use UCX for MPI communication
-#   --mca btl ^openib                     # Disable openib BTL to avoid conflict
-#   --mca btl ^tcp                        # Disable TCP BTL (let UCX handle it)
-#   -x "UCX_TLS=rc_mlx5,sm,self"         # RDMA RC transport + shared memory
-#   -x "UCX_NET_DEVICES=mlx5_0:1"        # InfiniBand device
-#   -x "UCX_WARN_UNUSED_ENV_VARS=n"      # Suppress warnings
+#   --mca pml ob1                         # Use standard ob1 PML
+#   --mca btl tcp,vader,self              # TCP + shared memory + loopback
+#   --mca btl_tcp_if_include eno1         # Use TCP interface explicitly
+#   --mca btl_openib_allow_ib 0           # Disable openib BTL
 #   -x PATH
 #   -x LD_LIBRARY_PATH
 # )
@@ -323,6 +329,11 @@ EOF
 
           # Give servers a bit more time to fully initialize
           sleep 5
+
+          # MPI Debug: Testing MPI communication before IOR
+          echo "MPI Debug: Testing MPI communication before IOR"
+          "${cmd_mpirun_common[@]}" -np "$np" --map-by "ppr:${ppn}:node" hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
+          echo "MPI Debug: Communication test completed"
 
           # Run IOR benchmark
           echo "Running IOR benchmark..."
