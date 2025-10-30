@@ -124,35 +124,51 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-# Optimized MPI configuration for IOR JSON hang fix
-# IMPORTANT: When using UCX as PML, BTL components should be minimal.
-# We only load self (loopback) and vader (shared memory) BTL components.
-# UCX handles the actual network transport (RDMA/InfiniBand), so we don't
-# need openib or tcp BTL which would conflict with UCX.
+# MPI Configuration Fix for UCX Transport Layer Issues
+# ==================================================
+# FIX: UCX couldn't find InfiniBand device (mlx5_0:1) causing "Destination is unreachable"
+# SOLUTION: Using TCP-only transport for stability, with alternative configs for optimization
+#
+# CURRENT: TCP-only mode (most stable, works across all environments)
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
-  --mca pml ucx                           # UCX for MPI communication
-  --mca btl self,vader                     # Use only self and shared memory BTL (no openib/tcp)
-  --mca osc ucx                            # OSC also uses UCX
-  -x "UCX_TLS=rc_mlx5,sm,self"           # RDMA RC + shared memory
-  -x "UCX_NET_DEVICES=mlx5_0:1"          # InfiniBand device
-  -x "UCX_RC_TIMEOUT=10s"                 # Set timeout to prevent infinite hang
-  -x "UCX_RC_RETRY_COUNT=7"                # Retry count for RC transport
-  -x "UCX_LOG_LEVEL=error"                # Only show error logs
-  -x "UCX_WARN_UNUSED_ENV_VARS=n"
+  --mca pml ob1                           # Use standard ob1 PML
+  --mca btl tcp,vader,self                # TCP + shared memory + loopback
+  --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
   -x PATH
   -x LD_LIBRARY_PATH
 )
 
-# Fallback: TCP-only transport if UCX continues to have issues
+# ALTERNATIVE 1: UCX with automatic transport detection (try after TCP works)
 # cmd_mpirun_common=(
 #   mpirun
 #   "${nqsii_mpiopts_array[@]}"
-#   --mca pml ob1                         # Use standard ob1 PML
-#   --mca btl tcp,vader,self              # TCP + shared memory + loopback
-#   --mca btl_tcp_if_include eno1         # Use TCP interface explicitly
-#   --mca btl_openib_allow_ib 0           # Disable openib BTL
+#   --mca pml ucx                         # UCX for MPI communication
+#   --mca btl self                        # Minimal BTL when using UCX
+#   --mca osc ucx                          # OSC also uses UCX
+#   -x "UCX_TLS=all"                      # Auto-detect available transports
+#   -x "UCX_NET_DEVICES=all"              # Auto-detect available devices
+#   -x "UCX_RC_TIMEOUT=10s"               # Timeout to prevent hangs
+#   -x "UCX_RC_RETRY_COUNT=7"             # Retry count
+#   -x "UCX_LOG_LEVEL=info"               # Info level for debugging
+#   -x PATH
+#   -x LD_LIBRARY_PATH
+# )
+
+# ALTERNATIVE 2: UCX with explicit InfiniBand (only if IB is confirmed working)
+# cmd_mpirun_common=(
+#   mpirun
+#   "${nqsii_mpiopts_array[@]}"
+#   --mca pml ucx
+#   --mca btl self,vader
+#   --mca osc ucx
+#   -x "UCX_TLS=rc_mlx5,sm,self"
+#   -x "UCX_NET_DEVICES=mlx5_0:1"
+#   -x "UCX_RC_TIMEOUT=10s"
+#   -x "UCX_RC_RETRY_COUNT=7"
+#   -x "UCX_LOG_LEVEL=error"
+#   -x "UCX_WARN_UNUSED_ENV_VARS=n"
 #   -x PATH
 #   -x LD_LIBRARY_PATH
 # )
@@ -280,6 +296,28 @@ EOF
           echo "Registry dir: ${BENCHFS_REGISTRY_DIR}"
           echo "Config file: ${config_file}"
           echo "Binary: ${BENCHFS_PREFIX}/benchfsd_mpi"
+
+          # UCX/Network Debug Information (only on first run for efficiency)
+          if [ "$runid" -eq 0 ]; then
+            echo ""
+            echo "=========================================="
+            echo "Network Configuration Debug Information"
+            echo "=========================================="
+            echo "UCX Configuration:"
+            echo "  UCX_TLS=${UCX_TLS:-not set}"
+            echo "  UCX_NET_DEVICES=${UCX_NET_DEVICES:-not set}"
+            echo ""
+            echo "Available network interfaces:"
+            ip -o -4 addr show | awk '{print "  " $2 " : " $4}' || echo "  Unable to list interfaces"
+            echo ""
+            echo "InfiniBand status:"
+            which ibstat >/dev/null 2>&1 && ibstat 2>/dev/null | grep -E "State:|Physical state:" | head -4 || echo "  InfiniBand not available or ibstat not found"
+            echo ""
+            echo "UCX info (if available):"
+            which ucx_info >/dev/null 2>&1 && ucx_info -v 2>/dev/null | head -3 || echo "  ucx_info not available"
+            echo "=========================================="
+            echo ""
+          fi
 
           # Verify files exist
           ls -la "${BENCHFS_REGISTRY_DIR}" || echo "WARNING: Registry dir not accessible"
