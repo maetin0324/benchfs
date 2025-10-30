@@ -289,43 +289,66 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
             tracing::info!("Node {} registered to registry", node_id_clone);
 
             // Wait for all nodes to register
-            let mut registered_count = 1; // This node is already registered
-            let max_wait_secs = 60;
+            let max_wait_secs = 120;  // Increased timeout for large-scale deployments
             let start_time = std::time::Instant::now();
 
             tracing::info!("Waiting for {} nodes to register...", mpi_size_clone);
 
-            while registered_count < mpi_size_clone && start_time.elapsed().as_secs() < max_wait_secs {
-                // Check how many nodes are registered
+            let mut registered_count;
+            loop {
+                // Count how many nodes are currently registered (including self)
+                registered_count = 1; // This node is already registered
+
                 for rank in 0..mpi_size_clone {
                     if rank != mpi_rank_clone {
                         let other_node_id = format!("node_{}", rank);
                         let registry_file = registry_dir_clone.join(format!("{}.addr", other_node_id));
                         if registry_file.exists() {
-                            if rank + 1 > registered_count {
-                                registered_count = rank + 1;
-                                tracing::debug!("Detected {} registered", other_node_id);
-                            }
+                            registered_count += 1;
                         }
                     }
                 }
 
                 if registered_count >= mpi_size_clone {
+                    tracing::info!("All {} nodes registered successfully", mpi_size_clone);
                     break;
                 }
 
-                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
-            }
+                if start_time.elapsed().as_secs() >= max_wait_secs {
+                    let error_msg = format!(
+                        "Only {}/{} nodes registered after {} seconds. Missing {} nodes.",
+                        registered_count,
+                        mpi_size_clone,
+                        max_wait_secs,
+                        mpi_size_clone - registered_count
+                    );
+                    tracing::error!("{}", error_msg);
 
-            if registered_count < mpi_size_clone {
-                tracing::warn!(
-                    "Only {}/{} nodes registered after {} seconds",
-                    registered_count,
-                    mpi_size_clone,
-                    max_wait_secs
-                );
-            } else {
-                tracing::info!("All {} nodes registered successfully", mpi_size_clone);
+                    // Log which nodes are missing for debugging
+                    for rank in 0..mpi_size_clone {
+                        let node_id = format!("node_{}", rank);
+                        let registry_file = registry_dir_clone.join(format!("{}.addr", node_id));
+                        if !registry_file.exists() {
+                            tracing::error!("Missing node: {}", node_id);
+                        }
+                    }
+
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        error_msg
+                    ));
+                }
+
+                if registered_count % 4 == 0 || start_time.elapsed().as_secs() % 10 == 0 {
+                    tracing::info!(
+                        "Registration progress: {}/{} nodes ({}s elapsed)",
+                        registered_count,
+                        mpi_size_clone,
+                        start_time.elapsed().as_secs()
+                    );
+                }
+
+                futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
             }
 
             Ok::<(), std::io::Error>(())
@@ -375,24 +398,32 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         tracing::info!("Storage server {} is running", node_id);
     }
 
-    runtime.clone().run(async move {
+    let runtime_result = runtime.clone().run(async move {
         // Wait for registration to complete first
         if let Err(e) = registration_handle.await {
             tracing::error!("Node registration failed: {:?}", e);
+            tracing::error!("Stopping server due to registration failure");
+            state.stop();
+            return Err(e);
         }
+
+        tracing::info!("Node registration completed successfully, server is now ready");
 
         // Then wait for server to complete
         match server_handle.await {
             Ok(_) => {
                 tracing::info!("Server shutdown complete");
+                Ok(())
             }
             Err(e) => {
                 tracing::error!("Server error: {:?}", e);
+                Err(e)
             }
         }
     });
 
-    Ok(())
+    // Convert runtime result to Box<dyn Error>
+    runtime_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 fn setup_logging(level: &str) {
