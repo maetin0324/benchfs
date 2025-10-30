@@ -65,6 +65,17 @@ echo ""
 echo "Checking IOR:"
 ls -la "${IOR_PREFIX}/src/ior" || echo "ERROR: IOR not found at ${IOR_PREFIX}/src/ior"
 echo "=========================================="
+echo ""
+echo "=========================================="
+echo "MPI Configuration Diagnostics"
+echo "=========================================="
+echo "NQSII_MPIOPTS: ${NQSII_MPIOPTS:-<not set>}"
+echo "NQSII_MPIOPTS_ARRAY (${#nqsii_mpiopts_array[@]} elements):"
+for i in "${!nqsii_mpiopts_array[@]}"; do
+  echo "  [$i] = ${nqsii_mpiopts_array[$i]}"
+done
+echo "=========================================="
+echo ""
 
 echo "prepare backend dir: ${JOB_BACKEND_DIR}"
 mkdir -p "${JOB_BACKEND_DIR}"
@@ -109,17 +120,19 @@ EOS
 # SOLUTION: Temporarily use TCP-only transport to ensure stability.
 # After verifying operation, will migrate to UCX-only configuration for RDMA.
 
-# CURRENT: UCX-only configuration (BTL completely disabled)
-# This eliminates UCX/BTL conflict that was causing hangs during IOR result output
+# CURRENT: UCX-only configuration (BTL and InfiniBand completely disabled)
+# This eliminates UCX/BTL conflict and InfiniBand initialization errors
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
   --mca pml ucx                           # Use UCX for MPI communication
-  --mca btl ^all                          # Disable ALL BTL transports to avoid conflict
+  --mca btl ^all                          # Disable ALL BTL transports
+  --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
   --mca osc ucx                           # One-sided communication also uses UCX
-  -x "UCX_TLS=tcp,sm,self"                # TCP + shared memory + loopback
-  # -x "UCX_NET_DEVICES=eno1"               # Explicitly specify network interface
-  -x "UCX_WARN_UNUSED_ENV_VARS=n"         # Suppress unused environment variable warnings
+  -x "UCX_TLS=tcp,sm,self"                # TCP only (no InfiniBand)
+  -x "UCX_NET_DEVICES=eno1"               # Explicitly use TCP interface (prevent mlx5_0 selection)
+  -x "UCX_IB_ENABLE=n"                    # Disable InfiniBand in UCX
+  -x "UCX_WARN_UNUSED_ENV_VARS=n"         # Suppress warnings
   -x PATH
   -x LD_LIBRARY_PATH
 )
@@ -272,9 +285,9 @@ EOF
             -np "$NNODES"
             --bind-to none
             -map-by ppr:1:node
-            -x PATH
             -x "RUST_LOG=debug"
             -x "RUST_BACKTRACE=1"
+            # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${BENCHFS_PREFIX}/benchfsd_mpi"
             "${BENCHFS_REGISTRY_DIR}"
             "${config_file}"
@@ -326,8 +339,8 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
-            -x PATH
-            -x "UCX_LOG_LEVEL=DEBUG"              # Suppress verbose UCX debug logs
+            -x "UCX_LOG_LEVEL=error"              # Suppress verbose UCX debug logs
+            # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
             -a BENCHFS
             -t "$transfer_size"
