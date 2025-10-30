@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use pluvio_ucx::async_ucx::ucp::AmMsg;
+use pluvio_ucx::{Worker, async_ucx::ucp::AmMsg};
 
 use crate::metadata::MetadataManager;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
@@ -14,6 +14,7 @@ pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+    pub worker: Rc<Worker>,
 }
 
 impl RpcHandlerContext {
@@ -21,12 +22,76 @@ impl RpcHandlerContext {
         metadata_manager: Rc<MetadataManager>,
         chunk_store: Rc<dyn ChunkStore>,
         allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+        worker: Rc<Worker>,
     ) -> Self {
         Self {
             metadata_manager,
             chunk_store,
             allocator,
+            worker,
         }
+    }
+
+    /// Send a response directly to the client using WorkerAddress
+    /// instead of reply_ep to avoid UCX lifetime issues
+    pub async fn send_response_direct<H: crate::rpc::Serializable>(
+        &self,
+        client_addr: &[u8],
+        stream_id: u16,
+        rpc_id: u16,
+        header: &H,
+        data: Option<&[u8]>,
+    ) -> Result<(), RpcError> {
+        use pluvio_ucx::async_ucx::ucp::WorkerAddressInner;
+
+        // Create WorkerAddress from bytes
+        let worker_address = WorkerAddressInner::from(client_addr);
+
+        // Connect to client
+        let endpoint = self
+            .worker
+            .connect_addr(&worker_address)
+            .map_err(|e| RpcError::TransportError(format!("Failed to connect to client: {:?}", e)))?;
+
+        // Serialize header
+        let header_bytes = zerocopy::IntoBytes::as_bytes(header);
+
+        // Prepare data payload
+        let data_slice = data.unwrap_or(&[]);
+
+        // Prepare IoSlice for data
+        let data_ioslice = if data_slice.is_empty() {
+            vec![]
+        } else {
+            vec![std::io::IoSlice::new(data_slice)]
+        };
+
+        // Determine protocol
+        let proto = if data_slice.is_empty() {
+            None
+        } else {
+            Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+        };
+
+        // Send response via AM (stream_id is the reply stream)
+        endpoint
+            .am_send_vectorized(
+                stream_id as u32,
+                header_bytes,
+                &data_ioslice,
+                false, // Not need_reply
+                proto,
+            )
+            .await
+            .map_err(|e| RpcError::TransportError(format!("Failed to send response: {:?}", e)))?;
+
+        tracing::debug!(
+            "Successfully sent direct response to client (stream_id={}, rpc_id={})",
+            stream_id,
+            rpc_id
+        );
+
+        Ok(())
     }
 }
 

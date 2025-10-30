@@ -100,7 +100,10 @@ impl ReadChunkResponseHeader {
 pub struct ReadChunkRequest {
     header: ReadChunkRequestHeader,
     path: String,
-    request_ioslice: UnsafeCell<IoSlice<'static>>,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlices: [worker_address, path]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
     /// Buffer to receive data (RDMA target)
     response_buffer: UnsafeCell<Vec<u8>>,
     /// IoSliceMut for the response buffer
@@ -111,14 +114,15 @@ pub struct ReadChunkRequest {
 unsafe impl Send for ReadChunkRequest {}
 
 impl ReadChunkRequest {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path: String) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path: String, worker_address: Vec<u8>) -> Self {
         let path_bytes = path.as_bytes();
         let path_len = path_bytes.len() as u64;
 
-        // SAFETY: We're creating a 'static IoSlice by transmuting the lifetime.
+        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
         let request_ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(path_bytes);
-            IoSlice::new(slice)
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(path_bytes);
+            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
         let mut buffer = vec![0u8; length as usize];
@@ -135,6 +139,7 @@ impl ReadChunkRequest {
         Self {
             header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len),
             path,
+            worker_address,
             request_ioslice: UnsafeCell::new(request_ioslice),
             response_buffer: UnsafeCell::new(buffer),
             response_ioslice: UnsafeCell::new(ioslice),
@@ -171,8 +176,8 @@ impl AmRpc for ReadChunkRequest {
     }
 
     fn request_data(&self) -> &[std::io::IoSlice<'_>] {
-        // Send path in request data section
-        unsafe { std::slice::from_ref(&*self.request_ioslice.get()) }
+        // Send worker_address and path in request data section
+        unsafe { &*self.request_ioslice.get() }
     }
 
     fn response_buffer(&self) -> &[IoSliceMut<'_>] {
@@ -218,57 +223,70 @@ impl AmRpc for ReadChunkRequest {
 
         let _span = tracing::trace_span!("rpc_read_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
 
-        // Receive path from request data
-        let path = if header.path_len > 0 && am_msg.contains_data() {
-            let mut path_bytes = vec![0u8; header.path_len as usize];
+        // Receive WorkerAddress and path from request data
+        // Estimate WorkerAddress size (typically 400-500 bytes)
+        let mut worker_addr_bytes = vec![0u8; 512];
+        let mut path_bytes = vec![0u8; header.path_len as usize];
+
+        if am_msg.contains_data() {
             if let Err(e) = am_msg
-                .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+                .recv_data_vectored(&[
+                    std::io::IoSliceMut::new(&mut worker_addr_bytes),
+                    std::io::IoSliceMut::new(&mut path_bytes),
+                ])
                 .await
             {
-                tracing::error!("Failed to receive path data: {:?}", e);
+                tracing::error!("Failed to receive request data: {:?}", e);
                 return Err((RpcError::InvalidHeader, am_msg));
-            }
-
-            match String::from_utf8(path_bytes) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("Failed to decode path: {:?}", e);
-                    return Err((RpcError::InvalidHeader, am_msg));
-                }
             }
         } else {
             return Err((RpcError::InvalidHeader, am_msg));
+        }
+
+        let path = match String::from_utf8(path_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to decode path: {:?}", e);
+                return Err((RpcError::InvalidHeader, am_msg));
+            }
         };
 
         tracing::trace!("Reading from path: {}", path);
 
         // Read chunk data from storage
-        match ctx
+        let (response_header, response_data) = match ctx
             .chunk_store
             .read_chunk(&path, header.chunk_index, header.offset, header.length)
             .await
         {
             Ok(data) => {
                 let bytes_read = data.len() as u64;
-                tracing::trace!("Read {} bytes from storage", bytes_read
-                );
-
-                Ok((
-                    crate::rpc::ServerResponse::with_data(
-                        ReadChunkResponseHeader::success(bytes_read),
-                        data,
-                    ),
-                    am_msg,
-                ))
+                tracing::trace!("Read {} bytes from storage", bytes_read);
+                (ReadChunkResponseHeader::success(bytes_read), Some(data))
             }
             Err(e) => {
                 tracing::error!("Failed to read chunk: {:?}", e);
-                Ok((
-                    crate::rpc::ServerResponse::new(ReadChunkResponseHeader::error(-2)),
-                    am_msg,
-                ))
+                (ReadChunkResponseHeader::error(-2), None)
             }
+        };
+
+        // Send response directly using WorkerAddress
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            response_data.as_deref(),
+        ).await {
+            tracing::error!("Failed to send direct response: {:?}", e);
+            return Err((e, am_msg));
         }
+
+        // Return empty response since we already sent the response directly
+        Ok((
+            crate::rpc::ServerResponse::new(response_header),
+            am_msg,
+        ))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -374,17 +392,19 @@ pub struct WriteChunkRequest {
     path: String,
     /// Data to write
     data: Vec<u8>,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
     /// Combined buffer (path + data) for RDMA
     combined_data: Vec<u8>,
-    /// IoSlice for the request data
-    request_ioslice: UnsafeCell<IoSlice<'static>>,
+    /// IoSlices: [worker_address, path+data]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
 }
 
 // SAFETY: WriteChunkRequest is only used in single-threaded context (Pluvio runtime)
 unsafe impl Send for WriteChunkRequest {}
 
 impl WriteChunkRequest {
-    pub fn new(chunk_index: u64, offset: u64, data: Vec<u8>, path: String) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, data: Vec<u8>, path: String, worker_address: Vec<u8>) -> Self {
         let length = data.len() as u64;
         let path_len = path.len() as u64;
 
@@ -393,22 +413,24 @@ impl WriteChunkRequest {
         combined_data.extend_from_slice(path.as_bytes());
         combined_data.extend_from_slice(&data);
 
-        // SAFETY: We're creating a 'static IoSlice by transmuting the lifetime.
+        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
         // This is safe because:
-        // 1. The combined_data buffer lives as long as the WriteChunkRequest
-        // 2. The IoSlice is only accessed through request_data()
-        // 3. The RPC client will only use it during the RPC call
-        let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(combined_data.as_slice());
-            IoSlice::new(slice)
+        // 1. The buffers live as long as the WriteChunkRequest
+        // 2. The IoSlices are only accessed through request_data()
+        // 3. The RPC client will only use them during the RPC call
+        let ioslices = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let data_slice: &'static [u8] = std::mem::transmute(combined_data.as_slice());
+            [IoSlice::new(addr_slice), IoSlice::new(data_slice)]
         };
 
         Self {
             header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
             path,
             data,
+            worker_address,
             combined_data,
-            request_ioslice: UnsafeCell::new(ioslice),
+            request_ioslice: UnsafeCell::new(ioslices),
         }
     }
 
@@ -436,9 +458,9 @@ impl AmRpc for WriteChunkRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        // SAFETY: We're returning a slice containing the IoSlice we created in new()
+        // SAFETY: We're returning a slice containing the IoSlices we created in new()
         // This is safe because the IoSlice lifetime is tied to self
-        unsafe { std::slice::from_ref(&*self.request_ioslice.get()) }
+        unsafe { &*self.request_ioslice.get() }
     }
 
     fn proto(&self) -> Option<pluvio_ucx::async_ucx::ucp::AmProto> {
@@ -478,8 +500,8 @@ impl AmRpc for WriteChunkRequest {
 
         let _span = tracing::trace_span!("rpc_write_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
 
-        // Receive path and data from client
-        // Data section layout: [path][chunk_data]
+        // Receive WorkerAddress, path and data from client
+        // Data section layout: [worker_address][path][chunk_data]
         if !am_msg.contains_data() {
             tracing::error!("WriteChunk request contains no data");
             return Ok((
@@ -488,6 +510,9 @@ impl AmRpc for WriteChunkRequest {
             ));
         }
 
+        // Receive WorkerAddress first
+        let mut worker_addr_bytes = vec![0u8; 512];
+
         // Check if chunk_store is IOUringChunkStore to use zero-copy path
         use crate::storage::chunk_store::IOUringChunkStore;
         use std::any::Any;
@@ -495,7 +520,7 @@ impl AmRpc for WriteChunkRequest {
         let data_len = header.length as usize;
         let chunk_store_any = &*ctx.chunk_store as &dyn Any;
 
-        if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
+        let response_header = if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
             tracing::debug!("Using zero-copy path for WriteChunk");
             // Zero-copy path: Use registered buffer
             let mut fixed_buffer = ctx.allocator.acquire().await;
@@ -507,143 +532,138 @@ impl AmRpc for WriteChunkRequest {
                     data_len,
                     fixed_buffer.len()
                 );
-                return Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
-                    am_msg,
-                ));
-            }
+                WriteChunkResponseHeader::error(-22)
+            } else {
+                // Receive WorkerAddress, path and chunk data in one vectored call (zero-copy RDMA)
+                let mut path_bytes = vec![0u8; header.path_len as usize];
+                let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
-            // Receive path and chunk data in one vectored call (zero-copy RDMA)
+                if let Err(e) = am_msg
+                    .recv_data_vectored(&[
+                        std::io::IoSliceMut::new(&mut worker_addr_bytes),
+                        std::io::IoSliceMut::new(&mut path_bytes),
+                        std::io::IoSliceMut::new(buffer_slice),
+                    ])
+                    .await
+                {
+                    tracing::error!("Failed to receive request data: {:?}", e);
+                    WriteChunkResponseHeader::error(-5)
+                } else {
+                    let path = match String::from_utf8(path_bytes) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!("Failed to decode path: {:?}", e);
+                            return Ok((
+                                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                                am_msg,
+                            ));
+                        }
+                    };
+
+                    tracing::debug!(
+                        "WriteChunk request (zero-copy): path={}, chunk={}, offset={}, length={}",
+                        path,
+                        header.chunk_index,
+                        header.offset,
+                        header.length
+                    );
+
+                    // Use zero-copy write with registered buffer
+                    match io_uring_store
+                        .write_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer, data_len)
+                        .await
+                    {
+                        Ok(bytes_written) => {
+                            tracing::debug!(
+                                "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
+                                bytes_written,
+                                path,
+                                header.chunk_index
+                            );
+                            WriteChunkResponseHeader::success(header.length)
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
+                            WriteChunkResponseHeader::error(-5)
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback path: Use Vec<u8> for non-IOUring backends
+            tracing::debug!("Using fallback path for WriteChunk (chunk_store is not IOUringChunkStore)");
             let mut path_bytes = vec![0u8; header.path_len as usize];
-            let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
+            let mut data = vec![0u8; data_len];
 
             if let Err(e) = am_msg
                 .recv_data_vectored(&[
+                    std::io::IoSliceMut::new(&mut worker_addr_bytes),
                     std::io::IoSliceMut::new(&mut path_bytes),
-                    std::io::IoSliceMut::new(buffer_slice),
+                    std::io::IoSliceMut::new(&mut data),
                 ])
                 .await
             {
-                tracing::error!("Failed to receive path and data: {:?}", e);
-                return Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
-                    am_msg,
-                ));
-            }
+                tracing::error!("Failed to receive request data: {:?}", e);
+                WriteChunkResponseHeader::error(-5)
+            } else {
+                let path = match String::from_utf8(path_bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!("Failed to decode path: {:?}", e);
+                        return Ok((
+                            crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                            am_msg,
+                        ));
+                    }
+                };
 
-            let path = match String::from_utf8(path_bytes) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("Failed to decode path: {:?}", e);
-                    return Ok((
-                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
-                        am_msg,
-                    ));
+                tracing::debug!(
+                    "WriteChunk request: path={}, chunk={}, offset={}, length={}",
+                    path,
+                    header.chunk_index,
+                    header.offset,
+                    header.length
+                );
+
+                match ctx
+                    .chunk_store
+                    .write_chunk(&path, header.chunk_index, header.offset, &data)
+                    .await
+                {
+                    Ok(_bytes_written) => {
+                        tracing::debug!(
+                            "Wrote {} bytes to storage (path={}, chunk={})",
+                            data.len(),
+                            path,
+                            header.chunk_index
+                        );
+                        WriteChunkResponseHeader::success(header.length)
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to write chunk: {:?}", e);
+                        WriteChunkResponseHeader::error(-5)
+                    }
                 }
-            };
-
-            tracing::debug!(
-                "WriteChunk request (zero-copy): path={}, chunk={}, offset={}, length={}",
-                path,
-                header.chunk_index,
-                header.offset,
-                header.length
-            );
-
-            // Use zero-copy write with registered buffer
-            match io_uring_store
-                .write_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer, data_len)
-                .await
-            {
-                Ok(bytes_written) => {
-                    tracing::debug!(
-                        "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
-                        bytes_written,
-                        path,
-                        header.chunk_index
-                    );
-                    return Ok((
-                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::success(
-                            header.length,
-                        )),
-                        am_msg,
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
-                    return Ok((
-                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
-                        am_msg,
-                    ));
-                }
-            }
-        }
-
-        // Fallback path: Use Vec<u8> for non-IOUring backends
-        tracing::debug!("Using fallback path for WriteChunk (chunk_store is not IOUringChunkStore)");
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-        let mut data = vec![0u8; data_len];
-
-        if let Err(e) = am_msg
-            .recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut path_bytes),
-                std::io::IoSliceMut::new(&mut data),
-            ])
-            .await
-        {
-            tracing::error!("Failed to receive path and data: {:?}", e);
-            return Ok((
-                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
-                am_msg,
-            ));
-        }
-
-        let path = match String::from_utf8(path_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("Failed to decode path: {:?}", e);
-                return Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)), // EINVAL
-                    am_msg,
-                ));
             }
         };
 
-        tracing::debug!(
-            "WriteChunk request: path={}, chunk={}, offset={}, length={}",
-            path,
-            header.chunk_index,
-            header.offset,
-            header.length
-        );
-
-        match ctx
-            .chunk_store
-            .write_chunk(&path, header.chunk_index, header.offset, &data)
-            .await
-        {
-            Ok(_bytes_written) => {
-                tracing::debug!(
-                    "Wrote {} bytes to storage (path={}, chunk={})",
-                    data.len(),
-                    path,
-                    header.chunk_index
-                );
-                Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::success(
-                        header.length,
-                    )),
-                    am_msg,
-                ))
-            }
-            Err(e) => {
-                tracing::error!("Failed to write chunk: {:?}", e);
-                Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-5)), // EIO
-                    am_msg,
-                ))
-            }
+        // Send response directly using WorkerAddress
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send direct response: {:?}", e);
+            return Err((e, am_msg));
         }
+
+        // Return empty response since we already sent the response directly
+        Ok((
+            crate::rpc::ServerResponse::new(response_header),
+            am_msg,
+        ))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -702,7 +722,8 @@ mod tests {
 
     #[test]
     fn test_read_chunk_request() {
-        let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string());
+        let dummy_worker_addr = vec![0u8; 512]; // Dummy WorkerAddress for testing
+        let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string(), dummy_worker_addr);
         assert_eq!(request.header.chunk_index, 0);
         assert_eq!(request.header.length, 1024);
         assert_eq!(request.header.path_len, 14); // "/test/file.txt".len()
@@ -734,7 +755,8 @@ mod tests {
     #[test]
     fn test_write_chunk_request() {
         let data = vec![0xAA; 512];
-        let request = WriteChunkRequest::new(1, 0, data.clone(), "/test/file.txt".to_string());
+        let dummy_worker_addr = vec![0u8; 512]; // Dummy WorkerAddress for testing
+        let request = WriteChunkRequest::new(1, 0, data.clone(), "/test/file.txt".to_string(), dummy_worker_addr);
 
         assert_eq!(request.header.chunk_index, 1);
         assert_eq!(request.header.length, 512);

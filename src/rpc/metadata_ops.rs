@@ -137,29 +137,33 @@ impl MetadataLookupResponseHeader {
 pub struct MetadataLookupRequest {
     header: MetadataLookupRequestHeader,
     path: String,
-    /// IoSlice for the path data
-    path_ioslice: UnsafeCell<IoSlice<'static>>,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlices: [worker_address, path]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
 }
 
 // SAFETY: MetadataLookupRequest is only used in single-threaded context (Pluvio runtime)
 unsafe impl Send for MetadataLookupRequest {}
 
 impl MetadataLookupRequest {
-    pub fn new(path: String) -> Self {
-        // SAFETY: We're creating a 'static IoSlice by transmuting the lifetime.
+    pub fn new(path: String, worker_address: Vec<u8>) -> Self {
+        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
         // This is safe because:
-        // 1. The path String lives as long as the MetadataLookupRequest
-        // 2. The IoSlice is only accessed through request_data()
-        // 3. The RPC client will only use it during the RPC call
-        let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            IoSlice::new(slice)
+        // 1. The buffers live as long as the MetadataLookupRequest
+        // 2. The IoSlices are only accessed through request_data()
+        // 3. The RPC client will only use them during the RPC call
+        let ioslices = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
         Self {
             header: MetadataLookupRequestHeader::new(path.len()),
             path,
-            path_ioslice: UnsafeCell::new(ioslice),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslices),
         }
     }
 
@@ -185,9 +189,9 @@ impl AmRpc for MetadataLookupRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        // SAFETY: We're returning a slice containing the IoSlice we created in new()
+        // SAFETY: We're returning a slice containing the IoSlices we created in new()
         // This is safe because the IoSlice lifetime is tied to self
-        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+        unsafe { &*self.request_ioslice.get() }
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -217,39 +221,49 @@ impl AmRpc for MetadataLookupRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
-        // Receive path data if present
+        // Receive WorkerAddress and path data
+        let mut worker_addr_bytes = vec![0u8; 512];
         let mut path_bytes = vec![0u8; header.path_len as usize];
+
         if am_msg.contains_data() {
-            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
-            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+            if let Err(_e) = am_msg.recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
+                std::io::IoSliceMut::new(&mut path_bytes),
+            ]).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::error(-2)),
                     am_msg,
                 ));
             }
         }
+
         let path_str = String::from_utf8_lossy(&path_bytes);
         let path = Path::new(path_str.as_ref());
 
-        // Try to find file metadata first
-        if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path) {
-            return Ok((
-                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::file(file_meta.size)),
-                am_msg,
-            ));
+        // Determine response
+        let response_header = if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path) {
+            MetadataLookupResponseHeader::file(file_meta.size)
+        } else if let Ok(_dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
+            MetadataLookupResponseHeader::directory()
+        } else {
+            MetadataLookupResponseHeader::not_found()
+        };
+
+        // Send response directly using WorkerAddress
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send direct response: {:?}", e);
+            return Err((e, am_msg));
         }
 
-        // Try to find directory metadata (dummy in path-based KV design)
-        if let Ok(_dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
-            return Ok((
-                crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::directory()),
-                am_msg,
-            ));
-        }
-
-        // Not found
+        // Return empty response since we already sent the response directly
         Ok((
-            crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::not_found()),
+            crate::rpc::ServerResponse::new(response_header),
             am_msg,
         ))
     }
@@ -350,25 +364,28 @@ impl MetadataCreateFileResponseHeader {
 pub struct MetadataCreateFileRequest {
     header: MetadataCreateFileRequestHeader,
     path: String,
-    /// IoSlice for the path data
-    path_ioslice: UnsafeCell<IoSlice<'static>>,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlices: [worker_address, path]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
 }
 
 // SAFETY: MetadataCreateFileRequest is only used in single-threaded context (Pluvio runtime)
 unsafe impl Send for MetadataCreateFileRequest {}
 
 impl MetadataCreateFileRequest {
-    pub fn new(path: String, size: u64, mode: u32) -> Self {
-        // SAFETY: Same as MetadataLookupRequest
-        let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            IoSlice::new(slice)
+    pub fn new(path: String, size: u64, mode: u32, worker_address: Vec<u8>) -> Self {
+        let ioslices = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
         Self {
             header: MetadataCreateFileRequestHeader::new(size, mode, path.len()),
             path,
-            path_ioslice: UnsafeCell::new(ioslice),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslices),
         }
     }
 
@@ -394,7 +411,7 @@ impl AmRpc for MetadataCreateFileRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+        unsafe { &*self.request_ioslice.get() }
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -424,33 +441,50 @@ impl AmRpc for MetadataCreateFileRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
-        // Receive path data
+        // Receive WorkerAddress and path data
+        let mut worker_addr_bytes = vec![0u8; 512];
         let mut path_bytes = vec![0u8; header.path_len as usize];
+
         if am_msg.contains_data() {
-            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
-            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+            if let Err(_e) = am_msg.recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
+                std::io::IoSliceMut::new(&mut path_bytes),
+            ]).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::error(-2)),
                     am_msg,
                 ));
             }
         }
+
         let path_str = String::from_utf8_lossy(&path_bytes);
 
         // Create file metadata (no inode in path-based KV design)
         let file_meta = FileMetadata::new(path_str.to_string(), header.size);
 
-        // Store file metadata
-        match ctx.metadata_manager.store_file_metadata(file_meta) {
-            Ok(()) => Ok((
-                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::success(0)), // Dummy inode
-                am_msg,
-            )),
-            Err(_e) => Ok((
-                crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::error(-5)),
-                am_msg,
-            )),
+        // Store file metadata and prepare response
+        let response_header = match ctx.metadata_manager.store_file_metadata(file_meta) {
+            Ok(()) => MetadataCreateFileResponseHeader::success(0), // Dummy inode
+            Err(_e) => MetadataCreateFileResponseHeader::error(-5),
+        };
+
+        // Send response directly using WorkerAddress
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send direct response: {:?}", e);
+            return Err((e, am_msg));
         }
+
+        // Return empty response since we already sent the response directly
+        Ok((
+            crate::rpc::ServerResponse::new(response_header),
+            am_msg,
+        ))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -1163,14 +1197,16 @@ mod tests {
 
     #[test]
     fn test_metadata_lookup_request() {
-        let request = MetadataLookupRequest::new("/foo/bar.txt".to_string());
+        let dummy_worker_addr = vec![0u8; 512]; // Dummy WorkerAddress for testing
+        let request = MetadataLookupRequest::new("/foo/bar.txt".to_string(), dummy_worker_addr);
         assert_eq!(request.path(), "/foo/bar.txt");
         assert_eq!(request.header.path_len, 12);
     }
 
     #[test]
     fn test_metadata_create_file_request() {
-        let request = MetadataCreateFileRequest::new("/new.txt".to_string(), 0, 0o644);
+        let dummy_worker_addr = vec![0u8; 512]; // Dummy WorkerAddress for testing
+        let request = MetadataCreateFileRequest::new("/new.txt".to_string(), 0, 0o644, dummy_worker_addr);
         assert_eq!(request.path(), "/new.txt");
         assert_eq!(request.header.size, 0);
         assert_eq!(request.header.mode, 0o644);

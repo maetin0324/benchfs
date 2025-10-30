@@ -266,6 +266,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         metadata_manager.clone(),
         chunk_store,
         allocator,
+        worker.clone(),
     ));
 
     // Create RPC server

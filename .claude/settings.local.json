@@ -64,7 +64,8 @@
       "Bash(./configure:*)",
       "Bash(bash:*)",
       "Read(//home/rmaeda/**)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Read(//home/NBB/rmaeda/.cargo/git/checkouts/**)"
     ],
     "deny": [],
     "ask": []

@@ -186,7 +186,7 @@ impl BenchFS {
         if let Some(pool) = &self.connection_pool {
             match pool.get_or_connect(&metadata_node).await {
                 Ok(client) => {
-                    let request = MetadataLookupRequest::new(path.to_string());
+                    let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
                     match request.call(&*client).await {
                         Ok(response) if response.is_success() && response.is_file() => {
                             let meta = FileMetadata::new(path.to_string(), response.size);
@@ -243,7 +243,7 @@ impl BenchFS {
             if let Some(pool) = &self.connection_pool {
                 match pool.get_or_connect(&metadata_node).await {
                     Ok(client) => {
-                        let request = MetadataLookupRequest::new(path.to_string());
+                        let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found on remote server - create local cache entry
@@ -377,7 +377,7 @@ impl BenchFS {
                     match pool.get_or_connect(&metadata_node).await {
                         Ok(client) => {
                             let request =
-                                MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
+                                MetadataCreateFileRequest::new(path.to_string(), 0, 0o644, client.worker_address().to_vec());
                             match request.call(&*client).await {
                                 Ok(response) if response.is_success() => {
                                     tracing::debug!("Remote file created: {}", path);
@@ -481,7 +481,7 @@ impl BenchFS {
                 if let Some(pool) = &self.connection_pool {
                     match pool.get_or_connect(&metadata_node).await {
                         Ok(client) => {
-                            let request = MetadataLookupRequest::new(path.to_string());
+                            let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
                             match request.call(&*client).await {
                                 Ok(response) if response.is_success() && response.is_file() => {
                                     response.size
@@ -604,6 +604,7 @@ impl BenchFS {
                                             0,
                                             self.chunk_manager.chunk_size() as u64,
                                             file_path.clone(),
+                                            client.worker_address().to_vec(),
                                         );
 
                                             // Execute RPC
@@ -781,6 +782,7 @@ impl BenchFS {
                                     chunk_offset,
                                     chunk_data,
                                     file_path.clone(),
+                                    client.worker_address().to_vec(),
                                 );
 
                                 // Execute RPC
@@ -1116,7 +1118,7 @@ impl BenchFS {
             if let Some(pool) = &self.connection_pool {
                 match pool.get_or_connect(&metadata_node).await {
                     Ok(client) => {
-                        let request = MetadataLookupRequest::new(path.to_string());
+                        let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found

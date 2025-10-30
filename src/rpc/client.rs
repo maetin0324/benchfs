@@ -10,14 +10,32 @@ pub struct RpcClient {
     // Store reply stream opaquely since pluvio_ucx may not export AmStream
     #[allow(dead_code)]
     reply_stream_id: RefCell<Option<u16>>,
+    /// Client's own WorkerAddress for direct response
+    worker_address: Vec<u8>,
 }
 
 impl RpcClient {
     pub fn new(conn: Connection) -> Self {
+        // Get worker address from the connection
+        let worker_address = conn
+            .worker()
+            .address()
+            .map(|addr| addr.as_ref().to_vec())
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to get worker address: {:?}", e);
+                vec![]
+            });
+
         Self {
             conn,
             reply_stream_id: RefCell::new(None),
+            worker_address,
         }
+    }
+
+    /// Get the client's WorkerAddress
+    pub fn worker_address(&self) -> &[u8] {
+        &self.worker_address
     }
 
     /// Initialize the reply stream for receiving RPC responses
