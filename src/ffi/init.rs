@@ -324,11 +324,11 @@ pub extern "C" fn benchfs_init(
 
         // Create io_uring reactor
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(256)
-            .buffer_size(1 << 20) // 1 MiB
-            .submit_depth(32)
-            .wait_submit_timeout(std::time::Duration::from_micros(10))
-            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .queue_size(2048)
+            .buffer_size(4 << 20) // 4 MiB (matches IOR transfer sizes, prevents buffer exhaustion)
+            .submit_depth(128)
+            .wait_submit_timeout(std::time::Duration::from_micros(1))
+            .wait_complete_timeout(std::time::Duration::from_micros(1))
             .build();
 
         let allocator = uring_reactor.allocator.clone();
@@ -538,11 +538,11 @@ pub extern "C" fn benchfs_init(
 
         // Create io_uring reactor (same as server)
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(256)
-            .buffer_size(1 << 20) // 1 MiB
-            .submit_depth(32)
-            .wait_submit_timeout(std::time::Duration::from_micros(10))
-            .wait_complete_timeout(std::time::Duration::from_micros(10))
+            .queue_size(2048)
+            .buffer_size(4 << 20) // 4 MiB (matches IOR transfer sizes, prevents buffer exhaustion)
+            .submit_depth(128)
+            .wait_submit_timeout(std::time::Duration::from_micros(1))
+            .wait_complete_timeout(std::time::Duration::from_micros(1))
             .build();
 
         let allocator = uring_reactor.allocator.clone();
