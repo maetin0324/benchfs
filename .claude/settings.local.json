@@ -62,7 +62,8 @@
       "Bash(chmod:*)",
       "Bash(cargo clean:*)",
       "Bash(./configure:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Read(//home/rmaeda/**)"
     ],
     "deny": [],
     "ask": []

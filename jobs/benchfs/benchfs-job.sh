@@ -109,13 +109,17 @@ EOS
 # SOLUTION: Temporarily use TCP-only transport to ensure stability.
 # After verifying operation, will migrate to UCX-only configuration for RDMA.
 
-# CURRENT: TCP fallback configuration (STABLE)
+# CURRENT: UCX-only configuration (BTL completely disabled)
+# This eliminates UCX/BTL conflict that was causing hangs during IOR result output
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
-  --mca btl self,vader,tcp                # Shared memory + TCP
-  --mca btl_tcp_if_include eno1           # Network interface
-  -x "UCX_TLS=tcp,sm,self"                # UCX also uses TCP
+  --mca pml ucx                           # Use UCX for MPI communication
+  --mca btl ^all                          # Disable ALL BTL transports to avoid conflict
+  --mca osc ucx                           # One-sided communication also uses UCX
+  -x "UCX_TLS=tcp,sm,self"                # TCP + shared memory + loopback
+  # -x "UCX_NET_DEVICES=eno1"               # Explicitly specify network interface
+  -x "UCX_WARN_UNUSED_ENV_VARS=n"         # Suppress unused environment variable warnings
   -x PATH
   -x LD_LIBRARY_PATH
 )
@@ -323,6 +327,7 @@ EOF
             --bind-to none
             --map-by "ppr:${ppn}:node"
             -x PATH
+            -x "UCX_LOG_LEVEL=DEBUG"              # Suppress verbose UCX debug logs
             "${IOR_PREFIX}/src/ior"
             -a BENCHFS
             -t "$transfer_size"
