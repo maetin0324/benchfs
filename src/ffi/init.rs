@@ -237,6 +237,20 @@ pub extern "C" fn benchfs_init(
     data_dir: *const c_char,
     is_server: i32,
 ) -> *mut benchfs_context_t {
+
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+
     // Validate pointers
     if node_id.is_null() || registry_dir.is_null() {
         set_error_message("node_id and registry_dir must not be null");
