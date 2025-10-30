@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use pluvio_runtime::executor::Runtime;
@@ -5,6 +6,14 @@ use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress};
 
 use crate::rpc::handlers::RpcHandlerContext;
 use crate::rpc::{AmRpc, RpcError, Serializable};
+
+struct SizeCheck<T, const N: usize>(PhantomData<T>);
+impl<T, const N: usize> SizeCheck<T, N> {
+    // ここは「const 文脈」なので assert! がコンパイル時に評価される
+    const OK: () = assert!(size_of::<T>() <= N);
+}
+
+pub const MAX_HEADER_SIZE: usize = 256;
 
 /// RPC server that receives and dispatches ActiveMessages
 pub struct RpcServer {
@@ -47,6 +56,10 @@ impl RpcServer {
         ReqH: Serializable + 'static,
         Rpc: AmRpc<RequestHeader = ReqH, ResponseHeader = ResH> + 'static,
     {
+        // header size check at compile time
+        let _ = SizeCheck::<ReqH, MAX_HEADER_SIZE>::OK;
+        let _ = SizeCheck::<ResH, MAX_HEADER_SIZE>::OK;
+
         let stream = self.worker.am_stream(Rpc::rpc_id()).map_err(|e| {
             RpcError::TransportError(format!("Failed to create AM stream: {:?}", e))
         })?;
