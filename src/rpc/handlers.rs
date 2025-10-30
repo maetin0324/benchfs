@@ -1,4 +1,6 @@
 use std::rc::Rc;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use pluvio_ucx::{Worker, async_ucx::ucp::AmMsg};
 
@@ -15,6 +17,9 @@ pub struct RpcHandlerContext {
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
     pub worker: Rc<Worker>,
+    /// Endpoint cache for reusing connections to clients
+    /// Key: client WorkerAddress bytes, Value: Rc<Endpoint>
+    client_endpoints: RefCell<HashMap<Vec<u8>, Rc<pluvio_ucx::endpoint::Endpoint>>>,
 }
 
 impl RpcHandlerContext {
@@ -29,6 +34,7 @@ impl RpcHandlerContext {
             chunk_store,
             allocator,
             worker,
+            client_endpoints: RefCell::new(HashMap::new()),
         }
     }
 
@@ -44,14 +50,48 @@ impl RpcHandlerContext {
     ) -> Result<(), RpcError> {
         use pluvio_ucx::async_ucx::ucp::WorkerAddressInner;
 
-        // Create WorkerAddress from bytes
-        let worker_address = WorkerAddressInner::from(client_addr);
+        // Try to get endpoint from cache, or create new one
+        let endpoint = {
+            let mut cache = self.client_endpoints.borrow_mut();
 
-        // Connect to client
-        let endpoint = self
-            .worker
-            .connect_addr(&worker_address)
-            .map_err(|e| RpcError::TransportError(format!("Failed to connect to client: {:?}", e)))?;
+            if let Some(ep) = cache.get(client_addr) {
+                // Cache hit - reuse existing endpoint
+                tracing::debug!(
+                    "Endpoint cache hit (stream_id={}, rpc_id={}, cache_size={})",
+                    stream_id,
+                    rpc_id,
+                    cache.len()
+                );
+                Rc::clone(ep)
+            } else {
+                // Cache miss - create new endpoint
+                tracing::debug!(
+                    "Endpoint cache miss (stream_id={}, rpc_id={}, cache_size={})",
+                    stream_id,
+                    rpc_id,
+                    cache.len()
+                );
+
+                let worker_address = WorkerAddressInner::from(client_addr);
+                let ep = self
+                    .worker
+                    .connect_addr(&worker_address)
+                    .map_err(|e| RpcError::TransportError(format!("Failed to connect to client: {:?}", e)))?;
+
+                // Wrap in Rc and store in cache for future reuse
+                let ep_rc = Rc::new(ep);
+                cache.insert(client_addr.to_vec(), Rc::clone(&ep_rc));
+
+                tracing::debug!(
+                    "Endpoint created and cached (stream_id={}, rpc_id={}, new_cache_size={})",
+                    stream_id,
+                    rpc_id,
+                    cache.len()
+                );
+
+                ep_rc
+            }
+        };
 
         // Serialize header
         let header_bytes = zerocopy::IntoBytes::as_bytes(header);
