@@ -221,12 +221,15 @@ impl BenchFS {
     /// # Returns
     /// File handle
     pub async fn benchfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle> {
+        let _span = tracing::debug_span!("api_open", path, ?flags).entered();
+
         use std::path::Path;
         let path_ref = Path::new(path);
 
         // Determine metadata server for this path
         let metadata_node = self.get_metadata_node(path);
         let is_local = self.is_local_metadata(path);
+        tracing::debug!("Metadata node: {}, is_local: {}", metadata_node, is_local);
 
         // Lookup file metadata (local or remote)
         let file_meta = if is_local {
@@ -509,6 +512,8 @@ impl BenchFS {
     /// # Returns
     /// Number of bytes read
     pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
+        let _span = tracing::trace_span!("api_read", path = %handle.path, len = buf.len(), pos = handle.position()).entered();
+
         if !handle.flags.read {
             return Err(ApiError::PermissionDenied(
                 "File not opened for reading".to_string(),
@@ -516,6 +521,7 @@ impl BenchFS {
         }
 
         // Get file metadata with caching
+        tracing::trace!("Fetching file metadata");
         let file_meta = self.get_file_metadata_cached(&handle.path).await?;
 
         let offset = handle.position();
@@ -536,6 +542,7 @@ impl BenchFS {
             .map_err(|e| ApiError::Internal(format!("Failed to calculate chunks: {:?}", e)))?;
 
         // Read all chunks concurrently
+        tracing::trace!("Reading {} chunks concurrently", chunks.len());
         use futures::future::join_all;
 
         // Collect futures for reading all chunks
@@ -648,6 +655,7 @@ impl BenchFS {
         let chunk_results = join_all(chunk_futures).await;
 
         // Copy data to buffer in correct order
+        tracing::trace!("Completed {} chunk reads", chunk_results.len());
         let mut bytes_read = 0;
         for ((_chunk_index, chunk_offset, read_size), (_result_idx, chunk_data)) in
             chunks.iter().zip(chunk_results.iter())
@@ -693,6 +701,8 @@ impl BenchFS {
     /// # Returns
     /// Number of bytes written
     pub async fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
+        let _span = tracing::trace_span!("api_write", path = %handle.path, len = data.len(), pos = handle.position()).entered();
+
         if !handle.flags.write {
             return Err(ApiError::PermissionDenied(
                 "File not opened for writing".to_string(),
@@ -700,6 +710,7 @@ impl BenchFS {
         }
 
         // Get file metadata with caching
+        tracing::trace!("Fetching file metadata");
         let mut file_meta = self.get_file_metadata_cached(&handle.path).await?;
 
         let offset = handle.position();
@@ -720,6 +731,7 @@ impl BenchFS {
         }
 
         // Write all chunks concurrently
+        tracing::trace!("Writing {} chunks concurrently", chunks.len());
         use futures::future::join_all;
 
         let chunk_write_futures: Vec<_> = chunks
@@ -807,6 +819,7 @@ impl BenchFS {
         let write_results = join_all(chunk_write_futures).await;
 
         // Check results and calculate total bytes written
+        tracing::trace!("Completed {} chunk writes", write_results.len());
         let mut bytes_written = 0;
         for result in write_results {
             bytes_written += result?;
@@ -836,6 +849,8 @@ impl BenchFS {
     /// # Arguments
     /// * `handle` - File handle
     pub async fn benchfs_close(&self, handle: &FileHandle) -> ApiResult<()> {
+        let _span = tracing::debug_span!("api_close", path = %handle.path).entered();
+
         use std::path::Path;
         let path_ref = Path::new(&handle.path);
 

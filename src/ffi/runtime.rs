@@ -266,12 +266,12 @@ where
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(120);
 
-        // Debug logging if enabled
-        let debug_enabled = std::env::var("BENCHFS_DEBUG").unwrap_or_default() == "1";
-        if debug_enabled {
-            eprintln!("[BENCHFS] Starting operation '{}' with {}s timeout",
-                     operation_name, timeout_secs);
-        }
+        // Debug logging
+        tracing::debug!(
+            "Starting operation '{}' with {}s timeout",
+            operation_name,
+            timeout_secs
+        );
 
         // Create a holder for the result and timeout flag
         let result_holder = Rc::new(RefCell::new(None));
@@ -292,14 +292,12 @@ where
 
             select! {
                 result = user_future => {
-                    if debug_enabled {
-                        eprintln!("[BENCHFS] Operation '{}' completed successfully", op_name);
-                    }
+                    tracing::debug!("Operation '{}' completed successfully", op_name);
                     *result_holder_clone.borrow_mut() = Some(result);
                 },
                 _ = timeout_future => {
-                    eprintln!(
-                        "ERROR: Operation '{}' timed out after {} seconds. Aborting to prevent hang.",
+                    tracing::error!(
+                        "Operation '{}' timed out after {} seconds. Aborting to prevent hang.",
                         op_name, timeout_secs
                     );
                     timed_out_clone.store(true, Ordering::Relaxed);
@@ -312,7 +310,7 @@ where
 
         // Check if timeout occurred
         if timed_out.load(Ordering::Relaxed) {
-            eprintln!("ERROR: Exiting due to timeout in operation '{}'", operation_name);
+            tracing::error!("Exiting due to timeout in operation '{}'", operation_name);
             std::process::exit(1);
         }
 

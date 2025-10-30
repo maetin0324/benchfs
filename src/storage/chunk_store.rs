@@ -733,6 +733,8 @@ impl IOUringChunkStore {
         offset: u64,
         data: &[u8],
     ) -> ChunkStoreResult<usize> {
+        let _span = tracing::trace_span!("chunk_write", path = file_path, chunk = chunk_index, offset, len = data.len()).entered();
+
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
@@ -752,13 +754,7 @@ impl IOUringChunkStore {
         // This is a common trade-off in high-performance filesystems.
         // self.backend.fsync(handle).await?;
 
-        tracing::debug!(
-            "Wrote {} bytes to chunk (path={}, chunk_index={}, offset={})",
-            bytes_to_write,
-            file_path,
-            chunk_index,
-            offset
-        );
+        tracing::trace!("Wrote {} bytes", bytes_to_write);
 
         Ok(bytes_to_write)
     }
@@ -771,6 +767,8 @@ impl IOUringChunkStore {
         offset: u64,
         length: u64,
     ) -> ChunkStoreResult<Vec<u8>> {
+        let _span = tracing::trace_span!("chunk_read", path = file_path, chunk = chunk_index, offset, len = length).entered();
+
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
@@ -793,13 +791,7 @@ impl IOUringChunkStore {
 
         buffer.truncate(bytes_read);
 
-        tracing::debug!(
-            "Read {} bytes from chunk (path={}, chunk_index={}, offset={})",
-            bytes_read,
-            file_path,
-            chunk_index,
-            offset
-        );
+        tracing::trace!("Read {} bytes", bytes_read);
 
         Ok(buffer)
     }

@@ -68,6 +68,8 @@ pub extern "C" fn benchfs_stat(
         }
     };
 
+    tracing::debug!("benchfs_stat: path={:?}", path_str);
+
     let result = with_benchfs_ctx(|fs| {
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
@@ -131,6 +133,8 @@ pub extern "C" fn benchfs_get_file_size(
         }
     };
 
+    tracing::debug!("benchfs_get_file_size: path={:?}", path_str);
+
     let result = with_benchfs_ctx(|fs| {
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
@@ -182,6 +186,8 @@ pub extern "C" fn benchfs_mkdir(
         }
     };
 
+    tracing::debug!("benchfs_mkdir: path={:?}, mode={:#o}", path_str, mode);
+
     let result = with_benchfs_ctx(|fs| {
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
         unsafe {
@@ -225,6 +231,8 @@ pub extern "C" fn benchfs_rmdir(
             }
         }
     };
+
+    tracing::debug!("benchfs_rmdir: path={:?}", path_str);
 
     let result = with_benchfs_ctx(|fs| fs.benchfs_rmdir(path_str).map_err(|e| e.to_string()));
 
@@ -271,6 +279,8 @@ pub extern "C" fn benchfs_rename(
         }
     };
 
+    tracing::debug!("benchfs_rename: oldpath={:?}, newpath={:?}", oldpath_str, newpath_str);
+
     let result = with_benchfs_ctx(|fs| {
         fs.benchfs_rename(oldpath_str, newpath_str)
             .map_err(|e| e.to_string())
@@ -313,6 +323,8 @@ pub extern "C" fn benchfs_truncate(
             }
         }
     };
+
+    tracing::debug!("benchfs_truncate: path={:?}, size={}", path_str, size);
 
     let result = with_benchfs_ctx(|fs| {
         let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
@@ -359,6 +371,8 @@ pub extern "C" fn benchfs_access(
             }
         }
     };
+
+    tracing::debug!("benchfs_access: path={:?}", path_str);
 
     // Check if file exists
     let result = with_benchfs_ctx(|fs| {

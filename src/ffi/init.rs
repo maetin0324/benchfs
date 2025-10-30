@@ -278,6 +278,14 @@ pub extern "C" fn benchfs_init(
         }
     };
 
+    tracing::info!(
+        "benchfs_init: node_id={}, is_server={}, registry_dir={}, data_dir={:?}",
+        node_id_str,
+        is_server != 0,
+        registry_dir_str,
+        data_dir_str
+    );
+
     // Create BenchFS instance based on mode
     let benchfs = if is_server != 0 {
         // ===== SERVER MODE =====
@@ -624,6 +632,8 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     if ctx.is_null() {
         return;
     }
+
+    tracing::info!("benchfs_finalize: cleaning up resources");
 
     // Convert back to Rc<BenchFS> and drop it
     // This will automatically trigger Drop implementations for all components

@@ -43,18 +43,15 @@ impl RpcClient {
     /// ```
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         let rpc_id = T::rpc_id();
+        let _span = tracing::trace_span!("rpc_call", rpc_id).entered();
+
         let reply_stream_id = T::reply_stream_id();
         let header = request.request_header();
         let data = request.request_data();
         let need_reply = request.need_reply();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        tracing::debug!(
-            "RpcClient::execute: rpc_id={}, reply_stream_id={}, has_data={}",
-            rpc_id,
-            reply_stream_id,
-            !data.is_empty()
-        );
+        tracing::trace!("Reply stream: {}, has_data: {}", reply_stream_id, !data.is_empty());
 
         let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
@@ -62,8 +59,6 @@ impl RpcClient {
                 e.to_string()
             ))
         })?;
-
-        tracing::debug!("RpcClient::execute: Created reply stream");
 
         if !need_reply {
             // No reply expected
@@ -73,7 +68,7 @@ impl RpcClient {
         }
 
         // Send the RPC request (proto is set to None for now)
-        tracing::debug!("RpcClient::execute: Sending AM request...");
+        tracing::trace!("Sending AM request");
         self.conn
             .endpoint()
             .am_send_vectorized(
@@ -86,7 +81,7 @@ impl RpcClient {
             .await
             .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;
 
-        tracing::debug!("RpcClient::execute: AM sent successfully, waiting for reply...");
+        tracing::trace!("Waiting for reply");
 
         // Wait for reply
         let mut msg = reply_stream
@@ -94,7 +89,7 @@ impl RpcClient {
             .await
             .ok_or_else(|| RpcError::Timeout)?;
 
-        tracing::debug!("RpcClient::execute: Received reply message");
+        tracing::trace!("Received reply message");
 
         // Deserialize the response header
         let response_header = msg

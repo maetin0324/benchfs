@@ -216,6 +216,8 @@ impl AmRpc for ReadChunkRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
+        let _span = tracing::trace_span!("rpc_read_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
+
         // Receive path from request data
         let path = if header.path_len > 0 && am_msg.contains_data() {
             let mut path_bytes = vec![0u8; header.path_len as usize];
@@ -238,13 +240,7 @@ impl AmRpc for ReadChunkRequest {
             return Err((RpcError::InvalidHeader, am_msg));
         };
 
-        tracing::debug!(
-            "ReadChunk request: path={}, chunk={}, offset={}, length={}",
-            path,
-            header.chunk_index,
-            header.offset,
-            header.length
-        );
+        tracing::trace!("Reading from path: {}", path);
 
         // Read chunk data from storage
         match ctx
@@ -254,11 +250,7 @@ impl AmRpc for ReadChunkRequest {
         {
             Ok(data) => {
                 let bytes_read = data.len() as u64;
-                tracing::debug!(
-                    "Read {} bytes from storage (path={}, chunk={})",
-                    bytes_read,
-                    path,
-                    header.chunk_index
+                tracing::trace!("Read {} bytes from storage", bytes_read
                 );
 
                 Ok((
@@ -483,6 +475,8 @@ impl AmRpc for WriteChunkRequest {
             Some(h) => h,
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
+
+        let _span = tracing::trace_span!("rpc_write_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
 
         // Receive path and data from client
         // Data section layout: [path][chunk_data]

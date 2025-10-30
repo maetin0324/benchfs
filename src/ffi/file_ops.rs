@@ -221,6 +221,8 @@ pub extern "C" fn benchfs_create(
         None => return std::ptr::null_mut(),
     };
 
+    tracing::debug!("benchfs_create: path={:?}, flags={:#x}", path_str, flags);
+
     // Convert flags to OpenFlags
     let mut open_flags = c_flags_to_open_flags(flags);
     open_flags.create = true; // Ensure create flag is set
@@ -269,6 +271,8 @@ pub extern "C" fn benchfs_open(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
+
+    tracing::debug!("benchfs_open: path={:?}, flags={:#x}", path_str, flags);
 
     let open_flags = c_flags_to_open_flags(flags);
 
@@ -327,6 +331,9 @@ pub extern "C" fn benchfs_write(
 
     unsafe {
         let handle = &*(file as *const FileHandle);
+
+        tracing::trace!("benchfs_write: path={:?}, size={}, offset={}", handle.path, size, offset);
+
         let handle_clone = handle.clone();
         let buf = slice::from_raw_parts(buffer, size).to_vec();
 
@@ -396,6 +403,9 @@ pub extern "C" fn benchfs_read(
 
     unsafe {
         let handle = &*(file as *const FileHandle);
+
+        tracing::trace!("benchfs_read: path={:?}, size={}, offset={}", handle.path, size, offset);
+
         let handle_clone = handle.clone();
         let buf_ptr = buffer;
         let buf_size = size;
@@ -461,6 +471,8 @@ pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
         // Take ownership of the handle and drop it
         let handle = Box::from_raw(file as *mut FileHandle);
 
+        tracing::debug!("benchfs_close: path={:?}", handle.path);
+
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
             let fs_ref = &*fs_ptr;
@@ -486,6 +498,8 @@ pub extern "C" fn benchfs_fsync(file: *mut benchfs_file_t) -> i32 {
 
     unsafe {
         let handle = &*(file as *const FileHandle);
+
+        tracing::debug!("benchfs_fsync: path={:?}", handle.path);
 
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
@@ -519,6 +533,8 @@ pub extern "C" fn benchfs_remove(
         Some(s) => s,
         None => return BENCHFS_EINVAL,
     };
+
+    tracing::debug!("benchfs_remove: path={:?}", path_str);
 
     let result = with_benchfs_ctx(|fs| {
         let fs_ptr = fs as *const BenchFS;
@@ -554,6 +570,8 @@ pub extern "C" fn benchfs_lseek(file: *mut benchfs_file_t, offset: i64, whence: 
 
     unsafe {
         let handle = &*(file as *const FileHandle);
+
+        tracing::trace!("benchfs_lseek: path={:?}, offset={}, whence={}", handle.path, offset, whence);
 
         let result = with_benchfs_ctx(|fs| {
             fs.benchfs_seek(handle, offset, whence)
