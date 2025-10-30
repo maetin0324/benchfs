@@ -125,11 +125,15 @@ export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
 # Optimized MPI configuration for IOR JSON hang fix
+# IMPORTANT: When using UCX as PML, BTL components should be minimal.
+# We only load self (loopback) and vader (shared memory) BTL components.
+# UCX handles the actual network transport (RDMA/InfiniBand), so we don't
+# need openib or tcp BTL which would conflict with UCX.
 cmd_mpirun_common=(
   mpirun
   "${nqsii_mpiopts_array[@]}"
   --mca pml ucx                           # UCX for MPI communication
-  --mca btl ^openib,^tcp                  # Disable openib and TCP BTL
+  --mca btl self,vader                     # Use only self and shared memory BTL (no openib/tcp)
   --mca osc ucx                            # OSC also uses UCX
   -x "UCX_TLS=rc_mlx5,sm,self"           # RDMA RC + shared memory
   -x "UCX_NET_DEVICES=mlx5_0:1"          # InfiniBand device
