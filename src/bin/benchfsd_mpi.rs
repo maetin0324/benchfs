@@ -277,15 +277,63 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
     // Registration will be done after runtime starts (moved to async task below)
 
-    // Spawn node registration task (must run after runtime starts for UCX reactor to progress)
+    // Register all RPC handlers FIRST (before publishing address)
+    // This ensures that when clients connect, the server is ready to handle requests
+    let server_clone = rpc_server.clone();
+    let runtime_clone = runtime.clone();
+
+    let handler_ready = std::rc::Rc::new(std::cell::RefCell::new(false));
+    let handler_ready_clone = handler_ready.clone();
+
+    runtime.spawn(async move {
+        tracing::info!("Registering RPC handlers...");
+        match server_clone.register_all_handlers(runtime_clone).await {
+            Ok(_) => {
+                tracing::info!("RPC handlers registered successfully");
+                *handler_ready_clone.borrow_mut() = true;
+            }
+            Err(e) => {
+                tracing::error!("Failed to register RPC handlers: {:?}", e);
+            }
+        }
+    });
+
+    // Spawn node registration task (must run after RPC handlers are ready)
     let pool_clone = connection_pool.clone();
     let node_id_clone = node_id.clone();
     let registry_dir_clone = PathBuf::from(registry_dir);
     let mpi_rank_clone = state.mpi_rank;
     let mpi_size_clone = state.mpi_size;
 
-    let registration_handle = runtime.spawn_with_name(
+    let _registration_handle = runtime.spawn_with_name(
         async move {
+            // Wait for RPC handlers to be ready before publishing address
+            tracing::info!("Waiting for RPC handlers to be ready...");
+            let max_wait = std::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+
+            loop {
+                if *handler_ready.borrow() {
+                    tracing::info!("RPC handlers confirmed ready");
+                    break;
+                }
+
+                if start.elapsed() > max_wait {
+                    tracing::error!("RPC handler registration timeout");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "RPC handler registration timeout"
+                    ));
+                }
+
+                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+            }
+
+            tracing::info!("RPC handlers ready, now registering node address");
+
+            // Small delay to ensure AM streams are fully established
+            futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
+
             // Register this node's worker address
             if let Err(e) = pool_clone.register_self(&node_id_clone) {
                 tracing::error!("Failed to register node address: {:?}", e);
@@ -361,17 +409,6 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         "node_registration".to_string(),
     );
 
-    // Register all RPC handlers (spawn in background)
-    let server_clone = rpc_server.clone();
-    let runtime_clone = runtime.clone();
-    runtime.spawn(async move {
-        match server_clone.register_all_handlers(runtime_clone).await {
-            Ok(_) => tracing::info!("RPC handlers registered successfully"),
-            Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
-        }
-    });
-    tracing::info!("RPC handler registration initiated");
-
     // Start server main loop
     let server_handle = {
         let state_clone = state.clone();
@@ -403,18 +440,11 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         tracing::info!("Storage server {} is running", node_id);
     }
 
+    // Run the runtime with the server handle
+    // Note: We don't await registration_handle here because it would create a deadlock.
+    // The registration task is spawned and will run concurrently with the server.
     runtime.clone().run(async move {
-        // Wait for registration to complete first
-        if let Err(e) = registration_handle.await {
-            tracing::error!("Node registration failed: {:?}", e);
-            tracing::error!("Stopping server due to registration failure");
-            state.stop();
-            return Err(e);
-        }
-
-        tracing::info!("Node registration completed successfully, server is now ready");
-
-        // Then wait for server to complete
+        // Wait for server to complete
         match server_handle.await {
             Ok(_) => {
                 tracing::info!("Server shutdown complete");

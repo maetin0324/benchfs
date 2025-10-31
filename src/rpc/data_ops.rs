@@ -108,6 +108,9 @@ pub struct ReadChunkRequest {
     worker_address: Vec<u8>,
     path_bytes: Vec<u8>,
     response_buffer: Vec<u8>,
+    /// Cached IoSlices - lazily initialized on first call
+    cached_request_ioslices: UnsafeCell<Option<[IoSlice<'static>; 2]>>,
+    cached_response_ioslice: UnsafeCell<Option<IoSliceMut<'static>>>,
 }
 
 // SAFETY: ReadChunkRequest is Send because all its fields are Send
@@ -125,6 +128,8 @@ impl ReadChunkRequest {
             worker_address,
             path_bytes,
             response_buffer,
+            cached_request_ioslices: UnsafeCell::new(None),
+            cached_response_ioslice: UnsafeCell::new(None),
         }
     }
 
@@ -157,43 +162,42 @@ impl AmRpc for ReadChunkRequest {
     }
 
     fn request_data(&self) -> &[std::io::IoSlice<'_>] {
-        // Use thread-local storage for IoSlices to work around lifetime issues
-        thread_local! {
-            static REQUEST_IOSLICES: UnsafeCell<Vec<IoSlice<'static>>> = UnsafeCell::new(Vec::with_capacity(2));
+        // Lazily initialize the cached IoSlices on first call
+        unsafe {
+            let cache = &mut *self.cached_request_ioslices.get();
+
+            if cache.is_none() {
+                let ioslices = [
+                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
+                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)),
+                ];
+                *cache = Some(ioslices);
+            }
+
+            std::mem::transmute::<&[IoSlice<'static>], &[IoSlice<'_>]>(
+                cache.as_ref().unwrap()
+            )
         }
-
-        REQUEST_IOSLICES.with(|ioslices| unsafe {
-            let vec = &mut *ioslices.get();
-            vec.clear();
-
-            // Create IoSlices with the proper lifetime
-            vec.push(IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)));
-            vec.push(IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)));
-
-            vec.as_slice()
-        })
     }
 
     fn response_buffer(&self) -> &[IoSliceMut<'_>] {
-        // Use thread-local storage for IoSliceMut to work around lifetime issues
-        thread_local! {
-            static RESPONSE_IOSLICES: UnsafeCell<Vec<IoSliceMut<'static>>> = UnsafeCell::new(Vec::with_capacity(1));
+        // Lazily initialize the cached IoSliceMut on first call
+        unsafe {
+            let cache = &mut *self.cached_response_ioslice.get();
+
+            if cache.is_none() {
+                // Create mutable slice from the response buffer
+                let ptr = self.response_buffer.as_ptr() as *mut u8;
+                let len = self.response_buffer.len();
+                let slice = std::slice::from_raw_parts_mut(ptr, len);
+                *cache = Some(IoSliceMut::new(std::mem::transmute::<&mut [u8], &'static mut [u8]>(slice)));
+            }
+
+            // Return as a slice
+            std::slice::from_ref(std::mem::transmute::<&IoSliceMut<'static>, &IoSliceMut<'_>>(
+                cache.as_ref().unwrap()
+            ))
         }
-
-        RESPONSE_IOSLICES.with(|ioslices| unsafe {
-            let vec = &mut *ioslices.get();
-            vec.clear();
-
-            // Create IoSliceMut with the proper lifetime
-            // This is safe because self.response_buffer is mutable through interior mutability
-            let ptr = self.response_buffer.as_ptr() as *mut u8;
-            let len = self.response_buffer.len();
-            vec.push(IoSliceMut::new(std::mem::transmute::<&mut [u8], &'static mut [u8]>(
-                std::slice::from_raw_parts_mut(ptr, len)
-            )));
-
-            vec.as_slice()
-        })
     }
 
     fn proto(&self) -> Option<pluvio_ucx::async_ucx::ucp::AmProto> {
@@ -408,6 +412,8 @@ pub struct WriteChunkRequest {
     worker_address: Vec<u8>,
     path_bytes: Vec<u8>,
     data: Vec<u8>,
+    /// Cached IoSlices - lazily initialized on first call to request_data()
+    cached_ioslices: UnsafeCell<Option<[IoSlice<'static>; 3]>>,
 }
 
 // SAFETY: WriteChunkRequest is Send because all its fields are Send
@@ -425,6 +431,7 @@ impl WriteChunkRequest {
             worker_address,
             path_bytes,
             data,
+            cached_ioslices: UnsafeCell::new(None),
         }
     }
 
@@ -452,33 +459,30 @@ impl AmRpc for WriteChunkRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        // We need to return a slice of IoSlices, but we can't create them on the stack
-        // because they need to outlive this function call.
-        // This is a known limitation of the current API design.
-        //
-        // The proper solution would be to change the trait to return Vec<IoSlice<'_>>
-        // or to use a callback pattern, but that requires changing the pluvio API.
-        //
-        // For now, we use a thread-local static to store the IoSlices.
-        thread_local! {
-            static IOSLICES: UnsafeCell<Vec<IoSlice<'static>>> = UnsafeCell::new(Vec::with_capacity(3));
+        // Lazily initialize the cached IoSlices on first call
+        unsafe {
+            let cache = &mut *self.cached_ioslices.get();
+
+            if cache.is_none() {
+                // Create IoSlices from our internal buffers
+                // We transmute to 'static lifetime, which is safe because:
+                // 1. The data is owned by self and won't move
+                // 2. The IoSlices are cached in self, so they live as long as self
+                // 3. self must outlive any use of these IoSlices (ensured by API contract)
+                let ioslices = [
+                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
+                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)),
+                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.data)),
+                ];
+                *cache = Some(ioslices);
+            }
+
+            // Return the cached IoSlices
+            // The lifetime is tied to &self, which is correct
+            std::mem::transmute::<&[IoSlice<'static>], &[IoSlice<'_>]>(
+                cache.as_ref().unwrap()
+            )
         }
-
-        IOSLICES.with(|ioslices| unsafe {
-            let vec = &mut *ioslices.get();
-            vec.clear();
-
-            // Create IoSlices with the proper lifetime
-            // These slices are valid as long as self is alive
-            vec.push(IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)));
-            vec.push(IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)));
-            vec.push(IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.data)));
-
-            // Return the slices
-            // This is safe because the IoSlices reference self's data,
-            // and self will outlive this function call
-            vec.as_slice()
-        })
     }
 
     fn proto(&self) -> Option<pluvio_ucx::async_ucx::ucp::AmProto> {

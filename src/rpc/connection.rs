@@ -18,6 +18,8 @@ pub struct ConnectionPool {
     worker: Rc<Worker>,
     registry: WorkerAddressRegistry,
     connections: RefCell<HashMap<String, Rc<RpcClient>>>,
+    /// Cache of worker address bytes (needed to keep the memory valid for WorkerAddressInner)
+    address_cache: RefCell<HashMap<String, Vec<u8>>>,
 }
 
 impl ConnectionPool {
@@ -36,6 +38,7 @@ impl ConnectionPool {
             worker,
             registry,
             connections: RefCell::new(HashMap::new()),
+            address_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -51,7 +54,7 @@ impl ConnectionPool {
         // Convert WorkerAddress to bytes using AsRef<[u8]>
         let address_bytes: &[u8] = address.as_ref();
         self.registry.register(node_id, address_bytes)?;
-        tracing::info!("Registered worker address for node {}", node_id);
+        tracing::info!("Registered worker address for node {} ({} bytes)", node_id, address_bytes.len());
         Ok(())
     }
 
@@ -80,8 +83,19 @@ impl ConnectionPool {
 
         let worker_address_bytes = self.registry.lookup(node_id)?;
 
-        // Convert bytes to WorkerAddressInner
-        let worker_address = pluvio_ucx::WorkerAddressInner::from(worker_address_bytes.as_slice());
+        // Store address bytes in cache to ensure the memory remains valid
+        self.address_cache
+            .borrow_mut()
+            .insert(node_id.to_string(), worker_address_bytes);
+
+        // Get reference to cached bytes
+        let addr_cache = self.address_cache.borrow();
+        let cached_bytes = addr_cache
+            .get(node_id)
+            .ok_or_else(|| RpcError::ConnectionError("Address cache error".to_string()))?;
+
+        // Convert bytes to WorkerAddressInner using the cached bytes
+        let worker_address = pluvio_ucx::WorkerAddressInner::from(cached_bytes.as_slice());
 
         // Create endpoint from WorkerAddress
         let endpoint = self.worker.connect_addr(&worker_address).map_err(|e| {
@@ -126,8 +140,19 @@ impl ConnectionPool {
             }
         }
 
-        // Convert bytes to WorkerAddressInner
-        let worker_address = pluvio_ucx::WorkerAddressInner::from(worker_address_bytes.as_slice());
+        // Store address bytes in cache to ensure the memory remains valid
+        self.address_cache
+            .borrow_mut()
+            .insert(node_id.to_string(), worker_address_bytes);
+
+        // Get reference to cached bytes
+        let addr_cache = self.address_cache.borrow();
+        let cached_bytes = addr_cache
+            .get(node_id)
+            .ok_or_else(|| RpcError::ConnectionError("Address cache error".to_string()))?;
+
+        // Convert bytes to WorkerAddressInner using the cached bytes
+        let worker_address = pluvio_ucx::WorkerAddressInner::from(cached_bytes.as_slice());
 
         // Create endpoint from WorkerAddress
         let endpoint = self.worker.connect_addr(&worker_address).map_err(|e| {
