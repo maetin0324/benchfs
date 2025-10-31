@@ -1,5 +1,6 @@
 use std::cell::UnsafeCell;
 use std::io::{IoSlice, IoSliceMut};
+use std::pin::Pin;
 use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
@@ -96,16 +97,22 @@ impl ReadChunkResponseHeader {
     }
 }
 
+/// Internal data structure for ReadChunkRequest
+/// This is boxed and pinned to ensure stable memory addresses
+struct ReadChunkData {
+    worker_address: Vec<u8>,
+    path_bytes: Vec<u8>,
+    response_buffer: Vec<u8>,
+}
+
 /// ReadChunk RPC request
 pub struct ReadChunkRequest {
     header: ReadChunkRequestHeader,
     path: String,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
+    /// Pinned data to ensure stable memory addresses for IoSlices
+    pinned_data: Pin<Box<ReadChunkData>>,
     /// IoSlices: [worker_address, path]
     request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
-    /// Buffer to receive data (RDMA target)
-    response_buffer: UnsafeCell<Vec<u8>>,
     /// IoSliceMut for the response buffer
     response_ioslice: UnsafeCell<IoSliceMut<'static>>,
 }
@@ -115,46 +122,65 @@ unsafe impl Send for ReadChunkRequest {}
 
 impl ReadChunkRequest {
     pub fn new(chunk_index: u64, offset: u64, length: u64, path: String, worker_address: Vec<u8>) -> Self {
-        let path_bytes = path.as_bytes();
+        let path_bytes = path.as_bytes().to_vec();
         let path_len = path_bytes.len() as u64;
+        let response_buffer = vec![0u8; length as usize];
 
-        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
+        // Create the pinned data structure
+        let pinned_data = Box::pin(ReadChunkData {
+            worker_address,
+            path_bytes,
+            response_buffer,
+        });
+
+        // Create IoSlices from the pinned data
+        // SAFETY: The pinned data ensures that the memory addresses remain stable
+        // throughout the lifetime of the ReadChunkRequest. The Pin guarantees
+        // that the data won't be moved in memory.
         let request_ioslice = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path_bytes);
+            let data_ptr = pinned_data.as_ref().get_ref() as *const ReadChunkData;
+            let addr_slice: &'static [u8] = std::slice::from_raw_parts(
+                (*data_ptr).worker_address.as_ptr(),
+                (*data_ptr).worker_address.len(),
+            );
+            let path_slice: &'static [u8] = std::slice::from_raw_parts(
+                (*data_ptr).path_bytes.as_ptr(),
+                (*data_ptr).path_bytes.len(),
+            );
             [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
-        let mut buffer = vec![0u8; length as usize];
-        // SAFETY: We're creating a 'static IoSliceMut by transmuting the lifetime.
-        // This is safe because:
-        // 1. The buffer lives as long as the ReadChunkRequest
-        // 2. The IoSliceMut is only accessed through response_buffer()
-        // 3. The RPC client will only use it during the RPC call
-        let ioslice = unsafe {
-            let slice: &'static mut [u8] = std::mem::transmute(buffer.as_mut_slice());
-            IoSliceMut::new(slice)
+        // Create IoSliceMut for the response buffer
+        let response_ioslice = unsafe {
+            let data_ptr = pinned_data.as_ref().get_ref() as *const ReadChunkData as *mut ReadChunkData;
+            let buffer_slice: &'static mut [u8] = std::slice::from_raw_parts_mut(
+                (*data_ptr).response_buffer.as_mut_ptr(),
+                (*data_ptr).response_buffer.len(),
+            );
+            IoSliceMut::new(buffer_slice)
         };
 
         Self {
             header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len),
             path,
-            worker_address,
+            pinned_data,
             request_ioslice: UnsafeCell::new(request_ioslice),
-            response_buffer: UnsafeCell::new(buffer),
-            response_ioslice: UnsafeCell::new(ioslice),
+            response_ioslice: UnsafeCell::new(response_ioslice),
         }
     }
 
     /// Get the data buffer after the RPC completes
-    pub fn take_data(self) -> Vec<u8> {
-        self.response_buffer.into_inner()
+    pub fn take_data(mut self) -> Vec<u8> {
+        // SAFETY: We have ownership of self and are consuming it
+        unsafe {
+            let data_ptr = Pin::get_unchecked_mut(self.pinned_data.as_mut()) as *mut ReadChunkData;
+            std::mem::take(&mut (*data_ptr).response_buffer)
+        }
     }
 
     /// Get a reference to the data buffer
     pub fn data(&self) -> &[u8] {
-        // SAFETY: We're only reading the buffer, not modifying it
-        unsafe { &*self.response_buffer.get() }
+        &self.pinned_data.response_buffer
     }
 }
 
@@ -385,17 +411,21 @@ impl WriteChunkResponseHeader {
     }
 }
 
+/// Internal data structure for WriteChunkRequest
+/// This is boxed and pinned to ensure stable memory addresses
+struct WriteChunkData {
+    worker_address: Vec<u8>,
+    path_bytes: Vec<u8>,
+    data: Vec<u8>,
+}
+
 /// WriteChunk RPC request
 pub struct WriteChunkRequest {
     header: WriteChunkRequestHeader,
-    /// File path
+    /// File path (for reference)
     path: String,
-    /// Path as bytes (kept for IoSlice reference)
-    path_bytes: Vec<u8>,
-    /// Data to write
-    data: Vec<u8>,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
+    /// Pinned data to ensure stable memory addresses for IoSlices
+    pinned_data: Pin<Box<WriteChunkData>>,
     /// IoSlices: [worker_address, path, data]
     request_ioslice: UnsafeCell<[IoSlice<'static>; 3]>,
 }
@@ -407,30 +437,35 @@ impl WriteChunkRequest {
     pub fn new(chunk_index: u64, offset: u64, data: Vec<u8>, path: String, worker_address: Vec<u8>) -> Self {
         let length = data.len() as u64;
         let path_len = path.len() as u64;
-
-        // Create a copy of path bytes that will be owned by the struct
         let path_bytes = path.as_bytes().to_vec();
 
-        // First create the struct with all data
-        let mut request = Self {
-            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
-            path,
+        // Create the pinned data structure
+        let pinned_data = Box::pin(WriteChunkData {
+            worker_address,
             path_bytes,
             data,
-            worker_address,
-            request_ioslice: UnsafeCell::new([IoSlice::new(&[]), IoSlice::new(&[]), IoSlice::new(&[])]),
-        };
+        });
 
-        // Now create IoSlices from the struct's owned data
-        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
-        // This is safe because:
-        // 1. The buffers (worker_address, path_bytes, data) live as long as the WriteChunkRequest
-        // 2. The IoSlices are only accessed through request_data()
-        // 3. The RPC client will only use them during the RPC call
+        // Create IoSlices from the pinned data
+        // SAFETY: The pinned data ensures that the memory addresses remain stable
+        // throughout the lifetime of the WriteChunkRequest. The Pin guarantees
+        // that the data won't be moved in memory.
         let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(request.worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(request.path_bytes.as_slice());
-            let data_slice: &'static [u8] = std::mem::transmute(request.data.as_slice());
+            // Get raw pointers to the pinned data
+            let data_ptr = pinned_data.as_ref().get_ref() as *const WriteChunkData;
+            let addr_slice: &'static [u8] = std::slice::from_raw_parts(
+                (*data_ptr).worker_address.as_ptr(),
+                (*data_ptr).worker_address.len(),
+            );
+            let path_slice: &'static [u8] = std::slice::from_raw_parts(
+                (*data_ptr).path_bytes.as_ptr(),
+                (*data_ptr).path_bytes.len(),
+            );
+            let data_slice: &'static [u8] = std::slice::from_raw_parts(
+                (*data_ptr).data.as_ptr(),
+                (*data_ptr).data.len(),
+            );
+
             [
                 IoSlice::new(addr_slice),
                 IoSlice::new(path_slice),
@@ -438,13 +473,17 @@ impl WriteChunkRequest {
             ]
         };
 
-        request.request_ioslice = UnsafeCell::new(ioslices);
-        request
+        Self {
+            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
+            path,
+            pinned_data,
+            request_ioslice: UnsafeCell::new(ioslices),
+        }
     }
 
     /// Get the data buffer
     pub fn data(&self) -> &[u8] {
-        &self.data
+        &self.pinned_data.data
     }
 }
 
@@ -474,7 +513,7 @@ impl AmRpc for WriteChunkRequest {
     fn proto(&self) -> Option<pluvio_ucx::async_ucx::ucp::AmProto> {
         // Use Rendezvous protocol for RDMA transfer if data is large enough
         // Otherwise use Eager protocol for better latency on small transfers
-        if crate::rpc::should_use_rdma(self.data.len() as u64) {
+        if crate::rpc::should_use_rdma(self.data().len() as u64) {
             Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
         } else {
             None // Eager protocol

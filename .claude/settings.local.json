@@ -66,7 +66,8 @@
       "Read(//home/rmaeda/**)",
       "Bash(ls:*)",
       "Read(//home/NBB/rmaeda/.cargo/git/checkouts/**)",
-      "Bash(git show:*)"
+      "Bash(git show:*)",
+      "Read(//usr/include/asm-generic/**)"
     ],
     "deny": [],
     "ask": []
