@@ -390,6 +390,8 @@ pub struct WriteChunkRequest {
     header: WriteChunkRequestHeader,
     /// File path
     path: String,
+    /// Path as bytes (kept for IoSlice reference)
+    path_bytes: Vec<u8>,
     /// Data to write
     data: Vec<u8>,
     /// Client's WorkerAddress for direct response
@@ -406,15 +408,29 @@ impl WriteChunkRequest {
         let length = data.len() as u64;
         let path_len = path.len() as u64;
 
+        // Create a copy of path bytes that will be owned by the struct
+        let path_bytes = path.as_bytes().to_vec();
+
+        // First create the struct with all data
+        let mut request = Self {
+            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
+            path,
+            path_bytes,
+            data,
+            worker_address,
+            request_ioslice: UnsafeCell::new([IoSlice::new(&[]), IoSlice::new(&[]), IoSlice::new(&[])]),
+        };
+
+        // Now create IoSlices from the struct's owned data
         // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
         // This is safe because:
-        // 1. The buffers live as long as the WriteChunkRequest
+        // 1. The buffers (worker_address, path_bytes, data) live as long as the WriteChunkRequest
         // 2. The IoSlices are only accessed through request_data()
         // 3. The RPC client will only use them during the RPC call
         let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            let data_slice: &'static [u8] = std::mem::transmute(data.as_slice());
+            let addr_slice: &'static [u8] = std::mem::transmute(request.worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(request.path_bytes.as_slice());
+            let data_slice: &'static [u8] = std::mem::transmute(request.data.as_slice());
             [
                 IoSlice::new(addr_slice),
                 IoSlice::new(path_slice),
@@ -422,13 +438,8 @@ impl WriteChunkRequest {
             ]
         };
 
-        Self {
-            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
-            path,
-            data,
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslices),
-        }
+        request.request_ioslice = UnsafeCell::new(ioslices);
+        request
     }
 
     /// Get the data buffer
