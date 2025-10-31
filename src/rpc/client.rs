@@ -69,7 +69,13 @@ impl RpcClient {
         let need_reply = request.need_reply();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        tracing::trace!("Reply stream: {}, has_data: {}", reply_stream_id, !data.is_empty());
+        tracing::debug!(
+            "RPC call: rpc_id={}, reply_stream_id={}, has_data={}, data_len={}",
+            rpc_id,
+            reply_stream_id,
+            !data.is_empty(),
+            data.iter().map(|s| s.len()).sum::<usize>()
+        );
 
         let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
@@ -77,6 +83,8 @@ impl RpcClient {
                 e.to_string()
             ))
         })?;
+
+        tracing::trace!("Created reply stream: stream_id={}", reply_stream_id);
 
         if !need_reply {
             // No reply expected
@@ -86,7 +94,14 @@ impl RpcClient {
         }
 
         // Send the RPC request (proto is set to None for now)
-        tracing::trace!("Sending AM request");
+        tracing::debug!(
+            "Sending AM request: rpc_id={}, header_size={}, need_reply={}, proto={:?}",
+            rpc_id,
+            std::mem::size_of_val(zerocopy::IntoBytes::as_bytes(header)),
+            need_reply,
+            proto
+        );
+
         self.conn
             .endpoint()
             .am_send_vectorized(
@@ -97,17 +112,31 @@ impl RpcClient {
                 proto,
             )
             .await
-            .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;
+            .map_err(|e| {
+                tracing::error!("Failed to send AM request: rpc_id={}, error={:?}", rpc_id, e);
+                RpcError::TransportError(format!("Failed to send AM: {:?}", e))
+            })?;
 
-        tracing::trace!("Waiting for reply");
+        tracing::debug!(
+            "Waiting for reply on stream_id={}, rpc_id={}",
+            reply_stream_id,
+            rpc_id
+        );
 
         // Wait for reply
         let mut msg = reply_stream
             .wait_msg()
             .await
-            .ok_or_else(|| RpcError::Timeout)?;
+            .ok_or_else(|| {
+                tracing::error!(
+                    "RPC timeout: no reply received (rpc_id={}, reply_stream_id={})",
+                    rpc_id,
+                    reply_stream_id
+                );
+                RpcError::Timeout
+            })?;
 
-        tracing::trace!("Received reply message");
+        tracing::debug!("Received reply message: rpc_id={}, reply_stream_id={}", rpc_id, reply_stream_id);
 
         // Deserialize the response header
         let response_header = msg

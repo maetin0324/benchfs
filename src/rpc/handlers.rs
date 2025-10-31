@@ -40,6 +40,12 @@ impl RpcHandlerContext {
 
     /// Send a response directly to the client using WorkerAddress
     /// instead of reply_ep to avoid UCX lifetime issues
+    #[tracing::instrument(skip(self, client_addr, header, data), fields(
+        client_addr_len = client_addr.len(),
+        stream_id = stream_id,
+        rpc_id = rpc_id,
+        data_len = data.map(|d| d.len()).unwrap_or(0)
+    ))]
     pub async fn send_response_direct<H: crate::rpc::Serializable>(
         &self,
         client_addr: &[u8],
@@ -49,6 +55,13 @@ impl RpcHandlerContext {
         data: Option<&[u8]>,
     ) -> Result<(), RpcError> {
         use pluvio_ucx::async_ucx::ucp::WorkerAddressInner;
+
+        // Log client address bytes for debugging
+        tracing::trace!(
+            "Client address bytes: {:?} (len={})",
+            &client_addr[..client_addr.len().min(32)],
+            client_addr.len()
+        );
 
         // Try to get endpoint from cache, or create new one
         let endpoint = {
@@ -72,6 +85,7 @@ impl RpcHandlerContext {
                     cache.len()
                 );
 
+                tracing::trace!("Creating endpoint for client address");
                 let worker_address = WorkerAddressInner::from(client_addr);
                 let ep = self
                     .worker
@@ -95,6 +109,7 @@ impl RpcHandlerContext {
 
         // Serialize header
         let header_bytes = zerocopy::IntoBytes::as_bytes(header);
+        tracing::trace!("Header size: {} bytes", header_bytes.len());
 
         // Prepare data payload
         let data_slice = data.unwrap_or(&[]);
@@ -113,6 +128,14 @@ impl RpcHandlerContext {
             Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
         };
 
+        tracing::debug!(
+            "Sending AM response: stream_id={}, header_size={}, data_size={}, proto={:?}",
+            stream_id,
+            header_bytes.len(),
+            data_slice.len(),
+            proto
+        );
+
         // Send response via AM (stream_id is the reply stream)
         endpoint
             .am_send_vectorized(
@@ -123,7 +146,14 @@ impl RpcHandlerContext {
                 proto,
             )
             .await
-            .map_err(|e| RpcError::TransportError(format!("Failed to send response: {:?}", e)))?;
+            .map_err(|e| {
+                tracing::error!(
+                    "Failed to send AM response: stream_id={}, error={:?}",
+                    stream_id,
+                    e
+                );
+                RpcError::TransportError(format!("Failed to send response: {:?}", e))
+            })?;
 
         tracing::debug!(
             "Successfully sent direct response to client (stream_id={}, rpc_id={})",

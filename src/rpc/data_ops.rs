@@ -520,6 +520,13 @@ impl AmRpc for WriteChunkRequest {
         let data_len = header.length as usize;
         let chunk_store_any = &*ctx.chunk_store as &dyn Any;
 
+        tracing::trace!(
+            "Processing WriteChunk: chunk={}, offset={}, len={}",
+            header.chunk_index,
+            header.offset,
+            header.length
+        );
+
         let response_header = if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
             tracing::debug!("Using zero-copy path for WriteChunk");
             // Zero-copy path: Use registered buffer
@@ -549,6 +556,12 @@ impl AmRpc for WriteChunkRequest {
                     tracing::error!("Failed to receive request data: {:?}", e);
                     WriteChunkResponseHeader::error(-5)
                 } else {
+                    tracing::trace!(
+                        "Received worker_address bytes: {:?} (len={})",
+                        &worker_addr_bytes[..worker_addr_bytes.len().min(32)],
+                        worker_addr_bytes.len()
+                    );
+
                     let path = match String::from_utf8(path_bytes) {
                         Ok(p) => p,
                         Err(e) => {
@@ -648,6 +661,13 @@ impl AmRpc for WriteChunkRequest {
         };
 
         // Send response directly using WorkerAddress
+        tracing::debug!(
+            "Preparing to send direct response: rpc_id={}, reply_stream_id={}, success={}",
+            Self::rpc_id(),
+            Self::reply_stream_id(),
+            response_header.is_success()
+        );
+
         if let Err(e) = ctx.send_response_direct(
             &worker_addr_bytes,
             Self::reply_stream_id(),
@@ -658,6 +678,12 @@ impl AmRpc for WriteChunkRequest {
             tracing::error!("Failed to send direct response: {:?}", e);
             return Err((e, am_msg));
         }
+
+        tracing::debug!(
+            "Direct response sent successfully (rpc_id={}, reply_stream_id={})",
+            Self::rpc_id(),
+            Self::reply_stream_id()
+        );
 
         // Return empty response since we already sent the response directly
         Ok((

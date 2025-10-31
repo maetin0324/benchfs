@@ -86,7 +86,12 @@ impl RpcServer {
 
             let ctx_clone = ctx.clone();
 
-            // Call the unified server_handler
+            // Call the unified server_handler with span for tracking
+            let _handler_span = tracing::debug_span!(
+                "rpc_server_handler",
+                rpc_id = Rpc::rpc_id()
+            ).entered();
+
             match Rpc::server_handler(ctx_clone, am_msg).await {
                 Ok((_response, _am_msg)) => {
                     // Response已经在server_handler内部通过send_response_direct()直接送信済み
@@ -105,6 +110,8 @@ impl RpcServer {
                     );
                 }
             }
+
+            drop(_handler_span);
         }
 
         Ok(())
