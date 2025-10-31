@@ -39,15 +39,19 @@ pub struct ReadChunkRequestHeader {
 
     /// Path length (path is sent in data section)
     pub path_len: u64,
+
+    /// WorkerAddress length (sent before path in data section)
+    pub worker_address_len: u64,
 }
 
 impl ReadChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64, worker_address_len: u64) -> Self {
         Self {
             chunk_index,
             offset,
             length,
             path_len,
+            worker_address_len,
         }
     }
 }
@@ -120,10 +124,11 @@ impl ReadChunkRequest {
     pub fn new(chunk_index: u64, offset: u64, length: u64, path: String, worker_address: Vec<u8>) -> Self {
         let path_bytes = path.as_bytes().to_vec();
         let path_len = path_bytes.len() as u64;
+        let worker_address_len = worker_address.len() as u64;
         let response_buffer = vec![0u8; length as usize];
 
         Self {
-            header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len),
+            header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len, worker_address_len),
             path,
             worker_address,
             path_bytes,
@@ -237,9 +242,8 @@ impl AmRpc for ReadChunkRequest {
 
         let _span = tracing::trace_span!("rpc_read_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
 
-        // Receive WorkerAddress and path from request data
-        // Estimate WorkerAddress size (typically 400-500 bytes)
-        let mut worker_addr_bytes = vec![0u8; 512];
+        // Receive WorkerAddress and path from request data using actual lengths from header
+        let mut worker_addr_bytes = vec![0u8; header.worker_address_len as usize];
         let mut path_bytes = vec![0u8; header.path_len as usize];
 
         if am_msg.contains_data() {
@@ -340,17 +344,21 @@ pub struct WriteChunkRequestHeader {
     /// Length to write
     pub length: u64,
 
-    /// Path length (path is sent before data in data section)
+    /// Path length (path is sent in data section)
     pub path_len: u64,
+
+    /// WorkerAddress length (sent before path in data section)
+    pub worker_address_len: u64,
 }
 
 impl WriteChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64, worker_address_len: u64) -> Self {
         Self {
             chunk_index,
             offset,
             length,
             path_len,
+            worker_address_len,
         }
     }
 }
@@ -404,29 +412,30 @@ impl WriteChunkResponseHeader {
 /// IMPORTANT: This struct must be kept alive for the entire duration of the RPC call.
 /// The IoSlices reference the internal data directly, so dropping this struct
 /// while the RPC is in flight will cause use-after-free errors.
-pub struct WriteChunkRequest {
+pub struct WriteChunkRequest<'a> {
     header: WriteChunkRequestHeader,
     /// File path (for reference)
     path: String,
     /// Data buffers - these must be stored directly in the struct
     worker_address: Vec<u8>,
     path_bytes: Vec<u8>,
-    data: Vec<u8>,
+    data: &'a [u8],
     /// Cached IoSlices - lazily initialized on first call to request_data()
     cached_ioslices: UnsafeCell<Option<[IoSlice<'static>; 3]>>,
 }
 
 // SAFETY: WriteChunkRequest is Send because all its fields are Send
-unsafe impl Send for WriteChunkRequest {}
+unsafe impl Send for WriteChunkRequest<'_> {}
 
-impl WriteChunkRequest {
-    pub fn new(chunk_index: u64, offset: u64, data: Vec<u8>, path: String, worker_address: Vec<u8>) -> Self {
+impl<'a> WriteChunkRequest<'a> {
+    pub fn new(chunk_index: u64, offset: u64, data: &'a [u8], path: String, worker_address: Vec<u8>) -> Self {
         let length = data.len() as u64;
         let path_len = path.len() as u64;
+        let worker_address_len = worker_address.len() as u64;
         let path_bytes = path.as_bytes().to_vec();
 
         Self {
-            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
+            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len, worker_address_len),
             path,
             worker_address,
             path_bytes,
@@ -441,7 +450,7 @@ impl WriteChunkRequest {
     }
 }
 
-impl AmRpc for WriteChunkRequest {
+impl AmRpc for WriteChunkRequest<'_> {
     type RequestHeader = WriteChunkRequestHeader;
     type ResponseHeader = WriteChunkResponseHeader;
 
@@ -532,8 +541,8 @@ impl AmRpc for WriteChunkRequest {
             ));
         }
 
-        // Receive WorkerAddress first
-        let mut worker_addr_bytes = vec![0u8; 512];
+        // Receive WorkerAddress first using actual length from header
+        let mut worker_addr_bytes = vec![0u8; header.worker_address_len as usize];
 
         // Check if chunk_store is IOUringChunkStore to use zero-copy path
         use crate::storage::chunk_store::IOUringChunkStore;
@@ -543,10 +552,11 @@ impl AmRpc for WriteChunkRequest {
         let chunk_store_any = &*ctx.chunk_store as &dyn Any;
 
         tracing::trace!(
-            "Processing WriteChunk: chunk={}, offset={}, len={}",
+            "Processing WriteChunk: chunk={}, offset={}, len={}, worker_address_len={}",
             header.chunk_index,
             header.offset,
-            header.length
+            header.length,
+            header.worker_address_len
         );
 
         let response_header = if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
@@ -741,11 +751,12 @@ mod tests {
 
     #[test]
     fn test_read_chunk_request_header() {
-        let header = ReadChunkRequestHeader::new(5, 1024, 4096, 42);
+        let header = ReadChunkRequestHeader::new(5, 1024, 4096, 42, 256);
         assert_eq!(header.chunk_index, 5);
         assert_eq!(header.offset, 1024);
         assert_eq!(header.length, 4096);
         assert_eq!(header.path_len, 42);
+        assert_eq!(header.worker_address_len, 256);
 
         // Verify it can be serialized
         let bytes = zerocopy::IntoBytes::as_bytes(&header);
@@ -782,11 +793,12 @@ mod tests {
 
     #[test]
     fn test_write_chunk_request_header() {
-        let header = WriteChunkRequestHeader::new(3, 512, 2048, 99);
+        let header = WriteChunkRequestHeader::new(3, 512, 2048, 99, 256);
         assert_eq!(header.chunk_index, 3);
         assert_eq!(header.offset, 512);
         assert_eq!(header.length, 2048);
         assert_eq!(header.path_len, 99);
+        assert_eq!(header.worker_address_len, 256);
     }
 
     #[test]
@@ -804,7 +816,7 @@ mod tests {
     fn test_write_chunk_request() {
         let data = vec![0xAA; 512];
         let dummy_worker_addr = vec![0u8; 512]; // Dummy WorkerAddress for testing
-        let request = WriteChunkRequest::new(1, 0, data.clone(), "/test/file.txt".to_string(), dummy_worker_addr);
+        let request = WriteChunkRequest::new(1, 0, &data[..], "/test/file.txt".to_string(), dummy_worker_addr);
 
         assert_eq!(request.header.chunk_index, 1);
         assert_eq!(request.header.length, 512);

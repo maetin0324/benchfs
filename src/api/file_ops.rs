@@ -746,7 +746,7 @@ impl BenchFS {
                 // Calculate data slice for this chunk
                 let data_offset: usize = chunks.iter().take(idx).map(|(_, _, s)| *s as usize).sum();
                 let data_len = write_size as usize;
-                let chunk_data = data[data_offset..data_offset + data_len].to_vec();
+                let chunk_data = &data[data_offset..data_offset + data_len];
 
                 let file_path = file_meta.path.clone();
                 let chunk_key = format!("{}/{}", &file_path, chunk_index);
