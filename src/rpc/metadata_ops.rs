@@ -465,7 +465,14 @@ impl AmRpc for MetadataCreateFileRequest {
         // Store file metadata and prepare response
         let response_header = match ctx.metadata_manager.store_file_metadata(file_meta) {
             Ok(()) => MetadataCreateFileResponseHeader::success(0), // Dummy inode
-            Err(_e) => MetadataCreateFileResponseHeader::error(-5),
+            Err(crate::metadata::manager::MetadataError::AlreadyExists(ref path)) => {
+                tracing::warn!("File already exists: {}", path);
+                MetadataCreateFileResponseHeader::error(-17) // EEXIST
+            }
+            Err(e) => {
+                tracing::error!("Failed to store file metadata: {:?}", e);
+                MetadataCreateFileResponseHeader::error(-5) // EIO
+            }
         };
 
         // Send response directly using WorkerAddress
@@ -646,7 +653,14 @@ impl AmRpc for MetadataCreateDirRequest {
         // Store directory metadata
         let response_header = match ctx.metadata_manager.store_dir_metadata(dir_meta) {
             Ok(()) => MetadataCreateDirResponseHeader::success(inode),
-            Err(_e) => MetadataCreateDirResponseHeader::error(-5),
+            Err(crate::metadata::manager::MetadataError::AlreadyExists(ref path)) => {
+                tracing::warn!("Directory already exists: {}", path);
+                MetadataCreateDirResponseHeader::error(-17) // EEXIST
+            }
+            Err(e) => {
+                tracing::error!("Failed to store directory metadata: {:?}", e);
+                MetadataCreateDirResponseHeader::error(-5) // EIO
+            }
         };
 
         // Send response directly to client
