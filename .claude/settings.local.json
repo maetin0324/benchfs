@@ -65,7 +65,8 @@
       "Bash(bash:*)",
       "Read(//home/rmaeda/**)",
       "Bash(ls:*)",
-      "Read(//home/NBB/rmaeda/.cargo/git/checkouts/**)"
+      "Read(//home/NBB/rmaeda/.cargo/git/checkouts/**)",
+      "Bash(git show:*)"
     ],
     "deny": [],
     "ask": []

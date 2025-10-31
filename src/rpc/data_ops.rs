@@ -394,10 +394,8 @@ pub struct WriteChunkRequest {
     data: Vec<u8>,
     /// Client's WorkerAddress for direct response
     worker_address: Vec<u8>,
-    /// Combined buffer (path + data) for RDMA
-    combined_data: Vec<u8>,
-    /// IoSlices: [worker_address, path+data]
-    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
+    /// IoSlices: [worker_address, path, data]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 3]>,
 }
 
 // SAFETY: WriteChunkRequest is only used in single-threaded context (Pluvio runtime)
@@ -408,11 +406,6 @@ impl WriteChunkRequest {
         let length = data.len() as u64;
         let path_len = path.len() as u64;
 
-        // Create combined buffer: [path][data]
-        let mut combined_data = Vec::with_capacity(path.len() + data.len());
-        combined_data.extend_from_slice(path.as_bytes());
-        combined_data.extend_from_slice(&data);
-
         // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
         // This is safe because:
         // 1. The buffers live as long as the WriteChunkRequest
@@ -420,8 +413,13 @@ impl WriteChunkRequest {
         // 3. The RPC client will only use them during the RPC call
         let ioslices = unsafe {
             let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let data_slice: &'static [u8] = std::mem::transmute(combined_data.as_slice());
-            [IoSlice::new(addr_slice), IoSlice::new(data_slice)]
+            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            let data_slice: &'static [u8] = std::mem::transmute(data.as_slice());
+            [
+                IoSlice::new(addr_slice),
+                IoSlice::new(path_slice),
+                IoSlice::new(data_slice),
+            ]
         };
 
         Self {
@@ -429,7 +427,6 @@ impl WriteChunkRequest {
             path,
             data,
             worker_address,
-            combined_data,
             request_ioslice: UnsafeCell::new(ioslices),
         }
     }
