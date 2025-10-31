@@ -392,6 +392,7 @@ EOF
             -x "RUST_LOG=Trace"
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
+            -vvv
             -a BENCHFS
             -t "$transfer_size"
             -b "$block_size"
