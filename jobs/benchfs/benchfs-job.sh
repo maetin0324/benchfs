@@ -390,6 +390,7 @@ EOF
             --map-by "ppr:${ppn}:node"
             -x "UCX_LOG_LEVEL=error"              # Suppress verbose UCX debug logs
             -x "RUST_LOG=Trace"
+            -x "RUST_BACKTRACE=1"
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
             -vvv
