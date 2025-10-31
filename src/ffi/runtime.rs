@@ -301,16 +301,18 @@ where
                         op_name, timeout_secs
                     );
                     timed_out_clone.store(true, Ordering::Relaxed);
-                    // Don't abort immediately, let runtime finish cleanly
+                    // We don't store a result on timeout
+                    // The process will exit before unwrapping
                 }
             }
         };
 
         rt.run(combined_future);
 
-        // Check if timeout occurred
+        // Check if timeout occurred BEFORE trying to extract result
         if timed_out.load(Ordering::Relaxed) {
             tracing::error!("Exiting due to timeout in operation '{}'", operation_name);
+            // Clean exit without panic
             std::process::exit(1);
         }
 
@@ -319,6 +321,7 @@ where
             .borrow_mut()
             .take()
             .unwrap_or_else(|| {
+                // This should not happen if the timeout logic worked correctly
                 panic!("Future for operation '{}' did not complete", operation_name)
             })
     })
