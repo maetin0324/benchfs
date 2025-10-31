@@ -538,25 +538,29 @@ pub type MetadataCreateDirResponseHeader = MetadataCreateFileResponseHeader;
 pub struct MetadataCreateDirRequest {
     header: MetadataCreateDirRequestHeader,
     path: String,
-    /// IoSlice for the path data
-    path_ioslice: UnsafeCell<IoSlice<'static>>,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlices: [worker_address, path]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
 }
 
 // SAFETY: MetadataCreateDirRequest is only used in single-threaded context (Pluvio runtime)
 unsafe impl Send for MetadataCreateDirRequest {}
 
 impl MetadataCreateDirRequest {
-    pub fn new(path: String, mode: u32) -> Self {
+    pub fn new(path: String, mode: u32, worker_address: Vec<u8>) -> Self {
         // SAFETY: Same as MetadataLookupRequest
-        let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            IoSlice::new(slice)
+        let ioslices = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
         Self {
             header: MetadataCreateDirRequestHeader::new(mode, path.len()),
             path,
-            path_ioslice: UnsafeCell::new(ioslice),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslices),
         }
     }
 
@@ -582,7 +586,8 @@ impl AmRpc for MetadataCreateDirRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+        // SAFETY: Same as MetadataLookupRequest
+        unsafe { &*self.request_ioslice.get() }
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -612,15 +617,24 @@ impl AmRpc for MetadataCreateDirRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
-        // Receive path data
+        // Receive WorkerAddress and path data
+        let mut worker_addr_bytes = vec![0u8; 512];
         let mut path_bytes = vec![0u8; header.path_len as usize];
         if am_msg.contains_data() {
-            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
-            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
-                return Ok((
-                    crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::error(-2)),
-                    am_msg,
-                ));
+            if let Err(_e) = am_msg.recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
+                std::io::IoSliceMut::new(&mut path_bytes),
+            ]).await {
+                let response_header = MetadataCreateDirResponseHeader::error(-2);
+                // Send error response directly
+                let _ = ctx.send_response_direct(
+                    &worker_addr_bytes,
+                    Self::reply_stream_id(),
+                    Self::rpc_id(),
+                    &response_header,
+                    None,
+                ).await;
+                return Ok((crate::rpc::ServerResponse::new(response_header), am_msg));
             }
         }
         let path_str = String::from_utf8_lossy(&path_bytes);
@@ -630,16 +644,24 @@ impl AmRpc for MetadataCreateDirRequest {
         let dir_meta = DirectoryMetadata::new(inode, path_str.to_string());
 
         // Store directory metadata
-        match ctx.metadata_manager.store_dir_metadata(dir_meta) {
-            Ok(()) => Ok((
-                crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::success(inode)),
-                am_msg,
-            )),
-            Err(_e) => Ok((
-                crate::rpc::ServerResponse::new(MetadataCreateDirResponseHeader::error(-5)),
-                am_msg,
-            )),
+        let response_header = match ctx.metadata_manager.store_dir_metadata(dir_meta) {
+            Ok(()) => MetadataCreateDirResponseHeader::success(inode),
+            Err(_e) => MetadataCreateDirResponseHeader::error(-5),
+        };
+
+        // Send response directly to client
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send MetadataCreateDir response: {:?}", e);
+            return Err((e, am_msg));
         }
+
+        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -741,39 +763,45 @@ impl MetadataDeleteResponseHeader {
 pub struct MetadataDeleteRequest {
     header: MetadataDeleteRequestHeader,
     path: String,
-    /// IoSlice for the path data
-    path_ioslice: UnsafeCell<IoSlice<'static>>,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlices: [worker_address, path]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
 }
 
 // SAFETY: MetadataDeleteRequest is only used in single-threaded context (Pluvio runtime)
 unsafe impl Send for MetadataDeleteRequest {}
 
 impl MetadataDeleteRequest {
-    pub fn delete_file(path: String) -> Self {
+    pub fn delete_file(path: String, worker_address: Vec<u8>) -> Self {
         // SAFETY: Same as MetadataLookupRequest
-        let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            IoSlice::new(slice)
+        let ioslices = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
         Self {
             header: MetadataDeleteRequestHeader::file(path.len()),
             path,
-            path_ioslice: UnsafeCell::new(ioslice),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslices),
         }
     }
 
-    pub fn delete_directory(path: String) -> Self {
+    pub fn delete_directory(path: String, worker_address: Vec<u8>) -> Self {
         // SAFETY: Same as MetadataLookupRequest
-        let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            IoSlice::new(slice)
+        let ioslices = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
         Self {
             header: MetadataDeleteRequestHeader::directory(path.len()),
             path,
-            path_ioslice: UnsafeCell::new(ioslice),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslices),
         }
     }
 
@@ -807,7 +835,8 @@ impl AmRpc for MetadataDeleteRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+        // SAFETY: Same as MetadataLookupRequest
+        unsafe { &*self.request_ioslice.get() }
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -837,44 +866,58 @@ impl AmRpc for MetadataDeleteRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
-        // Receive path data
+        // Receive WorkerAddress and path data
+        let mut worker_addr_bytes = vec![0u8; 512];
         let mut path_bytes = vec![0u8; header.path_len as usize];
         if am_msg.contains_data() {
-            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
-            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
-                return Ok((
-                    crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-2)),
-                    am_msg,
-                ));
+            if let Err(_e) = am_msg.recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
+                std::io::IoSliceMut::new(&mut path_bytes),
+            ]).await {
+                let response_header = MetadataDeleteResponseHeader::error(-2);
+                let _ = ctx.send_response_direct(
+                    &worker_addr_bytes,
+                    Self::reply_stream_id(),
+                    Self::rpc_id(),
+                    &response_header,
+                    None,
+                ).await;
+                return Ok((crate::rpc::ServerResponse::new(response_header), am_msg));
             }
         }
         let path_str = String::from_utf8_lossy(&path_bytes);
         let path = Path::new(path_str.as_ref());
 
         // Delete based on entry type
-        let result = if header.entry_type == 1 {
+        let response_header = if header.entry_type == 1 {
             // Delete file
-            ctx.metadata_manager.remove_file_metadata(path)
+            match ctx.metadata_manager.remove_file_metadata(path) {
+                Ok(()) => MetadataDeleteResponseHeader::success(),
+                Err(_e) => MetadataDeleteResponseHeader::error(-2), // ENOENT
+            }
         } else if header.entry_type == 2 {
             // Delete directory
-            ctx.metadata_manager.remove_dir_metadata(path)
+            match ctx.metadata_manager.remove_dir_metadata(path) {
+                Ok(()) => MetadataDeleteResponseHeader::success(),
+                Err(_e) => MetadataDeleteResponseHeader::error(-2), // ENOENT
+            }
         } else {
-            return Ok((
-                crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-22)), // EINVAL
-                am_msg,
-            ));
+            MetadataDeleteResponseHeader::error(-22) // EINVAL
         };
 
-        match result {
-            Ok(()) => Ok((
-                crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::success()),
-                am_msg,
-            )),
-            Err(_e) => Ok((
-                crate::rpc::ServerResponse::new(MetadataDeleteResponseHeader::error(-2)), // ENOENT
-                am_msg,
-            )),
+        // Send response directly to client
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send MetadataDelete response: {:?}", e);
+            return Err((e, am_msg));
         }
+
+        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -1225,7 +1268,7 @@ mod tests {
 
     #[test]
     fn test_metadata_create_dir_request() {
-        let request = MetadataCreateDirRequest::new("/newdir".to_string(), 0o755);
+        let request = MetadataCreateDirRequest::new("/newdir".to_string(), 0o755, vec![1, 2, 3, 4]);
         assert_eq!(request.path(), "/newdir");
         assert_eq!(request.header.mode, 0o755);
         assert_eq!(request.header.path_len, 7);
@@ -1233,12 +1276,12 @@ mod tests {
 
     #[test]
     fn test_metadata_delete_request() {
-        let file_req = MetadataDeleteRequest::delete_file("/file.txt".to_string());
+        let file_req = MetadataDeleteRequest::delete_file("/file.txt".to_string(), vec![1, 2, 3, 4]);
         assert_eq!(file_req.path(), "/file.txt");
         assert!(file_req.is_file());
         assert!(!file_req.is_directory());
 
-        let dir_req = MetadataDeleteRequest::delete_directory("/dir".to_string());
+        let dir_req = MetadataDeleteRequest::delete_directory("/dir".to_string(), vec![1, 2, 3, 4]);
         assert_eq!(dir_req.path(), "/dir");
         assert!(!dir_req.is_file());
         assert!(dir_req.is_directory());
