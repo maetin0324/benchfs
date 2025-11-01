@@ -159,13 +159,16 @@ impl WorkerAddressRegistry {
                 }
             }
 
-            // Simple polling with thread sleep
-            // Note: This is blocking, but acceptable for address registry polling
-            // In production, you might want to use a proper async timer
-            std::thread::sleep(Duration::from_millis(100));
+            // Use short blocking sleep
+            // Note: We use std::thread::sleep instead of async Delay because:
+            // 1. This function is called within UCX connection operations that block the runtime
+            // 2. Async delays cannot be polled when the runtime event loop is blocked
+            // 3. Short sleep intervals (10ms) minimize impact on UCX progress
+            std::thread::sleep(Duration::from_millis(10));
             check_count += 1;
 
-            if check_count % 10 == 0 {
+            // Log every 100 checks (= 1 second at 10ms intervals)
+            if check_count % 100 == 0 {
                 tracing::debug!(
                     "Still waiting for worker address for {} (elapsed: {:?})",
                     node_id,

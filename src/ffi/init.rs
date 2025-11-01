@@ -324,7 +324,7 @@ pub extern "C" fn benchfs_init(
 
         // Create io_uring reactor
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(2048)
+            .queue_size(256)  // Reduced from 2048 to limit memory: 256 × 4MiB = 1GiB max
             .buffer_size(4 << 20) // 4 MiB (matches IOR transfer sizes, prevents buffer exhaustion)
             .submit_depth(128)
             .wait_submit_timeout(std::time::Duration::from_micros(1))

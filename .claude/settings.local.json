@@ -67,7 +67,13 @@
       "Bash(ls:*)",
       "Read(//home/NBB/rmaeda/.cargo/git/checkouts/**)",
       "Bash(git show:*)",
-      "Read(//usr/include/asm-generic/**)"
+      "Read(//usr/include/asm-generic/**)",
+      "Bash(timeout 300 make test-ior:*)",
+      "Bash(timeout 180 make test-ior:*)",
+      "Bash(BENCHFS_OPERATION_TIMEOUT=30 timeout 60 make test-ior:*)",
+      "Bash(timeout 60 make:*)",
+      "Bash(docker stats:*)",
+      "Bash(git log:*)"
     ],
     "deny": [],
     "ask": []

@@ -64,9 +64,11 @@ impl RpcHandlerContext {
         );
 
         // Try to get endpoint from cache, or create new one
+        // IMPORTANT: Split the borrow scopes to avoid holding RefCell borrow
+        // across potentially blocking operations (connect_addr)
         let endpoint = {
-            let mut cache = self.client_endpoints.borrow_mut();
-
+            // First, try to get from cache with a short read-only borrow
+            let cache = self.client_endpoints.borrow();
             if let Some(ep) = cache.get(client_addr) {
                 // Cache hit - reuse existing endpoint
                 tracing::debug!(
@@ -75,36 +77,47 @@ impl RpcHandlerContext {
                     rpc_id,
                     cache.len()
                 );
-                Rc::clone(ep)
+                Some(Rc::clone(ep))
             } else {
-                // Cache miss - create new endpoint
+                // Cache miss - log and prepare to create
                 tracing::debug!(
                     "Endpoint cache miss (stream_id={}, rpc_id={}, cache_size={})",
                     stream_id,
                     rpc_id,
                     cache.len()
                 );
+                None
+            }
+        };
 
-                tracing::trace!("Creating endpoint for client address");
-                let worker_address = WorkerAddressInner::from(client_addr);
-                let ep = self
-                    .worker
-                    .connect_addr(&worker_address)
-                    .map_err(|e| RpcError::TransportError(format!("Failed to connect to client: {:?}", e)))?;
+        // If not in cache, create new endpoint OUTSIDE the borrow scope
+        let endpoint = if let Some(ep) = endpoint {
+            ep
+        } else {
+            // Create endpoint without holding any RefCell borrow
+            tracing::trace!("Creating endpoint for client address");
+            let worker_address = WorkerAddressInner::from(client_addr);
+            let ep = self
+                .worker
+                .connect_addr(&worker_address)
+                .map_err(|e| RpcError::TransportError(format!("Failed to connect to client: {:?}", e)))?;
 
-                // Wrap in Rc and store in cache for future reuse
-                let ep_rc = Rc::new(ep);
+            // Wrap in Rc
+            let ep_rc = Rc::new(ep);
+
+            // Insert into cache with a short-lived exclusive borrow
+            {
+                let mut cache = self.client_endpoints.borrow_mut();
                 cache.insert(client_addr.to_vec(), Rc::clone(&ep_rc));
-
                 tracing::debug!(
                     "Endpoint created and cached (stream_id={}, rpc_id={}, new_cache_size={})",
                     stream_id,
                     rpc_id,
                     cache.len()
                 );
+            } // borrow_mut is released here immediately
 
-                ep_rc
-            }
+            ep_rc
         };
 
         // Serialize header

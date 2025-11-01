@@ -123,6 +123,8 @@ case "$TEST_NAME" in
             -np ${NNODES} \
             --mca btl tcp,self \
             --mca btl_tcp_if_include eth0 \
+            -x RUST_LOG \
+            -x BENCHFS_OPERATION_TIMEOUT \
             ${IOR_BIN} \
                 -a BENCHFS \
                 --benchfs.registry ${REGISTRY_DIR} \

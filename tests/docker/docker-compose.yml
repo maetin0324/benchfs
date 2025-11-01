@@ -19,10 +19,12 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=debug
-      - UCX_TLS=tcp,sm,self
+      - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
+      - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30  # 30-second timeout for operations
     cap_add:
       - SYS_PTRACE
       - IPC_LOCK
@@ -33,7 +35,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -53,10 +55,12 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=debug
-      - UCX_TLS=tcp,sm,self
+      - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
+      - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30  # 30-second timeout for operations
     cap_add:
       - SYS_PTRACE
       - IPC_LOCK
@@ -67,7 +71,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -87,10 +91,12 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=debug
-      - UCX_TLS=tcp,sm,self
+      - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
+      - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30  # 30-second timeout for operations
     cap_add:
       - SYS_PTRACE
       - IPC_LOCK
@@ -101,7 +107,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -121,10 +127,12 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro                # Config files
     environment:
-      - RUST_LOG=debug
-      - UCX_TLS=tcp,sm,self
+      - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
+      - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30  # 30-second timeout for operations
     cap_add:
       - SYS_PTRACE
       - IPC_LOCK
@@ -135,7 +143,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 16G  # 8GiB data + 8GiB buffer for operations and page cache
+          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -155,10 +163,12 @@ services:
       - ./scripts:/scripts:ro
       - ./configs:/configs:ro
     environment:
-      - RUST_LOG=debug
-      - UCX_TLS=tcp,sm,self
+      - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
+      - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30  # 30-second timeout for operations
     depends_on:
       - server1
       - server2

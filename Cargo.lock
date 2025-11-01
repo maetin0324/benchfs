@@ -31,7 +31,7 @@ dependencies = [
 [[package]]
 name = "async-ucx"
 version = "0.1.1"
-source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#329f618d955639664a901d6dd4a9b4d86b5734eb"
+source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#7b4e2d35e69012761b882c53e64375af6a9d796c"
 dependencies = [
  "crossbeam",
  "derivative",
@@ -64,6 +64,7 @@ dependencies = [
  "mpi",
  "once_cell",
  "pluvio_runtime",
+ "pluvio_timer",
  "pluvio_ucx",
  "pluvio_uring",
  "serde",
@@ -750,7 +751,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "pluvio_runtime"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio.git?branch=main#2946e50ac8c6db42666f97723d728820606ab4bd"
+source = "git+https://github.com/maetin0324/pluvio.git?branch=main#c682e4669b5a199e00ae8102d05d9c74f6f600b5"
 dependencies = [
  "core_affinity",
  "futures",
@@ -761,9 +762,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pluvio_timer"
+version = "0.1.0"
+source = "git+https://github.com/maetin0324/pluvio.git?branch=main#c682e4669b5a199e00ae8102d05d9c74f6f600b5"
+dependencies = [
+ "futures",
+ "pluvio_runtime",
+ "tracing",
+]
+
+[[package]]
 name = "pluvio_ucx"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio.git?branch=main#2946e50ac8c6db42666f97723d728820606ab4bd"
+source = "git+https://github.com/maetin0324/pluvio.git?branch=main#c682e4669b5a199e00ae8102d05d9c74f6f600b5"
 dependencies = [
  "async-ucx",
  "pluvio_runtime",
@@ -774,7 +785,7 @@ dependencies = [
 [[package]]
 name = "pluvio_uring"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio.git?branch=main#2946e50ac8c6db42666f97723d728820606ab4bd"
+source = "git+https://github.com/maetin0324/pluvio.git?branch=main#c682e4669b5a199e00ae8102d05d9c74f6f600b5"
 dependencies = [
  "io-uring",
  "libc",
@@ -1169,7 +1180,7 @@ dependencies = [
 [[package]]
 name = "ucx1-sys"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#329f618d955639664a901d6dd4a9b4d86b5734eb"
+source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#7b4e2d35e69012761b882c53e64375af6a9d796c"
 dependencies = [
  "bindgen 0.66.1",
 ]

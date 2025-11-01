@@ -45,9 +45,6 @@ use crate::rpc::server::RpcServer;
 use pluvio_runtime::executor::Runtime;
 use std::cell::RefCell;
 use std::rc::Rc;
-use futures::{select, FutureExt};
-use futures_timer::Delay;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     /// Thread-local async runtime
@@ -217,8 +214,7 @@ where
 /// Execute an async function synchronously with operation name for debugging
 ///
 /// This is similar to [`block_on`] but includes an operation name for better
-/// debugging and timeout tracking. When a timeout occurs, the operation name
-/// is included in the error message to help identify which operation failed.
+/// debugging. The operation name is logged for tracking purposes.
 ///
 /// # Arguments
 ///
@@ -228,10 +224,6 @@ where
 /// # Returns
 ///
 /// The output of the future once it completes
-///
-/// # Panics
-///
-/// Exits the process if the operation times out
 ///
 /// # Example
 ///
@@ -260,69 +252,26 @@ where
             new_runtime_rc
         };
 
-        // Get timeout from environment or use default of 120 seconds
-        let timeout_secs = std::env::var("BENCHFS_OPERATION_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120);
-
         // Debug logging
-        tracing::debug!(
-            "Starting operation '{}' with {}s timeout",
-            operation_name,
-            timeout_secs
-        );
+        tracing::debug!("Starting operation '{}'", operation_name);
 
-        // Create a holder for the result and timeout flag
+        // Create a holder for the result
         let result_holder = Rc::new(RefCell::new(None));
         let result_holder_clone = result_holder.clone();
-        let timed_out = std::sync::Arc::new(AtomicBool::new(false));
-        let timed_out_clone = timed_out.clone();
 
-        // Create timeout future
-        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-        let op_name = operation_name.to_string();
-
-        // Combine the original future with timeout using select!
-        let combined_future = async move {
-            // Pin the future to make it work with select!
-            futures::pin_mut!(future);
-            let mut user_future = future.fuse();
-            let mut timeout_future = Delay::new(timeout_duration).fuse();
-
-            select! {
-                result = user_future => {
-                    tracing::debug!("Operation '{}' completed successfully", op_name);
-                    *result_holder_clone.borrow_mut() = Some(result);
-                },
-                _ = timeout_future => {
-                    tracing::error!(
-                        "Operation '{}' timed out after {} seconds. Aborting to prevent hang.",
-                        op_name, timeout_secs
-                    );
-                    timed_out_clone.store(true, Ordering::Relaxed);
-                    // We don't store a result on timeout
-                    // The process will exit before unwrapping
-                }
-            }
+        // Wrap the future to capture its result
+        let wrapped_future = async move {
+            let result = future.await;
+            *result_holder_clone.borrow_mut() = Some(result);
         };
 
-        rt.run(combined_future);
-
-        // Check if timeout occurred BEFORE trying to extract result
-        if timed_out.load(Ordering::Relaxed) {
-            tracing::error!("Exiting due to timeout in operation '{}'", operation_name);
-            // Clean exit without panic
-            std::process::exit(1);
-        }
+        // Execute the future
+        rt.run(wrapped_future);
 
         // Extract the result
         result_holder
             .borrow_mut()
             .take()
-            .unwrap_or_else(|| {
-                // This should not happen if the timeout logic worked correctly
-                panic!("Future for operation '{}' did not complete", operation_name)
-            })
+            .expect("Future did not complete")
     })
 }

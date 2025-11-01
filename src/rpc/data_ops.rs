@@ -246,7 +246,14 @@ impl AmRpc for ReadChunkRequest {
         let mut worker_addr_bytes = vec![0u8; header.worker_address_len as usize];
         let mut path_bytes = vec![0u8; header.path_len as usize];
 
+        tracing::debug!(
+            "ReadChunk: receiving data - worker_addr_len={}, path_len={}",
+            header.worker_address_len,
+            header.path_len
+        );
+
         if am_msg.contains_data() {
+            tracing::trace!("ReadChunk: calling recv_data_vectored...");
             if let Err(e) = am_msg
                 .recv_data_vectored(&[
                     std::io::IoSliceMut::new(&mut worker_addr_bytes),
@@ -254,10 +261,12 @@ impl AmRpc for ReadChunkRequest {
                 ])
                 .await
             {
-                tracing::error!("Failed to receive request data: {:?}", e);
+                tracing::error!("ReadChunk: failed to receive request data: {:?}", e);
                 return Err((RpcError::InvalidHeader, am_msg));
             }
+            tracing::trace!("ReadChunk: recv_data_vectored completed");
         } else {
+            tracing::error!("ReadChunk: am_msg contains no data");
             return Err((RpcError::InvalidHeader, am_msg));
         }
 
@@ -577,6 +586,14 @@ impl AmRpc for WriteChunkRequest<'_> {
                 let mut path_bytes = vec![0u8; header.path_len as usize];
                 let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
+                tracing::debug!(
+                    "WriteChunk: receiving data - worker_addr_len={}, path_len={}, data_len={}",
+                    header.worker_address_len,
+                    header.path_len,
+                    data_len
+                );
+                tracing::trace!("WriteChunk: calling recv_data_vectored (zero-copy)...");
+
                 if let Err(e) = am_msg
                     .recv_data_vectored(&[
                         std::io::IoSliceMut::new(&mut worker_addr_bytes),
@@ -585,9 +602,10 @@ impl AmRpc for WriteChunkRequest<'_> {
                     ])
                     .await
                 {
-                    tracing::error!("Failed to receive request data: {:?}", e);
+                    tracing::error!("WriteChunk: failed to receive request data (zero-copy): {:?}", e);
                     WriteChunkResponseHeader::error(-5)
                 } else {
+                    tracing::trace!("WriteChunk: recv_data_vectored completed (zero-copy)");
                     tracing::trace!(
                         "Received worker_address bytes: {:?} (len={})",
                         &worker_addr_bytes[..worker_addr_bytes.len().min(32)],
