@@ -20,6 +20,7 @@ services:
       - ./configs:/configs:ro                # Config files
     environment:
       - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - RUST_BACKTRACE=full  # Enable full backtrace for panics
       - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
       - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
@@ -35,7 +36,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
+          memory: 32G  # Reduced from 64G (queue_size reduction allows smaller memory limit)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -56,6 +57,7 @@ services:
       - ./configs:/configs:ro                # Config files
     environment:
       - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - RUST_BACKTRACE=full  # Enable full backtrace for panics
       - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
       - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
@@ -71,7 +73,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
+          memory: 32G  # Reduced from 64G (queue_size reduction allows smaller memory limit)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -92,6 +94,7 @@ services:
       - ./configs:/configs:ro                # Config files
     environment:
       - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - RUST_BACKTRACE=full  # Enable full backtrace for panics
       - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
       - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
@@ -107,7 +110,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
+          memory: 32G  # Reduced from 64G (queue_size reduction allows smaller memory limit)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -128,6 +131,7 @@ services:
       - ./configs:/configs:ro                # Config files
     environment:
       - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - RUST_BACKTRACE=full  # Enable full backtrace for panics
       - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
       - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
@@ -143,7 +147,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64G  # Support large IOR tests (32GiB total / 4 nodes = 8GiB per node + buffers)
+          memory: 32G  # Reduced from 64G (queue_size reduction allows smaller memory limit)
         reservations:
           memory: 4G
     command: /usr/sbin/sshd -D
@@ -164,6 +168,7 @@ services:
       - ./configs:/configs:ro
     environment:
       - RUST_LOG=trace  # Use trace level to see timer reactor details
+      - RUST_BACKTRACE=full  # Enable full backtrace for panics
       - UCX_TLS=tcp,self  # Disable 'sm' (shared memory) for Docker stability
       - UCX_LOG_LEVEL=info  # Enable UCX logging for debugging
       - OMPI_ALLOW_RUN_AS_ROOT=1
