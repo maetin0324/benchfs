@@ -227,6 +227,27 @@ impl RpcServer {
         Ok(())
     }
 
+    /// Register only benchmark RPC handlers (Ping-Pong, Throughput, etc.)
+    pub async fn register_bench_handlers(&self, runtime: Rc<Runtime>) -> Result<(), RpcError> {
+        use crate::rpc::bench_ops::BenchPingRequest;
+
+        tracing::info!("Registering benchmark RPC handlers...");
+
+        // Spawn BenchPing handler
+        {
+            let server = self.clone_for_handler();
+            let rt = runtime.clone();
+            runtime.spawn(async move {
+                if let Err(e) = server.listen::<BenchPingRequest, _, _>(rt).await {
+                    tracing::error!("BenchPing handler error: {:?}", e);
+                }
+            });
+        }
+
+        tracing::info!("Benchmark RPC handlers registered successfully");
+        Ok(())
+    }
+
     /// Clone the server for use in handler tasks
     /// This creates a shallow clone that shares the worker and handler context
     fn clone_for_handler(&self) -> Self {

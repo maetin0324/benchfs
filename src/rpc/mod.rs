@@ -7,6 +7,7 @@ use crate::rpc::client::RpcClient;
 use crate::rpc::handlers::RpcHandlerContext;
 
 pub mod address_registry;
+pub mod bench_ops;
 pub mod client;
 pub mod connection;
 pub mod data_ops;

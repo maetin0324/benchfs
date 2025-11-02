@@ -207,6 +207,11 @@ impl ConnectionPool {
         self.connections.borrow().len()
     }
 
+    /// Get the registry directory path
+    pub fn registry_dir(&self) -> &std::path::Path {
+        self.registry.registry_dir()
+    }
+
     /// Get all connected node addresses
     pub fn connected_nodes(&self) -> Vec<String> {
         self.connections.borrow().keys().cloned().collect()

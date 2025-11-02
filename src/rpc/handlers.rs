@@ -38,6 +38,34 @@ impl RpcHandlerContext {
         }
     }
 
+    /// Create a minimal context for benchmark (no storage/metadata)
+    pub fn new_bench(worker: Rc<Worker>) -> Self {
+        use crate::metadata::MetadataManager;
+        use crate::storage::InMemoryChunkStore;
+
+        // Create dummy metadata manager
+        let metadata_manager = Rc::new(MetadataManager::new("bench".to_string()));
+
+        // Create dummy chunk store
+        let chunk_store: Rc<dyn ChunkStore> = Rc::new(InMemoryChunkStore::new());
+
+        // Create dummy allocator (won't be used in benchmark)
+        // We need to create a minimal IoUring instance to initialize the allocator
+        // Leak the ring to keep it alive for the lifetime of the program
+        // This is acceptable for benchmark programs
+        let ring = Box::new(io_uring::IoUring::new(1).expect("Failed to create placeholder ring"));
+        let ring: &'static mut io_uring::IoUring = Box::leak(ring);
+        let allocator = pluvio_uring::allocator::FixedBufferAllocator::new(1, 4096, ring);
+
+        Self {
+            metadata_manager,
+            chunk_store,
+            allocator,
+            worker,
+            client_endpoints: RefCell::new(HashMap::new()),
+        }
+    }
+
     /// Send a response directly to the client using WorkerAddress
     /// instead of reply_ep to avoid UCX lifetime issues
     #[tracing::instrument(skip(self, client_addr, header, data), fields(
