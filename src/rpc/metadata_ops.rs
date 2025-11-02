@@ -1057,25 +1057,33 @@ impl MetadataUpdateResponseHeader {
 pub struct MetadataUpdateRequest {
     header: MetadataUpdateRequestHeader,
     path: String,
-    /// IoSlice for the path data
-    path_ioslice: UnsafeCell<IoSlice<'static>>,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlices: [worker_address, path]
+    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
 }
 
 // SAFETY: MetadataUpdateRequest is only used in single-threaded context (Pluvio runtime)
 unsafe impl Send for MetadataUpdateRequest {}
 
 impl MetadataUpdateRequest {
-    pub fn new(path: String) -> Self {
-        // SAFETY: Same as MetadataLookupRequest
-        let ioslice = unsafe {
-            let slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            IoSlice::new(slice)
+    pub fn new(path: String, worker_address: Vec<u8>) -> Self {
+        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
+        // This is safe because:
+        // 1. The buffers live as long as the MetadataUpdateRequest
+        // 2. The IoSlices are only accessed through request_data()
+        // 3. The RPC client will only use them during the RPC call
+        let ioslices = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
+            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
         };
 
         Self {
             header: MetadataUpdateRequestHeader::new(path.len()),
             path,
-            path_ioslice: UnsafeCell::new(ioslice),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslices),
         }
     }
 
@@ -1111,7 +1119,9 @@ impl AmRpc for MetadataUpdateRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        unsafe { std::slice::from_ref(&*self.path_ioslice.get()) }
+        // SAFETY: We're returning a slice containing the IoSlices we created in new()
+        // This is safe because the IoSlice lifetime is tied to self
+        unsafe { &*self.request_ioslice.get() }
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -1141,17 +1151,22 @@ impl AmRpc for MetadataUpdateRequest {
             None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
-        // Receive path data
+        // Receive WorkerAddress and path data
+        let mut worker_addr_bytes = vec![0u8; 512];
         let mut path_bytes = vec![0u8; header.path_len as usize];
+
         if am_msg.contains_data() {
-            let mut ioslices = vec![std::io::IoSliceMut::new(&mut path_bytes)];
-            if let Err(_e) = am_msg.recv_data_vectored(&mut ioslices).await {
+            if let Err(_e) = am_msg.recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
+                std::io::IoSliceMut::new(&mut path_bytes),
+            ]).await {
                 return Ok((
                     crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-2)),
                     am_msg,
                 ));
             }
         }
+
         let path_str = String::from_utf8_lossy(&path_bytes);
         let path = Path::new(path_str.as_ref());
 
@@ -1175,16 +1190,28 @@ impl AmRpc for MetadataUpdateRequest {
         // Note: Mode update would be handled here if FileMetadata supported it
 
         // Store updated metadata
-        match ctx.metadata_manager.update_file_metadata(file_meta) {
-            Ok(()) => Ok((
-                crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::success()),
-                am_msg,
-            )),
-            Err(_e) => Ok((
-                crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-5)), // EIO
-                am_msg,
-            )),
+        let response_header = match ctx.metadata_manager.update_file_metadata(file_meta) {
+            Ok(()) => MetadataUpdateResponseHeader::success(),
+            Err(_e) => MetadataUpdateResponseHeader::error(-5), // EIO
+        };
+
+        // Send response directly using WorkerAddress
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send direct response: {:?}", e);
+            return Err((e, am_msg));
         }
+
+        // Return empty response since we already sent the response directly
+        Ok((
+            crate::rpc::ServerResponse::new(response_header),
+            am_msg,
+        ))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

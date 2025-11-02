@@ -309,7 +309,10 @@ impl BenchFS {
                             Ok(client) => {
                                 use crate::rpc::metadata_ops::MetadataUpdateRequest;
                                 let request =
-                                    MetadataUpdateRequest::new(path.to_string()).with_size(0);
+                                    MetadataUpdateRequest::new(
+                                        path.to_string(),
+                                        client.worker_address().to_vec()
+                                    ).with_size(0);
                                 match request.call(&*client).await {
                                     Ok(response) if response.is_success() => {
                                         tracing::debug!("Remote truncate succeeded for {}", path);
@@ -892,8 +895,10 @@ impl BenchFS {
 
                         if let Some(Ok(client)) = client_result {
                             use crate::rpc::metadata_ops::MetadataUpdateRequest;
-                            let request = MetadataUpdateRequest::new(handle.path.clone())
-                                .with_size(file_meta.size);
+                            let request = MetadataUpdateRequest::new(
+                                handle.path.clone(),
+                                client.worker_address().to_vec()
+                            ).with_size(file_meta.size);
 
                             // Also use timeout for RPC call
                             let mut rpc_timeout = Delay::new(timeout_duration).fuse();
