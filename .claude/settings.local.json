@@ -73,7 +73,9 @@
       "Bash(BENCHFS_OPERATION_TIMEOUT=30 timeout 60 make test-ior:*)",
       "Bash(timeout 60 make:*)",
       "Bash(docker stats:*)",
-      "Bash(git log:*)"
+      "Bash(git log:*)",
+      "Bash(git describe:*)",
+      "Bash(git rev-parse:*)"
     ],
     "deny": [],
     "ask": []

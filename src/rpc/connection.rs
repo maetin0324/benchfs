@@ -66,14 +66,23 @@ impl ConnectionPool {
     /// # Returns
     /// RPC client for the specified node
     pub async fn get_or_connect(&self, node_id: &str) -> Result<Rc<RpcClient>, RpcError> {
-        // Check if connection already exists
+        // Check if connection already exists AND is still valid
         {
             let connections = self.connections.borrow();
             if let Some(client) = connections.get(node_id) {
-                tracing::debug!("Reusing existing connection to {}", node_id);
-                return Ok(client.clone());
+                // Check if the endpoint is still open
+                if !client.connection().endpoint().is_closed() {
+                    tracing::debug!("Reusing existing connection to {}", node_id);
+                    return Ok(client.clone());
+                } else {
+                    tracing::warn!("Existing connection to {} is closed, will reconnect", node_id);
+                    // Drop the borrow before removing the connection
+                }
             }
         }
+
+        // Remove closed connection if it exists
+        self.connections.borrow_mut().remove(node_id);
 
         // Lookup worker address
         tracing::info!(

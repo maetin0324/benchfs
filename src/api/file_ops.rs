@@ -1,10 +1,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::Duration;
 /// File operations for BenchFS
 ///
 /// This module provides POSIX-like file operations that work with
 /// the distributed metadata and data storage.
 use std::rc::Rc;
+
+use futures::FutureExt;
+use futures_timer::Delay;
 
 use crate::api::types::{ApiError, ApiResult, FileHandle, OpenFlags};
 use crate::cache::{ChunkCache, ChunkId};
@@ -866,38 +870,75 @@ impl BenchFS {
                 if let Ok(file_meta) = self.metadata_manager.get_file_metadata(path_ref) {
                     // Sync to remote metadata server
                     if let Some(pool) = &self.connection_pool {
-                        match pool.get_or_connect(&metadata_node).await {
-                            Ok(client) => {
-                                use crate::rpc::metadata_ops::MetadataUpdateRequest;
-                                let request = MetadataUpdateRequest::new(handle.path.clone())
-                                    .with_size(file_meta.size);
+                        // Use timeout to prevent hanging on close
+                        let timeout_duration = Duration::from_secs(5);
+                        let mut timeout = Delay::new(timeout_duration).fuse();
 
-                                match request.call(&*client).await {
-                                    Ok(response) if response.is_success() => {
-                                        tracing::debug!(
-                                            "Synced metadata on close: {} (size: {})",
-                                            handle.path,
-                                            file_meta.size
-                                        );
-                                    }
-                                    Ok(response) => {
-                                        tracing::warn!(
-                                            "Failed to sync metadata on close: {} (status: {})",
-                                            handle.path,
-                                            response.status
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Metadata sync RPC error on close: {:?}", e);
-                                    }
+                        // Try to connect with timeout
+                        let connect_future = pool.get_or_connect(&metadata_node).fuse();
+                        futures::pin_mut!(connect_future);
+
+                        let client_result = futures::select! {
+                            result = connect_future => Some(result),
+                            _ = timeout => {
+                                tracing::warn!(
+                                    "Connection timeout for metadata sync on close: {} (timeout: {:?})",
+                                    handle.path,
+                                    timeout_duration
+                                );
+                                None
+                            }
+                        };
+
+                        if let Some(Ok(client)) = client_result {
+                            use crate::rpc::metadata_ops::MetadataUpdateRequest;
+                            let request = MetadataUpdateRequest::new(handle.path.clone())
+                                .with_size(file_meta.size);
+
+                            // Also use timeout for RPC call
+                            let mut rpc_timeout = Delay::new(timeout_duration).fuse();
+                            let rpc_future = request.call(&*client).fuse();
+                            futures::pin_mut!(rpc_future);
+
+                            let rpc_result = futures::select! {
+                                result = rpc_future => Some(result),
+                                _ = rpc_timeout => {
+                                    tracing::warn!(
+                                        "Metadata sync RPC timeout on close: {} (timeout: {:?})",
+                                        handle.path,
+                                        timeout_duration
+                                    );
+                                    None
+                                }
+                            };
+
+                            match rpc_result {
+                                Some(Ok(response)) if response.is_success() => {
+                                    tracing::debug!(
+                                        "Synced metadata on close: {} (size: {})",
+                                        handle.path,
+                                        file_meta.size
+                                    );
+                                }
+                                Some(Ok(response)) => {
+                                    tracing::warn!(
+                                        "Failed to sync metadata on close: {} (status: {})",
+                                        handle.path,
+                                        response.status
+                                    );
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!("Metadata sync RPC error on close: {:?}", e);
+                                }
+                                None => {
+                                    // Already logged timeout
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to connect for metadata sync on close: {:?}",
-                                    e
-                                );
-                            }
+                        } else if let Some(Err(e)) = client_result {
+                            tracing::warn!(
+                                "Failed to connect for metadata sync on close: {:?}",
+                                e
+                            );
                         }
                     }
                 }

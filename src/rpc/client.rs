@@ -38,6 +38,11 @@ impl RpcClient {
         &self.worker_address
     }
 
+    /// Get the underlying connection
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Initialize the reply stream for receiving RPC responses
     /// This should be called before executing any RPCs that expect replies
     ///
