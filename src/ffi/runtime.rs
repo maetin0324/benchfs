@@ -275,3 +275,39 @@ where
             .expect("Future did not complete")
     })
 }
+
+/// Clean up thread-local runtime and context
+///
+/// This function clears all thread-local storage used by BenchFS:
+/// - Runtime instance
+/// - BenchFS context
+/// - RPC server (if in server mode)
+/// - Connection pool (if in distributed mode)
+///
+/// This should be called from `benchfs_finalize()` to ensure proper cleanup.
+///
+/// # Note
+///
+/// This is a best-effort cleanup. The actual resources will be cleaned up
+/// when the Rc references are dropped.
+pub fn cleanup_runtime() {
+    tracing::debug!("Cleaning up thread-local runtime and context");
+
+    BENCHFS_CTX.with(|ctx| {
+        *ctx.borrow_mut() = None;
+    });
+
+    RPC_SERVER.with(|srv| {
+        *srv.borrow_mut() = None;
+    });
+
+    CONNECTION_POOL.with(|pool| {
+        *pool.borrow_mut() = None;
+    });
+
+    LOCAL_RUNTIME.with(|rt| {
+        *rt.borrow_mut() = None;
+    });
+
+    tracing::debug!("Thread-local cleanup complete");
+}

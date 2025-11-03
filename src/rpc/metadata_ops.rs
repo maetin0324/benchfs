@@ -15,6 +15,7 @@ pub const RPC_METADATA_CREATE_FILE: RpcId = 21;
 pub const RPC_METADATA_CREATE_DIR: RpcId = 22;
 pub const RPC_METADATA_DELETE: RpcId = 23;
 pub const RPC_METADATA_UPDATE: RpcId = 24;
+pub const RPC_SHUTDOWN: RpcId = 25;
 
 // Maximum path length for RPC messages
 const _MAX_PATH_LEN: usize = 256;
@@ -1361,5 +1362,189 @@ mod tests {
         let resp = dir_metadata_to_lookup_response(&dir_meta);
         assert!(resp.is_directory());
         // inode is dummy value in path-based KV design
+    }
+}
+
+// ============================================================================
+// Shutdown RPC (for graceful server termination)
+// ============================================================================
+
+const SHUTDOWN_MAGIC: u64 = 0xDEADBEEF_CAFEBABE;
+
+/// Shutdown request header
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct ShutdownRequestHeader {
+    /// Magic number to verify request integrity
+    pub magic: u64,
+}
+
+impl ShutdownRequestHeader {
+    pub fn new() -> Self {
+        Self {
+            magic: SHUTDOWN_MAGIC,
+        }
+    }
+}
+
+/// Shutdown response header
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct ShutdownResponseHeader {
+    /// 1 if shutdown accepted, 0 otherwise
+    pub success: u64,
+}
+
+impl ShutdownResponseHeader {
+    pub fn new(success: bool) -> Self {
+        Self {
+            success: if success { 1 } else { 0 },
+        }
+    }
+}
+
+/// Shutdown RPC request
+pub struct ShutdownRequest {
+    header: ShutdownRequestHeader,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlice for worker_address
+    request_ioslice: UnsafeCell<IoSlice<'static>>,
+}
+
+// SAFETY: ShutdownRequest is only used in single-threaded context (Pluvio runtime)
+unsafe impl Send for ShutdownRequest {}
+
+impl ShutdownRequest {
+    pub fn new(worker_address: Vec<u8>) -> Self {
+        // SAFETY: We're creating 'static IoSlice by transmuting the lifetime.
+        // This is safe because:
+        // 1. The buffer lives as long as the ShutdownRequest
+        // 2. The IoSlice is only accessed through request_data()
+        // 3. The RPC client will only use it during the RPC call
+        let ioslice = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            IoSlice::new(addr_slice)
+        };
+
+        Self {
+            header: ShutdownRequestHeader::new(),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslice),
+        }
+    }
+}
+
+impl AmRpc for ShutdownRequest {
+    type RequestHeader = ShutdownRequestHeader;
+    type ResponseHeader = ShutdownResponseHeader;
+
+    fn rpc_id() -> RpcId {
+        RPC_SHUTDOWN
+    }
+
+    fn call_type(&self) -> AmRpcCallType {
+        AmRpcCallType::None
+    }
+
+    fn request_header(&self) -> &Self::RequestHeader {
+        &self.header
+    }
+
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        // SAFETY: We're returning a slice containing the IoSlice we created in new()
+        // This is safe because the IoSlice lifetime is tied to self
+        unsafe { std::slice::from_ref(&*self.request_ioslice.get()) }
+    }
+
+    async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
+        client.execute(self).await
+    }
+
+    async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
+        Err(RpcError::HandlerError(
+            "Shutdown requires a reply".to_string(),
+        ))
+    }
+
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<ShutdownRequestHeader>())
+            .and_then(|bytes| {
+                ShutdownRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        // Verify magic number
+        if header.magic != SHUTDOWN_MAGIC {
+            tracing::warn!("Invalid shutdown magic: {:#x}", header.magic);
+            return Err((RpcError::InvalidHeader, am_msg));
+        }
+
+        // Receive WorkerAddress
+        let mut worker_addr_bytes = vec![0u8; 512];
+
+        if am_msg.contains_data() {
+            if let Err(_e) = am_msg.recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
+            ]).await {
+                return Err((RpcError::TransportError("Failed to receive worker address".to_string()), am_msg));
+            }
+        }
+
+        tracing::info!("Received shutdown request");
+
+        // Set shutdown flag
+        ctx.set_shutdown_flag();
+
+        let response_header = ShutdownResponseHeader::new(true);
+
+        // Send response directly using WorkerAddress
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send direct response: {:?}", e);
+            return Err((e, am_msg));
+        }
+
+        // Return empty response since we already sent the response directly
+        Ok((
+            crate::rpc::ServerResponse::new(response_header),
+            am_msg,
+        ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let _ = error;
+        ShutdownResponseHeader::new(false)
     }
 }

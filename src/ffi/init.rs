@@ -660,11 +660,29 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
 
     tracing::info!("benchfs_finalize: cleaning up resources");
 
+    // NOTE: We do NOT send shutdown RPCs from benchfs_finalize() because:
+    //
+    // 1. IOR Benchmark:
+    //    - Servers and clients are separate processes
+    //    - IOR clients call benchfs_finalize() when they finish
+    //    - Servers are terminated by the job script with 'kill' command
+    //    - Sending shutdown RPCs from IOR clients would interfere with servers
+    //
+    // 2. RPC Benchmark:
+    //    - Client explicitly sends shutdown RPCs in run_client() (benchfs_rpc_bench.rs:280)
+    //    - benchfs_finalize() is not called (not using C FFI)
+    //
+    // Therefore, benchfs_finalize() should only clean up local resources,
+    // not send shutdown RPCs to other nodes.
+
     // Convert back to Rc<BenchFS> and drop it
     // This will automatically trigger Drop implementations for all components
     unsafe {
         let _ = Box::from_raw(ctx as *mut Rc<BenchFS>);
     }
+
+    // Clean up thread-local storage
+    super::runtime::cleanup_runtime();
 
     tracing::info!("BenchFS finalized");
 }

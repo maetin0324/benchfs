@@ -232,6 +232,18 @@ impl RpcServer {
             });
         }
 
+        // Spawn Shutdown handler
+        {
+            let server = self.clone_for_handler();
+            let rt = runtime.clone();
+            runtime.spawn(async move {
+                use crate::rpc::metadata_ops::ShutdownRequest;
+                if let Err(e) = server.listen::<ShutdownRequest, _, _>(rt).await {
+                    tracing::error!("Shutdown handler error: {:?}", e);
+                }
+            });
+        }
+
         tracing::info!("All RPC handlers registered successfully");
         Ok(())
     }
