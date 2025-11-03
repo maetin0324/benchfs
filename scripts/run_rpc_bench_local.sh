@@ -18,6 +18,9 @@ NPROCS="${NPROCS:-4}"
 # Binary path
 BENCHFS_BIN="${BENCHFS_BIN:-./target/debug/benchfs_rpc_bench}"
 
+# JSON output path (optional)
+JSON_OUTPUT="${JSON_OUTPUT:-}"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,6 +36,9 @@ echo "  MPI Processes:    $NPROCS (1 client + $((NPROCS - 1)) servers)"
 echo "  Registry Dir:     $REGISTRY_DIR"
 echo "  Ping Iterations:  $PING_ITERATIONS"
 echo "  Binary:           $BENCHFS_BIN"
+if [ -n "$JSON_OUTPUT" ]; then
+    echo "  JSON Output:      $JSON_OUTPUT"
+fi
 echo ""
 
 # Check if binary exists
@@ -52,12 +58,24 @@ mkdir -p "$REGISTRY_DIR"
 echo -e "${GREEN}Running RPC benchmark...${NC}"
 echo ""
 
-mpirun -np $NPROCS \
-    "$BENCHFS_BIN" \
-    "$REGISTRY_DIR" \
-    --ping-iterations $PING_ITERATIONS
+# Build command with optional JSON output
+RPC_CMD="mpirun -np $NPROCS \"$BENCHFS_BIN\" \"$REGISTRY_DIR\" --ping-iterations $PING_ITERATIONS"
+if [ -n "$JSON_OUTPUT" ]; then
+    RPC_CMD="$RPC_CMD --json-output \"$JSON_OUTPUT\""
+fi
+
+eval $RPC_CMD
 
 echo ""
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}RPC Benchmark Complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
+
+# Display JSON output path if used
+if [ -n "$JSON_OUTPUT" ]; then
+    if [ -f "$JSON_OUTPUT" ]; then
+        echo -e "${GREEN}JSON results written to: $JSON_OUTPUT${NC}"
+    else
+        echo -e "${RED}WARNING: JSON output file not found: $JSON_OUTPUT${NC}"
+    fi
+fi

@@ -25,16 +25,45 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LatencyStats {
+    min_us: f64,
+    avg_us: f64,
+    p50_us: f64,
+    p99_us: f64,
+    max_us: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ServerResult {
+    server_node: String,
+    operations: usize,
+    duration_secs: f64,
+    iops: f64,
+    miops: f64,
+    latency: LatencyStats,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BenchmarkResults {
+    timestamp: String,
+    total_servers: usize,
+    ping_iterations: usize,
+    server_results: Vec<ServerResult>,
+}
+
 struct BenchmarkConfig {
     ping_iterations: usize,
-    output_file: Option<String>,
+    json_output: Option<String>,
 }
 
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
             ping_iterations: 10000,
-            output_file: None,
+            json_output: None,
         }
     }
 }
@@ -49,8 +78,8 @@ fn parse_args(args: &[String]) -> BenchmarkConfig {
                 config.ping_iterations = args[i + 1].parse().unwrap_or(10000);
                 i += 2;
             }
-            "--output" if i + 1 < args.len() => {
-                config.output_file = Some(args[i + 1].clone());
+            "--json-output" if i + 1 < args.len() => {
+                config.json_output = Some(args[i + 1].clone());
                 i += 2;
             }
             _ => {
@@ -216,11 +245,35 @@ fn run_client(
             .map(|rank| format!("node_{}", rank))
             .collect();
 
-        run_ping_benchmark(
+        let bench_results = run_ping_benchmark(
             &connection_pool,
             &server_nodes,
             config.ping_iterations,
         ).await;
+
+        // Write JSON output if requested
+        if let Some(json_path) = &config.json_output {
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let results = BenchmarkResults {
+                timestamp,
+                total_servers: server_nodes.len(),
+                ping_iterations: config.ping_iterations,
+                server_results: bench_results,
+            };
+
+            match serde_json::to_string_pretty(&results) {
+                Ok(json_str) => {
+                    if let Err(e) = std::fs::write(json_path, json_str) {
+                        tracing::error!("Failed to write JSON output to {}: {:?}", json_path, e);
+                    } else {
+                        tracing::info!("JSON results written to {}", json_path);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to serialize results to JSON: {:?}", e);
+                }
+            }
+        }
 
         // Send shutdown RPC to all servers
         tracing::info!("Sending shutdown requests to all servers...");
@@ -273,7 +326,8 @@ async fn run_ping_benchmark(
     pool: &ConnectionPool,
     server_nodes: &[String],
     iterations: usize,
-) {
+) -> Vec<ServerResult> {
+    let mut results = Vec::new();
     tracing::info!("========================================== ");
     tracing::info!("Ping-Pong Benchmark");
     tracing::info!("==========================================");
@@ -314,6 +368,7 @@ async fn run_ping_benchmark(
         }
 
         // Actual benchmark
+        let benchmark_start = Instant::now();
         for seq in 0..iterations {
             let timestamp_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -342,6 +397,7 @@ async fn run_ping_benchmark(
                 tracing::debug!("Completed {} / {} pings", seq + 1, iterations);
             }
         }
+        let benchmark_duration = benchmark_start.elapsed();
 
         // Calculate statistics
         if !latencies.is_empty() {
@@ -352,18 +408,46 @@ async fn run_ping_benchmark(
             let p50 = latencies[latencies.len() / 2];
             let p99 = latencies[latencies.len() * 99 / 100];
 
+            // Calculate IOPS (operations per second)
+            let total_ops = latencies.len() as f64;
+            let duration_secs = benchmark_duration.as_secs_f64();
+            let iops = total_ops / duration_secs;
+            let miops = iops / 1_000_000.0;
+
             tracing::info!("Results for {}:", server_node);
+            tracing::info!("  Operations:   {}", latencies.len());
+            tracing::info!("  Duration:     {:.3}s", duration_secs);
+            tracing::info!("  IOPS:         {:.0}", iops);
+            tracing::info!("  MIOPS:        {:.3}", miops);
             tracing::info!("  Min latency:  {:?}", min);
             tracing::info!("  Avg latency:  {:?}", avg);
             tracing::info!("  P50 latency:  {:?}", p50);
             tracing::info!("  P99 latency:  {:?}", p99);
             tracing::info!("  Max latency:  {:?}", max);
+
+            // Store results for JSON output
+            results.push(ServerResult {
+                server_node: server_node.clone(),
+                operations: latencies.len(),
+                duration_secs,
+                iops,
+                miops,
+                latency: LatencyStats {
+                    min_us: min.as_micros() as f64,
+                    avg_us: avg.as_micros() as f64,
+                    p50_us: p50.as_micros() as f64,
+                    p99_us: p99.as_micros() as f64,
+                    max_us: max.as_micros() as f64,
+                },
+            });
         }
     }
 
     tracing::info!("==========================================");
     tracing::info!("Ping-Pong Benchmark Complete");
     tracing::info!("==========================================");
+
+    results
 }
 
 async fn send_shutdown_to_servers(

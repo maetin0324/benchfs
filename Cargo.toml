@@ -25,7 +25,9 @@ lru = "0.12"
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.9.8"
+chrono = "0.4"
 
 # Logging
 tracing = "0.1.41"
