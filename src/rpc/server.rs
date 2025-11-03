@@ -69,6 +69,15 @@ impl RpcServer {
         let ctx = self.handler_context.clone();
 
         loop {
+            // Check shutdown flag before waiting for next message
+            if ctx.should_shutdown() {
+                tracing::info!(
+                    "RpcServer: Handler terminating due to shutdown for RPC ID {}",
+                    Rpc::rpc_id()
+                );
+                break;
+            }
+
             tracing::debug!("RpcServer: Waiting for message on RPC ID {}", Rpc::rpc_id());
             let msg = stream.wait_msg().await;
             if msg.is_none() {
@@ -229,7 +238,7 @@ impl RpcServer {
 
     /// Register only benchmark RPC handlers (Ping-Pong, Throughput, etc.)
     pub async fn register_bench_handlers(&self, runtime: Rc<Runtime>) -> Result<(), RpcError> {
-        use crate::rpc::bench_ops::BenchPingRequest;
+        use crate::rpc::bench_ops::{BenchPingRequest, BenchShutdownRequest};
 
         tracing::info!("Registering benchmark RPC handlers...");
 
@@ -240,6 +249,17 @@ impl RpcServer {
             runtime.spawn(async move {
                 if let Err(e) = server.listen::<BenchPingRequest, _, _>(rt).await {
                     tracing::error!("BenchPing handler error: {:?}", e);
+                }
+            });
+        }
+
+        // Spawn BenchShutdown handler
+        {
+            let server = self.clone_for_handler();
+            let rt = runtime.clone();
+            runtime.spawn(async move {
+                if let Err(e) = server.listen::<BenchShutdownRequest, _, _>(rt).await {
+                    tracing::error!("BenchShutdown handler error: {:?}", e);
                 }
             });
         }

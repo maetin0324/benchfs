@@ -10,6 +10,7 @@ use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId};
 /// RPC IDs for benchmark operations
 pub const RPC_BENCH_PING: RpcId = 30;
 pub const RPC_BENCH_THROUGHPUT: RpcId = 31;
+pub const RPC_BENCH_SHUTDOWN: RpcId = 32;
 
 // ============================================================================
 // Ping-Pong RPC (for latency measurement)
@@ -196,5 +197,189 @@ impl AmRpc for BenchPingRequest {
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
         let _ = error;
         BenchPingResponseHeader::new(0, 0)
+    }
+}
+
+// ============================================================================
+// Shutdown RPC (for graceful server termination)
+// ============================================================================
+
+const SHUTDOWN_MAGIC: u64 = 0xDEADBEEF_CAFEBABE;
+
+/// Shutdown request header
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct BenchShutdownRequestHeader {
+    /// Magic number to verify request integrity
+    pub magic: u64,
+}
+
+impl BenchShutdownRequestHeader {
+    pub fn new() -> Self {
+        Self {
+            magic: SHUTDOWN_MAGIC,
+        }
+    }
+}
+
+/// Shutdown response header
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct BenchShutdownResponseHeader {
+    /// 1 if shutdown accepted, 0 otherwise
+    pub success: u64,
+}
+
+impl BenchShutdownResponseHeader {
+    pub fn new(success: bool) -> Self {
+        Self {
+            success: if success { 1 } else { 0 },
+        }
+    }
+}
+
+/// Shutdown RPC request
+pub struct BenchShutdownRequest {
+    header: BenchShutdownRequestHeader,
+    /// Client's WorkerAddress for direct response
+    worker_address: Vec<u8>,
+    /// IoSlice for worker_address
+    request_ioslice: UnsafeCell<IoSlice<'static>>,
+}
+
+// SAFETY: BenchShutdownRequest is only used in single-threaded context (Pluvio runtime)
+unsafe impl Send for BenchShutdownRequest {}
+
+impl BenchShutdownRequest {
+    pub fn new(worker_address: Vec<u8>) -> Self {
+        // SAFETY: We're creating 'static IoSlice by transmuting the lifetime.
+        // This is safe because:
+        // 1. The buffer lives as long as the BenchShutdownRequest
+        // 2. The IoSlice is only accessed through request_data()
+        // 3. The RPC client will only use it during the RPC call
+        let ioslice = unsafe {
+            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
+            IoSlice::new(addr_slice)
+        };
+
+        Self {
+            header: BenchShutdownRequestHeader::new(),
+            worker_address,
+            request_ioslice: UnsafeCell::new(ioslice),
+        }
+    }
+}
+
+impl AmRpc for BenchShutdownRequest {
+    type RequestHeader = BenchShutdownRequestHeader;
+    type ResponseHeader = BenchShutdownResponseHeader;
+
+    fn rpc_id() -> RpcId {
+        RPC_BENCH_SHUTDOWN
+    }
+
+    fn call_type(&self) -> AmRpcCallType {
+        AmRpcCallType::None
+    }
+
+    fn request_header(&self) -> &Self::RequestHeader {
+        &self.header
+    }
+
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        // SAFETY: We're returning a slice containing the IoSlice we created in new()
+        // This is safe because the IoSlice lifetime is tied to self
+        unsafe { std::slice::from_ref(&*self.request_ioslice.get()) }
+    }
+
+    async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
+        client.execute(self).await
+    }
+
+    async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
+        Err(RpcError::HandlerError(
+            "BenchShutdown requires a reply".to_string(),
+        ))
+    }
+
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Parse request header
+        let header = match am_msg
+            .header()
+            .get(..std::mem::size_of::<BenchShutdownRequestHeader>())
+            .and_then(|bytes| {
+                BenchShutdownRequestHeader::read_from_prefix(bytes)
+                    .ok()
+                    .map(|(h, _)| h.clone())
+            }) {
+            Some(h) => h,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
+        };
+
+        // Verify magic number
+        if header.magic != SHUTDOWN_MAGIC {
+            tracing::warn!("Invalid shutdown magic: {:#x}", header.magic);
+            return Err((RpcError::InvalidHeader, am_msg));
+        }
+
+        // Receive WorkerAddress
+        let mut worker_addr_bytes = vec![0u8; 512];
+
+        if am_msg.contains_data() {
+            if let Err(_e) = am_msg.recv_data_vectored(&[
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
+            ]).await {
+                return Err((RpcError::TransportError("Failed to receive worker address".to_string()), am_msg));
+            }
+        }
+
+        tracing::info!("Received shutdown request");
+
+        // Set shutdown flag
+        ctx.set_shutdown_flag();
+
+        let response_header = BenchShutdownResponseHeader::new(true);
+
+        // Send response directly using WorkerAddress
+        if let Err(e) = ctx.send_response_direct(
+            &worker_addr_bytes,
+            Self::reply_stream_id(),
+            Self::rpc_id(),
+            &response_header,
+            None,
+        ).await {
+            tracing::error!("Failed to send direct response: {:?}", e);
+            return Err((e, am_msg));
+        }
+
+        // Return empty response since we already sent the response directly
+        Ok((
+            crate::rpc::ServerResponse::new(response_header),
+            am_msg,
+        ))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let _ = error;
+        BenchShutdownResponseHeader::new(false)
     }
 }

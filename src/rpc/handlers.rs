@@ -20,6 +20,8 @@ pub struct RpcHandlerContext {
     /// Endpoint cache for reusing connections to clients
     /// Key: client WorkerAddress bytes, Value: Rc<Endpoint>
     client_endpoints: RefCell<HashMap<Vec<u8>, Rc<pluvio_ucx::endpoint::Endpoint>>>,
+    /// Shutdown flag for graceful termination
+    shutdown_flag: RefCell<bool>,
 }
 
 impl RpcHandlerContext {
@@ -35,6 +37,7 @@ impl RpcHandlerContext {
             allocator,
             worker,
             client_endpoints: RefCell::new(HashMap::new()),
+            shutdown_flag: RefCell::new(false),
         }
     }
 
@@ -63,7 +66,19 @@ impl RpcHandlerContext {
             allocator,
             worker,
             client_endpoints: RefCell::new(HashMap::new()),
+            shutdown_flag: RefCell::new(false),
         }
+    }
+
+    /// Set the shutdown flag to signal graceful termination
+    pub fn set_shutdown_flag(&self) {
+        *self.shutdown_flag.borrow_mut() = true;
+        tracing::info!("Shutdown flag set");
+    }
+
+    /// Check if shutdown has been requested
+    pub fn should_shutdown(&self) -> bool {
+        *self.shutdown_flag.borrow()
     }
 
     /// Send a response directly to the client using WorkerAddress

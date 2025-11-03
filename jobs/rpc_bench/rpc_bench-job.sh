@@ -152,7 +152,9 @@ for runid in 1; do
 done
 
 echo ""
-echo "=========================================="
+echo "=========================================
+
+"
 echo "All RPC Benchmark Runs Complete"
 echo "=========================================="
 echo "Results saved to: ${RESULTS_DIR}"

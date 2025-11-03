@@ -183,11 +183,8 @@ fn run_client(
     runtime_clone.run(async move {
         tracing::info!("Client starting...");
 
-        // Register handlers
-        if let Err(e) = rpc_server.register_bench_handlers(runtime.clone()).await {
-            tracing::error!("Failed to register handlers: {:?}", e);
-            return;
-        }
+        // Note: Client does not need to register handlers as it only sends requests,
+        // not receives them. This avoids having idle handler tasks that need cleanup.
 
         // Register self in connection pool
         if let Err(e) = connection_pool.register_self(&node_id) {
@@ -225,6 +222,10 @@ fn run_client(
             config.ping_iterations,
         ).await;
 
+        // Send shutdown RPC to all servers
+        tracing::info!("Sending shutdown requests to all servers...");
+        send_shutdown_to_servers(&connection_pool, &server_nodes).await;
+
         tracing::info!("Client finished");
     });
 }
@@ -253,10 +254,18 @@ fn run_server(
 
         tracing::info!("Server ready and waiting for requests...");
 
-        // Server loop - just keep running to handle RPCs
+        // Server loop - keep running until shutdown is requested
         loop {
-            pluvio_timer::sleep(Duration::from_secs(1)).await;
+            // Check shutdown flag
+            if rpc_server.handler_context().should_shutdown() {
+                tracing::info!("Shutdown requested, exiting server loop...");
+                break;
+            }
+
+            pluvio_timer::sleep(Duration::from_millis(100)).await;
         }
+
+        tracing::info!("Server shutting down gracefully");
     });
 }
 
@@ -355,4 +364,68 @@ async fn run_ping_benchmark(
     tracing::info!("==========================================");
     tracing::info!("Ping-Pong Benchmark Complete");
     tracing::info!("==========================================");
+}
+
+async fn send_shutdown_to_servers(
+    pool: &ConnectionPool,
+    server_nodes: &[String],
+) {
+    use benchfs::rpc::bench_ops::{BenchShutdownRequest, BenchPingRequest};
+    use benchfs::rpc::AmRpc;
+
+    tracing::info!("Sending shutdown to {} servers", server_nodes.len());
+
+    for server_node in server_nodes {
+        tracing::info!("Sending shutdown to {}", server_node);
+
+        // Connect to server
+        let client = match pool.get_or_connect(server_node).await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!("Failed to connect to {} for shutdown: {:?}", server_node, e);
+                continue;
+            }
+        };
+
+        // Send shutdown request
+        let request = BenchShutdownRequest::new(client.worker_address().to_vec());
+
+        match request.call(&*client).await {
+            Ok(response) => {
+                if response.success == 1 {
+                    tracing::info!("Server {} acknowledged shutdown", server_node);
+                } else {
+                    tracing::warn!("Server {} rejected shutdown", server_node);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to send shutdown to {}: {:?}", server_node, e);
+            }
+        }
+    }
+
+    // Give servers time to process shutdown
+    pluvio_timer::sleep(Duration::from_millis(100)).await;
+
+    // Send wake-up pings to unblock BenchPing handlers waiting on wait_msg()
+    // This allows them to check the shutdown flag and exit gracefully
+    tracing::debug!("Sending wake-up pings to unblock handlers...");
+    for server_node in server_nodes {
+        if let Ok(client) = pool.get_or_connect(server_node).await {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+
+            let wake_up_ping = BenchPingRequest::new(0, timestamp, client.worker_address().to_vec());
+
+            // Send ping but ignore response (server is shutting down)
+            let _ = wake_up_ping.call(&*client).await;
+        }
+    }
+
+    // Give handlers time to wake up and check shutdown flag
+    pluvio_timer::sleep(Duration::from_millis(200)).await;
+
+    tracing::info!("Shutdown requests sent to all servers");
 }
