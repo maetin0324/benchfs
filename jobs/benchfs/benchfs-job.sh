@@ -143,34 +143,35 @@ export OMPI_MCA_mpi_show_handle_leaks=0
 # SOLUTION: Using TCP-only transport for stability, with alternative configs for optimization
 #
 # CURRENT: TCP-only mode (most stable, works across all environments)
-cmd_mpirun_common=(
-  mpirun
-  "${nqsii_mpiopts_array[@]}"
-  --mca pml ob1                           # Use standard ob1 PML
-  --mca btl tcp,vader,self                # TCP + shared memory + loopback
-  --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
-  -x PATH
-  -x LD_LIBRARY_PATH
-  -x UCX_TLS
-  -x UCX_RNDV_THRESH                      # Propagate Rendezvous threshold
-  -x UCX_LOG_LEVEL                        # Suppress verbose UCX debug logs
-)
-
-# ALTERNATIVE 1: UCX with automatic transport detection (try after TCP works)
 # cmd_mpirun_common=(
 #   mpirun
 #   "${nqsii_mpiopts_array[@]}"
-#   --mca pml ucx                         # UCX for MPI communication
-#   --mca btl self                        # Minimal BTL when using UCX
-#   --mca osc ucx                          # OSC also uses UCX
-#   -x "UCX_TLS=all"                      # Auto-detect available transports
-#   -x "UCX_NET_DEVICES=all"              # Auto-detect available devices
-#   -x "UCX_RC_TIMEOUT=10s"               # Timeout to prevent hangs
-#   -x "UCX_RC_RETRY_COUNT=7"             # Retry count
-#   -x "UCX_LOG_LEVEL=info"               # Info level for debugging
+#   --mca pml ob1                           # Use standard ob1 PML
+#   --mca btl tcp,vader,self                # TCP + shared memory + loopback
+#   --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
 #   -x PATH
 #   -x LD_LIBRARY_PATH
+#   -x UCX_TLS
+#   -x UCX_RNDV_THRESH                      # Propagate Rendezvous threshold
+#   -x UCX_LOG_LEVEL                        # Suppress verbose UCX debug logs
 # )
+
+# ALTERNATIVE 1: UCX with automatic transport detection (try after TCP works)
+cmd_mpirun_common=(
+  mpirun
+  "${nqsii_mpiopts_array[@]}"
+  --mca pml ucx                         # UCX for MPI communication
+  --mca btl self                        # Minimal BTL when using UCX
+  --mca osc ucx                          # OSC also uses UCX
+  -x "UCX_TLS=all"                      # Auto-detect available transports
+  -x "UCX_NET_DEVICES=all"              # Auto-detect available devices
+  -x "UCX_RC_TIMEOUT=10s"               # Timeout to prevent hangs
+  -x "UCX_RC_RETRY_COUNT=7"             # Retry count
+  -x UCX_LOG_LEVEL                      # Suppress verbose UCX debug logs
+  -x UCX_RNDV_THRESH                  # Propagate Rendezvous threshold
+  -x PATH
+  -x LD_LIBRARY_PATH
+)
 
 # ALTERNATIVE 2: UCX with explicit InfiniBand (only if IB is confirmed working)
 # cmd_mpirun_common=(
