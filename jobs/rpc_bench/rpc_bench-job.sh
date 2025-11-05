@@ -116,7 +116,7 @@ run_rpc_benchmark() {
     "${BENCHFS_PREFIX}/benchfs_rpc_bench"
     "${BENCHFS_REGISTRY_DIR}"
     --ping-iterations "${PING_ITERATIONS}"
-    --output "${json_file}"
+    --json-output "${json_file}"
   )
 
   echo "Command: ${mpirun_cmd[*]}"

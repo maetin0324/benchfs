@@ -5,9 +5,9 @@ source "${SCRIPT_DIR}/common.sh"
 TIMESTAMP="$(timestamp)"
 
 # default params
-: ${ELAPSTIM_REQ:="0:30:00"}
+: ${ELAPSTIM_REQ:="2:00:00"}
 : ${LABEL:=default}
-: ${PING_ITERATIONS:=10000}
+: ${PING_ITERATIONS:=1000000}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -30,8 +30,9 @@ mkdir -p "${OUTPUT_DIR}"
 cd "${OUTPUT_DIR}"
 
 nnodes_list=(
-  4
-  # 8 16 32
+  # 4
+  # 4 8 16 32
+  32 64
 )
 niter=1
 
@@ -49,7 +50,8 @@ for nnodes in "${nnodes_list[@]}"; do
       cmd_qsub=(
         qsub
         -A NBBG
-        -q gen_S
+        # -q gen_S
+        -q gen_M
         -l elapstim_req="${ELAPSTIM_REQ}"
         -T openmpi
         -v NQSV_MPI_VER="${NQSV_MPI_VER}"

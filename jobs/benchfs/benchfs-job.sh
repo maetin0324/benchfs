@@ -35,6 +35,11 @@ BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
+UCX_LOG_LEVEL="DEBUG"
+UCX_TLS="tcp,sm,self"
+
+export UCX_LOG_LEVEL
+export UCX_TLS
 
 # Calculate project root from SCRIPT_DIR and set LD_LIBRARY_PATH dynamically
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -138,6 +143,8 @@ cmd_mpirun_common=(
   --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
   -x PATH
   -x LD_LIBRARY_PATH
+  -x UCX_TLS
+  -x UCX_LOG_LEVEL              # Suppress verbose UCX debug logs
 )
 
 # ALTERNATIVE 1: UCX with automatic transport detection (try after TCP works)
@@ -388,7 +395,6 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
-            -x "UCX_LOG_LEVEL=error"              # Suppress verbose UCX debug logs
             -x "RUST_LOG=Trace"
             -x "RUST_BACKTRACE=1"
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
