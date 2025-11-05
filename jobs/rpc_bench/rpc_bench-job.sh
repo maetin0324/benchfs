@@ -116,7 +116,7 @@ run_rpc_benchmark() {
     "${BENCHFS_PREFIX}/benchfs_rpc_bench"
     "${BENCHFS_REGISTRY_DIR}"
     --ping-iterations "${PING_ITERATIONS}"
-    --json-output "${json_file}"
+    --output "${json_file}"
   )
 
   echo "Command: ${mpirun_cmd[*]}"
@@ -168,7 +168,7 @@ if [ -f "${RESULTS_DIR}/rpc_bench_1.json" ]; then
   echo "JSON results available:"
   ls -lh "${RESULTS_DIR}"/*.json
 else
-  echo "No JSON results found (--output may not be implemented yet)"
+  echo "No JSON results found"
 fi
 echo ""
 echo "Log files:"

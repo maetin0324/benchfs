@@ -61,7 +61,7 @@ echo ""
 # Build command with optional JSON output
 RPC_CMD="mpirun -np $NPROCS \"$BENCHFS_BIN\" \"$REGISTRY_DIR\" --ping-iterations $PING_ITERATIONS"
 if [ -n "$JSON_OUTPUT" ]; then
-    RPC_CMD="$RPC_CMD --json-output \"$JSON_OUTPUT\""
+    RPC_CMD="$RPC_CMD --output \"$JSON_OUTPUT\""
 fi
 
 eval $RPC_CMD

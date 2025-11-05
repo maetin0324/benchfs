@@ -78,7 +78,7 @@ fn parse_args(args: &[String]) -> BenchmarkConfig {
                 config.ping_iterations = args[i + 1].parse().unwrap_or(10000);
                 i += 2;
             }
-            "--json-output" if i + 1 < args.len() => {
+            "--output" | "--json-output" if i + 1 < args.len() => {
                 config.json_output = Some(args[i + 1].clone());
                 i += 2;
             }
