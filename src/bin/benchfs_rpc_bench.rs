@@ -6,9 +6,11 @@
 //! Usage:
 //!   mpirun -n <num_nodes> benchfs_rpc_bench <registry_dir> [options]
 //!
-//! Roles:
-//! - Rank 0: Client that sends benchmark RPCs and measures metrics
-//! - Other ranks: Servers that respond to RPCs
+//! Roles (assuming N nodes with N/2 servers and N/2 clients):
+//! - Ranks 0 to N/2-1: Servers that respond to RPCs
+//! - Ranks N/2 to N-1: Clients that send benchmark RPCs
+//! - Each client connects to a different server (round-robin mapping)
+//! - All client results are aggregated to compute total IOPS
 
 use benchfs::rpc::bench_ops::BenchPingRequest;
 use benchfs::rpc::connection::ConnectionPool;
@@ -37,7 +39,8 @@ struct LatencyStats {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ServerResult {
+struct ClientResult {
+    client_rank: i32,
     server_node: String,
     operations: usize,
     duration_secs: f64,
@@ -50,8 +53,11 @@ struct ServerResult {
 struct BenchmarkResults {
     timestamp: String,
     total_servers: usize,
+    total_clients: usize,
     ping_iterations: usize,
-    server_results: Vec<ServerResult>,
+    client_results: Vec<ClientResult>,
+    aggregate_iops: f64,
+    aggregate_miops: f64,
 }
 
 struct BenchmarkConfig {
@@ -103,6 +109,15 @@ fn main() {
     let mpi_rank = world.rank();
     let mpi_size = world.size();
 
+    // Validate that we have even number of ranks
+    if mpi_size % 2 != 0 {
+        if mpi_rank == 0 {
+            eprintln!("ERROR: This benchmark requires an even number of MPI ranks (got {})", mpi_size);
+            eprintln!("Half will be servers, half will be clients");
+        }
+        std::process::exit(1);
+    }
+
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
@@ -113,6 +128,7 @@ fn main() {
             eprintln!("\nOptions:");
             eprintln!("  --ping-iterations N    Number of ping-pong iterations (default: 10000)");
             eprintln!("  --output FILE          Output results to JSON file");
+            eprintln!("\nNote: Requires even number of MPI ranks. First half are servers, second half are clients.");
         }
         std::process::exit(1);
     }
@@ -144,11 +160,19 @@ fn main() {
 
     let node_id = format!("node_{}", mpi_rank);
 
+    // Determine server and client groups
+    let num_servers = mpi_size / 2;
+    let num_clients = mpi_size / 2;
+    let is_server = mpi_rank < num_servers;
+    let first_client_rank = num_servers;
+
     if mpi_rank == 0 {
         tracing::info!("==============================================");
         tracing::info!("BenchFS RPC Benchmark");
         tracing::info!("==============================================");
-        tracing::info!("Nodes: {}", mpi_size);
+        tracing::info!("Total ranks: {}", mpi_size);
+        tracing::info!("Server ranks: 0-{} ({} servers)", num_servers - 1, num_servers);
+        tracing::info!("Client ranks: {}-{} ({} clients)", num_servers, mpi_size - 1, num_clients);
         tracing::info!("Registry: {:?}", registry_dir);
         tracing::info!("Ping iterations: {}", config.ping_iterations);
         if let Some(ref json_path) = config.json_output {
@@ -188,17 +212,7 @@ fn main() {
             .expect("Failed to create connection pool")
     );
 
-    if mpi_rank == 0 {
-        // Client mode
-        run_client(
-            runtime,
-            rpc_server,
-            connection_pool,
-            mpi_size,
-            config,
-            node_id,
-        );
-    } else {
+    if is_server {
         // Server mode
         run_server(
             runtime,
@@ -206,25 +220,64 @@ fn main() {
             connection_pool,
             node_id,
         );
+    } else {
+        // Client mode - each client connects to a specific server
+        let client_idx = mpi_rank - num_servers;
+        let target_server_rank = client_idx % num_servers;
+        let target_server_id = format!("node_{}", target_server_rank);
+
+        tracing::info!("Client {} (rank {}) will connect to server {} (rank {})",
+            client_idx, mpi_rank, target_server_id, target_server_rank);
+
+        run_client(
+            runtime,
+            rpc_server,
+            connection_pool,
+            mpi_rank,
+            num_servers,
+            num_clients,
+            first_client_rank,
+            target_server_id,
+            config,
+            node_id,
+            &world,
+        );
     }
 
     // Barrier before exit
     world.barrier();
 
-    if mpi_rank == 0 {
+    if mpi_rank == first_client_rank {
         tracing::info!("Benchmark completed successfully");
     }
 }
 
 fn run_client(
     runtime: Rc<Runtime>,
-    rpc_server: Rc<RpcServer>,
+    _rpc_server: Rc<RpcServer>,
     connection_pool: Rc<ConnectionPool>,
-    mpi_size: i32,
+    mpi_rank: i32,
+    num_servers: i32,
+    num_clients: i32,
+    first_client_rank: i32,
+    target_server_id: String,
     config: BenchmarkConfig,
     node_id: String,
+    world: &mpi::topology::SimpleCommunicator,
 ) {
     let runtime_clone = runtime.clone();
+
+    // Clone world for async use
+    let is_root_client = mpi_rank == first_client_rank;
+
+    // Use std::cell::RefCell to store result across async boundary
+    use std::cell::RefCell;
+    let result_cell: Rc<RefCell<Option<ClientResult>>> = Rc::new(RefCell::new(None));
+    let result_cell_clone = result_cell.clone();
+
+    // Clone connection_pool for later use in shutdown
+    let connection_pool_for_shutdown = connection_pool.clone();
+
     runtime_clone.run(async move {
         tracing::info!("Client starting...");
 
@@ -237,82 +290,157 @@ fn run_client(
             return;
         }
 
-        // Wait for all servers to register
-        tracing::info!("Waiting for all servers to register...");
+        // Wait for all nodes (servers + clients) to register
+        tracing::info!("Waiting for all nodes to register...");
+        let total_ranks = num_servers + num_clients;
         let mut registered_count = 0;
-        while registered_count < mpi_size {
+        while registered_count < total_ranks {
             registered_count = 0;
-            for rank in 0..mpi_size {
+            for rank in 0..total_ranks {
                 let other_node_id = format!("node_{}", rank);
                 let registry_file = connection_pool.registry_dir().join(format!("{}.addr", other_node_id));
                 if registry_file.exists() {
                     registered_count += 1;
                 }
             }
-            if registered_count < mpi_size {
+            if registered_count < total_ranks {
                 pluvio_timer::sleep(Duration::from_millis(100)).await;
             }
         }
 
-        tracing::info!("All servers registered. Starting benchmark...");
+        tracing::info!("All nodes registered. Starting benchmark...");
 
-        // Run ping-pong benchmark with server nodes (rank 1+)
-        let server_nodes: Vec<String> = (1..mpi_size)
-            .map(|rank| format!("node_{}", rank))
-            .collect();
-
-        let bench_results = run_ping_benchmark(
+        // Run ping-pong benchmark with assigned server
+        let my_result = run_ping_benchmark_single(
             &connection_pool,
-            &server_nodes,
+            &target_server_id,
             config.ping_iterations,
+            mpi_rank,
         ).await;
 
+        tracing::info!("Local benchmark completed. IOPS: {:.2}, MIOPS: {:.6}", my_result.iops, my_result.miops);
+
+        // Store result for MPI communication
+        *result_cell_clone.borrow_mut() = Some(my_result);
+
+        tracing::info!("Client finished");
+    });
+
+    // After async runtime exits, use MPI to gather results
+    world.barrier();
+
+    // Extract result from cell
+    let my_result = result_cell.borrow_mut().take().expect("Result not set");
+
+    // Serialize local result for MPI transfer
+    let my_result_json = serde_json::to_string(&my_result).expect("Failed to serialize result");
+    let my_result_bytes = my_result_json.as_bytes();
+
+    // First, gather the sizes of each result
+    let my_size = my_result_bytes.len() as i32;
+    let mut sizes = if is_root_client {
+        vec![0i32; num_clients as usize]
+    } else {
+        vec![]
+    };
+
+    if is_root_client {
+        tracing::info!("Root client (rank {}) gathering result sizes from {} clients...", mpi_rank, num_clients);
+    }
+
+    // Gather sizes at first client rank
+    if is_root_client {
+        world.process_at_rank(mpi_rank).gather_into_root(&my_size, &mut sizes[..]);
+    } else {
+        world.process_at_rank(first_client_rank).gather_into(&my_size);
+    }
+
+    // Prepare receive buffer
+    let mut all_results: Vec<ClientResult> = Vec::new();
+
+    if is_root_client {
+        tracing::info!("Gathering results from all clients...");
+
+        // Gather results one by one
+        for client_idx in 0..num_clients {
+            let client_rank = first_client_rank + client_idx;
+            let size = sizes[client_idx as usize] as usize;
+
+            let result_bytes = if client_rank == mpi_rank {
+                // Own result
+                my_result_bytes.to_vec()
+            } else {
+                // Receive from other client
+                let mut buf = vec![0u8; size];
+                world.process_at_rank(client_rank).receive_into(&mut buf[..]);
+                buf
+            };
+
+            let result_json = String::from_utf8(result_bytes).expect("Invalid UTF-8");
+            let result: ClientResult = serde_json::from_str(&result_json).expect("Failed to deserialize");
+            all_results.push(result);
+        }
+
+        // Calculate aggregate metrics
+        let total_iops: f64 = all_results.iter().map(|r| r.iops).sum();
+        let total_miops = total_iops / 1_000_000.0;
+
+        tracing::info!("==========================================");
+        tracing::info!("Aggregate Results");
+        tracing::info!("==========================================");
+        tracing::info!("Total clients: {}", num_clients);
+        tracing::info!("Total servers: {}", num_servers);
+        tracing::info!("Aggregate IOPS: {:.2}", total_iops);
+        tracing::info!("Aggregate MIOPS: {:.6}", total_miops);
+        tracing::info!("==========================================");
+
         // Write JSON output if requested
-        tracing::info!("Checking for JSON output path...");
         if let Some(json_path) = &config.json_output {
-            tracing::info!("JSON output path specified: {}", json_path);
-            tracing::info!("Preparing benchmark results for JSON output...");
-            tracing::info!("  Total servers: {}", server_nodes.len());
-            tracing::info!("  Ping iterations: {}", config.ping_iterations);
-            tracing::info!("  Results collected: {}", bench_results.len());
+            tracing::info!("Writing aggregate results to JSON: {}", json_path);
 
             let timestamp = chrono::Utc::now().to_rfc3339();
             let results = BenchmarkResults {
                 timestamp,
-                total_servers: server_nodes.len(),
+                total_servers: num_servers as usize,
+                total_clients: num_clients as usize,
                 ping_iterations: config.ping_iterations,
-                server_results: bench_results,
+                client_results: all_results,
+                aggregate_iops: total_iops,
+                aggregate_miops: total_miops,
             };
 
-            tracing::info!("Serializing results to JSON...");
             match serde_json::to_string_pretty(&results) {
                 Ok(json_str) => {
-                    tracing::info!("JSON serialization successful, writing to file: {}", json_path);
-                    tracing::info!("JSON content length: {} bytes", json_str.len());
                     if let Err(e) = std::fs::write(json_path, json_str) {
-                        tracing::error!("Failed to write JSON output to {}: {:?}", json_path, e);
-                        eprintln!("ERROR: Failed to write JSON output to {}: {:?}", json_path, e);
+                        tracing::error!("Failed to write JSON: {:?}", e);
+                        eprintln!("ERROR: Failed to write JSON: {:?}", e);
                     } else {
-                        tracing::info!("JSON results written successfully to {}", json_path);
+                        tracing::info!("JSON results written successfully");
                         eprintln!("SUCCESS: JSON results written to {}", json_path);
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to serialize results to JSON: {:?}", e);
-                    eprintln!("ERROR: Failed to serialize results to JSON: {:?}", e);
+                    tracing::error!("Failed to serialize: {:?}", e);
+                    eprintln!("ERROR: Failed to serialize: {:?}", e);
                 }
             }
-        } else {
-            tracing::warn!("No JSON output path specified, skipping JSON output");
-            eprintln!("WARNING: No JSON output path specified");
         }
 
-        // Send shutdown RPC to all servers
-        tracing::info!("Sending shutdown requests to all servers...");
-        send_shutdown_to_servers(&connection_pool, &server_nodes).await;
+        // Send shutdown to all servers
+        let runtime_shutdown = Runtime::new(256);
+        runtime_shutdown.run(async move {
+            tracing::info!("Sending shutdown to all servers...");
+            let server_nodes: Vec<String> = (0..num_servers)
+                .map(|rank| format!("node_{}", rank))
+                .collect();
+            send_shutdown_to_servers(&connection_pool_for_shutdown, &server_nodes).await;
+        });
+    } else {
+        // Non-root clients send their results
+        world.process_at_rank(first_client_rank).send(my_result_bytes);
+    }
 
-        tracing::info!("Client finished");
-    });
+    world.barrier();
 }
 
 fn run_server(
@@ -354,130 +482,143 @@ fn run_server(
     });
 }
 
-async fn run_ping_benchmark(
+// Run ping benchmark for a single client against one server
+async fn run_ping_benchmark_single(
     pool: &ConnectionPool,
-    server_nodes: &[String],
+    server_node: &str,
     iterations: usize,
-) -> Vec<ServerResult> {
-    let mut results = Vec::new();
-    tracing::info!("========================================== ");
-    tracing::info!("Ping-Pong Benchmark");
-    tracing::info!("==========================================");
-    tracing::info!("Iterations: {}", iterations);
-    tracing::info!("Servers: {}", server_nodes.len());
+    client_rank: i32,
+) -> ClientResult {
+    tracing::info!("------------------------------------------");
+    tracing::info!("Client {} testing server: {}", client_rank, server_node);
 
-    for server_node in server_nodes {
-        tracing::info!("------------------------------------------");
-        tracing::info!("Testing server: {}", server_node);
-
-        // Connect to server
-        let client = match pool.get_or_connect(server_node).await {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!("Failed to connect to {}: {:?}", server_node, e);
-                continue;
-            }
-        };
-
-        let mut latencies = Vec::with_capacity(iterations);
-
-        // Warm-up
-        for seq in 0..100 {
-            let timestamp_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
-
-            let request = BenchPingRequest::new(
-                seq,
-                timestamp_ns,
-            );
-
-            if let Err(e) = request.call(&*client).await {
-                tracing::warn!("Warm-up ping failed: {:?}", e);
-            }
-        }
-
-        // Actual benchmark
-        let benchmark_start = Instant::now();
-        for seq in 0..iterations {
-            let timestamp_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
-
-            let request = BenchPingRequest::new(
-                seq as u64,
-                timestamp_ns,
-            );
-
-            let start = Instant::now();
-            match request.call(&*client).await {
-                Ok(_response) => {
-                    let latency = start.elapsed();
-                    latencies.push(latency);
-                }
-                Err(e) => {
-                    tracing::error!("Ping {} failed: {:?}", seq, e);
-                }
-            }
-
-            // Progress indicator every 1000 iterations
-            if (seq + 1) % 1000 == 0 {
-                tracing::debug!("Completed {} / {} pings", seq + 1, iterations);
-            }
-        }
-        let benchmark_duration = benchmark_start.elapsed();
-
-        // Calculate statistics
-        if !latencies.is_empty() {
-            latencies.sort();
-            let min = latencies[0];
-            let max = latencies[latencies.len() - 1];
-            let avg: Duration = latencies.iter().sum::<Duration>() / latencies.len() as u32;
-            let p50 = latencies[latencies.len() / 2];
-            let p99 = latencies[latencies.len() * 99 / 100];
-
-            // Calculate IOPS (operations per second)
-            let total_ops = latencies.len() as f64;
-            let duration_secs = benchmark_duration.as_secs_f64();
-            let iops = total_ops / duration_secs;
-            let miops = iops / 1_000_000.0;
-
-            tracing::info!("Results for {}:", server_node);
-            tracing::info!("  Operations:   {}", latencies.len());
-            tracing::info!("  Duration:     {:.3}s", duration_secs);
-            tracing::info!("  IOPS:         {:.0}", iops);
-            tracing::info!("  MIOPS:        {:.3}", miops);
-            tracing::info!("  Min latency:  {:?}", min);
-            tracing::info!("  Avg latency:  {:?}", avg);
-            tracing::info!("  P50 latency:  {:?}", p50);
-            tracing::info!("  P99 latency:  {:?}", p99);
-            tracing::info!("  Max latency:  {:?}", max);
-
-            // Store results for JSON output
-            results.push(ServerResult {
-                server_node: server_node.clone(),
-                operations: latencies.len(),
-                duration_secs,
-                iops,
-                miops,
+    // Connect to server
+    let client = match pool.get_or_connect(server_node).await {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!("Failed to connect to {}: {:?}", server_node, e);
+            // Return dummy result on connection failure
+            return ClientResult {
+                client_rank,
+                server_node: server_node.to_string(),
+                operations: 0,
+                duration_secs: 0.0,
+                iops: 0.0,
+                miops: 0.0,
                 latency: LatencyStats {
-                    min_us: min.as_micros() as f64,
-                    avg_us: avg.as_micros() as f64,
-                    p50_us: p50.as_micros() as f64,
-                    p99_us: p99.as_micros() as f64,
-                    max_us: max.as_micros() as f64,
+                    min_us: 0.0,
+                    avg_us: 0.0,
+                    p50_us: 0.0,
+                    p99_us: 0.0,
+                    max_us: 0.0,
                 },
-            });
+            };
+        }
+    };
+
+    let mut latencies = Vec::with_capacity(iterations);
+
+    // Warm-up
+    for seq in 0..100 {
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+
+        let request = BenchPingRequest::new(seq, timestamp_ns);
+
+        if let Err(e) = request.call(&*client).await {
+            tracing::warn!("Warm-up ping failed: {:?}", e);
         }
     }
 
-    tracing::info!("==========================================");
-    tracing::info!("Ping-Pong Benchmark Complete");
-    tracing::info!("==========================================");
+    // Actual benchmark
+    let benchmark_start = Instant::now();
+    for seq in 0..iterations {
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
 
-    results
+        let request = BenchPingRequest::new(seq as u64, timestamp_ns);
+
+        let start = Instant::now();
+        match request.call(&*client).await {
+            Ok(_response) => {
+                let latency = start.elapsed();
+                latencies.push(latency);
+            }
+            Err(e) => {
+                tracing::error!("Ping {} failed: {:?}", seq, e);
+            }
+        }
+
+        // Progress indicator every 1000 iterations
+        if (seq + 1) % 1000 == 0 {
+            tracing::debug!("Completed {} / {} pings", seq + 1, iterations);
+        }
+    }
+    let benchmark_duration = benchmark_start.elapsed();
+
+    // Calculate statistics
+    if !latencies.is_empty() {
+        latencies.sort();
+        let min = latencies[0];
+        let max = latencies[latencies.len() - 1];
+        let avg: Duration = latencies.iter().sum::<Duration>() / latencies.len() as u32;
+        let p50 = latencies[latencies.len() / 2];
+        let p99 = latencies[latencies.len() * 99 / 100];
+
+        // Calculate IOPS (operations per second)
+        let total_ops = latencies.len() as f64;
+        let duration_secs = benchmark_duration.as_secs_f64();
+        let iops = total_ops / duration_secs;
+        let miops = iops / 1_000_000.0;
+
+        tracing::info!("Results for client {} -> {}:", client_rank, server_node);
+        tracing::info!("  Operations:   {}", latencies.len());
+        tracing::info!("  Duration:     {:.3}s", duration_secs);
+        tracing::info!("  IOPS:         {:.0}", iops);
+        tracing::info!("  MIOPS:        {:.3}", miops);
+        tracing::info!("  Min latency:  {:?}", min);
+        tracing::info!("  Avg latency:  {:?}", avg);
+        tracing::info!("  P50 latency:  {:?}", p50);
+        tracing::info!("  P99 latency:  {:?}", p99);
+        tracing::info!("  Max latency:  {:?}", max);
+
+        ClientResult {
+            client_rank,
+            server_node: server_node.to_string(),
+            operations: latencies.len(),
+            duration_secs,
+            iops,
+            miops,
+            latency: LatencyStats {
+                min_us: min.as_micros() as f64,
+                avg_us: avg.as_micros() as f64,
+                p50_us: p50.as_micros() as f64,
+                p99_us: p99.as_micros() as f64,
+                max_us: max.as_micros() as f64,
+            },
+        }
+    } else {
+        // No latencies collected
+        ClientResult {
+            client_rank,
+            server_node: server_node.to_string(),
+            operations: 0,
+            duration_secs: 0.0,
+            iops: 0.0,
+            miops: 0.0,
+            latency: LatencyStats {
+                min_us: 0.0,
+                avg_us: 0.0,
+                p50_us: 0.0,
+                p99_us: 0.0,
+                max_us: 0.0,
+            },
+        }
+    }
 }
 
 async fn send_shutdown_to_servers(

@@ -5,6 +5,15 @@
 #PBS -T openmpi
 #PBS -v NQSV_MPI_VER=4.1.8/gcc11.4.0-cuda12.8.1
 #------- Program execution -----------
+#
+# NOTE: This benchmark requires an even number of MPI ranks.
+# - First half (ranks 0 to N/2-1): Servers
+# - Second half (ranks N/2 to N-1): Clients
+# - Each client connects to a different server (round-robin)
+# - Results are aggregated across all clients
+#
+# For 48-core nodes: Use 48 ranks per node (24 servers + 24 clients)
+#
 set -euo pipefail
 
 # Increase file descriptor limit for large-scale MPI jobs

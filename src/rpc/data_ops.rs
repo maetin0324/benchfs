@@ -39,19 +39,15 @@ pub struct ReadChunkRequestHeader {
 
     /// Path length (path is sent in data section)
     pub path_len: u64,
-
-    /// WorkerAddress length (sent before path in data section)
-    pub worker_address_len: u64,
 }
 
 impl ReadChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64, worker_address_len: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
         Self {
             chunk_index,
             offset,
             length,
             path_len,
-            worker_address_len,
         }
     }
 }
@@ -109,11 +105,10 @@ pub struct ReadChunkRequest {
     header: ReadChunkRequestHeader,
     path: String,
     /// Data buffers - these must be stored directly in the struct
-    worker_address: Vec<u8>,
     path_bytes: Vec<u8>,
     response_buffer: Vec<u8>,
     /// Cached IoSlices - lazily initialized on first call
-    cached_request_ioslices: UnsafeCell<Option<[IoSlice<'static>; 2]>>,
+    cached_request_ioslices: UnsafeCell<Option<[IoSlice<'static>; 1]>>,
     cached_response_ioslice: UnsafeCell<Option<IoSliceMut<'static>>>,
 }
 
@@ -121,16 +116,14 @@ pub struct ReadChunkRequest {
 unsafe impl Send for ReadChunkRequest {}
 
 impl ReadChunkRequest {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path: String, worker_address: Vec<u8>) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path: String) -> Self {
         let path_bytes = path.as_bytes().to_vec();
         let path_len = path_bytes.len() as u64;
-        let worker_address_len = worker_address.len() as u64;
         let response_buffer = vec![0u8; length as usize];
 
         Self {
-            header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len, worker_address_len),
+            header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len),
             path,
-            worker_address,
             path_bytes,
             response_buffer,
             cached_request_ioslices: UnsafeCell::new(None),
@@ -168,14 +161,12 @@ impl AmRpc for ReadChunkRequest {
 
     fn request_data(&self) -> &[std::io::IoSlice<'_>] {
         // Lazily initialize the cached IoSlices on first call
-        // IMPORTANT: Order is [Path, WorkerAddress] to avoid Rendezvous protocol issues
         unsafe {
             let cache = &mut *self.cached_request_ioslices.get();
 
             if cache.is_none() {
                 let ioslices = [
                     IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)),
-                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
                 ];
                 *cache = Some(ioslices);
             }
@@ -236,31 +227,19 @@ impl AmRpc for ReadChunkRequest {
 
         let _span = tracing::trace_span!("rpc_read_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
 
-        // Receive Path and WorkerAddress from request data
-        // IMPORTANT: Order is [Path, WorkerAddress] to avoid Rendezvous protocol issues
+        // Receive Path from request data
         if !am_msg.contains_data() {
             return Err((RpcError::TransportError("Request contains no data".to_string()), am_msg));
         }
 
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-        let mut worker_addr_bytes = vec![0u8; header.worker_address_len as usize];
+        let path_bytes = match am_msg.recv_data().await {
+            Ok(data) => data,
+            Err(e) => return Err((RpcError::TransportError(format!("Failed to receive data: {:?}", e)), am_msg)),
+        };
 
-        if let Err(e) = am_msg
-            .recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut path_bytes),
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
-            ])
-            .await
-        {
-            return Err((RpcError::TransportError(format!("Failed to receive data: {:?}", e)), am_msg));
+        if path_bytes.len() != header.path_len as usize {
+            return Err((RpcError::TransportError(format!("Path length mismatch: expected {}, got {}", header.path_len, path_bytes.len())), am_msg));
         }
-
-        // Log received worker address for debugging
-        tracing::debug!(
-            "ReadChunkRequest: Received worker_addr_len={}, first_32_bytes={:?}",
-            worker_addr_bytes.len(),
-            &worker_addr_bytes.get(0..32.min(worker_addr_bytes.len())).unwrap_or(&[])
-        );
 
         let path = match String::from_utf8(path_bytes) {
             Ok(p) => p,
@@ -286,19 +265,13 @@ impl AmRpc for ReadChunkRequest {
             }
         };
 
-        // Send response directly using WorkerAddress
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        crate::rpc::helpers::send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             response_data.as_deref(),
-        ).await {
-            tracing::error!("Failed to send direct response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+            am_msg,
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -340,19 +313,15 @@ pub struct WriteChunkRequestHeader {
 
     /// Path length (path is sent in data section)
     pub path_len: u64,
-
-    /// WorkerAddress length (sent before path in data section)
-    pub worker_address_len: u64,
 }
 
 impl WriteChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64, worker_address_len: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
         Self {
             chunk_index,
             offset,
             length,
             path_len,
-            worker_address_len,
         }
     }
 }
@@ -411,27 +380,24 @@ pub struct WriteChunkRequest<'a> {
     /// File path (for reference)
     path: String,
     /// Data buffers - these must be stored directly in the struct
-    worker_address: Vec<u8>,
     path_bytes: Vec<u8>,
     data: &'a [u8],
     /// Cached IoSlices - lazily initialized on first call to request_data()
-    cached_ioslices: UnsafeCell<Option<[IoSlice<'static>; 3]>>,
+    cached_ioslices: UnsafeCell<Option<[IoSlice<'static>; 2]>>,
 }
 
 // SAFETY: WriteChunkRequest is Send because all its fields are Send
 unsafe impl Send for WriteChunkRequest<'_> {}
 
 impl<'a> WriteChunkRequest<'a> {
-    pub fn new(chunk_index: u64, offset: u64, data: &'a [u8], path: String, worker_address: Vec<u8>) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, data: &'a [u8], path: String) -> Self {
         let length = data.len() as u64;
         let path_len = path.len() as u64;
-        let worker_address_len = worker_address.len() as u64;
         let path_bytes = path.as_bytes().to_vec();
 
         Self {
-            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len, worker_address_len),
+            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
             path,
-            worker_address,
             path_bytes,
             data,
             cached_ioslices: UnsafeCell::new(None),
@@ -463,7 +429,6 @@ impl AmRpc for WriteChunkRequest<'_> {
 
     fn request_data(&self) -> &[IoSlice<'_>] {
         // Lazily initialize the cached IoSlices on first call
-        // IMPORTANT: Order is [Path, Data, WorkerAddress] to avoid Rendezvous protocol issues
         unsafe {
             let cache = &mut *self.cached_ioslices.get();
 
@@ -476,7 +441,6 @@ impl AmRpc for WriteChunkRequest<'_> {
                 let ioslices = [
                     IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)),
                     IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.data)),
-                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
                 ];
                 *cache = Some(ioslices);
             }
@@ -519,7 +483,7 @@ impl AmRpc for WriteChunkRequest<'_> {
 
         let _span = tracing::trace_span!("rpc_write_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
 
-        // Receive WorkerAddress, path and data from client
+        // Receive path and data from client
         if !am_msg.contains_data() {
             tracing::error!("WriteChunk request contains no data");
             return Ok((
@@ -527,9 +491,6 @@ impl AmRpc for WriteChunkRequest<'_> {
                 am_msg,
             ));
         }
-
-        // Receive WorkerAddress first using actual length from header
-        let mut worker_addr_bytes = vec![0u8; header.worker_address_len as usize];
 
         // Check if chunk_store is IOUringChunkStore to use zero-copy path
         use crate::storage::chunk_store::IOUringChunkStore;
@@ -539,11 +500,10 @@ impl AmRpc for WriteChunkRequest<'_> {
         let chunk_store_any = &*ctx.chunk_store as &dyn Any;
 
         tracing::trace!(
-            "Processing WriteChunk: chunk={}, offset={}, len={}, worker_address_len={}",
+            "Processing WriteChunk: chunk={}, offset={}, len={}",
             header.chunk_index,
             header.offset,
-            header.length,
-            header.worker_address_len
+            header.length
         );
 
         let response_header = if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
@@ -560,14 +520,12 @@ impl AmRpc for WriteChunkRequest<'_> {
                 );
                 WriteChunkResponseHeader::error(-22)
             } else {
-                // Receive Path, Data, and WorkerAddress in one vectored call (zero-copy RDMA)
-                // IMPORTANT: Order is [Path, Data, WorkerAddress] to avoid Rendezvous protocol issues
+                // Receive Path and Data in one vectored call (zero-copy RDMA)
                 let mut path_bytes = vec![0u8; header.path_len as usize];
                 let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
                 tracing::debug!(
-                    "WriteChunk: receiving data - worker_addr_len={}, path_len={}, data_len={}",
-                    header.worker_address_len,
+                    "WriteChunk: receiving data - path_len={}, data_len={}",
                     header.path_len,
                     data_len
                 );
@@ -577,7 +535,6 @@ impl AmRpc for WriteChunkRequest<'_> {
                     .recv_data_vectored(&[
                         std::io::IoSliceMut::new(&mut path_bytes),
                         std::io::IoSliceMut::new(buffer_slice),
-                        std::io::IoSliceMut::new(&mut worker_addr_bytes),
                     ])
                     .await
                 {
@@ -585,13 +542,6 @@ impl AmRpc for WriteChunkRequest<'_> {
                     WriteChunkResponseHeader::error(-5)
                 } else {
                     tracing::trace!("WriteChunk: recv_data_vectored completed (zero-copy)");
-
-                    // Log received worker address for debugging
-                    tracing::debug!(
-                        "WriteChunkRequest (zero-copy): Received worker_addr_len={}, first_32_bytes={:?}",
-                        worker_addr_bytes.len(),
-                        &worker_addr_bytes.get(0..32.min(worker_addr_bytes.len())).unwrap_or(&[])
-                    );
 
                     let path = match String::from_utf8(path_bytes) {
                         Ok(p) => p,
@@ -639,25 +589,16 @@ impl AmRpc for WriteChunkRequest<'_> {
             let mut path_bytes = vec![0u8; header.path_len as usize];
             let mut data = vec![0u8; data_len];
 
-            // IMPORTANT: Order is [Path, Data, WorkerAddress] to avoid Rendezvous protocol issues
             if let Err(e) = am_msg
                 .recv_data_vectored(&[
                     std::io::IoSliceMut::new(&mut path_bytes),
                     std::io::IoSliceMut::new(&mut data),
-                    std::io::IoSliceMut::new(&mut worker_addr_bytes),
                 ])
                 .await
             {
                 tracing::error!("Failed to receive request data: {:?}", e);
                 WriteChunkResponseHeader::error(-5)
             } else {
-                // Log received worker address for debugging
-                tracing::debug!(
-                    "WriteChunkRequest (fallback): Received worker_addr_len={}, first_32_bytes={:?}",
-                    worker_addr_bytes.len(),
-                    &worker_addr_bytes.get(0..32.min(worker_addr_bytes.len())).unwrap_or(&[])
-                );
-
                 let path = match String::from_utf8(path_bytes) {
                     Ok(p) => p,
                     Err(e) => {
@@ -699,19 +640,13 @@ impl AmRpc for WriteChunkRequest<'_> {
             }
         };
 
-        // Send response directly using WorkerAddress
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        crate::rpc::helpers::send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             None,
-        ).await {
-            tracing::error!("Failed to send direct response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+            am_msg,
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -741,12 +676,11 @@ mod tests {
 
     #[test]
     fn test_read_chunk_request_header() {
-        let header = ReadChunkRequestHeader::new(5, 1024, 4096, 42, 256);
+        let header = ReadChunkRequestHeader::new(5, 1024, 4096, 42);
         assert_eq!(header.chunk_index, 5);
         assert_eq!(header.offset, 1024);
         assert_eq!(header.length, 4096);
         assert_eq!(header.path_len, 42);
-        assert_eq!(header.worker_address_len, 256);
 
         // Verify it can be serialized
         let bytes = zerocopy::IntoBytes::as_bytes(&header);
@@ -771,8 +705,7 @@ mod tests {
 
     #[test]
     fn test_read_chunk_request() {
-        let dummy_worker_addr = vec![0u8; 512];
-        let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string(), dummy_worker_addr);
+        let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string());
         assert_eq!(request.header.chunk_index, 0);
         assert_eq!(request.header.length, 1024);
         assert_eq!(request.header.path_len, 14); // "/test/file.txt".len()
@@ -783,12 +716,11 @@ mod tests {
 
     #[test]
     fn test_write_chunk_request_header() {
-        let header = WriteChunkRequestHeader::new(3, 512, 2048, 99, 256);
+        let header = WriteChunkRequestHeader::new(3, 512, 2048, 99);
         assert_eq!(header.chunk_index, 3);
         assert_eq!(header.offset, 512);
         assert_eq!(header.length, 2048);
         assert_eq!(header.path_len, 99);
-        assert_eq!(header.worker_address_len, 256);
     }
 
     #[test]
@@ -805,8 +737,7 @@ mod tests {
     #[test]
     fn test_write_chunk_request() {
         let data = vec![0xAA; 512];
-        let dummy_worker_addr = vec![0u8; 512];
-        let request = WriteChunkRequest::new(1, 0, &data[..], "/test/file.txt".to_string(), dummy_worker_addr);
+        let request = WriteChunkRequest::new(1, 0, &data[..], "/test/file.txt".to_string());
 
         assert_eq!(request.header.chunk_index, 1);
         assert_eq!(request.header.length, 512);
