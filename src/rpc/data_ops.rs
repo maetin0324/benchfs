@@ -168,13 +168,14 @@ impl AmRpc for ReadChunkRequest {
 
     fn request_data(&self) -> &[std::io::IoSlice<'_>] {
         // Lazily initialize the cached IoSlices on first call
+        // IMPORTANT: Order is [Path, WorkerAddress] to avoid Rendezvous protocol issues
         unsafe {
             let cache = &mut *self.cached_request_ioslices.get();
 
             if cache.is_none() {
                 let ioslices = [
-                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
                     IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)),
+                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
                 ];
                 *cache = Some(ioslices);
             }
@@ -235,18 +236,19 @@ impl AmRpc for ReadChunkRequest {
 
         let _span = tracing::trace_span!("rpc_read_chunk", chunk = header.chunk_index, offset = header.offset, len = header.length).entered();
 
-        // Receive WorkerAddress and path from request data
+        // Receive Path and WorkerAddress from request data
+        // IMPORTANT: Order is [Path, WorkerAddress] to avoid Rendezvous protocol issues
         if !am_msg.contains_data() {
             return Err((RpcError::TransportError("Request contains no data".to_string()), am_msg));
         }
 
-        let mut worker_addr_bytes = vec![0u8; header.worker_address_len as usize];
         let mut path_bytes = vec![0u8; header.path_len as usize];
+        let mut worker_addr_bytes = vec![0u8; header.worker_address_len as usize];
 
         if let Err(e) = am_msg
             .recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
                 std::io::IoSliceMut::new(&mut path_bytes),
+                std::io::IoSliceMut::new(&mut worker_addr_bytes),
             ])
             .await
         {
@@ -461,6 +463,7 @@ impl AmRpc for WriteChunkRequest<'_> {
 
     fn request_data(&self) -> &[IoSlice<'_>] {
         // Lazily initialize the cached IoSlices on first call
+        // IMPORTANT: Order is [Path, Data, WorkerAddress] to avoid Rendezvous protocol issues
         unsafe {
             let cache = &mut *self.cached_ioslices.get();
 
@@ -471,9 +474,9 @@ impl AmRpc for WriteChunkRequest<'_> {
                 // 2. The IoSlices are cached in self, so they live as long as self
                 // 3. self must outlive any use of these IoSlices (ensured by API contract)
                 let ioslices = [
-                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
                     IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.path_bytes)),
                     IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.data)),
+                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.worker_address)),
                 ];
                 *cache = Some(ioslices);
             }
@@ -557,7 +560,8 @@ impl AmRpc for WriteChunkRequest<'_> {
                 );
                 WriteChunkResponseHeader::error(-22)
             } else {
-                // Receive WorkerAddress, path and chunk data in one vectored call (zero-copy RDMA)
+                // Receive Path, Data, and WorkerAddress in one vectored call (zero-copy RDMA)
+                // IMPORTANT: Order is [Path, Data, WorkerAddress] to avoid Rendezvous protocol issues
                 let mut path_bytes = vec![0u8; header.path_len as usize];
                 let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
@@ -571,9 +575,9 @@ impl AmRpc for WriteChunkRequest<'_> {
 
                 if let Err(e) = am_msg
                     .recv_data_vectored(&[
-                        std::io::IoSliceMut::new(&mut worker_addr_bytes),
                         std::io::IoSliceMut::new(&mut path_bytes),
                         std::io::IoSliceMut::new(buffer_slice),
+                        std::io::IoSliceMut::new(&mut worker_addr_bytes),
                     ])
                     .await
                 {
@@ -635,11 +639,12 @@ impl AmRpc for WriteChunkRequest<'_> {
             let mut path_bytes = vec![0u8; header.path_len as usize];
             let mut data = vec![0u8; data_len];
 
+            // IMPORTANT: Order is [Path, Data, WorkerAddress] to avoid Rendezvous protocol issues
             if let Err(e) = am_msg
                 .recv_data_vectored(&[
-                    std::io::IoSliceMut::new(&mut worker_addr_bytes),
                     std::io::IoSliceMut::new(&mut path_bytes),
                     std::io::IoSliceMut::new(&mut data),
+                    std::io::IoSliceMut::new(&mut worker_addr_bytes),
                 ])
                 .await
             {
