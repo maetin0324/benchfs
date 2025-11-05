@@ -265,13 +265,56 @@ impl AmRpc for ReadChunkRequest {
             }
         };
 
-        // Send response using reply_ep
-        crate::rpc::helpers::send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            response_data.as_deref(),
-            am_msg,
-        ).await
+        // Send response using reply_vectorized
+        if !am_msg.need_reply() {
+            tracing::error!("Message does not support reply");
+            return Err((RpcError::HandlerError("Message does not support reply".to_string()), am_msg));
+        }
+
+        let header_bytes = zerocopy::IntoBytes::as_bytes(&response_header);
+
+        // Determine protocol based on data size
+        let proto = if let Some(ref data) = response_data {
+            if crate::rpc::should_use_rdma(data.len() as u64) {
+                Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Use reply_vectorized with IoSlice
+        let result = if let Some(ref data) = response_data {
+            let data_slices = [std::io::IoSlice::new(data)];
+            unsafe {
+                am_msg.reply_vectorized(
+                    Self::reply_stream_id() as u32,
+                    header_bytes,
+                    &data_slices,
+                    false,  // need_reply
+                    proto,
+                ).await
+            }
+        } else {
+            // No data, just send header
+            unsafe {
+                am_msg.reply_vectorized(
+                    Self::reply_stream_id() as u32,
+                    header_bytes,
+                    &[],
+                    false,  // need_reply
+                    None,
+                ).await
+            }
+        };
+
+        if let Err(e) = result {
+            tracing::error!("Failed to send reply: {:?}", e);
+            return Err((RpcError::TransportError(format!("Failed to send reply: {:?}", e)), am_msg));
+        }
+
+        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -640,13 +683,31 @@ impl AmRpc for WriteChunkRequest<'_> {
             }
         };
 
-        // Send response using reply_ep
-        crate::rpc::helpers::send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        // Send response using reply_vectorized
+        if !am_msg.need_reply() {
+            tracing::error!("Message does not support reply");
+            return Err((RpcError::HandlerError("Message does not support reply".to_string()), am_msg));
+        }
+
+        let header_bytes = zerocopy::IntoBytes::as_bytes(&response_header);
+
+        // Send header only (no data payload for write response)
+        let result = unsafe {
+            am_msg.reply_vectorized(
+                Self::reply_stream_id() as u32,
+                header_bytes,
+                &[],
+                false,  // need_reply
+                None,   // No data, so no protocol needed
+            ).await
+        };
+
+        if let Err(e) = result {
+            tracing::error!("Failed to send reply: {:?}", e);
+            return Err((RpcError::TransportError(format!("Failed to send reply: {:?}", e)), am_msg));
+        }
+
+        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
