@@ -35,11 +35,19 @@ BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
+
+# UCX Configuration for avoiding Rendezvous protocol issues
+# - UCX_TLS: Use only TCP, shared memory, and self transports (avoid InfiniBand)
+# - UCX_RNDV_THRESH: Set to inf to disable Rendezvous protocol completely
+#   This forces all messages to use Eager protocol, which is compatible
+#   with current implementation
 UCX_LOG_LEVEL="DEBUG"
 UCX_TLS="tcp,sm,self"
+UCX_RNDV_THRESH="inf"
 
 export UCX_LOG_LEVEL
 export UCX_TLS
+export UCX_RNDV_THRESH
 
 # Calculate project root from SCRIPT_DIR and set LD_LIBRARY_PATH dynamically
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -144,7 +152,8 @@ cmd_mpirun_common=(
   -x PATH
   -x LD_LIBRARY_PATH
   -x UCX_TLS
-  -x UCX_LOG_LEVEL              # Suppress verbose UCX debug logs
+  -x UCX_RNDV_THRESH                      # Propagate Rendezvous threshold
+  -x UCX_LOG_LEVEL                        # Suppress verbose UCX debug logs
 )
 
 # ALTERNATIVE 1: UCX with automatic transport detection (try after TCP works)

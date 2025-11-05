@@ -41,6 +41,15 @@ RESULTS_DIR="${JOB_OUTPUT_DIR}/results"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:${LD_LIBRARY_PATH:-}"
 
+# UCX Configuration for avoiding Rendezvous protocol issues
+# - UCX_TLS: Use only TCP, shared memory, and self transports (avoid InfiniBand)
+# - UCX_RNDV_THRESH: Set to inf to disable Rendezvous protocol completely
+#   This forces all messages to use Eager protocol, which is compatible
+#   with current implementation
+export UCX_LOG_LEVEL="WARN"  # Less verbose for benchmark
+export UCX_TLS="tcp,sm,self"
+export UCX_RNDV_THRESH="inf"
+
 # Default ping iterations if not set
 : ${PING_ITERATIONS:=10000}
 
@@ -136,6 +145,9 @@ run_rpc_benchmark() {
   local mpirun_cmd=(
     mpirun
     "${nqsii_mpiopts_array[@]}"
+    -x "UCX_TLS=${UCX_TLS}"
+    -x "UCX_RNDV_THRESH=${UCX_RNDV_THRESH}"
+    -x "UCX_LOG_LEVEL=${UCX_LOG_LEVEL}"
     "${BENCHFS_PREFIX}/benchfs_rpc_bench"
     "${BENCHFS_REGISTRY_DIR}"
     --ping-iterations "${PING_ITERATIONS}"
