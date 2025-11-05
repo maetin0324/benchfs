@@ -120,6 +120,17 @@ fn main() {
     let registry_dir = PathBuf::from(&args[1]);
     let config = parse_args(&args);
 
+    // Log parsed configuration (rank 0 only)
+    if mpi_rank == 0 {
+        tracing::info!("Command line arguments:");
+        for (i, arg) in args.iter().enumerate() {
+            tracing::info!("  args[{}] = {}", i, arg);
+        }
+        tracing::info!("Parsed configuration:");
+        tracing::info!("  ping_iterations: {}", config.ping_iterations);
+        tracing::info!("  json_output: {:?}", config.json_output);
+    }
+
     // Create registry directory (rank 0 only)
     if mpi_rank == 0 {
         if !registry_dir.exists() {
@@ -140,6 +151,11 @@ fn main() {
         tracing::info!("Nodes: {}", mpi_size);
         tracing::info!("Registry: {:?}", registry_dir);
         tracing::info!("Ping iterations: {}", config.ping_iterations);
+        if let Some(ref json_path) = config.json_output {
+            tracing::info!("JSON output: {}", json_path);
+        } else {
+            tracing::info!("JSON output: <not specified>");
+        }
         tracing::info!("==============================================");
     }
 
@@ -252,7 +268,14 @@ fn run_client(
         ).await;
 
         // Write JSON output if requested
+        tracing::info!("Checking for JSON output path...");
         if let Some(json_path) = &config.json_output {
+            tracing::info!("JSON output path specified: {}", json_path);
+            tracing::info!("Preparing benchmark results for JSON output...");
+            tracing::info!("  Total servers: {}", server_nodes.len());
+            tracing::info!("  Ping iterations: {}", config.ping_iterations);
+            tracing::info!("  Results collected: {}", bench_results.len());
+
             let timestamp = chrono::Utc::now().to_rfc3339();
             let results = BenchmarkResults {
                 timestamp,
@@ -261,18 +284,27 @@ fn run_client(
                 server_results: bench_results,
             };
 
+            tracing::info!("Serializing results to JSON...");
             match serde_json::to_string_pretty(&results) {
                 Ok(json_str) => {
+                    tracing::info!("JSON serialization successful, writing to file: {}", json_path);
+                    tracing::info!("JSON content length: {} bytes", json_str.len());
                     if let Err(e) = std::fs::write(json_path, json_str) {
                         tracing::error!("Failed to write JSON output to {}: {:?}", json_path, e);
+                        eprintln!("ERROR: Failed to write JSON output to {}: {:?}", json_path, e);
                     } else {
-                        tracing::info!("JSON results written to {}", json_path);
+                        tracing::info!("JSON results written successfully to {}", json_path);
+                        eprintln!("SUCCESS: JSON results written to {}", json_path);
                     }
                 }
                 Err(e) => {
                     tracing::error!("Failed to serialize results to JSON: {:?}", e);
+                    eprintln!("ERROR: Failed to serialize results to JSON: {:?}", e);
                 }
             }
+        } else {
+            tracing::warn!("No JSON output path specified, skipping JSON output");
+            eprintln!("WARNING: No JSON output path specified");
         }
 
         // Send shutdown RPC to all servers

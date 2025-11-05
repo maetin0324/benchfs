@@ -106,6 +106,20 @@ run_rpc_benchmark() {
   echo "Ping Iterations: ${PING_ITERATIONS}"
   echo ""
 
+  # Verify results directory exists and is writable
+  if [ ! -d "${RESULTS_DIR}" ]; then
+    echo "ERROR: Results directory does not exist: ${RESULTS_DIR}"
+    mkdir -p "${RESULTS_DIR}" || { echo "Failed to create results directory"; return 1; }
+  fi
+
+  if [ ! -w "${RESULTS_DIR}" ]; then
+    echo "ERROR: Results directory is not writable: ${RESULTS_DIR}"
+    return 1
+  fi
+
+  echo "Results directory verified: ${RESULTS_DIR}"
+  echo "JSON output will be written to: ${json_file}"
+
   # Clean registry before each run
   rm -rf "${BENCHFS_REGISTRY_DIR}"/*
 
@@ -124,7 +138,17 @@ run_rpc_benchmark() {
 
   # Run benchmark with time measurement
   if time_json "${mpirun_cmd[@]}" 2>&1 | tee "${output_file}"; then
+    echo ""
     echo "RPC benchmark completed successfully"
+    echo ""
+    # Check if JSON file was created
+    if [ -f "${json_file}" ]; then
+      echo "JSON file created successfully: ${json_file}"
+      ls -lh "${json_file}"
+    else
+      echo "WARNING: JSON file was not created: ${json_file}"
+      echo "Check the log file for error messages: ${output_file}"
+    fi
   else
     echo "ERROR: RPC benchmark failed"
     return 1
@@ -164,13 +188,29 @@ echo ""
 echo "=========================================="
 echo "Results Summary"
 echo "=========================================="
+echo "Results directory: ${RESULTS_DIR}"
+echo ""
+echo "Checking for JSON results..."
 if [ -f "${RESULTS_DIR}/rpc_bench_1.json" ]; then
   echo "JSON results available:"
   ls -lh "${RESULTS_DIR}"/*.json
+  echo ""
+  echo "JSON content preview:"
+  head -20 "${RESULTS_DIR}/rpc_bench_1.json"
 else
-  echo "No JSON results found"
+  echo "No JSON results found at ${RESULTS_DIR}/rpc_bench_1.json"
+  echo ""
+  echo "Files in results directory:"
+  ls -la "${RESULTS_DIR}/" || echo "Results directory does not exist or is empty"
 fi
 echo ""
 echo "Log files:"
-ls -lh "${RESULTS_DIR}"/*.log
+if ls "${RESULTS_DIR}"/*.log 1> /dev/null 2>&1; then
+  ls -lh "${RESULTS_DIR}"/*.log
+  echo ""
+  echo "Checking log for JSON output messages:"
+  grep -i "json\|output\|SUCCESS\|ERROR\|WARNING" "${RESULTS_DIR}"/*.log | tail -20
+else
+  echo "No log files found"
+fi
 echo "=========================================="
