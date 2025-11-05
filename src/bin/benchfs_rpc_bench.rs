@@ -359,7 +359,6 @@ async fn run_ping_benchmark(
             let request = BenchPingRequest::new(
                 seq,
                 timestamp_ns,
-                client.worker_address().to_vec(),
             );
 
             if let Err(e) = request.call(&*client).await {
@@ -378,7 +377,6 @@ async fn run_ping_benchmark(
             let request = BenchPingRequest::new(
                 seq as u64,
                 timestamp_ns,
-                client.worker_address().to_vec(),
             );
 
             let start = Instant::now();
@@ -472,7 +470,7 @@ async fn send_shutdown_to_servers(
         };
 
         // Send shutdown request
-        let request = BenchShutdownRequest::new(client.worker_address().to_vec());
+        let request = BenchShutdownRequest::new();
 
         match request.call(&*client).await {
             Ok(response) => {
@@ -501,7 +499,7 @@ async fn send_shutdown_to_servers(
                 .unwrap()
                 .as_nanos() as u64;
 
-            let wake_up_ping = BenchPingRequest::new(0, timestamp, client.worker_address().to_vec());
+            let wake_up_ping = BenchPingRequest::new(0, timestamp);
 
             // Send ping but ignore response (server is shutting down)
             let _ = wake_up_ping.call(&*client).await;
