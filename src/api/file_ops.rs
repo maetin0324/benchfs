@@ -608,6 +608,7 @@ impl BenchFS {
                                             0,
                                             self.chunk_manager.chunk_size() as u64,
                                             file_path.clone(),
+                                            client.worker_address().to_vec(),
                                         );
 
                                             // Execute RPC
@@ -785,6 +786,7 @@ impl BenchFS {
                                     chunk_offset,
                                     chunk_data,
                                     file_path.clone(),
+                                    client.worker_address().to_vec(),
                                 );
 
                                 // Execute RPC
