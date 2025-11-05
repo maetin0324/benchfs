@@ -20,9 +20,18 @@ impl RpcClient {
         let worker_address = conn
             .worker()
             .address()
-            .map(|addr| addr.as_ref().to_vec())
+            .map(|addr| {
+                let addr_vec = addr.as_ref().to_vec();
+                tracing::debug!(
+                    "RpcClient: Got worker address, length={}, first_32_bytes={:?}",
+                    addr_vec.len(),
+                    &addr_vec.get(0..32.min(addr_vec.len())).unwrap_or(&[])
+                );
+                addr_vec
+            })
             .unwrap_or_else(|e| {
                 tracing::error!("Failed to get worker address: {:?}", e);
+                tracing::error!("RpcClient: Returning empty worker address due to error");
                 vec![]
             });
 

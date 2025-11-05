@@ -253,6 +253,13 @@ impl AmRpc for ReadChunkRequest {
             return Err((RpcError::TransportError(format!("Failed to receive data: {:?}", e)), am_msg));
         }
 
+        // Log received worker address for debugging
+        tracing::debug!(
+            "ReadChunkRequest: Received worker_addr_len={}, first_32_bytes={:?}",
+            worker_addr_bytes.len(),
+            &worker_addr_bytes.get(0..32.min(worker_addr_bytes.len())).unwrap_or(&[])
+        );
+
         let path = match String::from_utf8(path_bytes) {
             Ok(p) => p,
             Err(e) => return Err((RpcError::TransportError(format!("Invalid UTF-8 in path: {:?}", e)), am_msg)),
@@ -575,6 +582,13 @@ impl AmRpc for WriteChunkRequest<'_> {
                 } else {
                     tracing::trace!("WriteChunk: recv_data_vectored completed (zero-copy)");
 
+                    // Log received worker address for debugging
+                    tracing::debug!(
+                        "WriteChunkRequest (zero-copy): Received worker_addr_len={}, first_32_bytes={:?}",
+                        worker_addr_bytes.len(),
+                        &worker_addr_bytes.get(0..32.min(worker_addr_bytes.len())).unwrap_or(&[])
+                    );
+
                     let path = match String::from_utf8(path_bytes) {
                         Ok(p) => p,
                         Err(e) => {
@@ -632,6 +646,13 @@ impl AmRpc for WriteChunkRequest<'_> {
                 tracing::error!("Failed to receive request data: {:?}", e);
                 WriteChunkResponseHeader::error(-5)
             } else {
+                // Log received worker address for debugging
+                tracing::debug!(
+                    "WriteChunkRequest (fallback): Received worker_addr_len={}, first_32_bytes={:?}",
+                    worker_addr_bytes.len(),
+                    &worker_addr_bytes.get(0..32.min(worker_addr_bytes.len())).unwrap_or(&[])
+                );
+
                 let path = match String::from_utf8(path_bytes) {
                     Ok(p) => p,
                     Err(e) => {

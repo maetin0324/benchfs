@@ -602,13 +602,22 @@ impl BenchFS {
                                 // Connect to remote node using node_id
                                 match pool.get_or_connect(&node_id).await {
                                     Ok(client) => {
+                                        // Get worker address and log it
+                                        let worker_addr = client.worker_address().to_vec();
+                                        tracing::debug!(
+                                            "Creating ReadChunkRequest: chunk={}, worker_addr_len={}, first_32_bytes={:?}",
+                                            chunk_index,
+                                            worker_addr.len(),
+                                            &worker_addr.get(0..32.min(worker_addr.len())).unwrap_or(&[])
+                                        );
+
                                         // Create RPC request
                                         let request = ReadChunkRequest::new(
                                             chunk_index,
                                             0,
                                             self.chunk_manager.chunk_size() as u64,
                                             file_path.clone(),
-                                            client.worker_address().to_vec(),
+                                            worker_addr,
                                         );
 
                                             // Execute RPC
@@ -780,13 +789,24 @@ impl BenchFS {
 
                         match pool.get_or_connect(&target_node).await {
                             Ok(client) => {
+                                // Get worker address and log it
+                                let worker_addr = client.worker_address().to_vec();
+                                tracing::debug!(
+                                    "Creating WriteChunkRequest: chunk={}, offset={}, len={}, worker_addr_len={}, first_32_bytes={:?}",
+                                    chunk_index,
+                                    chunk_offset,
+                                    chunk_data.len(),
+                                    worker_addr.len(),
+                                    &worker_addr.get(0..32.min(worker_addr.len())).unwrap_or(&[])
+                                );
+
                                 // Create RPC request
                                 let request = WriteChunkRequest::new(
                                     chunk_index,
                                     chunk_offset,
                                     chunk_data,
                                     file_path.clone(),
-                                    client.worker_address().to_vec(),
+                                    worker_addr,
                                 );
 
                                 // Execute RPC
