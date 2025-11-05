@@ -190,7 +190,7 @@ impl BenchFS {
         if let Some(pool) = &self.connection_pool {
             match pool.get_or_connect(&metadata_node).await {
                 Ok(client) => {
-                    let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
+                    let request = MetadataLookupRequest::new(path.to_string());
                     match request.call(&*client).await {
                         Ok(response) if response.is_success() && response.is_file() => {
                             let meta = FileMetadata::new(path.to_string(), response.size);
@@ -247,7 +247,7 @@ impl BenchFS {
             if let Some(pool) = &self.connection_pool {
                 match pool.get_or_connect(&metadata_node).await {
                     Ok(client) => {
-                        let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
+                        let request = MetadataLookupRequest::new(path.to_string());
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found on remote server - create local cache entry
@@ -309,10 +309,7 @@ impl BenchFS {
                             Ok(client) => {
                                 use crate::rpc::metadata_ops::MetadataUpdateRequest;
                                 let request =
-                                    MetadataUpdateRequest::new(
-                                        path.to_string(),
-                                        client.worker_address().to_vec()
-                                    ).with_size(0);
+                                    MetadataUpdateRequest::new(path.to_string()).with_size(0);
                                 match request.call(&*client).await {
                                     Ok(response) if response.is_success() => {
                                         tracing::debug!("Remote truncate succeeded for {}", path);
@@ -384,7 +381,7 @@ impl BenchFS {
                     match pool.get_or_connect(&metadata_node).await {
                         Ok(client) => {
                             let request =
-                                MetadataCreateFileRequest::new(path.to_string(), 0, 0o644, client.worker_address().to_vec());
+                                MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
                             match request.call(&*client).await {
                                 Ok(response) if response.is_success() => {
                                     tracing::debug!("Remote file created: {}", path);
@@ -488,7 +485,7 @@ impl BenchFS {
                 if let Some(pool) = &self.connection_pool {
                     match pool.get_or_connect(&metadata_node).await {
                         Ok(client) => {
-                            let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
+                            let request = MetadataLookupRequest::new(path.to_string());
                             match request.call(&*client).await {
                                 Ok(response) if response.is_success() && response.is_file() => {
                                     response.size
@@ -611,7 +608,6 @@ impl BenchFS {
                                             0,
                                             self.chunk_manager.chunk_size() as u64,
                                             file_path.clone(),
-                                            client.worker_address().to_vec(),
                                         );
 
                                             // Execute RPC
@@ -789,7 +785,6 @@ impl BenchFS {
                                     chunk_offset,
                                     chunk_data,
                                     file_path.clone(),
-                                    client.worker_address().to_vec(),
                                 );
 
                                 // Execute RPC
@@ -895,10 +890,8 @@ impl BenchFS {
 
                         if let Some(Ok(client)) = client_result {
                             use crate::rpc::metadata_ops::MetadataUpdateRequest;
-                            let request = MetadataUpdateRequest::new(
-                                handle.path.clone(),
-                                client.worker_address().to_vec()
-                            ).with_size(file_meta.size);
+                            let request = MetadataUpdateRequest::new(handle.path.clone())
+                                .with_size(file_meta.size);
 
                             // Also use timeout for RPC call
                             let mut rpc_timeout = Delay::new(timeout_duration).fuse();
@@ -1164,7 +1157,7 @@ impl BenchFS {
             if let Some(pool) = &self.connection_pool {
                 match pool.get_or_connect(&metadata_node).await {
                     Ok(client) => {
-                        let request = MetadataLookupRequest::new(path.to_string(), client.worker_address().to_vec());
+                        let request = MetadataLookupRequest::new(path.to_string());
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
                                 // File found

@@ -1,13 +1,12 @@
-use std::cell::UnsafeCell;
 use std::io::IoSlice;
 use std::path::Path;
 use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
-use zerocopy::FromBytes;
 
 use crate::metadata::{DirectoryMetadata, FileMetadata};
-use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId};
+use crate::rpc::helpers::{parse_header, receive_path, rpc_error_to_errno, send_rpc_response_via_reply, RpcIoSliceHelper};
+use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, SHUTDOWN_MAGIC};
 
 /// RPC IDs for metadata operations
 pub const RPC_METADATA_LOOKUP: RpcId = 20;
@@ -138,33 +137,18 @@ impl MetadataLookupResponseHeader {
 pub struct MetadataLookupRequest {
     header: MetadataLookupRequestHeader,
     path: String,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
-    /// IoSlices: [worker_address, path]
-    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
+    /// Helper for managing IoSlices with extended lifetimes
+    io_helper: RpcIoSliceHelper<1>,
 }
 
-// SAFETY: MetadataLookupRequest is only used in single-threaded context (Pluvio runtime)
-unsafe impl Send for MetadataLookupRequest {}
-
 impl MetadataLookupRequest {
-    pub fn new(path: String, worker_address: Vec<u8>) -> Self {
-        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
-        // This is safe because:
-        // 1. The buffers live as long as the MetadataLookupRequest
-        // 2. The IoSlices are only accessed through request_data()
-        // 3. The RPC client will only use them during the RPC call
-        let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
-        };
+    pub fn new(path: String) -> Self {
+        let io_helper = RpcIoSliceHelper::new(vec![path.as_bytes().to_vec()]);
 
         Self {
             header: MetadataLookupRequestHeader::new(path.len()),
             path,
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslices),
+            io_helper,
         }
     }
 
@@ -190,9 +174,7 @@ impl AmRpc for MetadataLookupRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        // SAFETY: We're returning a slice containing the IoSlices we created in new()
-        // This is safe because the IoSlice lifetime is tied to self
-        unsafe { &*self.request_ioslice.get() }
+        self.io_helper.get()
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -206,78 +188,43 @@ impl AmRpc for MetadataLookupRequest {
     }
 
     async fn server_handler(
-        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        _ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header = match am_msg
-            .header()
-            .get(..std::mem::size_of::<MetadataLookupRequestHeader>())
-            .and_then(|bytes| {
-                MetadataLookupRequestHeader::read_from_prefix(bytes)
-                    .ok()
-                    .map(|(h, _)| h.clone())
-            }) {
-            Some(h) => h,
-            None => return Err((RpcError::InvalidHeader, am_msg)),
+        let header: MetadataLookupRequestHeader = match parse_header(&am_msg) {
+            Ok(h) => h,
+            Err(e) => return Err((e, am_msg)),
         };
 
-        // Receive WorkerAddress and path data
-        let mut worker_addr_bytes = vec![0u8; 512];
-        let mut path_bytes = vec![0u8; header.path_len as usize];
+        // Receive path data
+        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+            Ok(data) => data,
+            Err(e) => return Err((e, am_msg)),
+        };
 
-        if am_msg.contains_data() {
-            if let Err(_e) = am_msg.recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
-                std::io::IoSliceMut::new(&mut path_bytes),
-            ]).await {
-                return Ok((
-                    crate::rpc::ServerResponse::new(MetadataLookupResponseHeader::error(-2)),
-                    am_msg,
-                ));
-            }
-        }
-
-        let path_str = String::from_utf8_lossy(&path_bytes);
-        let path = Path::new(path_str.as_ref());
+        let path = Path::new(&path_str);
 
         // Determine response
-        let response_header = if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path) {
+        let response_header = if let Ok(file_meta) = _ctx.metadata_manager.get_file_metadata(path) {
             MetadataLookupResponseHeader::file(file_meta.size)
-        } else if let Ok(_dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
+        } else if let Ok(_dir_meta) = _ctx.metadata_manager.get_dir_metadata(path) {
             MetadataLookupResponseHeader::directory()
         } else {
             MetadataLookupResponseHeader::not_found()
         };
 
-        // Send response directly using WorkerAddress
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             None,
-        ).await {
-            tracing::error!("Failed to send direct response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        // Return empty response since we already sent the response directly
-        Ok((
-            crate::rpc::ServerResponse::new(response_header),
             am_msg,
-        ))
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
-        let status = match error {
-            RpcError::InvalidHeader => -1,
-            RpcError::TransportError(_) => -2,
-            RpcError::HandlerError(_) => -3,
-            RpcError::ConnectionError(_) => -4,
-            RpcError::Timeout => -5,
-        };
-        MetadataLookupResponseHeader::error(status)
+        MetadataLookupResponseHeader::error(rpc_error_to_errno(error))
     }
 }
 
@@ -365,28 +312,18 @@ impl MetadataCreateFileResponseHeader {
 pub struct MetadataCreateFileRequest {
     header: MetadataCreateFileRequestHeader,
     path: String,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
-    /// IoSlices: [worker_address, path]
-    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
+    /// Helper for managing IoSlices with extended lifetimes
+    io_helper: RpcIoSliceHelper<1>,
 }
 
-// SAFETY: MetadataCreateFileRequest is only used in single-threaded context (Pluvio runtime)
-unsafe impl Send for MetadataCreateFileRequest {}
-
 impl MetadataCreateFileRequest {
-    pub fn new(path: String, size: u64, mode: u32, worker_address: Vec<u8>) -> Self {
-        let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
-        };
+    pub fn new(path: String, size: u64, mode: u32) -> Self {
+        let io_helper = RpcIoSliceHelper::new(vec![path.as_bytes().to_vec()]);
 
         Self {
             header: MetadataCreateFileRequestHeader::new(size, mode, path.len()),
             path,
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslices),
+            io_helper,
         }
     }
 
@@ -412,7 +349,7 @@ impl AmRpc for MetadataCreateFileRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        unsafe { &*self.request_ioslice.get() }
+        self.io_helper.get()
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -430,35 +367,16 @@ impl AmRpc for MetadataCreateFileRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header = match am_msg
-            .header()
-            .get(..std::mem::size_of::<MetadataCreateFileRequestHeader>())
-            .and_then(|bytes| {
-                MetadataCreateFileRequestHeader::read_from_prefix(bytes)
-                    .ok()
-                    .map(|(h, _)| h.clone())
-            }) {
-            Some(h) => h,
-            None => return Err((RpcError::InvalidHeader, am_msg)),
+        let header: MetadataCreateFileRequestHeader = match parse_header(&am_msg) {
+            Ok(h) => h,
+            Err(e) => return Err((e, am_msg)),
         };
 
-        // Receive WorkerAddress and path data
-        let mut worker_addr_bytes = vec![0u8; 512];
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-
-        if am_msg.contains_data() {
-            if let Err(_e) = am_msg.recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
-                std::io::IoSliceMut::new(&mut path_bytes),
-            ]).await {
-                return Ok((
-                    crate::rpc::ServerResponse::new(MetadataCreateFileResponseHeader::error(-2)),
-                    am_msg,
-                ));
-            }
-        }
-
-        let path_str = String::from_utf8_lossy(&path_bytes);
+        // Receive path data
+        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+            Ok(data) => data,
+            Err(e) => return Err((e, am_msg)),
+        };
 
         // Create file metadata (no inode in path-based KV design)
         let file_meta = FileMetadata::new(path_str.to_string(), header.size);
@@ -476,34 +394,17 @@ impl AmRpc for MetadataCreateFileRequest {
             }
         };
 
-        // Send response directly using WorkerAddress
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             None,
-        ).await {
-            tracing::error!("Failed to send direct response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        // Return empty response since we already sent the response directly
-        Ok((
-            crate::rpc::ServerResponse::new(response_header),
             am_msg,
-        ))
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
-        let status = match error {
-            RpcError::InvalidHeader => -1,
-            RpcError::TransportError(_) => -2,
-            RpcError::HandlerError(_) => -3,
-            RpcError::ConnectionError(_) => -4,
-            RpcError::Timeout => -5,
-        };
-        MetadataCreateFileResponseHeader::error(status)
+        MetadataCreateFileResponseHeader::error(rpc_error_to_errno(error))
     }
 }
 
@@ -546,29 +447,18 @@ pub type MetadataCreateDirResponseHeader = MetadataCreateFileResponseHeader;
 pub struct MetadataCreateDirRequest {
     header: MetadataCreateDirRequestHeader,
     path: String,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
-    /// IoSlices: [worker_address, path]
-    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
+    /// Helper for managing IoSlices with extended lifetimes
+    io_helper: RpcIoSliceHelper<1>,
 }
 
-// SAFETY: MetadataCreateDirRequest is only used in single-threaded context (Pluvio runtime)
-unsafe impl Send for MetadataCreateDirRequest {}
-
 impl MetadataCreateDirRequest {
-    pub fn new(path: String, mode: u32, worker_address: Vec<u8>) -> Self {
-        // SAFETY: Same as MetadataLookupRequest
-        let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
-        };
+    pub fn new(path: String, mode: u32) -> Self {
+        let io_helper = RpcIoSliceHelper::new(vec![path.as_bytes().to_vec()]);
 
         Self {
             header: MetadataCreateDirRequestHeader::new(mode, path.len()),
             path,
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslices),
+            io_helper,
         }
     }
 
@@ -595,7 +485,7 @@ impl AmRpc for MetadataCreateDirRequest {
 
     fn request_data(&self) -> &[IoSlice<'_>] {
         // SAFETY: Same as MetadataLookupRequest
-        unsafe { &*self.request_ioslice.get() }
+        self.io_helper.get()
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -613,39 +503,16 @@ impl AmRpc for MetadataCreateDirRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header = match am_msg
-            .header()
-            .get(..std::mem::size_of::<MetadataCreateDirRequestHeader>())
-            .and_then(|bytes| {
-                MetadataCreateDirRequestHeader::read_from_prefix(bytes)
-                    .ok()
-                    .map(|(h, _)| h.clone())
-            }) {
-            Some(h) => h,
-            None => return Err((RpcError::InvalidHeader, am_msg)),
+        let header: MetadataCreateDirRequestHeader = match parse_header(&am_msg) {
+            Ok(h) => h,
+            Err(e) => return Err((e, am_msg)),
         };
 
-        // Receive WorkerAddress and path data
-        let mut worker_addr_bytes = vec![0u8; 512];
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-        if am_msg.contains_data() {
-            if let Err(_e) = am_msg.recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
-                std::io::IoSliceMut::new(&mut path_bytes),
-            ]).await {
-                let response_header = MetadataCreateDirResponseHeader::error(-2);
-                // Send error response directly
-                let _ = ctx.send_response_direct(
-                    &worker_addr_bytes,
-                    Self::reply_stream_id(),
-                    Self::rpc_id(),
-                    &response_header,
-                    None,
-                ).await;
-                return Ok((crate::rpc::ServerResponse::new(response_header), am_msg));
-            }
-        }
-        let path_str = String::from_utf8_lossy(&path_bytes);
+        // Receive path data
+        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+            Ok(data) => data,
+            Err(e) => return Err((e, am_msg)),
+        };
 
         // Generate inode and create directory metadata
         let inode = ctx.metadata_manager.generate_inode();
@@ -664,30 +531,17 @@ impl AmRpc for MetadataCreateDirRequest {
             }
         };
 
-        // Send response directly to client
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             None,
-        ).await {
-            tracing::error!("Failed to send MetadataCreateDir response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+            am_msg,
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
-        let status = match error {
-            RpcError::InvalidHeader => -1,
-            RpcError::TransportError(_) => -2,
-            RpcError::HandlerError(_) => -3,
-            RpcError::ConnectionError(_) => -4,
-            RpcError::Timeout => -5,
-        };
-        MetadataCreateDirResponseHeader::error(status)
+        MetadataCreateDirResponseHeader::error(rpc_error_to_errno(error))
     }
 }
 
@@ -778,45 +632,28 @@ impl MetadataDeleteResponseHeader {
 pub struct MetadataDeleteRequest {
     header: MetadataDeleteRequestHeader,
     path: String,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
-    /// IoSlices: [worker_address, path]
-    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
+    /// Helper for managing IoSlices with extended lifetimes
+    io_helper: RpcIoSliceHelper<1>,
 }
 
-// SAFETY: MetadataDeleteRequest is only used in single-threaded context (Pluvio runtime)
-unsafe impl Send for MetadataDeleteRequest {}
-
 impl MetadataDeleteRequest {
-    pub fn delete_file(path: String, worker_address: Vec<u8>) -> Self {
-        // SAFETY: Same as MetadataLookupRequest
-        let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
-        };
+    pub fn delete_file(path: String) -> Self {
+        let io_helper = RpcIoSliceHelper::new(vec![path.as_bytes().to_vec()]);
 
         Self {
             header: MetadataDeleteRequestHeader::file(path.len()),
             path,
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslices),
+            io_helper,
         }
     }
 
-    pub fn delete_directory(path: String, worker_address: Vec<u8>) -> Self {
-        // SAFETY: Same as MetadataLookupRequest
-        let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
-        };
+    pub fn delete_directory(path: String) -> Self {
+        let io_helper = RpcIoSliceHelper::new(vec![path.as_bytes().to_vec()]);
 
         Self {
             header: MetadataDeleteRequestHeader::directory(path.len()),
             path,
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslices),
+            io_helper,
         }
     }
 
@@ -851,7 +688,7 @@ impl AmRpc for MetadataDeleteRequest {
 
     fn request_data(&self) -> &[IoSlice<'_>] {
         // SAFETY: Same as MetadataLookupRequest
-        unsafe { &*self.request_ioslice.get() }
+        self.io_helper.get()
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -869,39 +706,18 @@ impl AmRpc for MetadataDeleteRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header = match am_msg
-            .header()
-            .get(..std::mem::size_of::<MetadataDeleteRequestHeader>())
-            .and_then(|bytes| {
-                MetadataDeleteRequestHeader::read_from_prefix(bytes)
-                    .ok()
-                    .map(|(h, _)| h.clone())
-            }) {
-            Some(h) => h,
-            None => return Err((RpcError::InvalidHeader, am_msg)),
+        let header: MetadataDeleteRequestHeader = match parse_header(&am_msg) {
+            Ok(h) => h,
+            Err(e) => return Err((e, am_msg)),
         };
 
-        // Receive WorkerAddress and path data
-        let mut worker_addr_bytes = vec![0u8; 512];
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-        if am_msg.contains_data() {
-            if let Err(_e) = am_msg.recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
-                std::io::IoSliceMut::new(&mut path_bytes),
-            ]).await {
-                let response_header = MetadataDeleteResponseHeader::error(-2);
-                let _ = ctx.send_response_direct(
-                    &worker_addr_bytes,
-                    Self::reply_stream_id(),
-                    Self::rpc_id(),
-                    &response_header,
-                    None,
-                ).await;
-                return Ok((crate::rpc::ServerResponse::new(response_header), am_msg));
-            }
-        }
-        let path_str = String::from_utf8_lossy(&path_bytes);
-        let path = Path::new(path_str.as_ref());
+        // Receive path data
+        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+            Ok(data) => data,
+            Err(e) => return Err((e, am_msg)),
+        };
+
+        let path = Path::new(&path_str);
 
         // Delete based on entry type
         let response_header = if header.entry_type == 1 {
@@ -920,30 +736,17 @@ impl AmRpc for MetadataDeleteRequest {
             MetadataDeleteResponseHeader::error(-22) // EINVAL
         };
 
-        // Send response directly to client
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             None,
-        ).await {
-            tracing::error!("Failed to send MetadataDelete response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+            am_msg,
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
-        let status = match error {
-            RpcError::InvalidHeader => -1,
-            RpcError::TransportError(_) => -2,
-            RpcError::HandlerError(_) => -3,
-            RpcError::ConnectionError(_) => -4,
-            RpcError::Timeout => -5,
-        };
-        MetadataDeleteResponseHeader::error(status)
+        MetadataDeleteResponseHeader::error(rpc_error_to_errno(error))
     }
 }
 
@@ -1058,33 +861,18 @@ impl MetadataUpdateResponseHeader {
 pub struct MetadataUpdateRequest {
     header: MetadataUpdateRequestHeader,
     path: String,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
-    /// IoSlices: [worker_address, path]
-    request_ioslice: UnsafeCell<[IoSlice<'static>; 2]>,
+    /// Helper for managing IoSlices with extended lifetimes
+    io_helper: RpcIoSliceHelper<1>,
 }
 
-// SAFETY: MetadataUpdateRequest is only used in single-threaded context (Pluvio runtime)
-unsafe impl Send for MetadataUpdateRequest {}
-
 impl MetadataUpdateRequest {
-    pub fn new(path: String, worker_address: Vec<u8>) -> Self {
-        // SAFETY: We're creating 'static IoSlices by transmuting the lifetime.
-        // This is safe because:
-        // 1. The buffers live as long as the MetadataUpdateRequest
-        // 2. The IoSlices are only accessed through request_data()
-        // 3. The RPC client will only use them during the RPC call
-        let ioslices = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            let path_slice: &'static [u8] = std::mem::transmute(path.as_bytes());
-            [IoSlice::new(addr_slice), IoSlice::new(path_slice)]
-        };
+    pub fn new(path: String) -> Self {
+        let io_helper = RpcIoSliceHelper::new(vec![path.as_bytes().to_vec()]);
 
         Self {
             header: MetadataUpdateRequestHeader::new(path.len()),
             path,
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslices),
+            io_helper,
         }
     }
 
@@ -1120,9 +908,7 @@ impl AmRpc for MetadataUpdateRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        // SAFETY: We're returning a slice containing the IoSlices we created in new()
-        // This is safe because the IoSlice lifetime is tied to self
-        unsafe { &*self.request_ioslice.get() }
+        self.io_helper.get()
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -1140,45 +926,29 @@ impl AmRpc for MetadataUpdateRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header = match am_msg
-            .header()
-            .get(..std::mem::size_of::<MetadataUpdateRequestHeader>())
-            .and_then(|bytes| {
-                MetadataUpdateRequestHeader::read_from_prefix(bytes)
-                    .ok()
-                    .map(|(h, _)| h.clone())
-            }) {
-            Some(h) => h,
-            None => return Err((RpcError::InvalidHeader, am_msg)),
+        let header: MetadataUpdateRequestHeader = match parse_header(&am_msg) {
+            Ok(h) => h,
+            Err(e) => return Err((e, am_msg)),
         };
 
-        // Receive WorkerAddress and path data
-        let mut worker_addr_bytes = vec![0u8; 512];
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-
-        if am_msg.contains_data() {
-            if let Err(_e) = am_msg.recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
-                std::io::IoSliceMut::new(&mut path_bytes),
-            ]).await {
-                return Ok((
-                    crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-2)),
-                    am_msg,
-                ));
-            }
-        }
-
-        let path_str = String::from_utf8_lossy(&path_bytes);
-        let path = Path::new(path_str.as_ref());
+        // Receive path data
+        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+            Ok(data) => data,
+            Err(e) => return Err((e, am_msg)),
+        };
+        let path = Path::new(&path_str);
 
         // Get current file metadata
         let mut file_meta = match ctx.metadata_manager.get_file_metadata(path) {
             Ok(meta) => meta,
             Err(_) => {
-                return Ok((
-                    crate::rpc::ServerResponse::new(MetadataUpdateResponseHeader::error(-2)), // ENOENT
+                let error_header = MetadataUpdateResponseHeader::error(-2); // ENOENT
+                return send_rpc_response_via_reply(
+                    Self::reply_stream_id(),
+                    &error_header,
+                    None,
                     am_msg,
-                ));
+                ).await;
             }
         };
 
@@ -1196,34 +966,17 @@ impl AmRpc for MetadataUpdateRequest {
             Err(_e) => MetadataUpdateResponseHeader::error(-5), // EIO
         };
 
-        // Send response directly using WorkerAddress
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             None,
-        ).await {
-            tracing::error!("Failed to send direct response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        // Return empty response since we already sent the response directly
-        Ok((
-            crate::rpc::ServerResponse::new(response_header),
             am_msg,
-        ))
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
-        let status = match error {
-            RpcError::InvalidHeader => -1,
-            RpcError::TransportError(_) => -2,
-            RpcError::HandlerError(_) => -3,
-            RpcError::ConnectionError(_) => -4,
-            RpcError::Timeout => -5,
-        };
-        MetadataUpdateResponseHeader::error(status)
+        MetadataUpdateResponseHeader::error(rpc_error_to_errno(error))
     }
 }
 
@@ -1283,7 +1036,7 @@ mod tests {
     #[test]
     fn test_metadata_lookup_request() {
         let dummy_worker_addr = vec![0u8; 512]; // Dummy WorkerAddress for testing
-        let request = MetadataLookupRequest::new("/foo/bar.txt".to_string(), dummy_worker_addr);
+        let request = MetadataLookupRequest::new("/foo/bar.txt".to_string());
         assert_eq!(request.path(), "/foo/bar.txt");
         assert_eq!(request.header.path_len, 12);
     }
@@ -1291,7 +1044,7 @@ mod tests {
     #[test]
     fn test_metadata_create_file_request() {
         let dummy_worker_addr = vec![0u8; 512]; // Dummy WorkerAddress for testing
-        let request = MetadataCreateFileRequest::new("/new.txt".to_string(), 0, 0o644, dummy_worker_addr);
+        let request = MetadataCreateFileRequest::new("/new.txt".to_string(), 0, 0o644);
         assert_eq!(request.path(), "/new.txt");
         assert_eq!(request.header.size, 0);
         assert_eq!(request.header.mode, 0o644);
@@ -1310,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_metadata_create_dir_request() {
-        let request = MetadataCreateDirRequest::new("/newdir".to_string(), 0o755, vec![1, 2, 3, 4]);
+        let request = MetadataCreateDirRequest::new("/newdir".to_string(), 0o755);
         assert_eq!(request.path(), "/newdir");
         assert_eq!(request.header.mode, 0o755);
         assert_eq!(request.header.path_len, 7);
@@ -1318,12 +1071,12 @@ mod tests {
 
     #[test]
     fn test_metadata_delete_request() {
-        let file_req = MetadataDeleteRequest::delete_file("/file.txt".to_string(), vec![1, 2, 3, 4]);
+        let file_req = MetadataDeleteRequest::delete_file("/file.txt".to_string());
         assert_eq!(file_req.path(), "/file.txt");
         assert!(file_req.is_file());
         assert!(!file_req.is_directory());
 
-        let dir_req = MetadataDeleteRequest::delete_directory("/dir".to_string(), vec![1, 2, 3, 4]);
+        let dir_req = MetadataDeleteRequest::delete_directory("/dir".to_string());
         assert_eq!(dir_req.path(), "/dir");
         assert!(!dir_req.is_file());
         assert!(dir_req.is_directory());
@@ -1368,8 +1121,6 @@ mod tests {
 // ============================================================================
 // Shutdown RPC (for graceful server termination)
 // ============================================================================
-
-const SHUTDOWN_MAGIC: u64 = 0xDEADBEEF_CAFEBABE;
 
 /// Shutdown request header
 #[repr(C)]
@@ -1422,31 +1173,12 @@ impl ShutdownResponseHeader {
 /// Shutdown RPC request
 pub struct ShutdownRequest {
     header: ShutdownRequestHeader,
-    /// Client's WorkerAddress for direct response
-    worker_address: Vec<u8>,
-    /// IoSlice for worker_address
-    request_ioslice: UnsafeCell<IoSlice<'static>>,
 }
 
-// SAFETY: ShutdownRequest is only used in single-threaded context (Pluvio runtime)
-unsafe impl Send for ShutdownRequest {}
-
 impl ShutdownRequest {
-    pub fn new(worker_address: Vec<u8>) -> Self {
-        // SAFETY: We're creating 'static IoSlice by transmuting the lifetime.
-        // This is safe because:
-        // 1. The buffer lives as long as the ShutdownRequest
-        // 2. The IoSlice is only accessed through request_data()
-        // 3. The RPC client will only use it during the RPC call
-        let ioslice = unsafe {
-            let addr_slice: &'static [u8] = std::mem::transmute(worker_address.as_slice());
-            IoSlice::new(addr_slice)
-        };
-
+    pub fn new() -> Self {
         Self {
             header: ShutdownRequestHeader::new(),
-            worker_address,
-            request_ioslice: UnsafeCell::new(ioslice),
         }
     }
 }
@@ -1468,9 +1200,7 @@ impl AmRpc for ShutdownRequest {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        // SAFETY: We're returning a slice containing the IoSlice we created in new()
-        // This is safe because the IoSlice lifetime is tied to self
-        unsafe { std::slice::from_ref(&*self.request_ioslice.get()) }
+        &[] // No data payload - reply via reply_ep
     }
 
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
@@ -1485,36 +1215,18 @@ impl AmRpc for ShutdownRequest {
 
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
-        mut am_msg: AmMsg,
+        am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header = match am_msg
-            .header()
-            .get(..std::mem::size_of::<ShutdownRequestHeader>())
-            .and_then(|bytes| {
-                ShutdownRequestHeader::read_from_prefix(bytes)
-                    .ok()
-                    .map(|(h, _)| h.clone())
-            }) {
-            Some(h) => h,
-            None => return Err((RpcError::InvalidHeader, am_msg)),
+        let header: ShutdownRequestHeader = match parse_header(&am_msg) {
+            Ok(h) => h,
+            Err(e) => return Err((e, am_msg)),
         };
 
         // Verify magic number
         if header.magic != SHUTDOWN_MAGIC {
             tracing::warn!("Invalid shutdown magic: {:#x}", header.magic);
             return Err((RpcError::InvalidHeader, am_msg));
-        }
-
-        // Receive WorkerAddress
-        let mut worker_addr_bytes = vec![0u8; 512];
-
-        if am_msg.contains_data() {
-            if let Err(_e) = am_msg.recv_data_vectored(&[
-                std::io::IoSliceMut::new(&mut worker_addr_bytes),
-            ]).await {
-                return Err((RpcError::TransportError("Failed to receive worker address".to_string()), am_msg));
-            }
         }
 
         tracing::info!("Received shutdown request");
@@ -1524,23 +1236,13 @@ impl AmRpc for ShutdownRequest {
 
         let response_header = ShutdownResponseHeader::new(true);
 
-        // Send response directly using WorkerAddress
-        if let Err(e) = ctx.send_response_direct(
-            &worker_addr_bytes,
+        // Send response using reply_ep
+        send_rpc_response_via_reply(
             Self::reply_stream_id(),
-            Self::rpc_id(),
             &response_header,
             None,
-        ).await {
-            tracing::error!("Failed to send direct response: {:?}", e);
-            return Err((e, am_msg));
-        }
-
-        // Return empty response since we already sent the response directly
-        Ok((
-            crate::rpc::ServerResponse::new(response_header),
             am_msg,
-        ))
+        ).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
