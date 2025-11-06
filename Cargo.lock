@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "async-ucx"
 version = "0.1.1"
-source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#7b4e2d35e69012761b882c53e64375af6a9d796c"
+source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#af0cfd6c70b2eb88be1883737d694941b162a6d3"
 dependencies = [
  "crossbeam",
  "derivative",
@@ -1298,7 +1298,7 @@ dependencies = [
 [[package]]
 name = "ucx1-sys"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#7b4e2d35e69012761b882c53e64375af6a9d796c"
+source = "git+https://github.com/maetin0324/async-ucx.git?branch=main#af0cfd6c70b2eb88be1883737d694941b162a6d3"
 dependencies = [
  "bindgen 0.66.1",
 ]

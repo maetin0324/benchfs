@@ -71,7 +71,8 @@ export UCX_RC_TIMEOUT_MULTIPLIER=4.0     # タイムアウト乗数（デフォ�
 
 export UCX_AM_MAX_SHORT=128              # Short AMの最大サイズ (デフォルト: 128B)
 export UCX_AM_MAX_EAGER=8192             # Eager AMの最大サイズ (8KB)
-export UCX_RNDV_THRESH=16384             # Rendezvous閾値 (16KB)
+# export UCX_RNDV_THRESH=16384             # Rendezvous閾値 (16KB)
+export UCX_RNDV_THRESH=inf              # Rendezvousプロトコル無効化（全てEagerに）
 
 # AMストリームのキューサイズ
 export UCX_AM_SEND_QUEUE_SIZE=1024       # 送信キューサイズ
@@ -490,8 +491,8 @@ EOF
 
           # Run IOR benchmark
           echo "Running IOR benchmark..."
-          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
-          ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.txt"
+          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.txt"
+          ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
 
           cmd_ior=(
             time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
@@ -511,7 +512,7 @@ EOF
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"
             -o "${BENCHFS_DATA_DIR}/testfile"
-            -O summaryFormat=JSON
+            # -O summaryFormat=JSON
             -O summaryFile="${ior_json_file}"
           )
 
@@ -521,7 +522,7 @@ EOF
           # NOTE: Use simple redirection instead of process substitution to avoid FD leak
           "${cmd_ior[@]}" \
             > "${ior_stdout_file}" \
-            2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.txt" || true
+            2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || true
 
           # Stop BenchFS servers
           echo "Stopping BenchFS servers..."

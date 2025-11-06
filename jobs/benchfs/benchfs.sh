@@ -39,6 +39,7 @@ nnodes_list=(
   4
   # 2 4 8 16
   # 32
+  # 64
 )
 niter=1
 
@@ -58,6 +59,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -A NBBG
         -q gen_S
         # -q gen_M
+        # -q gen_L
         -l elapstim_req="${ELAPSTIM_REQ}"
         -T openmpi
         -v NQSV_MPI_VER="${NQSV_MPI_VER}"
