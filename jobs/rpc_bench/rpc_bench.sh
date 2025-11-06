@@ -5,7 +5,7 @@ source "${SCRIPT_DIR}/common.sh"
 TIMESTAMP="$(timestamp)"
 
 # default params
-: ${ELAPSTIM_REQ:="2:00:00"}
+: ${ELAPSTIM_REQ:="4:00:00"}
 : ${LABEL:=default}
 : ${PING_ITERATIONS:=1000000}
 

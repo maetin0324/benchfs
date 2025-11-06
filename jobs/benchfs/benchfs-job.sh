@@ -36,17 +36,98 @@ BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 
+# ==============================================================================
+# 1. トランスポート層設定（最優先）
+# ==============================================================================
+# 問題: UD (Unreliable Datagram) はパケットロスが発生しやすい
+# 解決: RC (Reliable Connection) へ変更
+
+# InfiniBand環境の場合（推奨）
+export UCX_TLS=all
+# export UCX_TLS=rc_verbs,self  # 代替: IBVerbsバックエンド
+
+export UCX_PROTOS=^ud,dc
+
+# InfiniBandが利用できない場合（フォールバック）
+# export UCX_TLS=tcp,self
+
+# ネットワークデバイス指定（環境に応じて変更）
+export UCX_NET_DEVICES=mlx5_0:1  # mlx5_0の1番ポート使用
+# export UCX_NET_DEVICES=all      # 全デバイス使用（自動選択）
+
+# ==============================================================================
+# 2. タイムアウトとリトライ設定
+# ==============================================================================
+# UCXのデフォルト値では不十分な場合があるため、増加
+
+export UCX_RC_TIMEOUT=2.0s               # タイムアウト時間（デフォルト: 1.0s）
+export UCX_RC_RETRY_COUNT=16             # リトライ回数（デフォルト: 7）
+export UCX_RC_TIMEOUT_MULTIPLIER=4.0     # タイムアウト乗数（デフォルト: 2.0）
+
+# ==============================================================================
+# 3. Active Message設定
+# ==============================================================================
+# Active Messageのバッファサイズとプロトコル閾値を最適化
+
+export UCX_AM_MAX_SHORT=128              # Short AMの最大サイズ (デフォルト: 128B)
+export UCX_AM_MAX_EAGER=8192             # Eager AMの最大サイズ (8KB)
+export UCX_RNDV_THRESH=16384             # Rendezvous閾値 (16KB)
+
+# AMストリームのキューサイズ
+export UCX_AM_SEND_QUEUE_SIZE=1024       # 送信キューサイズ
+export UCX_AM_RECV_QUEUE_SIZE=1024       # 受信キューサイズ
+
+# ==============================================================================
+# 4. RDMA設定
+# ==============================================================================
+# ゼロコピーとRendezvousプロトコルの最適化
+
+export UCX_ZCOPY_THRESH=0                # ゼロコピー常時有効（0 = 常時）
+export UCX_RNDV_SCHEME=get_zcopy         # Rendezvous方式: GET with zero-copy
+
+# InfiniBand固有設定
+export UCX_IB_NUM_PATHS=2                # IBパス数
+export UCX_RC_MLX5_TM_ENABLE=y           # タグマッチングハードウェア加速
+export UCX_RC_MLX5_RX_QUEUE_LEN=4096     # 受信キューの長さ（デフォルト: 1024）
+
+# ==============================================================================
+# 5. メモリ登録キャッシュ
+# ==============================================================================
+export UCX_MEMTYPE_CACHE=y               # メモリタイプキャッシュ有効
+export UCX_RCACHE_ENABLE=y               # 登録キャッシュ有効
+
+# ==============================================================================
+# 6. フロー制御
+# ==============================================================================
+export UCX_RC_FC_ENABLE=y                # フロー制御有効化
+export UCX_RC_MAX_NUM_EPS=-1             # エンドポイント数無制限
+
+# ==============================================================================
+# 7. ネットワーク層設定
+# ==============================================================================
+export UCX_IB_SEG_SIZE=8192              # IBセグメントサイズ (8KB)
+export UCX_RC_PATH_MTU=4096              # Path MTU (4KB推奨)
+
+# RoCE使用時（必要に応じて有効化）
+# export UCX_IB_GID_INDEX=0              # GIDインデックス
+
+# ==============================================================================
+# 8. プログレス設定
+# ==============================================================================
+export UCX_ADAPTIVE_PROGRESS=y           # アダプティブプログレス
+export UCX_ASYNC_MAX_EVENTS=256          # 非同期イベント最大数
+
+# シングルスレッドの場合（MPIプロセス内でスレッド不使用）
+export UCX_USE_MT_MUTEX=n                # マルチスレッドmutex無効
+
 # UCX Configuration for avoiding Rendezvous protocol issues
 # - UCX_TLS: Use only TCP, shared memory, and self transports (avoid InfiniBand)
 # - UCX_RNDV_THRESH: Set to inf to disable Rendezvous protocol completely
 #   This forces all messages to use Eager protocol, which is compatible
 #   with current implementation
 UCX_LOG_LEVEL="DEBUG"
-UCX_TLS="tcp,sm,self"
-UCX_RNDV_THRESH="inf"
 
 export UCX_LOG_LEVEL
-export UCX_TLS
 export UCX_RNDV_THRESH
 
 # Calculate project root from SCRIPT_DIR and set LD_LIBRARY_PATH dynamically
@@ -137,6 +218,9 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
+export RUST_LOG=Trace
+export RUST_BACKTRACE=full
+
 # MPI Configuration Fix for UCX Transport Layer Issues
 # ==================================================
 # FIX: UCX couldn't find InfiniBand device (mlx5_0:1) causing "Destination is unreachable"
@@ -163,12 +247,22 @@ cmd_mpirun_common=(
   --mca pml ucx                         # UCX for MPI communication
   --mca btl self                        # Minimal BTL when using UCX
   --mca osc ucx                          # OSC also uses UCX
-  -x "UCX_TLS=all"                      # Auto-detect available transports
-  -x "UCX_NET_DEVICES=all"              # Auto-detect available devices
-  -x "UCX_RC_TIMEOUT=10s"               # Timeout to prevent hangs
-  -x "UCX_RC_RETRY_COUNT=7"             # Retry count
+  -x UCX_TLS                              # Auto-detect available transports
+  # # -x "UCX_PROTOS=rc_mlx5"               # Use rc_mlx5 protocol
+  # -x "UCX_NET_DEVICES=all"              # Auto-detect available devices
+  # -x "UCX_RC_TIMEOUT=10s"               # Timeout to prevent hangs
+  # -x "UCX_RC_RETRY_COUNT=7"             # Retry count
+  -x UCX_PROTOS
   -x UCX_LOG_LEVEL                      # Suppress verbose UCX debug logs
   -x UCX_RNDV_THRESH                  # Propagate Rendezvous threshold
+  -x UCX_RC_TIMEOUT                   # Propagate RC timeout
+  -x UCX_RC_RETRY_COUNT               # Propagate RC retry count
+  -x UCX_RC_TIMEOUT_MULTIPLIER       # Propagate RC timeout multiplier
+  -x UCX_AM_MAX_SHORT             # Short AMの最大サイズ (デフォルト: 128B)
+  -x UCX_AM_MAX_EAGER            # Eager AMの最大サイズ (8KB)
+  -x UCX_RNDV_THRESH             # Rendezvous閾値 (16KB)
+
+
   -x PATH
   -x LD_LIBRARY_PATH
 )
@@ -346,8 +440,8 @@ EOF
             -np "$NNODES"
             --bind-to none
             -map-by ppr:1:node
-            -x "RUST_LOG=Trace"
-            -x "RUST_BACKTRACE=1"
+            -x RUST_LOG
+            -x RUST_BACKTRACE
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${BENCHFS_PREFIX}/benchfsd_mpi"
             "${BENCHFS_REGISTRY_DIR}"
@@ -405,8 +499,8 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
-            -x "RUST_LOG=Trace"
-            -x "RUST_BACKTRACE=1"
+            -x RUST_LOG
+            -x RUST_BACKTRACE
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
             -vvv
