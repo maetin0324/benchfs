@@ -219,6 +219,8 @@ fn main() {
             rpc_server,
             connection_pool,
             node_id,
+            &world,
+            mpi_rank,
         );
     } else {
         // Client mode - each client connects to a specific server
@@ -244,10 +246,7 @@ fn main() {
         );
     }
 
-    // Barrier before exit
-    world.barrier();
-
-    if mpi_rank == first_client_rank {
+    if mpi_rank == 0 {
         tracing::info!("Benchmark completed successfully");
     }
 }
@@ -326,11 +325,27 @@ fn run_client(
         tracing::info!("Client finished");
     });
 
-    // After async runtime exits, use MPI to gather results
-    world.barrier();
-
     // Extract result from cell
     let my_result = result_cell.borrow_mut().take().expect("Result not set");
+
+    // IMPORTANT: Send shutdown to servers BEFORE MPI operations
+    // This ensures servers can exit their async loop and participate in final barrier
+    if is_root_client {
+        tracing::info!("Sending shutdown to all servers...");
+        let runtime_shutdown = Runtime::new(256);
+        runtime_shutdown.run(async move {
+            let server_nodes: Vec<String> = (0..num_servers)
+                .map(|rank| format!("node_{}", rank))
+                .collect();
+            send_shutdown_to_servers(&connection_pool_for_shutdown, &server_nodes).await;
+            tracing::info!("Shutdown requests sent to all servers");
+        });
+    }
+
+    // Wait for all clients to finish and servers to receive shutdown
+    world.barrier();
+
+    tracing::info!("Starting result aggregation...");
 
     // Serialize local result for MPI transfer
     let my_result_json = serde_json::to_string(&my_result).expect("Failed to serialize result");
@@ -425,22 +440,15 @@ fn run_client(
                 }
             }
         }
-
-        // Send shutdown to all servers
-        let runtime_shutdown = Runtime::new(256);
-        runtime_shutdown.run(async move {
-            tracing::info!("Sending shutdown to all servers...");
-            let server_nodes: Vec<String> = (0..num_servers)
-                .map(|rank| format!("node_{}", rank))
-                .collect();
-            send_shutdown_to_servers(&connection_pool_for_shutdown, &server_nodes).await;
-        });
     } else {
         // Non-root clients send their results
         world.process_at_rank(first_client_rank).send(my_result_bytes);
     }
 
+    // Final barrier to ensure all clients have completed MPI operations
     world.barrier();
+
+    tracing::info!("Client rank {} exiting", mpi_rank);
 }
 
 fn run_server(
@@ -448,6 +456,8 @@ fn run_server(
     rpc_server: Rc<RpcServer>,
     connection_pool: Rc<ConnectionPool>,
     node_id: String,
+    world: &mpi::topology::SimpleCommunicator,
+    mpi_rank: i32,
 ) {
     let runtime_clone = runtime.clone();
     runtime_clone.run(async move {
@@ -480,6 +490,17 @@ fn run_server(
 
         tracing::info!("Server shutting down gracefully");
     });
+
+    // After async runtime exits, participate in synchronization barriers
+    // First barrier: Wait for all clients to finish and send shutdown
+    tracing::info!("Server rank {} waiting at first barrier...", mpi_rank);
+    world.barrier();
+
+    // Second barrier: Wait for all clients to complete result aggregation
+    tracing::info!("Server rank {} waiting at second barrier...", mpi_rank);
+    world.barrier();
+
+    tracing::info!("Server rank {} exiting", mpi_rank);
 }
 
 // Run ping benchmark for a single client against one server
