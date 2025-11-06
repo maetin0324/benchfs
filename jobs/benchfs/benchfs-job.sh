@@ -39,21 +39,34 @@ IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
 # ==============================================================================
-# 問題: UD (Unreliable Datagram) はパケットロスが発生しやすい
-# 解決: RC (Reliable Connection) へ変更
+# UD/DC を許可すると DCI QP で Input/output error が発生し、返信が
+# 捨てられて RPC がハングする。GPU (cuda_copy) も無効化し CPU 専用にする。
 
-# InfiniBand環境の場合（推奨）
-export UCX_TLS=all
-# export UCX_TLS=rc_verbs,self  # 代替: IBVerbsバックエンド
+detect_active_ib() {
+  command -v ibstat >/dev/null 2>&1 || return 1
+  ibstat 2>/dev/null | grep -q "State:.*Active"
+}
 
-export UCX_PROTOS=^ud,dc
+if [[ -z "${UCX_TLS:-}" ]]; then
+  if detect_active_ib; then
+    # RC + 共有メモリのみを使用し、UD/DC/cuda 系を完全に除外
+    export UCX_TLS="rc_mlx5,rc_verbs,sm,self"
+  else
+    # IB が無い場合は TCP にフォールバック
+    export UCX_TLS="tcp,sm,self"
+  fi
+fi
 
-# InfiniBandが利用できない場合（フォールバック）
-# export UCX_TLS=tcp,self
+# UCX が GPU メモリタイプを誤検出しないように memtype cache を無効化
+export UCX_MEMTYPE_CACHE="n"
 
-# ネットワークデバイス指定（環境に応じて変更）
-export UCX_NET_DEVICES=mlx5_0:1  # mlx5_0の1番ポート使用
-# export UCX_NET_DEVICES=all      # 全デバイス使用（自動選択）
+# UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
+if [[ -z "${UCX_NET_DEVICES:-}" && "${UCX_TLS}" == *rc* ]]; then
+  export UCX_NET_DEVICES="mlx5_0:1"
+fi
+
+# 明示的に UD/DC を使わせない
+export UCX_PROTOS="^ud,dc"
 
 # ==============================================================================
 # 2. タイムアウトとリトライ設定
@@ -94,7 +107,7 @@ export UCX_RC_MLX5_RX_QUEUE_LEN=4096     # 受信キューの長さ（デフォ�
 # ==============================================================================
 # 5. メモリ登録キャッシュ
 # ==============================================================================
-export UCX_MEMTYPE_CACHE=y               # メモリタイプキャッシュ有効
+# memtype cache は GPU 誤検出を避けるためセクション1で n に設定済み
 export UCX_RCACHE_ENABLE=y               # 登録キャッシュ有効
 
 # ==============================================================================
@@ -248,21 +261,18 @@ cmd_mpirun_common=(
   --mca pml ucx                         # UCX for MPI communication
   --mca btl self                        # Minimal BTL when using UCX
   --mca osc ucx                          # OSC also uses UCX
-  -x UCX_TLS                              # Auto-detect available transports
-  # # -x "UCX_PROTOS=rc_mlx5"               # Use rc_mlx5 protocol
-  # -x "UCX_NET_DEVICES=all"              # Auto-detect available devices
-  # -x "UCX_RC_TIMEOUT=10s"               # Timeout to prevent hangs
-  # -x "UCX_RC_RETRY_COUNT=7"             # Retry count
+  -x UCX_TLS                              # Propagate transport selection
+  -x UCX_NET_DEVICES                      # Ensure consistent IB port selection
+  -x UCX_MEMTYPE_CACHE                    # Keep CPU-only mode across ranks
   -x UCX_PROTOS
   -x UCX_LOG_LEVEL                      # Suppress verbose UCX debug logs
   -x UCX_RNDV_THRESH                  # Propagate Rendezvous threshold
+  -x UCX_RNDV_SCHEME
   -x UCX_RC_TIMEOUT                   # Propagate RC timeout
   -x UCX_RC_RETRY_COUNT               # Propagate RC retry count
   -x UCX_RC_TIMEOUT_MULTIPLIER       # Propagate RC timeout multiplier
   -x UCX_AM_MAX_SHORT             # Short AMの最大サイズ (デフォルト: 128B)
   -x UCX_AM_MAX_EAGER            # Eager AMの最大サイズ (8KB)
-  -x UCX_RNDV_THRESH             # Rendezvous閾値 (16KB)
-
 
   -x PATH
   -x LD_LIBRARY_PATH
