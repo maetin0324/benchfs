@@ -61,8 +61,12 @@ fi
 export UCX_MEMTYPE_CACHE="n"
 
 # UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
-if [[ -z "${UCX_NET_DEVICES:-}" && "${UCX_TLS}" == *rc* ]]; then
-  export UCX_NET_DEVICES="mlx5_0:1"
+if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
+  if [[ "${UCX_TLS}" == *rc* ]]; then
+    export UCX_NET_DEVICES="mlx5_0:1"
+  else
+    export UCX_NET_DEVICES="all"
+  fi
 fi
 
 # 明示的に UD/DC を使わせない
@@ -237,63 +241,54 @@ export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
 # ==================================================
-# FIX: UCX couldn't find InfiniBand device (mlx5_0:1) causing "Destination is unreachable"
-# SOLUTION: Using TCP-only transport for stability, with alternative configs for optimization
-#
-# CURRENT: TCP-only mode (most stable, works across all environments)
-# cmd_mpirun_common=(
-#   mpirun
-#   "${nqsii_mpiopts_array[@]}"
-#   --mca pml ob1                           # Use standard ob1 PML
-#   --mca btl tcp,vader,self                # TCP + shared memory + loopback
-#   --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
-#   -x PATH
-#   -x LD_LIBRARY_PATH
-#   -x UCX_TLS
-#   -x UCX_RNDV_THRESH                      # Propagate Rendezvous threshold
-#   -x UCX_LOG_LEVEL                        # Suppress verbose UCX debug logs
-# )
+# Automatically detect whether UCX PML is available; fall back to TCP/ob1 if not.
 
-# ALTERNATIVE 1: UCX with automatic transport detection (try after TCP works)
-cmd_mpirun_common=(
-  mpirun
-  "${nqsii_mpiopts_array[@]}"
-  --mca pml ucx                         # UCX for MPI communication
-  --mca btl self                        # Minimal BTL when using UCX
-  --mca osc ucx                          # OSC also uses UCX
-  -x UCX_TLS                              # Propagate transport selection
-  -x UCX_NET_DEVICES                      # Ensure consistent IB port selection
-  -x UCX_MEMTYPE_CACHE                    # Keep CPU-only mode across ranks
-  -x UCX_PROTOS
-  -x UCX_LOG_LEVEL                      # Suppress verbose UCX debug logs
-  -x UCX_RNDV_THRESH                  # Propagate Rendezvous threshold
-  -x UCX_RNDV_SCHEME
-  -x UCX_RC_TIMEOUT                   # Propagate RC timeout
-  -x UCX_RC_RETRY_COUNT               # Propagate RC retry count
-  -x UCX_RC_TIMEOUT_MULTIPLIER       # Propagate RC timeout multiplier
-  -x UCX_AM_MAX_SHORT             # Short AMの最大サイズ (デフォルト: 128B)
-  -x UCX_AM_MAX_EAGER            # Eager AMの最大サイズ (8KB)
+supports_ucx_pml() {
+  command -v ompi_info >/dev/null 2>&1 || return 1
+  ompi_info --param pml all --level 9 2>/dev/null | grep -q "mca:pml:.*ucx"
+}
 
-  -x PATH
-  -x LD_LIBRARY_PATH
-)
+if supports_ucx_pml; then
+  USE_UCX_PML=1
+  echo "UCX PML detected – using --mca pml ucx configuration"
+else
+  USE_UCX_PML=0
+  echo "WARNING: UCX PML not available – falling back to ob1/tcp configuration"
+fi
 
-# ALTERNATIVE 2: UCX with explicit InfiniBand (only if IB is confirmed working)
-# cmd_mpirun_common=(
-#   mpirun
-#   "${nqsii_mpiopts_array[@]}"
-#   --mca pml ucx
-#   --mca btl self,vader
-#   --mca osc ucx
-#   -x "UCX_TLS=rc_mlx5,sm,self"
-#   -x "UCX_NET_DEVICES=mlx5_0:1"
-#   -x "UCX_RC_TIMEOUT=10s"
-#   -x "UCX_RC_RETRY_COUNT=7"
-#   -x "UCX_LOG_LEVEL=error"
-#   -x "UCX_WARN_UNUSED_ENV_VARS=n"
-#   -x PATH
-#   -x LD_LIBRARY_PATH
-# )
+if [[ "${USE_UCX_PML}" -eq 1 ]]; then
+  cmd_mpirun_common=(
+    mpirun
+    "${nqsii_mpiopts_array[@]}"
+    --mca pml ucx
+    --mca btl self
+    --mca osc ucx
+    -x UCX_TLS
+    -x UCX_NET_DEVICES
+    -x UCX_MEMTYPE_CACHE
+    -x UCX_PROTOS
+    -x UCX_LOG_LEVEL
+    -x UCX_RNDV_THRESH
+    -x UCX_RNDV_SCHEME
+    -x UCX_RC_TIMEOUT
+    -x UCX_RC_RETRY_COUNT
+    -x UCX_RC_TIMEOUT_MULTIPLIER
+    -x UCX_AM_MAX_SHORT
+    -x UCX_AM_MAX_EAGER
+    -x PATH
+    -x LD_LIBRARY_PATH
+  )
+else
+  cmd_mpirun_common=(
+    mpirun
+    "${nqsii_mpiopts_array[@]}"
+    --mca pml ob1
+    --mca btl tcp,vader,self
+    --mca btl_openib_allow_ib 0
+    -x PATH
+    -x LD_LIBRARY_PATH
+  )
+fi
 
 # Kill any previous benchfsd instances
 cmd_mpirun_kill=(
