@@ -268,8 +268,8 @@ where
             *result_holder_clone.borrow_mut() = Some(result);
         };
 
-        // Execute the future
-        rt.run(wrapped_future);
+        // Execute the future with the provided operation name
+        rt.run_with_name(operation_name, wrapped_future);
 
         // Extract the result
         result_holder

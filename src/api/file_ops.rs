@@ -1571,7 +1571,7 @@ mod tests {
         let runtime = Runtime::new(256);
         let chunk_store = create_test_chunk_store(&runtime);
         let future = test(runtime.clone(), chunk_store);
-        runtime.run(future);
+        runtime.run_with_name("benchfs_file_ops_test", future);
     }
 
     #[test]

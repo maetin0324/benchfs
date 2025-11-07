@@ -439,11 +439,13 @@ mod tests {
         file.write_all(b"12345").unwrap();
         drop(file);
 
-        runtime.clone().run(async move {
-            let backend = IOUringBackend::new(allocator);
-            let stat = backend.stat(&test_file).await.unwrap();
-            assert_eq!(stat.size, 5);
-        });
+        runtime
+            .clone()
+            .run_with_name("iouring_backend_test_stat", async move {
+                let backend = IOUringBackend::new(allocator);
+                let stat = backend.stat(&test_file).await.unwrap();
+                assert_eq!(stat.size, 5);
+            });
     }
 
     #[test]
@@ -457,25 +459,27 @@ mod tests {
         file.write_all(b"Hello, IOURING!").unwrap();
         drop(file);
 
-        runtime.clone().run(async move {
-            let backend = IOUringBackend::new(allocator);
+        runtime
+            .clone()
+            .run_with_name("iouring_backend_test_open_read_write", async move {
+                let backend = IOUringBackend::new(allocator);
 
-            // ファイルを開く
-            let handle = backend
-                .open(&test_file, OpenFlags::read_only())
-                .await
-                .unwrap();
+                // ファイルを開く
+                let handle = backend
+                    .open(&test_file, OpenFlags::read_only())
+                    .await
+                    .unwrap();
 
-            // 読み込み
-            let mut buffer = vec![0u8; 15];
-            let bytes_read = backend.read(handle, 0, &mut buffer).await.unwrap();
+                // 読み込み
+                let mut buffer = vec![0u8; 15];
+                let bytes_read = backend.read(handle, 0, &mut buffer).await.unwrap();
 
-            assert_eq!(bytes_read, 15);
-            assert_eq!(&buffer, b"Hello, IOURING!");
+                assert_eq!(bytes_read, 15);
+                assert_eq!(&buffer, b"Hello, IOURING!");
 
-            // ファイルを閉じる
-            backend.close(handle).await.unwrap();
-        });
+                // ファイルを閉じる
+                backend.close(handle).await.unwrap();
+            });
     }
 
     #[test]
@@ -484,23 +488,25 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("new_file.txt");
 
-        runtime.clone().run(async move {
-            let backend = IOUringBackend::new(allocator);
+        runtime
+            .clone()
+            .run_with_name("iouring_backend_test_create_write", async move {
+                let backend = IOUringBackend::new(allocator);
 
-            // ファイルを作成
-            let handle = backend.create(&test_file, 0o644).await.unwrap();
+                // ファイルを作成
+                let handle = backend.create(&test_file, 0o644).await.unwrap();
 
-            // 書き込み
-            let data = b"Test data for IOURING";
-            let bytes_written = backend.write(handle, 0, data).await.unwrap();
+                // 書き込み
+                let data = b"Test data for IOURING";
+                let bytes_written = backend.write(handle, 0, data).await.unwrap();
 
-            assert_eq!(bytes_written, data.len());
+                assert_eq!(bytes_written, data.len());
 
-            // ファイルを閉じる
-            backend.close(handle).await.unwrap();
+                // ファイルを閉じる
+                backend.close(handle).await.unwrap();
 
-            // ファイルが存在することを確認
-            assert!(test_file.exists());
-        });
+                // ファイルが存在することを確認
+                assert!(test_file.exists());
+            });
     }
 }

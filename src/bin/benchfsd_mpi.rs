@@ -449,19 +449,21 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Run the runtime with the server handle
     // Note: We don't await registration_handle here because it would create a deadlock.
     // The registration task is spawned and will run concurrently with the server.
-    runtime.clone().run(async move {
-        // Wait for server to complete
-        match server_handle.await {
-            Ok(_) => {
-                tracing::info!("Server shutdown complete");
-                Ok(())
+    runtime
+        .clone()
+        .run_with_name("benchfsd_mpi_server_main", async move {
+            // Wait for server to complete
+            match server_handle.await {
+                Ok(_) => {
+                    tracing::info!("Server shutdown complete");
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::error!("Server error: {:?}", e);
+                    Err(e)
+                }
             }
-            Err(e) => {
-                tracing::error!("Server error: {:?}", e);
-                Err(e)
-            }
-        }
-    });
+        });
 
     // Convert runtime result to Box<dyn Error>
     Ok(())

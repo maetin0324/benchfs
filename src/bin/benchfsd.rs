@@ -203,16 +203,18 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Run the runtime
     tracing::info!("Server is running (Press Ctrl+C to stop)");
 
-    runtime.clone().run(async move {
-        match server_handle.await {
-            Ok(_) => {
-                tracing::info!("Server shutdown complete");
+    runtime
+        .clone()
+        .run_with_name("benchfsd_server_main", async move {
+            match server_handle.await {
+                Ok(_) => {
+                    tracing::info!("Server shutdown complete");
+                }
+                Err(e) => {
+                    tracing::error!("Server error: {:?}", e);
+                }
             }
-            Err(e) => {
-                tracing::error!("Server error: {:?}", e);
-            }
-        }
-    });
+        });
 
     Ok(())
 }
