@@ -236,37 +236,32 @@ impl AmRpc for ReadChunkRequest {
         )
         .entered();
 
-        // Receive Path from request data
-        if !am_msg.contains_data() {
-            return Err((
-                RpcError::TransportError("Request contains no data".to_string()),
-                am_msg,
-            ));
-        }
-
-        let path_bytes = match am_msg.recv_data().await {
-            Ok(data) => data,
-            Err(e) => {
-                return Err((
-                    RpcError::TransportError(format!("Failed to receive data: {:?}", e)),
-                    am_msg,
-                ));
-            }
-        };
-
-        if path_bytes.len() != header.path_len as usize {
+        // Receive Path from request data using reusable buffer
+        let path_len = header.path_len as usize;
+        if path_len == 0 || path_len > crate::constants::MAX_PATH_LENGTH {
             return Err((
                 RpcError::TransportError(format!(
-                    "Path length mismatch: expected {}, got {}",
-                    header.path_len,
-                    path_bytes.len()
+                    "Invalid path length {} (max {})",
+                    path_len,
+                    crate::constants::MAX_PATH_LENGTH
                 )),
                 am_msg,
             ));
         }
 
-        let path = match String::from_utf8(path_bytes) {
-            Ok(p) => p,
+        let mut path_buffer = ctx.acquire_path_buffer();
+        if let Err(e) = am_msg
+            .recv_data_vectored(&[std::io::IoSliceMut::new(path_buffer.as_mut_slice(path_len))])
+            .await
+        {
+            return Err((
+                RpcError::TransportError(format!("Failed to receive data: {:?}", e)),
+                am_msg,
+            ));
+        }
+
+        let path = match path_buffer.as_str(path_len) {
+            Ok(p) => p.to_owned(),
             Err(e) => {
                 return Err((
                     RpcError::TransportError(format!("Invalid UTF-8 in path: {:?}", e)),
@@ -612,10 +607,18 @@ impl AmRpc for WriteChunkRequest<'_> {
             } else {
                 // Receive Path and Data in one vectored call (zero-copy RDMA)
                 let path_len = header.path_len as usize;
-                let mut path_bytes = ctx.path_buffer();
-                if path_len > path_bytes.len() {
-                    path_bytes.resize(path_len, 0);
+                if path_len > crate::constants::MAX_PATH_LENGTH {
+                    tracing::error!(
+                        "Path length {} exceeds MAX_PATH_LENGTH {}",
+                        path_len,
+                        crate::constants::MAX_PATH_LENGTH
+                    );
+                    return Ok((
+                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                        am_msg,
+                    ));
                 }
+                let mut path_buffer = ctx.acquire_path_buffer();
                 let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
                 tracing::debug!(
@@ -627,7 +630,7 @@ impl AmRpc for WriteChunkRequest<'_> {
 
                 if let Err(e) = am_msg
                     .recv_data_vectored(&[
-                        std::io::IoSliceMut::new(&mut path_bytes[..path_len]),
+                        std::io::IoSliceMut::new(path_buffer.as_mut_slice(path_len)),
                         std::io::IoSliceMut::new(buffer_slice),
                     ])
                     .await
@@ -640,7 +643,7 @@ impl AmRpc for WriteChunkRequest<'_> {
                 } else {
                     tracing::trace!("WriteChunk: recv_data_vectored completed (zero-copy)");
 
-                    let path = match std::str::from_utf8(&path_bytes[..path_len]) {
+                    let path = match path_buffer.as_str(path_len) {
                         Ok(p) => p.to_owned(),
                         Err(e) => {
                             tracing::error!("Failed to decode path: {:?}", e);
@@ -694,15 +697,23 @@ impl AmRpc for WriteChunkRequest<'_> {
                 "Using fallback path for WriteChunk (chunk_store is not IOUringChunkStore)"
             );
             let path_len = header.path_len as usize;
-            let mut path_bytes = ctx.path_buffer();
-            if path_len > path_bytes.len() {
-                path_bytes.resize(path_len, 0);
+            if path_len > crate::constants::MAX_PATH_LENGTH {
+                tracing::error!(
+                    "Path length {} exceeds MAX_PATH_LENGTH {}",
+                    path_len,
+                    crate::constants::MAX_PATH_LENGTH
+                );
+                return Ok((
+                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                    am_msg,
+                ));
             }
+            let mut path_buffer = ctx.acquire_path_buffer();
             let mut data = vec![0u8; data_len];
 
             if let Err(e) = am_msg
                 .recv_data_vectored(&[
-                    std::io::IoSliceMut::new(&mut path_bytes[..path_len]),
+                    std::io::IoSliceMut::new(path_buffer.as_mut_slice(path_len)),
                     std::io::IoSliceMut::new(&mut data),
                 ])
                 .await
@@ -710,7 +721,7 @@ impl AmRpc for WriteChunkRequest<'_> {
                 tracing::error!("Failed to receive request data: {:?}", e);
                 WriteChunkResponseHeader::error(-5)
             } else {
-                let path = match std::str::from_utf8(&path_bytes[..path_len]) {
+                let path = match path_buffer.as_str(path_len) {
                     Ok(p) => p.to_owned(),
                     Err(e) => {
                         tracing::error!("Failed to decode path: {:?}", e);

@@ -1,11 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
-use pluvio_ucx::{Worker, async_ucx::ucp::AmMsg};
+use pluvio_ucx::async_ucx::ucp::AmMsg;
 
-use crate::constants::MAX_PATH_LENGTH;
 use crate::metadata::MetadataManager;
+use crate::rpc::buffer_pool::{PathBufferLease, PathBufferPool};
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 use crate::storage::ChunkStore;
 
@@ -17,14 +16,9 @@ pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
-    pub worker: Rc<Worker>,
-    /// Endpoint cache for reusing connections to clients
-    /// Key: client WorkerAddress bytes, Value: Rc<Endpoint>
-    client_endpoints: RefCell<HashMap<Vec<u8>, Rc<pluvio_ucx::endpoint::Endpoint>>>,
+    path_buffer_pool: Rc<PathBufferPool>,
     /// Shutdown flag for graceful termination
     shutdown_flag: RefCell<bool>,
-    /// Scratch buffer for receiving path data without reallocating each RPC
-    path_scratch: RefCell<Vec<u8>>,
 }
 
 impl RpcHandlerContext {
@@ -32,21 +26,18 @@ impl RpcHandlerContext {
         metadata_manager: Rc<MetadataManager>,
         chunk_store: Rc<dyn ChunkStore>,
         allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
-        worker: Rc<Worker>,
     ) -> Self {
         Self {
             metadata_manager,
             chunk_store,
             allocator,
-            worker,
-            client_endpoints: RefCell::new(HashMap::new()),
+            path_buffer_pool: Rc::new(PathBufferPool::new(64)),
             shutdown_flag: RefCell::new(false),
-            path_scratch: RefCell::new(vec![0u8; MAX_PATH_LENGTH]),
         }
     }
 
     /// Create a minimal context for benchmark (no storage/metadata)
-    pub fn new_bench(worker: Rc<Worker>) -> Self {
+    pub fn new_bench() -> Self {
         use crate::metadata::MetadataManager;
         use crate::storage::InMemoryChunkStore;
 
@@ -68,10 +59,8 @@ impl RpcHandlerContext {
             metadata_manager,
             chunk_store,
             allocator,
-            worker,
-            client_endpoints: RefCell::new(HashMap::new()),
+            path_buffer_pool: Rc::new(PathBufferPool::new(16)),
             shutdown_flag: RefCell::new(false),
-            path_scratch: RefCell::new(vec![0u8; MAX_PATH_LENGTH]),
         }
     }
 
@@ -86,147 +75,8 @@ impl RpcHandlerContext {
         *self.shutdown_flag.borrow()
     }
 
-    /// Borrow the reusable path buffer (caller must release the RefMut promptly).
-    pub fn path_buffer(&self) -> std::cell::RefMut<'_, Vec<u8>> {
-        self.path_scratch.borrow_mut()
-    }
-
-    /// Send a response directly to the client using WorkerAddress
-    /// instead of reply_ep to avoid UCX lifetime issues
-    #[tracing::instrument(skip(self, client_addr, header, data), fields(
-        client_addr_len = client_addr.len(),
-        stream_id = stream_id,
-        rpc_id = rpc_id,
-        data_len = data.map(|d| d.len()).unwrap_or(0)
-    ))]
-    pub async fn send_response_direct<H: crate::rpc::Serializable>(
-        &self,
-        client_addr: &[u8],
-        stream_id: u16,
-        rpc_id: u16,
-        header: &H,
-        data: Option<&[u8]>,
-    ) -> Result<(), RpcError> {
-        use pluvio_ucx::async_ucx::ucp::WorkerAddressInner;
-
-        // Log client address bytes for debugging
-        tracing::trace!(
-            "Client address bytes: {:?} (len={})",
-            &client_addr[..client_addr.len().min(32)],
-            client_addr.len()
-        );
-
-        // Try to get endpoint from cache, or create new one
-        // IMPORTANT: Split the borrow scopes to avoid holding RefCell borrow
-        // across potentially blocking operations (connect_addr)
-        let endpoint = {
-            // First, try to get from cache with a short read-only borrow
-            let cache = self.client_endpoints.borrow();
-            if let Some(ep) = cache.get(client_addr) {
-                // Cache hit - reuse existing endpoint
-                tracing::debug!(
-                    "Endpoint cache hit (stream_id={}, rpc_id={}, cache_size={})",
-                    stream_id,
-                    rpc_id,
-                    cache.len()
-                );
-                Some(Rc::clone(ep))
-            } else {
-                // Cache miss - log and prepare to create
-                tracing::debug!(
-                    "Endpoint cache miss (stream_id={}, rpc_id={}, cache_size={})",
-                    stream_id,
-                    rpc_id,
-                    cache.len()
-                );
-                None
-            }
-        };
-
-        // If not in cache, create new endpoint OUTSIDE the borrow scope
-        let endpoint = if let Some(ep) = endpoint {
-            ep
-        } else {
-            // Create endpoint without holding any RefCell borrow
-            tracing::trace!("Creating endpoint for client address");
-            let worker_address = WorkerAddressInner::from(client_addr);
-            let ep = self.worker.connect_addr(&worker_address).map_err(|e| {
-                RpcError::TransportError(format!("Failed to connect to client: {:?}", e))
-            })?;
-
-            // Wrap in Rc
-            let ep_rc = Rc::new(ep);
-
-            // Insert into cache with a short-lived exclusive borrow
-            {
-                let mut cache = self.client_endpoints.borrow_mut();
-                cache.insert(client_addr.to_vec(), Rc::clone(&ep_rc));
-                tracing::debug!(
-                    "Endpoint created and cached (stream_id={}, rpc_id={}, new_cache_size={})",
-                    stream_id,
-                    rpc_id,
-                    cache.len()
-                );
-            } // borrow_mut is released here immediately
-
-            ep_rc
-        };
-
-        // Serialize header
-        let header_bytes = zerocopy::IntoBytes::as_bytes(header);
-        tracing::trace!("Header size: {} bytes", header_bytes.len());
-
-        // Prepare data payload
-        let data_slice = data.unwrap_or(&[]);
-
-        // Prepare IoSlice for data
-        let data_ioslice = if data_slice.is_empty() {
-            vec![]
-        } else {
-            vec![std::io::IoSlice::new(data_slice)]
-        };
-
-        // Determine protocol
-        let proto = if data_slice.is_empty() {
-            None
-        } else {
-            Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
-        };
-
-        tracing::debug!(
-            "Sending AM response: stream_id={}, header_size={}, data_size={}, proto={:?}",
-            stream_id,
-            header_bytes.len(),
-            data_slice.len(),
-            proto
-        );
-
-        // Send response via AM (stream_id is the reply stream)
-        endpoint
-            .am_send_vectorized(
-                stream_id as u32,
-                header_bytes,
-                &data_ioslice,
-                false, // Not need_reply
-                proto,
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to send AM response: stream_id={}, error={:?}",
-                    stream_id,
-                    e
-                );
-                RpcError::TransportError(format!("Failed to send response: {:?}", e))
-            })?;
-
-        tracing::debug!(
-            "Successfully sent direct response to client (stream_id={}, rpc_id={})",
-            stream_id,
-            rpc_id
-        );
-
-        Ok(())
+    pub fn acquire_path_buffer(&self) -> PathBufferLease {
+        self.path_buffer_pool.acquire()
     }
 }
 

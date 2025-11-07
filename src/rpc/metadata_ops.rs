@@ -190,7 +190,7 @@ impl AmRpc for MetadataLookupRequest {
     }
 
     async fn server_handler(
-        _ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
@@ -200,7 +200,7 @@ impl AmRpc for MetadataLookupRequest {
         };
 
         // Receive path data
-        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+        let path_str = match receive_path(&ctx, &mut am_msg, header.path_len).await {
             Ok(data) => data,
             Err(e) => return Err((e, am_msg)),
         };
@@ -208,9 +208,9 @@ impl AmRpc for MetadataLookupRequest {
         let path = Path::new(&path_str);
 
         // Determine response
-        let response_header = if let Ok(file_meta) = _ctx.metadata_manager.get_file_metadata(path) {
+        let response_header = if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path) {
             MetadataLookupResponseHeader::file(file_meta.size)
-        } else if let Ok(_dir_meta) = _ctx.metadata_manager.get_dir_metadata(path) {
+        } else if let Ok(_dir_meta) = ctx.metadata_manager.get_dir_metadata(path) {
             MetadataLookupResponseHeader::directory()
         } else {
             MetadataLookupResponseHeader::not_found()
@@ -370,7 +370,7 @@ impl AmRpc for MetadataCreateFileRequest {
         };
 
         // Receive path data
-        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+        let path_str = match receive_path(&ctx, &mut am_msg, header.path_len).await {
             Ok(data) => data,
             Err(e) => return Err((e, am_msg)),
         };
@@ -501,7 +501,7 @@ impl AmRpc for MetadataCreateDirRequest {
         };
 
         // Receive path data
-        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+        let path_str = match receive_path(&ctx, &mut am_msg, header.path_len).await {
             Ok(data) => data,
             Err(e) => return Err((e, am_msg)),
         };
@@ -699,7 +699,7 @@ impl AmRpc for MetadataDeleteRequest {
         };
 
         // Receive path data
-        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+        let path_str = match receive_path(&ctx, &mut am_msg, header.path_len).await {
             Ok(data) => data,
             Err(e) => return Err((e, am_msg)),
         };
@@ -914,7 +914,7 @@ impl AmRpc for MetadataUpdateRequest {
         };
 
         // Receive path data
-        let path_str = match receive_path(&mut am_msg, header.path_len).await {
+        let path_str = match receive_path(&ctx, &mut am_msg, header.path_len).await {
             Ok(data) => data,
             Err(e) => return Err((e, am_msg)),
         };

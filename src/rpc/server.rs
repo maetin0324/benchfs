@@ -101,7 +101,7 @@ impl RpcServer {
 
             match Rpc::server_handler(ctx_clone, am_msg).await {
                 Ok((_response, _am_msg)) => {
-                    // Response已经在server_handler内部通过send_response_direct()直接送信済み
+                    // Response was already sent within server_handler via reply_ep
                     // reply_ep使用を回避するため、ここでは何もしない
                     tracing::debug!(
                         "RPC handler completed successfully for RPC ID {} (response sent directly)",

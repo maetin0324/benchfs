@@ -390,7 +390,6 @@ pub extern "C" fn benchfs_init(
             metadata_manager.clone(),
             chunk_store.clone(),
             allocator.clone(),
-            worker.clone(),
         ));
 
         // Create RPC server

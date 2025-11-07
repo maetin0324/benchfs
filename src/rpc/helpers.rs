@@ -13,6 +13,7 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 use zerocopy::FromBytes;
 
 use super::RpcError;
+use crate::rpc::handlers::RpcHandlerContext;
 
 /// Helper for creating IoSlices with extended lifetimes for RPC requests
 ///
@@ -134,21 +135,35 @@ pub fn rpc_error_to_errno(error: &RpcError) -> i32 {
 ///
 /// - `Ok(path)` on success
 /// - `Err(RpcError)` if data reception fails or path is invalid UTF-8
-pub async fn receive_path(am_msg: &mut AmMsg, path_len: u32) -> Result<String, RpcError> {
+pub async fn receive_path(
+    ctx: &RpcHandlerContext,
+    am_msg: &mut AmMsg,
+    path_len: u32,
+) -> Result<String, RpcError> {
     if !am_msg.contains_data() {
         return Err(RpcError::TransportError(
             "Request contains no data".to_string(),
         ));
     }
 
-    let mut path_bytes = vec![0u8; path_len as usize];
+    let mut buffer = ctx.acquire_path_buffer();
+    let len = path_len as usize;
+    if len > buffer.capacity() {
+        return Err(RpcError::TransportError(format!(
+            "Path length {} exceeds maximum {}",
+            len,
+            buffer.capacity()
+        )));
+    }
 
     am_msg
-        .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
+        .recv_data_vectored(&[std::io::IoSliceMut::new(buffer.as_mut_slice(len))])
         .await
         .map_err(|e| RpcError::TransportError(format!("Failed to receive path: {:?}", e)))?;
 
-    String::from_utf8(path_bytes)
+    buffer
+        .as_str(len)
+        .map(|s| s.to_owned())
         .map_err(|e| RpcError::TransportError(format!("Invalid UTF-8 in path: {:?}", e)))
 }
 
