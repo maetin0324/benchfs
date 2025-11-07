@@ -843,7 +843,6 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "pluvio_runtime"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio.git?branch=main#a7581995ed6556592c072b01a8f23ebab0fa1bc7"
 dependencies = [
  "core_affinity",
  "futures",
@@ -856,7 +855,6 @@ dependencies = [
 [[package]]
 name = "pluvio_timer"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio.git?branch=main#a7581995ed6556592c072b01a8f23ebab0fa1bc7"
 dependencies = [
  "futures",
  "pluvio_runtime",
@@ -866,7 +864,6 @@ dependencies = [
 [[package]]
 name = "pluvio_ucx"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio.git?branch=main#a7581995ed6556592c072b01a8f23ebab0fa1bc7"
 dependencies = [
  "async-ucx",
  "pluvio_runtime",
@@ -877,7 +874,6 @@ dependencies = [
 [[package]]
 name = "pluvio_uring"
 version = "0.1.0"
-source = "git+https://github.com/maetin0324/pluvio.git?branch=main#a7581995ed6556592c072b01a8f23ebab0fa1bc7"
 dependencies = [
  "aligned_box",
  "io-uring",
