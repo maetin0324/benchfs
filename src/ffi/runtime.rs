@@ -241,18 +241,14 @@ where
     LOCAL_RUNTIME.with(|runtime_cell| {
         let runtime = runtime_cell.borrow();
 
-        // Get or create runtime
         let rt: Rc<Runtime> = if let Some(ref rt) = *runtime {
             rt.clone()
         } else {
-            // Fallback: create a basic runtime if not initialized
-            // This should only happen in local mode
-            drop(runtime);
-            let new_runtime_rc: Rc<Runtime> = Runtime::new(256); // Runtime::new() returns Rc<Runtime>
-            let timer_reactor = TimerReactor::current();
-            new_runtime_rc.register_reactor("timer", timer_reactor);
-            *runtime_cell.borrow_mut() = Some(new_runtime_rc.clone());
-            new_runtime_rc
+            tracing::error!(
+                "BenchFS runtime is not initialized on this thread. \
+                 Call benchfs_init (or the appropriate thread attach API) before invoking BenchFS operations."
+            );
+            panic!("BenchFS runtime not initialized on this thread");
         };
 
         // Debug logging
