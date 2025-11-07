@@ -75,17 +75,17 @@ fn rdma_allowed() -> bool {
                 return true;
             } else {
                 tracing::warn!(
-                    "UCX_TLS ({}) has no RC/DC transports; using eager protocol",
+                    "UCX_TLS ({}) has no RC/DC transports; forcing eager protocol",
                     tls
                 );
                 return false;
             }
         }
 
-        tracing::warn!(
-            "UCX_TLS not set; defaulting to eager protocol (set BENCHFS_FORCE_RDMA=1 to override)"
+        tracing::info!(
+            "UCX_TLS not set; assuming RC-capable transports. Set BENCHFS_DISABLE_RDMA=1 to force eager."
         );
-        false
+        true
     })
 }
 
