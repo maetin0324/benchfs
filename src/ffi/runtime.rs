@@ -43,6 +43,7 @@ use crate::api::file_ops::BenchFS;
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::server::RpcServer;
 use pluvio_runtime::executor::Runtime;
+use pluvio_timer::TimerReactor;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -248,6 +249,8 @@ where
             // This should only happen in local mode
             drop(runtime);
             let new_runtime_rc: Rc<Runtime> = Runtime::new(256); // Runtime::new() returns Rc<Runtime>
+            let timer_reactor = TimerReactor::current();
+            new_runtime_rc.register_reactor("timer", timer_reactor);
             *runtime_cell.borrow_mut() = Some(new_runtime_rc.clone());
             new_runtime_rc
         };

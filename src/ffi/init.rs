@@ -23,6 +23,7 @@ use crate::rpc::server::RpcServer;
 use crate::storage::{IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
+use pluvio_timer::TimerReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
 
@@ -323,6 +324,10 @@ pub extern "C" fn benchfs_init(
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
 
+        // Register timer reactor (required for Delay/timeout futures)
+        let timer_reactor = TimerReactor::current();
+        runtime.register_reactor("timer", timer_reactor.clone());
+
         // Create io_uring reactor
         tracing::info!("Starting IoUringReactor initialization...");
         let start = std::time::Instant::now();
@@ -451,6 +456,10 @@ pub extern "C" fn benchfs_init(
 
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
+
+        // Register timer reactor for client as well
+        let timer_reactor = TimerReactor::current();
+        runtime.register_reactor("timer", timer_reactor.clone());
 
         // Create UCX context and reactor
         let ucx_context = match UcxContext::new() {
