@@ -287,18 +287,21 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let handler_ready = std::rc::Rc::new(std::cell::RefCell::new(false));
     let handler_ready_clone = handler_ready.clone();
 
-    runtime.spawn(async move {
-        tracing::info!("Registering RPC handlers...");
-        match server_clone.register_all_handlers(runtime_clone).await {
-            Ok(_) => {
-                tracing::info!("RPC handlers registered successfully");
-                *handler_ready_clone.borrow_mut() = true;
+    runtime.spawn_with_name(
+        async move {
+            tracing::info!("Registering RPC handlers...");
+            match server_clone.register_all_handlers(runtime_clone).await {
+                Ok(_) => {
+                    tracing::info!("RPC handlers registered successfully");
+                    *handler_ready_clone.borrow_mut() = true;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to register RPC handlers: {:?}", e);
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to register RPC handlers: {:?}", e);
-            }
-        }
-    });
+        },
+        "rpc_handler_registration".to_string(),
+    );
 
     // Spawn node registration task (must run after RPC handlers are ready)
     let pool_clone = connection_pool.clone();

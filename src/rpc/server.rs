@@ -153,89 +153,113 @@ impl RpcServer {
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn_polling(async move {
-                if let Err(e) = server.listen::<ReadChunkRequest, _, _>(rt).await {
-                    tracing::error!("ReadChunk handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_polling_with_name(
+                async move {
+                    if let Err(e) = server.listen::<ReadChunkRequest, _, _>(rt).await {
+                        tracing::error!("ReadChunk handler error: {:?}", e);
+                    }
+                },
+                "rpc_read_chunk_handler".to_string(),
+            );
         }
 
         // Spawn WriteChunk handler with polling priority
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn_polling(async move {
-                if let Err(e) = server.listen::<WriteChunkRequest, _, _>(rt).await {
-                    tracing::error!("WriteChunk handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_polling_with_name(
+                async move {
+                    if let Err(e) = server.listen::<WriteChunkRequest, _, _>(rt).await {
+                        tracing::error!("WriteChunk handler error: {:?}", e);
+                    }
+                },
+                "rpc_write_chunk_handler".to_string(),
+            );
         }
 
         // Spawn MetadataLookup handler
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataLookupRequest, _, _>(rt).await {
-                    tracing::error!("MetadataLookup handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataLookupRequest, _, _>(rt).await {
+                        tracing::error!("MetadataLookup handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_lookup_handler".to_string(),
+            );
         }
 
         // Spawn MetadataCreateFile handler
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataCreateFileRequest, _, _>(rt).await {
-                    tracing::error!("MetadataCreateFile handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataCreateFileRequest, _, _>(rt).await {
+                        tracing::error!("MetadataCreateFile handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_create_file_handler".to_string(),
+            );
         }
 
         // Spawn MetadataCreateDir handler
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataCreateDirRequest, _, _>(rt).await {
-                    tracing::error!("MetadataCreateDir handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataCreateDirRequest, _, _>(rt).await {
+                        tracing::error!("MetadataCreateDir handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_create_dir_handler".to_string(),
+            );
         }
 
         // Spawn MetadataDelete handler
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataDeleteRequest, _, _>(rt).await {
-                    tracing::error!("MetadataDelete handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataDeleteRequest, _, _>(rt).await {
+                        tracing::error!("MetadataDelete handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_delete_handler".to_string(),
+            );
         }
 
         // Spawn MetadataUpdate handler
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataUpdateRequest, _, _>(rt).await {
-                    tracing::error!("MetadataUpdate handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataUpdateRequest, _, _>(rt).await {
+                        tracing::error!("MetadataUpdate handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_update_handler".to_string(),
+            );
         }
 
         // Spawn Shutdown handler
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                use crate::rpc::metadata_ops::ShutdownRequest;
-                if let Err(e) = server.listen::<ShutdownRequest, _, _>(rt).await {
-                    tracing::error!("Shutdown handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    use crate::rpc::metadata_ops::ShutdownRequest;
+                    if let Err(e) = server.listen::<ShutdownRequest, _, _>(rt).await {
+                        tracing::error!("Shutdown handler error: {:?}", e);
+                    }
+                },
+                "rpc_shutdown_handler".to_string(),
+            );
         }
 
         tracing::info!("All RPC handlers registered successfully");
@@ -252,22 +276,28 @@ impl RpcServer {
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<BenchPingRequest, _, _>(rt).await {
-                    tracing::error!("BenchPing handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<BenchPingRequest, _, _>(rt).await {
+                        tracing::error!("BenchPing handler error: {:?}", e);
+                    }
+                },
+                "bench_ping_handler".to_string(),
+            );
         }
 
         // Spawn BenchShutdown handler
         {
             let server = self.clone_for_handler();
             let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<BenchShutdownRequest, _, _>(rt).await {
-                    tracing::error!("BenchShutdown handler error: {:?}", e);
-                }
-            });
+            runtime.spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<BenchShutdownRequest, _, _>(rt).await {
+                        tracing::error!("BenchShutdown handler error: {:?}", e);
+                    }
+                },
+                "bench_shutdown_handler".to_string(),
+            );
         }
 
         tracing::info!("Benchmark RPC handlers registered successfully");

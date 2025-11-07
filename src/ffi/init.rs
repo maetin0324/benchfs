@@ -420,12 +420,15 @@ pub extern "C" fn benchfs_init(
         // These handlers run perpetual listening loops, so we can't block_on() them
         let server_clone = rpc_server.clone();
         let runtime_clone = runtime.clone();
-        runtime.spawn(async move {
-            match server_clone.register_all_handlers(runtime_clone).await {
-                Ok(_) => tracing::info!("RPC handlers registered successfully"),
-                Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
-            }
-        });
+        runtime.spawn_with_name(
+            async move {
+                match server_clone.register_all_handlers(runtime_clone).await {
+                    Ok(_) => tracing::info!("RPC handlers registered successfully"),
+                    Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
+                }
+            },
+            "ffi_rpc_handler_registration".to_string(),
+        );
         tracing::info!("RPC handler registration initiated");
 
         // Create BenchFS instance with distributed metadata
