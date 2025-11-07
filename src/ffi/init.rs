@@ -323,6 +323,8 @@ pub extern "C" fn benchfs_init(
 
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
+        set_runtime(runtime.clone());
+        set_runtime(runtime.clone());
 
         // Register timer reactor (required for Delay/timeout futures)
         let timer_reactor = TimerReactor::current();
@@ -444,7 +446,6 @@ pub extern "C" fn benchfs_init(
         ));
 
         // Store in thread-local storage
-        set_runtime(runtime);
         set_rpc_server(rpc_server);
         set_connection_pool(connection_pool);
 
@@ -615,8 +616,7 @@ pub extern "C" fn benchfs_init(
             metadata_nodes,
         ));
 
-        // Store in thread-local storage
-        set_runtime(runtime);
+        // Runtime already stored in thread-local storage above
         set_connection_pool(connection_pool);
 
         benchfs
