@@ -130,18 +130,11 @@ impl AmRpc for BenchPingRequest {
             .unwrap()
             .as_nanos() as u64;
 
-        let response_header = BenchPingResponseHeader::new(
-            header.sequence_number,
-            server_timestamp_ns,
-        );
+        let response_header =
+            BenchPingResponseHeader::new(header.sequence_number, server_timestamp_ns);
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -269,12 +262,7 @@ impl AmRpc for BenchShutdownRequest {
         let response_header = BenchShutdownResponseHeader::new(true);
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

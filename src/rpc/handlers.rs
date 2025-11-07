@@ -1,9 +1,10 @@
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use pluvio_ucx::{Worker, async_ucx::ucp::AmMsg};
 
+use crate::constants::MAX_PATH_LENGTH;
 use crate::metadata::MetadataManager;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 use crate::storage::ChunkStore;
@@ -22,6 +23,8 @@ pub struct RpcHandlerContext {
     client_endpoints: RefCell<HashMap<Vec<u8>, Rc<pluvio_ucx::endpoint::Endpoint>>>,
     /// Shutdown flag for graceful termination
     shutdown_flag: RefCell<bool>,
+    /// Scratch buffer for receiving path data without reallocating each RPC
+    path_scratch: RefCell<Vec<u8>>,
 }
 
 impl RpcHandlerContext {
@@ -38,6 +41,7 @@ impl RpcHandlerContext {
             worker,
             client_endpoints: RefCell::new(HashMap::new()),
             shutdown_flag: RefCell::new(false),
+            path_scratch: RefCell::new(vec![0u8; MAX_PATH_LENGTH]),
         }
     }
 
@@ -67,6 +71,7 @@ impl RpcHandlerContext {
             worker,
             client_endpoints: RefCell::new(HashMap::new()),
             shutdown_flag: RefCell::new(false),
+            path_scratch: RefCell::new(vec![0u8; MAX_PATH_LENGTH]),
         }
     }
 
@@ -79,6 +84,11 @@ impl RpcHandlerContext {
     /// Check if shutdown has been requested
     pub fn should_shutdown(&self) -> bool {
         *self.shutdown_flag.borrow()
+    }
+
+    /// Borrow the reusable path buffer (caller must release the RefMut promptly).
+    pub fn path_buffer(&self) -> std::cell::RefMut<'_, Vec<u8>> {
+        self.path_scratch.borrow_mut()
     }
 
     /// Send a response directly to the client using WorkerAddress
@@ -140,10 +150,9 @@ impl RpcHandlerContext {
             // Create endpoint without holding any RefCell borrow
             tracing::trace!("Creating endpoint for client address");
             let worker_address = WorkerAddressInner::from(client_addr);
-            let ep = self
-                .worker
-                .connect_addr(&worker_address)
-                .map_err(|e| RpcError::TransportError(format!("Failed to connect to client: {:?}", e)))?;
+            let ep = self.worker.connect_addr(&worker_address).map_err(|e| {
+                RpcError::TransportError(format!("Failed to connect to client: {:?}", e))
+            })?;
 
             // Wrap in Rc
             let ep_rc = Rc::new(ep);
@@ -417,7 +426,13 @@ pub async fn handle_write_chunk(
     if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
         // Use zero-copy write with registered buffer
         match io_uring_store
-            .write_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer, data_len)
+            .write_chunk_fixed(
+                &path,
+                header.chunk_index,
+                header.offset,
+                fixed_buffer,
+                data_len,
+            )
             .await
         {
             Ok(bytes_written) => {

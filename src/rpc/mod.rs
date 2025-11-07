@@ -20,7 +20,9 @@ pub mod server;
 pub type RpcId = u16;
 
 // Re-export commonly used constants from the constants module
-pub use crate::constants::{should_use_rdma, RDMA_THRESHOLD, SHUTDOWN_MAGIC, WORKER_ADDRESS_BUFFER_SIZE};
+pub use crate::constants::{
+    RDMA_THRESHOLD, SHUTDOWN_MAGIC, WORKER_ADDRESS_BUFFER_SIZE, should_use_rdma,
+};
 
 /// Unified server response structure
 /// Contains response header and optional data payload

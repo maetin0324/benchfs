@@ -5,7 +5,9 @@ use std::rc::Rc;
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::{DirectoryMetadata, FileMetadata};
-use crate::rpc::helpers::{parse_header, receive_path, rpc_error_to_errno, send_rpc_response_via_reply, RpcIoSliceHelper};
+use crate::rpc::helpers::{
+    RpcIoSliceHelper, parse_header, receive_path, rpc_error_to_errno, send_rpc_response_via_reply,
+};
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, SHUTDOWN_MAGIC};
 
 /// RPC IDs for metadata operations
@@ -215,12 +217,7 @@ impl AmRpc for MetadataLookupRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -395,12 +392,7 @@ impl AmRpc for MetadataCreateFileRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -532,12 +524,7 @@ impl AmRpc for MetadataCreateDirRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -737,12 +724,7 @@ impl AmRpc for MetadataDeleteRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -948,7 +930,8 @@ impl AmRpc for MetadataUpdateRequest {
                     &error_header,
                     None,
                     am_msg,
-                ).await;
+                )
+                .await;
             }
         };
 
@@ -967,12 +950,7 @@ impl AmRpc for MetadataUpdateRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -1237,12 +1215,7 @@ impl AmRpc for ShutdownRequest {
         let response_header = ShutdownResponseHeader::new(true);
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(
-            Self::reply_stream_id(),
-            &response_header,
-            None,
-            am_msg,
-        ).await
+        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

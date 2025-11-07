@@ -127,7 +127,11 @@ impl RpcClient {
             )
             .await
             .map_err(|e| {
-                tracing::error!("Failed to send AM request: rpc_id={}, error={:?}", rpc_id, e);
+                tracing::error!(
+                    "Failed to send AM request: rpc_id={}, error={:?}",
+                    rpc_id,
+                    e
+                );
                 RpcError::TransportError(format!("Failed to send AM: {:?}", e))
             })?;
 
@@ -138,19 +142,20 @@ impl RpcClient {
         );
 
         // Wait for reply
-        let mut msg = reply_stream
-            .wait_msg()
-            .await
-            .ok_or_else(|| {
-                tracing::error!(
-                    "RPC timeout: no reply received (rpc_id={}, reply_stream_id={})",
-                    rpc_id,
-                    reply_stream_id
-                );
-                RpcError::Timeout
-            })?;
+        let mut msg = reply_stream.wait_msg().await.ok_or_else(|| {
+            tracing::error!(
+                "RPC timeout: no reply received (rpc_id={}, reply_stream_id={})",
+                rpc_id,
+                reply_stream_id
+            );
+            RpcError::Timeout
+        })?;
 
-        tracing::debug!("Received reply message: rpc_id={}, reply_stream_id={}", rpc_id, reply_stream_id);
+        tracing::debug!(
+            "Received reply message: rpc_id={}, reply_stream_id={}",
+            rpc_id,
+            reply_stream_id
+        );
 
         // Deserialize the response header
         let response_header = msg

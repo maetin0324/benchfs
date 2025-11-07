@@ -216,7 +216,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         return Err(format!("Failed to create chunk store directory: {}", e).into());
     }
 
-    let (chunk_store, allocator): (Rc<dyn ChunkStore>, Rc<pluvio_uring::allocator::FixedBufferAllocator>) = if config.storage.use_iouring {
+    let (chunk_store, allocator): (
+        Rc<dyn ChunkStore>,
+        Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+    ) = if config.storage.use_iouring {
         tracing::info!("Using io_uring for storage backend");
 
         // Create io_uring reactor
@@ -322,7 +325,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                     tracing::error!("RPC handler registration timeout");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "RPC handler registration timeout"
+                        "RPC handler registration timeout",
                     ));
                 }
 
@@ -337,12 +340,15 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
             // Register this node's worker address
             if let Err(e) = pool_clone.register_self(&node_id_clone) {
                 tracing::error!("Failed to register node address: {:?}", e);
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Registration failed: {:?}", e)));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Registration failed: {:?}", e),
+                ));
             }
             tracing::info!("Node {} registered to registry", node_id_clone);
 
             // Wait for all nodes to register
-            let max_wait_secs = 120;  // Increased timeout for large-scale deployments
+            let max_wait_secs = 120; // Increased timeout for large-scale deployments
             let start_time = std::time::Instant::now();
 
             tracing::info!("Waiting for {} nodes to register...", mpi_size_clone);
@@ -355,7 +361,8 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                 for rank in 0..mpi_size_clone {
                     if rank != mpi_rank_clone {
                         let other_node_id = format!("node_{}", rank);
-                        let registry_file = registry_dir_clone.join(format!("{}.addr", other_node_id));
+                        let registry_file =
+                            registry_dir_clone.join(format!("{}.addr", other_node_id));
                         if registry_file.exists() {
                             registered_count += 1;
                         }
@@ -386,10 +393,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                         }
                     }
 
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        error_msg
-                    ));
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error_msg));
                 }
 
                 if registered_count % 4 == 0 || start_time.elapsed().as_secs() % 10 == 0 {

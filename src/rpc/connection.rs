@@ -54,7 +54,11 @@ impl ConnectionPool {
         // Convert WorkerAddress to bytes using AsRef<[u8]>
         let address_bytes: &[u8] = address.as_ref();
         self.registry.register(node_id, address_bytes)?;
-        tracing::info!("Registered worker address for node {} ({} bytes)", node_id, address_bytes.len());
+        tracing::info!(
+            "Registered worker address for node {} ({} bytes)",
+            node_id,
+            address_bytes.len()
+        );
         Ok(())
     }
 
@@ -75,7 +79,10 @@ impl ConnectionPool {
                     tracing::debug!("Reusing existing connection to {}", node_id);
                     return Ok(client.clone());
                 } else {
-                    tracing::warn!("Existing connection to {} is closed, will reconnect", node_id);
+                    tracing::warn!(
+                        "Existing connection to {} is closed, will reconnect",
+                        node_id
+                    );
                     // Drop the borrow before removing the connection
                 }
             }

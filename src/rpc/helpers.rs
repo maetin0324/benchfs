@@ -134,10 +134,7 @@ pub fn rpc_error_to_errno(error: &RpcError) -> i32 {
 ///
 /// - `Ok(path)` on success
 /// - `Err(RpcError)` if data reception fails or path is invalid UTF-8
-pub async fn receive_path(
-    am_msg: &mut AmMsg,
-    path_len: u32,
-) -> Result<String, RpcError> {
+pub async fn receive_path(am_msg: &mut AmMsg, path_len: u32) -> Result<String, RpcError> {
     if !am_msg.contains_data() {
         return Err(RpcError::TransportError(
             "Request contains no data".to_string(),
@@ -182,13 +179,22 @@ pub async fn send_rpc_response_via_reply<H>(
     response_header: &H,
     response_data: Option<&[u8]>,
     am_msg: pluvio_ucx::async_ucx::ucp::AmMsg,
-) -> Result<(crate::rpc::ServerResponse<H>, pluvio_ucx::async_ucx::ucp::AmMsg), (RpcError, pluvio_ucx::async_ucx::ucp::AmMsg)>
+) -> Result<
+    (
+        crate::rpc::ServerResponse<H>,
+        pluvio_ucx::async_ucx::ucp::AmMsg,
+    ),
+    (RpcError, pluvio_ucx::async_ucx::ucp::AmMsg),
+>
 where
     H: zerocopy::IntoBytes + zerocopy::KnownLayout + zerocopy::Immutable + Clone,
 {
     if !am_msg.need_reply() {
         tracing::error!("Message does not support reply");
-        return Err((RpcError::HandlerError("Message does not support reply".to_string()), am_msg));
+        return Err((
+            RpcError::HandlerError("Message does not support reply".to_string()),
+            am_msg,
+        ));
     }
 
     let header_bytes = zerocopy::IntoBytes::as_bytes(response_header);
@@ -204,21 +210,29 @@ where
     };
 
     let result = unsafe {
-        am_msg.reply(
-            reply_stream_id as u32,
-            header_bytes,
-            data,
-            false,  // need_reply
-            proto,
-        ).await
+        am_msg
+            .reply(
+                reply_stream_id as u32,
+                header_bytes,
+                data,
+                false, // need_reply
+                proto,
+            )
+            .await
     };
 
     if let Err(e) = result {
         tracing::error!("Failed to send reply: {:?}", e);
-        return Err((RpcError::TransportError(format!("Failed to send reply: {:?}", e)), am_msg));
+        return Err((
+            RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
+            am_msg,
+        ));
     }
 
-    Ok((crate::rpc::ServerResponse::new(response_header.clone()), am_msg))
+    Ok((
+        crate::rpc::ServerResponse::new(response_header.clone()),
+        am_msg,
+    ))
 }
 
 #[cfg(test)]

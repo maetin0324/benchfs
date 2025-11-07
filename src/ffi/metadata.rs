@@ -279,7 +279,11 @@ pub extern "C" fn benchfs_rename(
         }
     };
 
-    tracing::debug!("benchfs_rename: oldpath={:?}, newpath={:?}", oldpath_str, newpath_str);
+    tracing::debug!(
+        "benchfs_rename: oldpath={:?}, newpath={:?}",
+        oldpath_str,
+        newpath_str
+    );
 
     let result = with_benchfs_ctx(|fs| {
         fs.benchfs_rename(oldpath_str, newpath_str)

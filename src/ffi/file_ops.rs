@@ -232,7 +232,9 @@ pub extern "C" fn benchfs_create(
         let fs_ptr = fs as *const BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on_with_name("create", async move { fs_ref.benchfs_open(path_str, open_flags).await })
+            block_on_with_name("create", async move {
+                fs_ref.benchfs_open(path_str, open_flags).await
+            })
         }
     });
 
@@ -280,7 +282,9 @@ pub extern "C" fn benchfs_open(
         let fs_ptr = fs as *const BenchFS;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on_with_name("open", async move { fs_ref.benchfs_open(path_str, open_flags).await })
+            block_on_with_name("open", async move {
+                fs_ref.benchfs_open(path_str, open_flags).await
+            })
         }
     });
 
@@ -332,7 +336,12 @@ pub extern "C" fn benchfs_write(
     unsafe {
         let handle = &*(file as *const FileHandle);
 
-        tracing::trace!("benchfs_write: path={:?}, size={}, offset={}", handle.path, size, offset);
+        tracing::trace!(
+            "benchfs_write: path={:?}, size={}, offset={}",
+            handle.path,
+            size,
+            offset
+        );
 
         let handle_clone = handle.clone();
         let buf = slice::from_raw_parts(buffer, size).to_vec();
@@ -351,8 +360,10 @@ pub extern "C" fn benchfs_write(
                 return Err(format!("Seek failed: {:?}", e));
             }
 
-            block_on_with_name("write", async move { fs_ref.benchfs_write(&handle_clone, &buf).await })
-                .map_err(|e| e.to_string())
+            block_on_with_name("write", async move {
+                fs_ref.benchfs_write(&handle_clone, &buf).await
+            })
+            .map_err(|e| e.to_string())
         });
 
         match result {
@@ -404,7 +415,12 @@ pub extern "C" fn benchfs_read(
     unsafe {
         let handle = &*(file as *const FileHandle);
 
-        tracing::trace!("benchfs_read: path={:?}, size={}, offset={}", handle.path, size, offset);
+        tracing::trace!(
+            "benchfs_read: path={:?}, size={}, offset={}",
+            handle.path,
+            size,
+            offset
+        );
 
         let handle_clone = handle.clone();
         let buf_ptr = buffer;
@@ -427,8 +443,9 @@ pub extern "C" fn benchfs_read(
 
             let mut local_buf = std::slice::from_raw_parts_mut(temp_buf_ptr, buf_size);
 
-            let n =
-                block_on_with_name("read", async move { fs_ref.benchfs_read(&handle_clone, &mut local_buf).await });
+            let n = block_on_with_name("read", async move {
+                fs_ref.benchfs_read(&handle_clone, &mut local_buf).await
+            });
 
             match n {
                 Ok(bytes_read) => {
@@ -476,7 +493,8 @@ pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
             let fs_ref = &*fs_ptr;
-            block_on_with_name("close", async move { fs_ref.benchfs_close(&handle).await }).map_err(|e| e.to_string())
+            block_on_with_name("close", async move { fs_ref.benchfs_close(&handle).await })
+                .map_err(|e| e.to_string())
         });
 
         result_to_error_code(result.and_then(|r| r))
@@ -571,7 +589,12 @@ pub extern "C" fn benchfs_lseek(file: *mut benchfs_file_t, offset: i64, whence: 
     unsafe {
         let handle = &*(file as *const FileHandle);
 
-        tracing::trace!("benchfs_lseek: path={:?}, offset={}, whence={}", handle.path, offset, whence);
+        tracing::trace!(
+            "benchfs_lseek: path={:?}, offset={}, whence={}",
+            handle.path,
+            offset,
+            whence
+        );
 
         let result = with_benchfs_ctx(|fs| {
             fs.benchfs_seek(handle, offset, whence)

@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::Duration;
 /// File operations for BenchFS
 ///
 /// This module provides POSIX-like file operations that work with
 /// the distributed metadata and data storage.
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures::FutureExt;
 use futures_timer::Delay;
@@ -158,13 +158,15 @@ impl BenchFS {
     fn get_chunk_node(&self, chunk_key: &str) -> String {
         // Priority 1: Use data node ring for chunk distribution
         if let Some(ring) = &self.data_ring {
-            return ring.get_node(chunk_key)
+            return ring
+                .get_node(chunk_key)
                 .unwrap_or_else(|| self.node_id.clone());
         }
 
         // Priority 2: Fall back to metadata ring (backward compatibility)
         if let Some(ring) = &self.metadata_ring {
-            return ring.get_node(chunk_key)
+            return ring
+                .get_node(chunk_key)
                 .unwrap_or_else(|| self.node_id.clone());
         }
 
@@ -933,10 +935,7 @@ impl BenchFS {
                                 }
                             }
                         } else if let Some(Err(e)) = client_result {
-                            tracing::warn!(
-                                "Failed to connect for metadata sync on close: {:?}",
-                                e
-                            );
+                            tracing::warn!("Failed to connect for metadata sync on close: {:?}", e);
                         }
                     }
                 }

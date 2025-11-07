@@ -12,11 +12,11 @@
 //! - Each client connects to a different server (round-robin mapping)
 //! - All client results are aggregated to compute total IOPS
 
+use benchfs::rpc::AmRpc;
 use benchfs::rpc::bench_ops::BenchPingRequest;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
-use benchfs::rpc::AmRpc;
 
 use pluvio_runtime::executor::Runtime;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LatencyStats {
@@ -112,7 +112,10 @@ fn main() {
     // Validate that we have even number of ranks
     if mpi_size % 2 != 0 {
         if mpi_rank == 0 {
-            eprintln!("ERROR: This benchmark requires an even number of MPI ranks (got {})", mpi_size);
+            eprintln!(
+                "ERROR: This benchmark requires an even number of MPI ranks (got {})",
+                mpi_size
+            );
             eprintln!("Half will be servers, half will be clients");
         }
         std::process::exit(1);
@@ -123,12 +126,17 @@ fn main() {
 
     if args.len() < 2 {
         if mpi_rank == 0 {
-            eprintln!("Usage: mpirun -n <num_nodes> {} <registry_dir> [options]", args[0]);
+            eprintln!(
+                "Usage: mpirun -n <num_nodes> {} <registry_dir> [options]",
+                args[0]
+            );
             eprintln!("  registry_dir: Shared directory for service discovery (required)");
             eprintln!("\nOptions:");
             eprintln!("  --ping-iterations N    Number of ping-pong iterations (default: 10000)");
             eprintln!("  --output FILE          Output results to JSON file");
-            eprintln!("\nNote: Requires even number of MPI ranks. First half are servers, second half are clients.");
+            eprintln!(
+                "\nNote: Requires even number of MPI ranks. First half are servers, second half are clients."
+            );
         }
         std::process::exit(1);
     }
@@ -171,8 +179,17 @@ fn main() {
         tracing::info!("BenchFS RPC Benchmark");
         tracing::info!("==============================================");
         tracing::info!("Total ranks: {}", mpi_size);
-        tracing::info!("Server ranks: 0-{} ({} servers)", num_servers - 1, num_servers);
-        tracing::info!("Client ranks: {}-{} ({} clients)", num_servers, mpi_size - 1, num_clients);
+        tracing::info!(
+            "Server ranks: 0-{} ({} servers)",
+            num_servers - 1,
+            num_servers
+        );
+        tracing::info!(
+            "Client ranks: {}-{} ({} clients)",
+            num_servers,
+            mpi_size - 1,
+            num_clients
+        );
         tracing::info!("Registry: {:?}", registry_dir);
         tracing::info!("Ping iterations: {}", config.ping_iterations);
         if let Some(ref json_path) = config.json_output {
@@ -209,7 +226,7 @@ fn main() {
     // Create connection pool
     let connection_pool = Rc::new(
         ConnectionPool::new(worker.clone(), &registry_dir)
-            .expect("Failed to create connection pool")
+            .expect("Failed to create connection pool"),
     );
 
     if is_server {
@@ -228,8 +245,13 @@ fn main() {
         let target_server_rank = client_idx % num_servers;
         let target_server_id = format!("node_{}", target_server_rank);
 
-        tracing::info!("Client {} (rank {}) will connect to server {} (rank {})",
-            client_idx, mpi_rank, target_server_id, target_server_rank);
+        tracing::info!(
+            "Client {} (rank {}) will connect to server {} (rank {})",
+            client_idx,
+            mpi_rank,
+            target_server_id,
+            target_server_rank
+        );
 
         run_client(
             runtime,
@@ -297,7 +319,9 @@ fn run_client(
             registered_count = 0;
             for rank in 0..total_ranks {
                 let other_node_id = format!("node_{}", rank);
-                let registry_file = connection_pool.registry_dir().join(format!("{}.addr", other_node_id));
+                let registry_file = connection_pool
+                    .registry_dir()
+                    .join(format!("{}.addr", other_node_id));
                 if registry_file.exists() {
                     registered_count += 1;
                 }
@@ -315,9 +339,14 @@ fn run_client(
             &target_server_id,
             config.ping_iterations,
             mpi_rank,
-        ).await;
+        )
+        .await;
 
-        tracing::info!("Local benchmark completed. IOPS: {:.2}, MIOPS: {:.6}", my_result.iops, my_result.miops);
+        tracing::info!(
+            "Local benchmark completed. IOPS: {:.2}, MIOPS: {:.6}",
+            my_result.iops,
+            my_result.miops
+        );
 
         // Store result for MPI communication
         *result_cell_clone.borrow_mut() = Some(my_result);
@@ -360,14 +389,22 @@ fn run_client(
     };
 
     if is_root_client {
-        tracing::info!("Root client (rank {}) gathering result sizes from {} clients...", mpi_rank, num_clients);
+        tracing::info!(
+            "Root client (rank {}) gathering result sizes from {} clients...",
+            mpi_rank,
+            num_clients
+        );
     }
 
     // Gather sizes at first client rank
     if is_root_client {
-        world.process_at_rank(mpi_rank).gather_into_root(&my_size, &mut sizes[..]);
+        world
+            .process_at_rank(mpi_rank)
+            .gather_into_root(&my_size, &mut sizes[..]);
     } else {
-        world.process_at_rank(first_client_rank).gather_into(&my_size);
+        world
+            .process_at_rank(first_client_rank)
+            .gather_into(&my_size);
     }
 
     // Prepare receive buffer
@@ -387,12 +424,15 @@ fn run_client(
             } else {
                 // Receive from other client
                 let mut buf = vec![0u8; size];
-                world.process_at_rank(client_rank).receive_into(&mut buf[..]);
+                world
+                    .process_at_rank(client_rank)
+                    .receive_into(&mut buf[..]);
                 buf
             };
 
             let result_json = String::from_utf8(result_bytes).expect("Invalid UTF-8");
-            let result: ClientResult = serde_json::from_str(&result_json).expect("Failed to deserialize");
+            let result: ClientResult =
+                serde_json::from_str(&result_json).expect("Failed to deserialize");
             all_results.push(result);
         }
 
@@ -442,7 +482,9 @@ fn run_client(
         }
     } else {
         // Non-root clients send their results
-        world.process_at_rank(first_client_rank).send(my_result_bytes);
+        world
+            .process_at_rank(first_client_rank)
+            .send(my_result_bytes);
     }
 
     // Final barrier to ensure all clients have completed MPI operations
@@ -642,12 +684,9 @@ async fn run_ping_benchmark_single(
     }
 }
 
-async fn send_shutdown_to_servers(
-    pool: &ConnectionPool,
-    server_nodes: &[String],
-) {
-    use benchfs::rpc::bench_ops::{BenchShutdownRequest, BenchPingRequest};
+async fn send_shutdown_to_servers(pool: &ConnectionPool, server_nodes: &[String]) {
     use benchfs::rpc::AmRpc;
+    use benchfs::rpc::bench_ops::{BenchPingRequest, BenchShutdownRequest};
 
     tracing::info!("Sending shutdown to {} servers", server_nodes.len());
 
