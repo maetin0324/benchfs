@@ -459,9 +459,9 @@ mod tests {
         file.write_all(b"Hello, IOURING!").unwrap();
         drop(file);
 
-        runtime
-            .clone()
-            .run_with_name_and_runtime("iouring_backend_test_open_read_write", async move {
+        runtime.clone().run_with_name_and_runtime(
+            "iouring_backend_test_open_read_write",
+            async move {
                 let backend = IOUringBackend::new(allocator);
 
                 // ファイルを開く
@@ -479,7 +479,8 @@ mod tests {
 
                 // ファイルを閉じる
                 backend.close(handle).await.unwrap();
-            });
+            },
+        );
     }
 
     #[test]

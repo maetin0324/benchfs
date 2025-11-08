@@ -299,7 +299,9 @@ impl AmRpc for ReadChunkRequest {
             ));
         }
 
-        let header_bytes = zerocopy::IntoBytes::as_bytes(&response_header);
+        // Copy header bytes into an owned buffer so they live for the entire async send.
+        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
+        let header_bytes: &[u8] = &header_vec;
 
         // Determine protocol based on data size
         let proto = if let Some(ref data) = response_data {
@@ -773,7 +775,8 @@ impl AmRpc for WriteChunkRequest<'_> {
             ));
         }
 
-        let header_bytes = zerocopy::IntoBytes::as_bytes(&response_header);
+        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
+        let header_bytes: &[u8] = &header_vec;
 
         // Send header only (no data payload for write response)
         let result = unsafe {
