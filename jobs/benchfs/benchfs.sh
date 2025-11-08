@@ -5,14 +5,14 @@ source "${SCRIPT_DIR}/common.sh"
 TIMESTAMP="$(timestamp)"
 
 # default params
-: ${ELAPSTIM_REQ:="2:00:00"}
+: ${ELAPSTIM_REQ:="0:10:00"}
 : ${LABEL:=default}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
 OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
-BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
+BENCHFS_PREFIX="${PROJECT_ROOT}/target/debug"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 # Debug: Print paths

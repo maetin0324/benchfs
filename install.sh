@@ -42,7 +42,7 @@ fi
 
 # Build BenchFS library
 echo -e "${YELLOW}Building BenchFS library...${NC}"
-cargo build --release --lib
+cargo build --lib
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Failed to build BenchFS library${NC}"
@@ -57,7 +57,7 @@ mkdir -p "$PREFIX/lib/pkgconfig"
 
 # Install library
 echo -e "${YELLOW}Installing library files...${NC}"
-cp -v target/release/libbenchfs.so "$PREFIX/lib/" || {
+cp -v target/debug/libbenchfs.so "$PREFIX/lib/" || {
     echo -e "${RED}Error: Failed to copy library file${NC}"
     exit 1
 }
