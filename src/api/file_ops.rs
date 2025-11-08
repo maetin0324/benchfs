@@ -50,6 +50,7 @@ pub struct BenchFS {
     chunk_manager: ChunkManager,
 
     /// Placement strategy
+    #[allow(dead_code)]
     placement: Rc<dyn PlacementStrategy>,
 
     /// Open file descriptors

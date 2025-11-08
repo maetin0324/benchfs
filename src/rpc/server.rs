@@ -1,7 +1,6 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use pluvio_runtime::executor::Runtime;
 use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress};
 
 use crate::rpc::handlers::RpcHandlerContext;

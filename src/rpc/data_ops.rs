@@ -103,6 +103,7 @@ impl ReadChunkResponseHeader {
 /// while the RPC is in flight will cause use-after-free errors.
 pub struct ReadChunkRequest {
     header: ReadChunkRequestHeader,
+    #[allow(dead_code)]
     path: String,
     /// Data buffers - these must be stored directly in the struct
     path_bytes: Vec<u8>,
@@ -455,6 +456,7 @@ impl WriteChunkResponseHeader {
 pub struct WriteChunkRequest<'a> {
     header: WriteChunkRequestHeader,
     /// File path (for reference)
+    #[allow(dead_code)]
     path: String,
     /// Data buffers - these must be stored directly in the struct
     path_bytes: Vec<u8>,

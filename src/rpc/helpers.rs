@@ -28,6 +28,7 @@ use crate::rpc::handlers::RpcHandlerContext;
 /// 3. The RPC client only uses them during the RPC call lifetime
 /// 4. All RPC operations run in single-threaded Pluvio runtime context
 pub struct RpcIoSliceHelper<const N: usize> {
+    #[allow(dead_code)]
     buffers: Vec<Vec<u8>>,
     slices: UnsafeCell<[IoSlice<'static>; N]>,
 }
