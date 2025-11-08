@@ -203,6 +203,9 @@ fn main() {
     // Create pluvio runtime
     let runtime = Runtime::new(256);
 
+    // Set runtime in TLS for TLS-based APIs
+    pluvio_runtime::set_runtime(runtime.clone());
+
     // Create UCX context and reactor
     let ucx_context = Rc::new(UcxContext::new().expect("Failed to create UCX context"));
     let ucx_reactor = UCXReactor::current();
@@ -299,7 +302,7 @@ fn run_client(
     // Clone connection_pool for later use in shutdown
     let connection_pool_for_shutdown = connection_pool.clone();
 
-    runtime_clone.run_with_name("benchfs_rpc_client_main", async move {
+    runtime_clone.run_with_name_and_runtime("benchfs_rpc_client_main", async move {
         tracing::info!("Client starting...");
 
         // Note: Client does not need to register handlers as it only sends requests,
@@ -362,7 +365,11 @@ fn run_client(
     if is_root_client {
         tracing::info!("Sending shutdown to all servers...");
         let runtime_shutdown = Runtime::new(256);
-        runtime_shutdown.run_with_name("benchfs_rpc_client_shutdown", async move {
+
+        // Set runtime in TLS for TLS-based APIs
+        pluvio_runtime::set_runtime(runtime_shutdown.clone());
+
+        pluvio_runtime::run_with_name("benchfs_rpc_client_shutdown", async move {
             let server_nodes: Vec<String> = (0..num_servers)
                 .map(|rank| format!("node_{}", rank))
                 .collect();
@@ -494,19 +501,18 @@ fn run_client(
 }
 
 fn run_server(
-    runtime: Rc<Runtime>,
+    _runtime: Rc<Runtime>,
     rpc_server: Rc<RpcServer>,
     connection_pool: Rc<ConnectionPool>,
     node_id: String,
     world: &mpi::topology::SimpleCommunicator,
     mpi_rank: i32,
 ) {
-    let runtime_clone = runtime.clone();
-    runtime_clone.run_with_name("benchfs_rpc_server_main", async move {
+    pluvio_runtime::run_with_name("benchfs_rpc_server_main", async move {
         tracing::info!("Server starting...");
 
         // Register handlers
-        if let Err(e) = rpc_server.register_bench_handlers(runtime.clone()).await {
+        if let Err(e) = rpc_server.register_bench_handlers().await {
             tracing::error!("Failed to register handlers: {:?}", e);
             return;
         }

@@ -34,6 +34,7 @@ COPY pluvio /build/pluvio
 COPY benchfs/Cargo.toml benchfs/Cargo.lock /build/
 COPY benchfs/src /build/src/
 COPY benchfs/build.rs /build/
+COPY benchfs/lib /build/lib/
 COPY benchfs/ior_integration /build/ior_integration
 
 # Build BenchFS library and binaries with MPI support

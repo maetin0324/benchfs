@@ -186,6 +186,9 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Create pluvio runtime
     let runtime = Runtime::new(256);
 
+    // Set runtime in TLS for TLS-based APIs
+    pluvio_runtime::set_runtime(runtime.clone());
+
     // Create UCX context and reactor
     let ucx_context = Rc::new(UcxContext::new()?);
     let ucx_reactor = UCXReactor::current();
@@ -282,15 +285,14 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Register all RPC handlers FIRST (before publishing address)
     // This ensures that when clients connect, the server is ready to handle requests
     let server_clone = rpc_server.clone();
-    let runtime_clone = runtime.clone();
 
     let handler_ready = std::rc::Rc::new(std::cell::RefCell::new(false));
     let handler_ready_clone = handler_ready.clone();
 
-    runtime.spawn_with_name(
+    pluvio_runtime::spawn_with_name(
         async move {
             tracing::info!("Registering RPC handlers...");
-            match server_clone.register_all_handlers(runtime_clone).await {
+            match server_clone.register_all_handlers().await {
                 Ok(_) => {
                     tracing::info!("RPC handlers registered successfully");
                     *handler_ready_clone.borrow_mut() = true;
@@ -310,7 +312,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let mpi_rank_clone = state.mpi_rank;
     let mpi_size_clone = state.mpi_size;
 
-    let _registration_handle = runtime.spawn_with_name(
+    let _registration_handle = pluvio_runtime::spawn_with_name(
         async move {
             // Wait for RPC handlers to be ready before publishing address
             tracing::info!("Waiting for RPC handlers to be ready...");
@@ -419,7 +421,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let server_handle = {
         let state_clone = state.clone();
 
-        runtime.spawn_with_name(
+        pluvio_runtime::spawn_with_name(
             async move {
                 tracing::info!("RPC server listening for requests");
 
@@ -449,21 +451,19 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Run the runtime with the server handle
     // Note: We don't await registration_handle here because it would create a deadlock.
     // The registration task is spawned and will run concurrently with the server.
-    runtime
-        .clone()
-        .run_with_name("benchfsd_mpi_server_main", async move {
-            // Wait for server to complete
-            match server_handle.await {
-                Ok(_) => {
-                    tracing::info!("Server shutdown complete");
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("Server error: {:?}", e);
-                    Err(e)
-                }
+    pluvio_runtime::run_with_name("benchfsd_mpi_server_main", async move {
+        // Wait for server to complete
+        match server_handle.await {
+            Ok(_) => {
+                tracing::info!("Server shutdown complete");
+                Ok(())
             }
-        });
+            Err(e) => {
+                tracing::error!("Server error: {:?}", e);
+                Err(e)
+            }
+        }
+    });
 
     // Convert runtime result to Box<dyn Error>
     Ok(())

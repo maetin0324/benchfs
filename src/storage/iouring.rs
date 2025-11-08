@@ -441,7 +441,7 @@ mod tests {
 
         runtime
             .clone()
-            .run_with_name("iouring_backend_test_stat", async move {
+            .run_with_name_and_runtime("iouring_backend_test_stat", async move {
                 let backend = IOUringBackend::new(allocator);
                 let stat = backend.stat(&test_file).await.unwrap();
                 assert_eq!(stat.size, 5);
@@ -461,7 +461,7 @@ mod tests {
 
         runtime
             .clone()
-            .run_with_name("iouring_backend_test_open_read_write", async move {
+            .run_with_name_and_runtime("iouring_backend_test_open_read_write", async move {
                 let backend = IOUringBackend::new(allocator);
 
                 // ファイルを開く

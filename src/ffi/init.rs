@@ -324,7 +324,6 @@ pub extern "C" fn benchfs_init(
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
         set_runtime(runtime.clone());
-        set_runtime(runtime.clone());
 
         // Register timer reactor (required for Delay/timeout futures)
         let timer_reactor = TimerReactor::current();
@@ -421,10 +420,9 @@ pub extern "C" fn benchfs_init(
         // Register all RPC handlers (spawn in background, don't block)
         // These handlers run perpetual listening loops, so we can't block_on() them
         let server_clone = rpc_server.clone();
-        let runtime_clone = runtime.clone();
-        runtime.spawn_with_name(
+        pluvio_runtime::spawn_with_name(
             async move {
-                match server_clone.register_all_handlers(runtime_clone).await {
+                match server_clone.register_all_handlers().await {
                     Ok(_) => tracing::info!("RPC handlers registered successfully"),
                     Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
                 }
@@ -460,6 +458,9 @@ pub extern "C" fn benchfs_init(
 
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
+
+        // Set runtime in thread-local storage BEFORE any async operations
+        set_runtime(runtime.clone());
 
         // Register timer reactor for client as well
         let timer_reactor = TimerReactor::current();

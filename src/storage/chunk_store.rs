@@ -1020,7 +1020,7 @@ mod tests {
         F: std::future::Future<Output = ()> + 'static,
     {
         let runtime = Runtime::new(256);
-        runtime.clone().run_with_name("chunk_store_test", test);
+        runtime.clone().run_with_name_and_runtime("chunk_store_test", test);
     }
 
     #[test]

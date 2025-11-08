@@ -50,7 +50,7 @@ impl RpcServer {
     ///
     /// server.listen::<ReadChunkRequest, _, _>(runtime.clone()).await?;
     /// ```
-    pub async fn listen<Rpc, ReqH, ResH>(&self, _runtime: Rc<Runtime>) -> Result<(), RpcError>
+    pub async fn listen<Rpc, ReqH, ResH>(&self) -> Result<(), RpcError>
     where
         ResH: Serializable + 'static,
         ReqH: Serializable + 'static,
@@ -137,10 +137,9 @@ impl RpcServer {
     /// ```ignore
     /// use pluvio_runtime::executor::Runtime;
     ///
-    /// let runtime = Rc::new(Runtime::new());
-    /// server.register_all_handlers(runtime.clone()).await?;
+    /// server.register_all_handlers().await?;
     /// ```
-    pub async fn register_all_handlers(&self, runtime: Rc<Runtime>) -> Result<(), RpcError> {
+    pub async fn register_all_handlers(&self) -> Result<(), RpcError> {
         use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
         use crate::rpc::metadata_ops::{
             MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
@@ -152,10 +151,9 @@ impl RpcServer {
         // Spawn ReadChunk handler with polling priority
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_polling_with_name(
+            pluvio_runtime::spawn_polling_with_name(
                 async move {
-                    if let Err(e) = server.listen::<ReadChunkRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<ReadChunkRequest, _, _>().await {
                         tracing::error!("ReadChunk handler error: {:?}", e);
                     }
                 },
@@ -166,10 +164,9 @@ impl RpcServer {
         // Spawn WriteChunk handler with polling priority
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_polling_with_name(
+            pluvio_runtime::spawn_polling_with_name(
                 async move {
-                    if let Err(e) = server.listen::<WriteChunkRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<WriteChunkRequest, _, _>().await {
                         tracing::error!("WriteChunk handler error: {:?}", e);
                     }
                 },
@@ -180,10 +177,9 @@ impl RpcServer {
         // Spawn MetadataLookup handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
-                    if let Err(e) = server.listen::<MetadataLookupRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<MetadataLookupRequest, _, _>().await {
                         tracing::error!("MetadataLookup handler error: {:?}", e);
                     }
                 },
@@ -194,10 +190,9 @@ impl RpcServer {
         // Spawn MetadataCreateFile handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
-                    if let Err(e) = server.listen::<MetadataCreateFileRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<MetadataCreateFileRequest, _, _>().await {
                         tracing::error!("MetadataCreateFile handler error: {:?}", e);
                     }
                 },
@@ -208,10 +203,9 @@ impl RpcServer {
         // Spawn MetadataCreateDir handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
-                    if let Err(e) = server.listen::<MetadataCreateDirRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<MetadataCreateDirRequest, _, _>().await {
                         tracing::error!("MetadataCreateDir handler error: {:?}", e);
                     }
                 },
@@ -222,10 +216,9 @@ impl RpcServer {
         // Spawn MetadataDelete handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
-                    if let Err(e) = server.listen::<MetadataDeleteRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<MetadataDeleteRequest, _, _>().await {
                         tracing::error!("MetadataDelete handler error: {:?}", e);
                     }
                 },
@@ -236,10 +229,9 @@ impl RpcServer {
         // Spawn MetadataUpdate handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
-                    if let Err(e) = server.listen::<MetadataUpdateRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<MetadataUpdateRequest, _, _>().await {
                         tracing::error!("MetadataUpdate handler error: {:?}", e);
                     }
                 },
@@ -250,11 +242,10 @@ impl RpcServer {
         // Spawn Shutdown handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
                     use crate::rpc::metadata_ops::ShutdownRequest;
-                    if let Err(e) = server.listen::<ShutdownRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<ShutdownRequest, _, _>().await {
                         tracing::error!("Shutdown handler error: {:?}", e);
                     }
                 },
@@ -267,7 +258,7 @@ impl RpcServer {
     }
 
     /// Register only benchmark RPC handlers (Ping-Pong, Throughput, etc.)
-    pub async fn register_bench_handlers(&self, runtime: Rc<Runtime>) -> Result<(), RpcError> {
+    pub async fn register_bench_handlers(&self) -> Result<(), RpcError> {
         use crate::rpc::bench_ops::{BenchPingRequest, BenchShutdownRequest};
 
         tracing::info!("Registering benchmark RPC handlers...");
@@ -275,10 +266,9 @@ impl RpcServer {
         // Spawn BenchPing handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
-                    if let Err(e) = server.listen::<BenchPingRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<BenchPingRequest, _, _>().await {
                         tracing::error!("BenchPing handler error: {:?}", e);
                     }
                 },
@@ -289,10 +279,9 @@ impl RpcServer {
         // Spawn BenchShutdown handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
-                    if let Err(e) = server.listen::<BenchShutdownRequest, _, _>(rt).await {
+                    if let Err(e) = server.listen::<BenchShutdownRequest, _, _>().await {
                         tracing::error!("BenchShutdown handler error: {:?}", e);
                     }
                 },

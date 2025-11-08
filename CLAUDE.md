@@ -16,5 +16,3 @@ This document defines the project's rules, objectives, and progress management m
 - Run cargo check to verify there are no compilation errors after each implementation step.
 - Run cargo test frequently to verify that your implementation is correct.
 
-# 補足事項
-- pluvioのソースコードは/home/rmaeda/workspace/rust/pluvioにあります、github経由で参照しているので、pluvioのソースコードを変更した場合は、githubにpushしてください。

@@ -3,7 +3,7 @@
 //! This module manages the async runtime and global state required for executing
 //! BenchFS async operations from C code. It provides:
 //!
-//! - **Thread-local Runtime**: Each thread maintains its own async runtime instance
+//! - **Thread-local Runtime**: Each thread maintains its own async runtime instance (via pluvio_runtime TLS)
 //! - **BenchFS Context Storage**: Thread-local storage for BenchFS instances
 //! - **RPC Components**: Storage for RPC server and connection pool in distributed mode
 //! - **Async-to-Sync Conversion**: [`block_on`] helper for executing async functions synchronously
@@ -26,7 +26,7 @@
 //!              ▼
 //! ┌─────────────────────────────────────┐
 //! │  Thread-Local Runtime & Context     │
-//! │  - LOCAL_RUNTIME                    │
+//! │  - pluvio_runtime TLS (Runtime)     │
 //! │  - BENCHFS_CTX                      │
 //! │  - RPC_SERVER (server mode)         │
 //! │  - CONNECTION_POOL (distributed)    │
@@ -42,21 +42,14 @@
 use crate::api::file_ops::BenchFS;
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::server::RpcServer;
-use pluvio_runtime::executor::Runtime;
-use pluvio_timer::TimerReactor;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-thread_local! {
-    /// Thread-local async runtime
-    ///
-    /// Each thread maintains its own runtime instance because `Runtime` contains
-    /// `RefCell` which is not `Sync`. For distributed mode, this runtime is
-    /// initialized in `benchfs_init()` with UCX and io_uring reactors registered.
-    ///
-    /// In local mode (non-distributed), a basic runtime is created on-demand.
-    static LOCAL_RUNTIME: RefCell<Option<Rc<Runtime>>> = RefCell::new(None);
-}
+// Re-export pluvio_runtime's TLS-based runtime functions
+use pluvio_runtime::executor::Runtime;
+pub use pluvio_runtime::executor::{
+    get_runtime as get_pluvio_runtime, set_runtime as set_pluvio_runtime,
+};
 
 thread_local! {
     /// Thread-local BenchFS context
@@ -86,7 +79,7 @@ thread_local! {
 
 /// Set the async runtime for the current thread
 ///
-/// This function stores the runtime instance in thread-local storage.
+/// This function stores the runtime instance in pluvio_runtime's thread-local storage.
 /// The runtime is initialized in `benchfs_init()` with appropriate reactors
 /// (io_uring, UCX) registered for the mode (client or server).
 ///
@@ -94,9 +87,7 @@ thread_local! {
 ///
 /// * `runtime` - Shared reference to the runtime instance
 pub fn set_runtime(runtime: Rc<Runtime>) {
-    LOCAL_RUNTIME.with(|rt| {
-        *rt.borrow_mut() = Some(runtime);
-    });
+    set_pluvio_runtime(runtime);
 }
 
 /// Set the BenchFS context for the current thread
@@ -238,47 +229,43 @@ where
     F: std::future::Future + 'static,
     F::Output: 'static,
 {
-    LOCAL_RUNTIME.with(|runtime_cell| {
-        let runtime = runtime_cell.borrow();
+    let rt: Rc<Runtime> = if let Some(rt) = get_pluvio_runtime() {
+        rt
+    } else {
+        tracing::error!(
+            "BenchFS runtime is not initialized on this thread. \
+             Call benchfs_init (or the appropriate thread attach API) before invoking BenchFS operations."
+        );
+        panic!("BenchFS runtime not initialized on this thread");
+    };
 
-        let rt: Rc<Runtime> = if let Some(ref rt) = *runtime {
-            rt.clone()
-        } else {
-            tracing::error!(
-                "BenchFS runtime is not initialized on this thread. \
-                 Call benchfs_init (or the appropriate thread attach API) before invoking BenchFS operations."
-            );
-            panic!("BenchFS runtime not initialized on this thread");
-        };
+    // Debug logging
+    tracing::debug!("Starting operation '{}'", operation_name);
 
-        // Debug logging
-        tracing::debug!("Starting operation '{}'", operation_name);
+    // Create a holder for the result
+    let result_holder = Rc::new(RefCell::new(None));
+    let result_holder_clone = result_holder.clone();
 
-        // Create a holder for the result
-        let result_holder = Rc::new(RefCell::new(None));
-        let result_holder_clone = result_holder.clone();
+    // Wrap the future to capture its result
+    let wrapped_future = async move {
+        let result = future.await;
+        *result_holder_clone.borrow_mut() = Some(result);
+    };
 
-        // Wrap the future to capture its result
-        let wrapped_future = async move {
-            let result = future.await;
-            *result_holder_clone.borrow_mut() = Some(result);
-        };
+    // Execute the future with the provided operation name using the thread-local runtime
+    rt.run_with_name_and_runtime(operation_name, wrapped_future);
 
-        // Execute the future with the provided operation name
-        rt.run_with_name(operation_name, wrapped_future);
-
-        // Extract the result
-        result_holder
-            .borrow_mut()
-            .take()
-            .expect("Future did not complete")
-    })
+    // Extract the result
+    result_holder
+        .borrow_mut()
+        .take()
+        .expect("Future did not complete")
 }
 
 /// Clean up thread-local runtime and context
 ///
 /// This function clears all thread-local storage used by BenchFS:
-/// - Runtime instance
+/// - Runtime instance (via pluvio_runtime TLS)
 /// - BenchFS context
 /// - RPC server (if in server mode)
 /// - Connection pool (if in distributed mode)
@@ -304,9 +291,8 @@ pub fn cleanup_runtime() {
         *pool.borrow_mut() = None;
     });
 
-    LOCAL_RUNTIME.with(|rt| {
-        *rt.borrow_mut() = None;
-    });
+    // Clear the pluvio_runtime TLS
+    pluvio_runtime::clear_runtime();
 
     tracing::debug!("Thread-local cleanup complete");
 }
