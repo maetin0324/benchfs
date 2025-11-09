@@ -556,6 +556,19 @@ impl SocketAcceptor {
                         connection_count
                     );
 
+                    // CRITICAL: Wait for endpoint to be fully established across all UCX transports
+                    // After accept(), the endpoint may not have completed wireup on all lanes
+                    // (especially rc_mlx5). Give it time to complete before attempting stream operations.
+                    // This delay allows UCX to:
+                    // 1. Complete InfiniBand RC endpoint wireup (if rc_mlx5 is in UCX_TLS)
+                    // 2. Exchange remote endpoint addresses for all active lanes
+                    // 3. Establish ready-to-use bi-directional communication channels
+                    //
+                    // Without this delay, stream_send() may fail with:
+                    // - UCS_ERR_UNREACHABLE: no remote ep address for lane[N]
+                    // - UCS_ERR_CONNECTION_RESET: connection closed during incomplete wireup
+                    futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
+
                     // Send client_id to client via stream handshake
                     tracing::debug!("About to send client_id {} via stream_send", client_id);
                     let client_id_bytes = client_id.to_ne_bytes();
