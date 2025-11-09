@@ -278,7 +278,7 @@ if [[ "${USE_UCX_PML}" -eq 1 ]]; then
     -x UCX_NET_DEVICES
     -x UCX_MEMTYPE_CACHE
     -x UCX_PROTOS
-    # -x UCX_LOG_LEVEL
+    -x UCX_LOG_LEVEL
     -x UCX_RNDV_THRESH
     -x UCX_RNDV_SCHEME
     -x UCX_RC_TIMEOUT
