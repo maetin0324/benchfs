@@ -52,9 +52,14 @@ BenchFSは、[CHFS (Cached Hierarchical File System)](https://github.com/otatebe
 - **UCX ActiveMessage**: 低レイテンシメッセージング
 - **ゼロコピー転送**: zerocopyクレートによる効率的なシリアライゼーション
 - **プロトコル自動選択**: Eager/Rendezvousの自動切り替え
+- **2つの接続モード**:
+  - **Socket接続モード** (デフォルト): 永続エンドポイント + LRUキャッシュ (最大1024クライアント)
+  - **WorkerAddressモード** (レガシー): リプライエンドポイント方式
 - **7種類のRPC操作**:
   - ReadChunk / WriteChunk
   - MetadataLookup / MetadataCreateFile / MetadataCreateDir / MetadataUpdate / MetadataDelete
+
+詳細は [docs/SOCKET_CONNECTION_MODE.md](docs/SOCKET_CONNECTION_MODE.md) を参照してください。
 
 ### ストレージバックエンド
 
@@ -258,6 +263,37 @@ rdma_threshold_bytes = 32768
 rdma_threshold_bytes = 131072  # 128KB
 ```
 
+### 接続モード設定
+
+BenchFSは2つのRPC接続モードをサポートしています：
+
+```toml
+[network]
+# Socket接続モード（推奨、デフォルト）
+# - 永続的なエンドポイント接続
+# - LRUキャッシュで最大1024クライアントをサポート
+# - 高並行性シナリオに最適
+use_socket_connection = true
+
+# WorkerAddressモード（レガシー）
+# - リクエストごとにreply_epを作成
+# - epoll_waitオーバーヘッドを回避
+# - 低並行性シナリオに適する
+# use_socket_connection = false
+```
+
+**Socket接続モード** (推奨):
+- サーバーがUCX Listenerを作成し、`server_list.txt`にソケットアドレスを書き込み
+- クライアントは自動的に`server_list.txt`を検出してソケット経由で接続
+- ClientRegistryがLRUキャッシュで永続エンドポイントを管理
+
+**WorkerAddressモード** (レガシー):
+- 各ノードがWorkerAddressを`*.addr`ファイルに書き込み
+- クライアントはWorkerAddressから接続し、RPCごとにreply_epを使用
+- 後方互換性のために保持
+
+詳細は [docs/SOCKET_CONNECTION_MODE.md](docs/SOCKET_CONNECTION_MODE.md) を参照してください。
+
 ### キャッシュ設定
 
 ```toml
@@ -272,7 +308,7 @@ chunk_cache_mb = 100
 cache_ttl_secs = 0
 ```
 
-詳細は `benchfs.toml.example` を参照してください。
+詳細は `benchfs.toml` を参照してください。
 
 ## 📖 使用例
 
@@ -449,6 +485,7 @@ cargo doc --no-deps --open
 
 - **[アーキテクチャ比較](docs/ARCHITECTURE_COMPARISON.md)**: BenchFS vs CHFS の詳細比較（日本語）
 - **[実装変更ログ](docs/IMPLEMENTATION_CHANGELOG.md)**: 最新の実装変更内容
+- **[Socket接続モード](docs/SOCKET_CONNECTION_MODE.md)**: Socket vs WorkerAddress接続モードの詳細（英語）
 
 ### 設計ノート
 

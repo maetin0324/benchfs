@@ -155,8 +155,12 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         allocator.clone(),
     ));
 
-    // Create RPC server
-    let rpc_server = Rc::new(RpcServer::new(worker, handler_context));
+    // Create RPC server with WorkerAddress connection mode
+    let rpc_server = Rc::new(RpcServer::new(
+        worker,
+        handler_context,
+        benchfs::rpc::ConnectionMode::WorkerAddress,
+    ));
 
     // Note: This server uses WorkerAddress-based connections (not socket-based),
     // so no listener is needed. Clients connect via worker.connect_addr() using

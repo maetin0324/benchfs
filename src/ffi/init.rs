@@ -398,8 +398,12 @@ pub extern "C" fn benchfs_init(
             allocator.clone(),
         ));
 
-        // Create RPC server
-        let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
+        // Create RPC server with WorkerAddress connection mode (default for FFI)
+        let rpc_server = Rc::new(RpcServer::new(
+            worker.clone(),
+            handler_context,
+            crate::rpc::ConnectionMode::WorkerAddress,
+        ));
 
         // Create connection pool
         let connection_pool = match ConnectionPool::new(worker.clone(), registry_dir_str) {
@@ -498,60 +502,170 @@ pub extern "C" fn benchfs_init(
             }
         };
 
-        // Discover data nodes BEFORE connecting (critical for load distribution)
-        tracing::info!("Discovering data nodes from registry...");
-        let discovered_nodes = match discover_data_nodes(registry_dir_str) {
-            Ok(nodes) => {
-                tracing::info!(
-                    "Discovered {} data nodes for distributed connections",
-                    nodes.len()
-                );
-                nodes
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to discover data nodes: {}. Falling back to node_0 only",
-                    e
-                );
-                vec!["node_0".to_string()]
-            }
-        };
+        // Wait for server to initialize connection endpoint
+        // (either server_list.txt for Socket mode or .addr files for WorkerAddress mode)
+        // This retry logic handles the race condition where clients start before servers
+        let server_list_path = std::path::Path::new(registry_dir_str).join("server_list.txt");
+        {
+            let max_retries = 30; // Wait up to 30 seconds
+            let retry_delay = std::time::Duration::from_secs(1);
 
-        // Distribute initial connections across nodes using client node_id hash
-        // This prevents all 256 clients from connecting to node_0 simultaneously
-        let target_node = if discovered_nodes.len() > 1 {
-            // Hash the node_id to select a target node
-            let hash = node_id_str
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
-            let index = (hash as usize) % discovered_nodes.len();
-            &discovered_nodes[index]
-        } else {
-            &discovered_nodes[0]
-        };
+            tracing::info!("Waiting for server initialization...");
 
-        tracing::info!(
-            "Connecting to distributed node: {} (selected from {} nodes)",
-            target_node,
-            discovered_nodes.len()
-        );
+            for attempt in 0..max_retries {
+                // Check if either Socket mode (server_list.txt) or WorkerAddress mode (.addr files) is available
+                let socket_ready = server_list_path.exists();
+                let workeraddr_ready = discover_data_nodes(registry_dir_str).is_ok();
 
-        let pool_clone = connection_pool.clone();
-        let target_node_owned = target_node.to_string();
-        let connect_result = block_on_with_name("connect_to_server", async move {
-            pool_clone.wait_and_connect(&target_node_owned, 30).await
-        });
+                if socket_ready || workeraddr_ready {
+                    tracing::info!(
+                        "Server ready after {} attempt(s) (Socket: {}, WorkerAddress: {})",
+                        attempt + 1,
+                        socket_ready,
+                        workeraddr_ready
+                    );
+                    break;
+                }
 
-        match connect_result {
-            Ok(_) => tracing::info!("Successfully connected to server: {}", target_node),
-            Err(e) => {
-                set_error_message(&format!(
-                    "Failed to connect to server {}: {:?}",
-                    target_node, e
-                ));
-                return std::ptr::null_mut();
+                if attempt == 0 {
+                    tracing::info!(
+                        "Server not ready yet, will retry for up to {} seconds",
+                        max_retries
+                    );
+                }
+
+                std::thread::sleep(retry_delay);
             }
         }
+
+        // Detect connection mode and discover available nodes
+        let connection_mode = match connection_pool.detect_connection_mode() {
+            Ok(mode) => mode,
+            Err(e) => {
+                set_error_message(&format!("Failed to detect connection mode: {:?}", e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let discovered_nodes = match &connection_mode {
+            crate::rpc::ConnectionMode::Socket { .. } => {
+                tracing::info!("Socket connection mode detected (server_list.txt exists)");
+
+                // Read server list
+                use crate::rpc::server_list::read_server_list_with_retry;
+
+                let servers = match read_server_list_with_retry(
+                    &server_list_path,
+                    30, // max_retries
+                    std::time::Duration::from_millis(1000), // delay
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        set_error_message(&format!("Failed to read server_list.txt: {:?}", e));
+                        return std::ptr::null_mut();
+                    }
+                };
+
+                tracing::info!("Discovered {} servers from server_list.txt", servers.len());
+
+                // Select target server using hash-based distribution
+                let target_server = if servers.len() > 1 {
+                    let hash = node_id_str
+                        .bytes()
+                        .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+                    let index = (hash as usize) % servers.len();
+                    &servers[index]
+                } else {
+                    &servers[0]
+                };
+
+                tracing::info!(
+                    "Connecting to server: {} (auto-detected mode)",
+                    target_server.node_id
+                );
+
+                // Use connect_auto() which handles mode detection internally
+                let pool_clone = connection_pool.clone();
+                let target_node_id = target_server.node_id.clone();
+
+                let connect_result = block_on_with_name("connect_auto", async move {
+                    pool_clone.connect_auto(&target_node_id).await
+                });
+
+                match connect_result {
+                    Ok(_) => tracing::info!("Successfully connected to {}", target_server.node_id),
+                    Err(e) => {
+                        set_error_message(&format!(
+                            "Failed to connect to {}: {:?}",
+                            target_server.node_id, e
+                        ));
+                        return std::ptr::null_mut();
+                    }
+                }
+
+                // Return list of all server node IDs
+                servers.into_iter().map(|s| s.node_id).collect()
+            }
+            crate::rpc::ConnectionMode::WorkerAddress => {
+                tracing::info!("WorkerAddress connection mode detected");
+
+                // Discover data nodes from .addr files
+                let nodes = match discover_data_nodes(registry_dir_str) {
+                    Ok(nodes) => {
+                        tracing::info!(
+                            "Discovered {} data nodes for distributed connections",
+                            nodes.len()
+                        );
+                        nodes
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to discover data nodes: {}. Falling back to node_0 only",
+                            e
+                        );
+                        vec!["node_0".to_string()]
+                    }
+                };
+
+                // Select target node using hash-based distribution
+                let target_node = if nodes.len() > 1 {
+                    let hash = node_id_str
+                        .bytes()
+                        .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+                    let index = (hash as usize) % nodes.len();
+                    &nodes[index]
+                } else {
+                    &nodes[0]
+                };
+
+                tracing::info!(
+                    "Connecting to node: {} (auto-detected mode, selected from {} nodes)",
+                    target_node,
+                    nodes.len()
+                );
+
+                // Use connect_auto() which handles mode detection internally
+                let pool_clone = connection_pool.clone();
+                let target_node_owned = target_node.to_string();
+
+                let connect_result = block_on_with_name("connect_auto", async move {
+                    pool_clone.connect_auto(&target_node_owned).await
+                });
+
+                match connect_result {
+                    Ok(_) => tracing::info!("Successfully connected to {}", target_node),
+                    Err(e) => {
+                        set_error_message(&format!(
+                            "Failed to connect to {}: {:?}",
+                            target_node, e
+                        ));
+                        return std::ptr::null_mut();
+                    }
+                }
+
+                nodes
+            }
+        };
 
         // Get data_dir for client (use temp dir if not specified)
         let client_data_dir = match data_dir_str {

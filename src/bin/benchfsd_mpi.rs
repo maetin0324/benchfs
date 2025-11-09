@@ -13,6 +13,7 @@
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
 use benchfs::metadata::MetadataManager;
+use benchfs::rpc::client_registry::ClientRegistry;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
@@ -61,6 +62,7 @@ impl ServerState {
         self.mpi_rank == 0
     }
 
+    #[allow(dead_code)]
     fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
@@ -267,15 +269,31 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         (chunk_store, allocator)
     };
 
-    // Create RPC handler context
-    let handler_context = Rc::new(RpcHandlerContext::new(
+    // Create client registry for persistent endpoint management
+    // Max 1024 clients (can be configured later if needed)
+    let client_registry = Rc::new(ClientRegistry::new(1024));
+
+    // Create RPC handler context with client registry
+    let handler_context = Rc::new(RpcHandlerContext::new_with_client_registry(
         metadata_manager.clone(),
         chunk_store,
         allocator,
+        client_registry.clone(),
     ));
 
-    // Create RPC server
-    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
+    // Create RPC server with appropriate connection mode
+    let connection_mode = if config.network.use_socket_connection {
+        benchfs::rpc::ConnectionMode::Socket {
+            bind_addr: "0.0.0.0:0".parse().unwrap(),
+        }
+    } else {
+        benchfs::rpc::ConnectionMode::WorkerAddress
+    };
+    let rpc_server = Rc::new(RpcServer::new(
+        worker.clone(),
+        handler_context,
+        connection_mode,
+    ));
 
     // Create connection pool for inter-node communication
     let connection_pool = Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?);
@@ -307,10 +325,12 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
     // Spawn node registration task (must run after RPC handlers are ready)
     let pool_clone = connection_pool.clone();
+    let rpc_server_clone = rpc_server.clone();  // For start_listener()
     let node_id_clone = node_id.clone();
     let registry_dir_clone = PathBuf::from(registry_dir);
     let mpi_rank_clone = state.mpi_rank;
     let mpi_size_clone = state.mpi_size;
+    let client_registry_clone = client_registry.clone();  // For start_listener()
 
     let _registration_handle = pluvio_runtime::spawn_with_name(
         async move {
@@ -411,6 +431,30 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
                 futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
             }
+
+            tracing::info!("All {} nodes registered successfully", mpi_size_clone);
+
+            // Start listener based on connection mode
+            // This call handles both Socket and WorkerAddress modes
+            let registry_dir_str = registry_dir_clone
+                .to_str()
+                .ok_or_else(|| std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Registry directory path is not valid UTF-8",
+                ))?;
+
+            if let Err(e) = rpc_server_clone
+                .start_listener(registry_dir_str, &node_id_clone, client_registry_clone)
+                .await
+            {
+                tracing::error!("Failed to start listener: {:?}", e);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Listener start failed: {:?}", e),
+                ));
+            }
+
+            tracing::info!("Listener started successfully for node {}", node_id_clone);
 
             Ok::<(), std::io::Error>(())
         },

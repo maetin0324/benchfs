@@ -52,14 +52,23 @@ timeout_secs = 30
 # optimal balance between RDMA setup overhead and transfer efficiency.
 rdma_threshold_bytes = 32768
 
-# WorkerAddress registry directory (default: /tmp/benchfs/worker_addrs)
+# Registry directory for service discovery (default: /tmp/benchfs/worker_addrs)
 #
-# This directory is used for WorkerAddress exchange between nodes.
+# This directory is used for service discovery between nodes.
 # IMPORTANT: This should be a shared filesystem path accessible by all nodes.
-#
-# WorkerAddress-based connection avoids the epoll_wait overhead of socket_bind
-# when ucp_worker_progress is called frequently.
 registry_dir = "/tmp/benchfs/worker_addrs"
+
+# Connection mode: Socket vs WorkerAddress
+# - true (default): Use socket-based connections with persistent endpoints
+#   * Server creates a UCX Listener and accepts incoming connections
+#   * Clients connect using socket addresses from server_list.txt
+#   * Better scalability with LRU cache for client endpoints (max 1024 clients)
+#   * Recommended for production and high-concurrency scenarios
+# - false: Use WorkerAddress-based connections (legacy)
+#   * Uses reply_ep for each RPC request
+#   * Service discovery via .addr files
+#   * Avoids epoll_wait overhead but may have scalability issues
+use_socket_connection = true
 
 [cache]
 # Number of metadata cache entries (default: 1000)

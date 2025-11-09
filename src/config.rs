@@ -144,6 +144,15 @@ pub struct NetworkConfig {
     /// This should be a shared filesystem path accessible by all nodes
     #[serde(default = "default_registry_dir")]
     pub registry_dir: PathBuf,
+
+    /// Use socket-based connections instead of WorkerAddress
+    ///
+    /// When true (default): Server creates a Listener and accepts socket connections.
+    ///                      Clients connect using socket addresses from server_list.txt.
+    /// When false: Use WorkerAddress-based connection management.
+    ///             This is the original BenchFS connection method.
+    #[serde(default = "default_use_socket_connection")]
+    pub use_socket_connection: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -156,6 +165,10 @@ fn default_rdma_threshold() -> usize {
 
 fn default_registry_dir() -> PathBuf {
     PathBuf::from(defaults::default_registry_dir())
+}
+
+fn default_use_socket_connection() -> bool {
+    true
 }
 
 /// Cache configuration
@@ -201,6 +214,7 @@ impl Default for ServerConfig {
                 timeout_secs: default_timeout(),
                 rdma_threshold_bytes: default_rdma_threshold(),
                 registry_dir: default_registry_dir(),
+                use_socket_connection: true,
             },
             cache: CacheConfig {
                 metadata_cache_entries: default_metadata_cache_entries(),

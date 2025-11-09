@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress};
+use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress, listener::Listener};
 
+use crate::rpc::client_registry::ClientRegistry;
 use crate::rpc::handlers::RpcHandlerContext;
 use crate::rpc::{AmRpc, RpcError, Serializable};
 
@@ -18,13 +20,21 @@ pub const MAX_HEADER_SIZE: usize = 256;
 pub struct RpcServer {
     worker: Rc<Worker>,
     handler_context: Rc<RpcHandlerContext>,
+    socket_acceptor: RefCell<Option<Rc<SocketAcceptor>>>,
+    connection_mode: crate::rpc::ConnectionMode,
 }
 
 impl RpcServer {
-    pub fn new(worker: Rc<Worker>, handler_context: Rc<RpcHandlerContext>) -> Self {
+    pub fn new(
+        worker: Rc<Worker>,
+        handler_context: Rc<RpcHandlerContext>,
+        connection_mode: crate::rpc::ConnectionMode,
+    ) -> Self {
         Self {
             worker,
             handler_context,
+            socket_acceptor: RefCell::new(None),
+            connection_mode,
         }
     }
 
@@ -36,6 +46,141 @@ impl RpcServer {
         self.worker
             .address()
             .map_err(|e| RpcError::TransportError(format!("Failed to get worker address: {:?}", e)))
+    }
+
+    /// Start listener based on connection mode
+    ///
+    /// In Socket mode, this creates a UCX Listener and spawns the accept loop.
+    /// In WorkerAddress mode, this does nothing (legacy behavior).
+    ///
+    /// # Arguments
+    /// * `registry_dir` - Directory for service discovery files (server_list.txt or *.addr)
+    /// * `node_id` - Node identifier for logging
+    /// * `client_registry` - Registry for managing client endpoints (Socket mode only)
+    pub async fn start_listener(
+        &self,
+        registry_dir: &str,
+        node_id: &str,
+        client_registry: Rc<ClientRegistry>,
+    ) -> Result<(), RpcError> {
+        match &self.connection_mode {
+            crate::rpc::ConnectionMode::Socket { bind_addr } => {
+                tracing::info!(
+                    "Starting Socket listener on {} for node {}",
+                    bind_addr,
+                    node_id
+                );
+
+                // Create UCX Listener
+                let listener = self.worker.create_listener(*bind_addr).map_err(|e| {
+                    RpcError::ConnectionError(format!("Failed to create listener: {:?}", e))
+                })?;
+
+                // Get the actual bound address (important when using port 0 for dynamic allocation)
+                let actual_addr = listener.socket_addr().map_err(|e| {
+                    RpcError::ConnectionError(format!("Failed to get listener address: {:?}", e))
+                })?;
+
+                tracing::info!(
+                    "Listener created on actual address {} for node {}",
+                    actual_addr,
+                    node_id
+                );
+
+                // Write socket address to server_list.txt with node_id
+                let server_list_path = format!("{}/server_list.txt", registry_dir);
+
+                // Get the actual IP address
+                // If bind address is 0.0.0.0, get the container's actual IP address
+                let ip_addr = if actual_addr.ip().is_unspecified() {
+                    // Try to get IP from hostname -i command
+                    match std::process::Command::new("hostname").arg("-i").output() {
+                        Ok(output) if output.status.success() => {
+                            let ip_str = String::from_utf8_lossy(&output.stdout);
+                            let ip_trimmed = ip_str.trim();
+
+                            tracing::debug!(
+                                "Resolved IP from hostname -i: {} (port: {})",
+                                ip_trimmed,
+                                actual_addr.port()
+                            );
+
+                            // Parse IP and combine with port
+                            if let Ok(ip) = ip_trimmed.parse::<std::net::IpAddr>() {
+                                format!("{}:{}", ip, actual_addr.port())
+                            } else {
+                                tracing::warn!(
+                                    "Failed to parse IP from hostname -i: {}, using 0.0.0.0",
+                                    ip_trimmed
+                                );
+                                actual_addr.to_string()
+                            }
+                        }
+                        Ok(_) | Err(_) => {
+                            tracing::warn!("hostname -i command failed, using bind address 0.0.0.0");
+                            actual_addr.to_string()
+                        }
+                    }
+                } else {
+                    actual_addr.to_string()
+                };
+
+                let addr_line = format!("{} {}\n", node_id, ip_addr);
+
+                // Append to server_list.txt
+                use std::fs::OpenOptions;
+                use std::io::Write;
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&server_list_path)
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "Failed to open server_list.txt: {:?}",
+                            e
+                        ))
+                    })?;
+                file.write_all(addr_line.as_bytes()).map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "Failed to write to server_list.txt: {:?}",
+                        e
+                    ))
+                })?;
+
+                tracing::info!(
+                    "Wrote {} {} to {}",
+                    node_id,
+                    ip_addr,
+                    server_list_path
+                );
+
+                // Create SocketAcceptor and spawn accept loop
+                let acceptor = Rc::new(SocketAcceptor::new(
+                    listener,
+                    client_registry,
+                    self.worker.clone(),
+                    node_id.to_string(),
+                ));
+
+                // Store the acceptor for later cleanup if needed
+                *self.socket_acceptor.borrow_mut() = Some(acceptor.clone());
+
+                // Spawn accept loop (this consumes the Rc)
+                acceptor.spawn_accept_loop();
+
+                tracing::info!("Socket accept loop started for node {}", node_id);
+            }
+            crate::rpc::ConnectionMode::WorkerAddress => {
+                tracing::info!(
+                    "WorkerAddress mode: no listener needed for node {}",
+                    node_id
+                );
+                // In WorkerAddress mode, we rely on *.addr files written elsewhere
+                // No additional setup needed here
+            }
+        }
+
+        Ok(())
     }
 
     /// Start listening for RPC requests on the given AM stream ID
@@ -122,6 +267,7 @@ impl RpcServer {
     /// Register and start all standard RPC handlers
     ///
     /// This is a convenience method that starts listeners for all standard RPC types:
+    /// - ClientRegister (RPC_CLIENT_REGISTER)
     /// - ReadChunk (RPC_READ_CHUNK)
     /// - WriteChunk (RPC_WRITE_CHUNK)
     /// - MetadataLookup (RPC_METADATA_LOOKUP)
@@ -139,6 +285,7 @@ impl RpcServer {
     /// server.register_all_handlers().await?;
     /// ```
     pub async fn register_all_handlers(&self) -> Result<(), RpcError> {
+        use crate::rpc::client_id_protocol::ClientRegisterRpc;
         use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
         use crate::rpc::metadata_ops::{
             MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
@@ -146,6 +293,19 @@ impl RpcServer {
         };
 
         tracing::info!("Registering all RPC handlers...");
+
+        // Spawn ClientRegister handler
+        {
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<ClientRegisterRpc, _, _>().await {
+                        tracing::error!("ClientRegister handler error: {:?}", e);
+                    }
+                },
+                "rpc_client_register_handler".to_string(),
+            );
+        }
 
         // Spawn ReadChunk handler with polling priority
         {
@@ -298,6 +458,118 @@ impl RpcServer {
         Self {
             worker: self.worker.clone(),
             handler_context: self.handler_context.clone(),
+            socket_acceptor: RefCell::new(None),
+            connection_mode: self.connection_mode.clone(),
         }
+    }
+}
+
+/// Socket connection acceptor for incoming client connections
+///
+/// Handles accept loop in socket connection mode, automatically registering
+/// client endpoints with the ClientRegistry for persistent connections.
+pub struct SocketAcceptor {
+    listener: RefCell<Option<Listener>>,
+    client_registry: Rc<ClientRegistry>,
+    worker: Rc<Worker>,
+    node_id: String,
+}
+
+impl SocketAcceptor {
+    /// Create a new SocketAcceptor
+    ///
+    /// # Arguments
+    /// * `listener` - UCX Listener for accepting incoming connections
+    /// * `client_registry` - Registry for managing client endpoints (LRU cache)
+    /// * `worker` - UCX Worker for accepting connections
+    /// * `node_id` - Node identifier for logging
+    pub fn new(
+        listener: Listener,
+        client_registry: Rc<ClientRegistry>,
+        worker: Rc<Worker>,
+        node_id: String,
+    ) -> Self {
+        Self {
+            listener: RefCell::new(Some(listener)),
+            client_registry,
+            worker,
+            node_id,
+        }
+    }
+
+    /// Spawn accept loop as a background task
+    ///
+    /// The accept loop runs indefinitely, accepting incoming client connections
+    /// and registering them with the ClientRegistry.
+    pub fn spawn_accept_loop(self: Rc<Self>) {
+        pluvio_runtime::spawn_with_name(
+            async move {
+                self.run_accept_loop().await;
+            },
+            "socket_accept_loop".to_string(),
+        );
+    }
+
+    /// Internal accept loop implementation
+    ///
+    /// This is the core logic moved from benchfsd_mpi.rs.
+    /// Continuously accepts connections and registers client endpoints.
+    async fn run_accept_loop(&self) {
+        let mut listener = self.listener.borrow_mut().take().unwrap();
+        let mut connection_count = 0u64;
+        let mut consecutive_errors = 0u32;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
+        tracing::info!("Accept loop started for node {}", self.node_id);
+
+        loop {
+            // Wait for incoming connection
+            let conn_request = listener.next().await;
+            connection_count += 1;
+
+            tracing::debug!("Received connection request #{}", connection_count);
+
+            // Accept the connection to create an endpoint
+            match self.worker.accept(conn_request).await {
+                Ok(endpoint) => {
+                    consecutive_errors = 0; // Reset error counter on success
+                    let endpoint = Rc::new(endpoint);
+
+                    // Generate client_id from connection count
+                    // TODO: In future, receive client_id from client via first message
+                    let client_id = format!("client_{}", connection_count);
+
+                    tracing::info!(
+                        "Accepted connection from client {} (total: {})",
+                        client_id,
+                        connection_count
+                    );
+
+                    // Register the client endpoint
+                    if let Some(evicted_id) = self.client_registry.register(client_id.clone(), endpoint) {
+                        tracing::warn!("Evicted client {} to make room for {}", evicted_id, client_id);
+                    }
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    tracing::error!(
+                        "Failed to accept connection (consecutive errors: {}/{}): {:?}",
+                        consecutive_errors,
+                        MAX_CONSECUTIVE_ERRORS,
+                        e
+                    );
+
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        tracing::error!(
+                            "Accept loop encountered {} consecutive errors, terminating",
+                            MAX_CONSECUTIVE_ERRORS
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::warn!("Accept loop terminated for node {}", self.node_id);
     }
 }

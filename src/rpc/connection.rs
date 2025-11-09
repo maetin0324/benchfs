@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::rpc::address_registry::WorkerAddressRegistry;
-use crate::rpc::{RpcClient, RpcError};
+use crate::rpc::{ConnectionMode, RpcClient, RpcError};
 use pluvio_ucx::Worker;
 
 /// Connection pool for managing RPC client connections to remote nodes
@@ -222,6 +222,168 @@ impl ConnectionPool {
     /// Get all connected node addresses
     pub fn connected_nodes(&self) -> Vec<String> {
         self.connections.borrow().keys().cloned().collect()
+    }
+
+    /// Detect connection mode based on registry directory contents
+    ///
+    /// Checks for the existence of server_list.txt to determine if Socket mode is available.
+    /// If server_list.txt exists, returns Socket mode. Otherwise, returns WorkerAddress mode.
+    ///
+    /// # Returns
+    /// ConnectionMode::Socket if server_list.txt exists, ConnectionMode::WorkerAddress otherwise
+    pub fn detect_connection_mode(&self) -> Result<ConnectionMode, RpcError> {
+        let server_list_path = self.registry.registry_dir().join("server_list.txt");
+
+        if server_list_path.exists() {
+            tracing::debug!(
+                "Found server_list.txt, using Socket connection mode: {:?}",
+                server_list_path
+            );
+            // Return Socket mode with a placeholder bind address
+            // (bind_addr is only used on the server side, not needed for client connections)
+            Ok(ConnectionMode::Socket {
+                bind_addr: "0.0.0.0:0".parse().unwrap(),
+            })
+        } else {
+            tracing::debug!(
+                "server_list.txt not found, using WorkerAddress connection mode"
+            );
+            Ok(ConnectionMode::WorkerAddress)
+        }
+    }
+
+    /// Parse server_list.txt to find socket address for a given node_id
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier to search for
+    ///
+    /// # Returns
+    /// Socket address if found in server_list.txt
+    fn parse_server_list(&self, node_id: &str) -> Result<std::net::SocketAddr, RpcError> {
+        let server_list_path = self.registry.registry_dir().join("server_list.txt");
+
+        let content = std::fs::read_to_string(&server_list_path).map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to read server_list.txt: {:?}", e))
+        })?;
+
+        for line in content.lines() {
+            let parts: Vec<&str> = line.trim().split_whitespace().collect();
+            if parts.len() >= 2 && parts[0] == node_id {
+                return parts[1].parse().map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "Invalid socket address '{}' for node {}: {:?}",
+                        parts[1], node_id, e
+                    ))
+                });
+            }
+        }
+
+        Err(RpcError::ConnectionError(format!(
+            "Node {} not found in server_list.txt",
+            node_id
+        )))
+    }
+
+    /// Automatically detect connection mode and connect to a remote node
+    ///
+    /// This method checks for server_list.txt in the registry directory:
+    /// - If found: Uses Socket connection mode (reads socket address from server_list.txt)
+    /// - If not found: Uses WorkerAddress connection mode (reads .addr file)
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier to connect to
+    ///
+    /// # Returns
+    /// RPC client for the specified node
+    pub async fn connect_auto(&self, node_id: &str) -> Result<Rc<RpcClient>, RpcError> {
+        let mode = self.detect_connection_mode()?;
+
+        match mode {
+            ConnectionMode::Socket { .. } => {
+                // Socket mode: parse server_list.txt to get socket address
+                let socket_addr = self.parse_server_list(node_id)?;
+                tracing::info!(
+                    "Auto-detected Socket mode, connecting to {} at {}",
+                    node_id,
+                    socket_addr
+                );
+                self.connect_via_socket(node_id, socket_addr).await
+            }
+            ConnectionMode::WorkerAddress => {
+                // WorkerAddress mode: use get_or_connect with .addr files
+                tracing::info!(
+                    "Auto-detected WorkerAddress mode, connecting to {}",
+                    node_id
+                );
+                self.get_or_connect(node_id).await
+            }
+        }
+    }
+
+    /// Connect to a remote server using socket address
+    ///
+    /// This method uses socket-based connection instead of WorkerAddress.
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier for caching
+    /// * `socket_addr` - Socket address (ip:port) to connect to
+    ///
+    /// # Returns
+    /// RPC client for the specified server
+    pub async fn connect_via_socket(
+        &self,
+        node_id: &str,
+        socket_addr: std::net::SocketAddr,
+    ) -> Result<Rc<RpcClient>, RpcError> {
+        // Check if connection already exists AND is still valid
+        {
+            let connections = self.connections.borrow();
+            if let Some(client) = connections.get(node_id) {
+                if !client.connection().endpoint().is_closed() {
+                    tracing::debug!("Reusing existing socket connection to {}", node_id);
+                    return Ok(client.clone());
+                } else {
+                    tracing::warn!(
+                        "Existing connection to {} is closed, will reconnect",
+                        node_id
+                    );
+                }
+            }
+        }
+
+        // Remove closed connection if it exists
+        self.connections.borrow_mut().remove(node_id);
+
+        tracing::info!(
+            "Creating new socket connection to {} at {}",
+            node_id,
+            socket_addr
+        );
+
+        // Connect using socket address
+        let endpoint = self.worker.connect_socket(socket_addr).await.map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Failed to connect to {} at {}: {:?}",
+                node_id, socket_addr, e
+            ))
+        })?;
+
+        let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
+        let client = Rc::new(RpcClient::new(conn));
+
+        // Initialize reply stream
+        if let Err(e) = client.init_reply_stream(100) {
+            tracing::warn!("Failed to initialize reply stream: {:?}", e);
+        }
+
+        // Store in cache
+        self.connections
+            .borrow_mut()
+            .insert(node_id.to_string(), client.clone());
+
+        tracing::info!("Successfully connected to {} at {}", node_id, socket_addr);
+
+        Ok(client)
     }
 }
 

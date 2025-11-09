@@ -1,5 +1,5 @@
 # BenchFS Test Configuration for Docker Environment
-# Default: Socket connection mode (recommended)
+# Socket Connection Mode (Recommended)
 
 [node]
 node_id = "node0"  # Will be overridden by MPI rank
@@ -16,9 +16,10 @@ bind_addr = "0.0.0.0:50051"
 timeout_secs = 30
 rdma_threshold_bytes = 32768  # 32 KB
 registry_dir = "/shared/registry"
-# Socket connection mode (default: true)
-# - true: Use socket-based connections with Listener (recommended)
-# - false: Use WorkerAddress-based connections (legacy)
+# Socket connection mode: Server creates Listener, clients connect via socket
+# - Persistent endpoints with LRU cache
+# - Better for high-concurrency scenarios
+# - Uses server_list.txt for service discovery
 use_socket_connection = true
 
 [cache]

@@ -1,5 +1,5 @@
 # BenchFS Test Configuration for Docker Environment
-# Default: Socket connection mode (recommended)
+# WorkerAddress Connection Mode (Legacy)
 
 [node]
 node_id = "node0"  # Will be overridden by MPI rank
@@ -16,10 +16,11 @@ bind_addr = "0.0.0.0:50051"
 timeout_secs = 30
 rdma_threshold_bytes = 32768  # 32 KB
 registry_dir = "/shared/registry"
-# Socket connection mode (default: true)
-# - true: Use socket-based connections with Listener (recommended)
-# - false: Use WorkerAddress-based connections (legacy)
-use_socket_connection = true
+# WorkerAddress connection mode: Original BenchFS connection method
+# - Uses WorkerAddress files (*.addr) for service discovery
+# - Reply endpoint for each RPC request
+# - May have scalability issues with many concurrent clients
+use_socket_connection = false
 
 [cache]
 metadata_cache_entries = 1000

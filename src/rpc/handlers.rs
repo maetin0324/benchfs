@@ -5,6 +5,7 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
 use crate::rpc::buffer_pool::{PathBufferLease, PathBufferPool};
+use crate::rpc::client_registry::ClientRegistry;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 use crate::storage::ChunkStore;
 
@@ -17,6 +18,8 @@ pub struct RpcHandlerContext {
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
     path_buffer_pool: Rc<PathBufferPool>,
+    /// Client registry for persistent connections (optional for servers)
+    pub client_registry: Option<Rc<ClientRegistry>>,
     /// Shutdown flag for graceful termination
     shutdown_flag: RefCell<bool>,
 }
@@ -32,6 +35,24 @@ impl RpcHandlerContext {
             chunk_store,
             allocator,
             path_buffer_pool: Rc::new(PathBufferPool::new(64)),
+            client_registry: None,
+            shutdown_flag: RefCell::new(false),
+        }
+    }
+
+    /// Create a new RpcHandlerContext with client registry for servers
+    pub fn new_with_client_registry(
+        metadata_manager: Rc<MetadataManager>,
+        chunk_store: Rc<dyn ChunkStore>,
+        allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+        client_registry: Rc<ClientRegistry>,
+    ) -> Self {
+        Self {
+            metadata_manager,
+            chunk_store,
+            allocator,
+            path_buffer_pool: Rc::new(PathBufferPool::new(64)),
+            client_registry: Some(client_registry),
             shutdown_flag: RefCell::new(false),
         }
     }
@@ -60,6 +81,7 @@ impl RpcHandlerContext {
             chunk_store,
             allocator,
             path_buffer_pool: Rc::new(PathBufferPool::new(16)),
+            client_registry: None,
             shutdown_flag: RefCell::new(false),
         }
     }

@@ -153,7 +153,23 @@ static aiori_fd_t *BENCHFS_Create(
   /* Call BenchFS C API */
   benchfs_file_t *file = benchfs_create(benchfs_ctx, testFileName, flags, 0644);
   if (file == NULL) {
-    ERRF("BENCHFS create failed: %s", benchfs_get_error());
+    /* If file already exists (EEXIST), try to open it instead
+     * This happens when multiple MPI ranks try to create the same file simultaneously
+     */
+    const char *err_msg = benchfs_get_error();
+    if (strstr(err_msg, "status -17") != NULL || strstr(err_msg, "File exists") != NULL) {
+      if (verbose >= 3) {
+        WARNF("BENCHFS create: file exists (rank %d), opening instead: %s",
+              benchfs_rank, testFileName);
+      }
+      /* Open the existing file with write permissions */
+      file = benchfs_open(benchfs_ctx, testFileName, BENCHFS_O_WRONLY);
+      if (file == NULL) {
+        ERRF("BENCHFS open (after EEXIST) failed: %s", benchfs_get_error());
+      }
+    } else {
+      ERRF("BENCHFS create failed: %s", err_msg);
+    }
   }
 
   return (aiori_fd_t*)file;

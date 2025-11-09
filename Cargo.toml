@@ -50,6 +50,7 @@ once_cell = "1.19"
 
 # MPI support
 mpi = { version = "0.8", features = ["derive"], optional = true }
+hostname = "0.4.1"
 
 [dev-dependencies]
 tempfile = "3.0"

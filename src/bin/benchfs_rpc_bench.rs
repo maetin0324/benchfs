@@ -223,8 +223,12 @@ fn main() {
     // Create RPC handler context (minimal for benchmark)
     let handler_context = Rc::new(RpcHandlerContext::new_bench());
 
-    // Create RPC server
-    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));
+    // Create RPC server with WorkerAddress connection mode
+    let rpc_server = Rc::new(RpcServer::new(
+        worker.clone(),
+        handler_context.clone(),
+        benchfs::rpc::ConnectionMode::WorkerAddress,
+    ));
 
     // Create connection pool
     let connection_pool = Rc::new(

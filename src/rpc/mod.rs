@@ -10,12 +10,15 @@ pub mod address_registry;
 pub mod bench_ops;
 pub mod buffer_pool;
 pub mod client;
+pub mod client_id_protocol;
+pub mod client_registry;
 pub mod connection;
 pub mod data_ops;
 pub mod handlers;
 pub mod helpers;
 pub mod metadata_ops;
 pub mod server;
+pub mod server_list;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
@@ -81,6 +84,30 @@ impl Connection {
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
+}
+
+/// Connection mode for RPC server
+///
+/// Determines how the server accepts incoming client connections:
+/// - WorkerAddress: Uses WorkerAddress exchange via filesystem (legacy)
+/// - Socket: Uses UCX Listener for socket-based connections (recommended)
+#[derive(Debug, Clone)]
+pub enum ConnectionMode {
+    /// WorkerAddress-based connection (legacy)
+    ///
+    /// Each RPC request creates a new reply endpoint.
+    /// Service discovery via *.addr files.
+    WorkerAddress,
+
+    /// Socket-based connection with persistent endpoints
+    ///
+    /// Server creates a UCX Listener on the specified bind address.
+    /// Clients connect using socket addresses from server_list.txt.
+    /// Better scalability with LRU cache for client endpoints (max 1024 clients).
+    Socket {
+        /// Address to bind the listener (e.g., "0.0.0.0:0" for dynamic port)
+        bind_addr: std::net::SocketAddr,
+    },
 }
 
 pub enum AmRpcCallType {
