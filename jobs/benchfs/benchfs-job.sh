@@ -48,13 +48,18 @@ detect_active_ib() {
 }
 
 if [[ -z "${UCX_TLS:-}" ]]; then
+  # Force InfiniBand + TCP configuration for Socket connection mode
+  # Note: detect_active_ib() may fail in some HPC environments even when IB is available
+  # Socket connection mode requires TCP for listener/connect_socket handshake,
+  # then UCX can use RC (InfiniBand) for actual data transfer
+  export UCX_TLS="tcp,rc_mlx5,rc_verbs,sm,self"
+
+  # Fallback detection (for diagnostic purposes only, not used for configuration)
   if detect_active_ib; then
-    # Socket connection mode: TCPも追加してlistener/connect_socketをサポート
-    # RC + TCP + 共有メモリを使用（UD/DC/cuda系は除外）
-    export UCX_TLS="tcp,rc_mlx5,rc_verbs,sm,self"
+    echo "InfiniBand detected: Active"
   else
-    # IB が無い場合は TCP にフォールバック
-    export UCX_TLS="tcp,sm,self"
+    echo "WARNING: InfiniBand detection failed, but using IB+TCP configuration anyway"
+    echo "If connection errors occur, manually set UCX_TLS=tcp,sm,self for TCP-only mode"
   fi
 fi
 
