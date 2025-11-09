@@ -291,8 +291,16 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
     // Create RPC server with appropriate connection mode
     let connection_mode = if config.network.use_socket_connection {
+        // Use deterministic port assignment: 10000 + MPI rank
+        // This avoids dynamic port allocation issues and ensures consistent port numbers
+        const SOCKET_PORT_BASE: u16 = 10000;
+        let socket_port = SOCKET_PORT_BASE + state.mpi_rank as u16;
+        let bind_addr_str = format!("0.0.0.0:{}", socket_port);
+
+        tracing::info!("Socket connection mode: binding to {} (rank {})", bind_addr_str, state.mpi_rank);
+
         benchfs::rpc::ConnectionMode::Socket {
-            bind_addr: "0.0.0.0:0".parse().unwrap(),
+            bind_addr: bind_addr_str.parse().unwrap(),
         }
     } else {
         benchfs::rpc::ConnectionMode::WorkerAddress

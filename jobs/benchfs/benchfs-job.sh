@@ -66,10 +66,14 @@ fi
 # UCX が GPU メモリタイプを誤検出しないように memtype cache を無効化
 export UCX_MEMTYPE_CACHE="n"
 
-# UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
+# UCX network device configuration for Socket connection mode
+# Socket mode requires flexibility to accept connections from various network interfaces
 if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
   if [[ "${UCX_TLS}" == *rc* ]]; then
-    export UCX_NET_DEVICES="mlx5_0:1"
+    # Allow all network devices to support connections from different interfaces
+    # This is critical for Socket mode where clients may connect via different NICs
+    # (InfiniBand, Ethernet, etc.)
+    export UCX_NET_DEVICES="all"
   else
     export UCX_NET_DEVICES="all"
   fi
