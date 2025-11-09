@@ -49,8 +49,9 @@ detect_active_ib() {
 
 if [[ -z "${UCX_TLS:-}" ]]; then
   if detect_active_ib; then
-    # RC + 共有メモリのみを使用し、UD/DC/cuda 系を完全に除外
-    export UCX_TLS="rc_mlx5,rc_verbs,sm,self"
+    # Socket connection mode: TCPも追加してlistener/connect_socketをサポート
+    # RC + TCP + 共有メモリを使用（UD/DC/cuda系は除外）
+    export UCX_TLS="tcp,rc_mlx5,rc_verbs,sm,self"
   else
     # IB が無い場合は TCP にフォールバック
     export UCX_TLS="tcp,sm,self"
