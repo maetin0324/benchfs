@@ -52,7 +52,8 @@ if [[ -z "${UCX_TLS:-}" ]]; then
   # Note: detect_active_ib() may fail in some HPC environments even when IB is available
   # Socket connection mode requires TCP for listener/connect_socket handshake,
   # then UCX can use RC (InfiniBand) for actual data transfer
-  export UCX_TLS="tcp,rc_mlx5,rc_verbs,sm,self"
+  # Use rc_mlx5 only (not rc_verbs) to avoid transport conflicts
+  export UCX_TLS="tcp,rc_mlx5,sm,self"
 
   # Fallback detection (for diagnostic purposes only, not used for configuration)
   if detect_active_ib; then
