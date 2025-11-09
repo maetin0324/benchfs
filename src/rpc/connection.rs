@@ -361,6 +361,7 @@ impl ConnectionPool {
         );
 
         // Connect using socket address
+        tracing::debug!("About to call connect_socket for {}", node_id);
         let endpoint = self.worker.connect_socket(socket_addr).await.map_err(|e| {
             RpcError::ConnectionError(format!(
                 "Failed to connect to {} at {}: {:?}",
@@ -368,8 +369,31 @@ impl ConnectionPool {
             ))
         })?;
 
+        tracing::info!("Socket connection established to {}, about to receive client_id", node_id);
+
+        // Receive client_id from server via stream handshake
+        use std::mem::MaybeUninit;
+        let mut client_id_bytes = [MaybeUninit::<u8>::uninit(); 4];
+        endpoint.stream_recv(&mut client_id_bytes).await.map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Failed to receive client_id from {}: {:?}",
+                node_id, e
+            ))
+        })?;
+        // SAFETY: stream_recv has initialized the bytes
+        let client_id_bytes_init: [u8; 4] = unsafe {
+            std::mem::transmute::<[MaybeUninit<u8>; 4], [u8; 4]>(client_id_bytes)
+        };
+        let client_id = u32::from_ne_bytes(client_id_bytes_init);
+
+        tracing::info!("Received client_id {} from server {}", client_id, node_id);
+
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
         let client = Rc::new(RpcClient::new(conn));
+
+        // Set client_id
+        client.set_client_id(client_id);
+        tracing::debug!("Set client_id {} for connection to {}", client_id, node_id);
 
         // Initialize reply stream
         if let Err(e) = client.init_reply_stream(100) {
@@ -381,7 +405,7 @@ impl ConnectionPool {
             .borrow_mut()
             .insert(node_id.to_string(), client.clone());
 
-        tracing::info!("Successfully connected to {} at {}", node_id, socket_addr);
+        tracing::info!("Successfully connected to {} at {} with client_id {}", node_id, socket_addr, client_id);
 
         Ok(client)
     }

@@ -12,6 +12,8 @@ pub struct RpcClient {
     reply_stream_id: RefCell<Option<u16>>,
     /// Client's own WorkerAddress for direct response
     worker_address: Vec<u8>,
+    /// Client identifier for Socket mode (u32 for efficient header packing)
+    client_id: RefCell<u32>,
 }
 
 impl RpcClient {
@@ -39,7 +41,18 @@ impl RpcClient {
             conn,
             reply_stream_id: RefCell::new(None),
             worker_address,
+            client_id: RefCell::new(0), // Will be set by FFI layer or init function
         }
+    }
+
+    /// Set the client ID for Socket mode
+    pub fn set_client_id(&self, client_id: u32) {
+        *self.client_id.borrow_mut() = client_id;
+    }
+
+    /// Get the client ID
+    pub fn client_id(&self) -> u32 {
+        *self.client_id.borrow()
     }
 
     /// Get the client's WorkerAddress
@@ -107,11 +120,18 @@ impl RpcClient {
             ));
         }
 
+        // Prepare header with client_id set
+        // All RPC headers have client_id as the first field (u32), so we modify the first 4 bytes
+        let mut header_bytes = zerocopy::IntoBytes::as_bytes(header).to_vec();
+        let client_id = self.client_id();
+        header_bytes[0..4].copy_from_slice(&client_id.to_ne_bytes());
+
         // Send the RPC request (proto is set to None for now)
         tracing::debug!(
-            "Sending AM request: rpc_id={}, header_size={}, need_reply={}, proto={:?}",
+            "Sending AM request: rpc_id={}, header_size={}, client_id={}, need_reply={}, proto={:?}",
             rpc_id,
-            std::mem::size_of_val(zerocopy::IntoBytes::as_bytes(header)),
+            header_bytes.len(),
+            client_id,
             need_reply,
             proto
         );
@@ -120,7 +140,7 @@ impl RpcClient {
             .endpoint()
             .am_send_vectorized(
                 rpc_id as u32,
-                zerocopy::IntoBytes::as_bytes(header),
+                &header_bytes,
                 &data,
                 need_reply,
                 proto,
@@ -185,11 +205,17 @@ impl RpcClient {
         let data = request.request_data();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
+        // Prepare header with client_id set
+        // All RPC headers have client_id as the first field (u32), so we modify the first 4 bytes
+        let mut header_bytes = zerocopy::IntoBytes::as_bytes(header).to_vec();
+        let client_id = self.client_id();
+        header_bytes[0..4].copy_from_slice(&client_id.to_ne_bytes());
+
         self.conn
             .endpoint()
             .am_send_vectorized(
                 rpc_id as u32,
-                zerocopy::IntoBytes::as_bytes(header),
+                &header_bytes,
                 &data,
                 false, // need_reply = false
                 proto, // proto - TODO: pass actual proto when available

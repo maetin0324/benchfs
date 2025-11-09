@@ -6,7 +6,7 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::{DirectoryMetadata, FileMetadata};
 use crate::rpc::helpers::{
-    RpcIoSliceHelper, parse_header, receive_path, rpc_error_to_errno, send_rpc_response_via_reply,
+    RpcIoSliceHelper, parse_header, receive_path, rpc_error_to_errno, send_rpc_response,
 };
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, SHUTDOWN_MAGIC};
 
@@ -37,18 +37,18 @@ const _MAX_PATH_LEN: usize = 256;
     zerocopy::Immutable,
 )]
 pub struct MetadataLookupRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
     /// Path length
     pub path_len: u32,
-
-    /// Padding for alignment
-    _padding: [u8; 4],
 }
 
 impl MetadataLookupRequestHeader {
     pub fn new(path_len: usize) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
             path_len: path_len as u32,
-            _padding: [0; 4],
         }
     }
 }
@@ -216,8 +216,8 @@ impl AmRpc for MetadataLookupRequest {
             MetadataLookupResponseHeader::not_found()
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -241,22 +241,30 @@ impl AmRpc for MetadataLookupRequest {
     zerocopy::Immutable,
 )]
 pub struct MetadataCreateFileRequestHeader {
-    /// Initial file size
-    pub size: u64,
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
 
     /// File mode (permissions)
     pub mode: u32,
 
+    /// Initial file size
+    pub size: u64,
+
     /// Path length
     pub path_len: u32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
 }
 
 impl MetadataCreateFileRequestHeader {
     pub fn new(size: u64, mode: u32, path_len: usize) -> Self {
         Self {
-            size,
+            client_id: 0, // Will be set by RpcClient during execution
             mode,
+            size,
             path_len: path_len as u32,
+            _padding: [0; 4],
         }
     }
 }
@@ -391,8 +399,8 @@ impl AmRpc for MetadataCreateFileRequest {
             }
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -416,18 +424,26 @@ impl AmRpc for MetadataCreateFileRequest {
     zerocopy::Immutable,
 )]
 pub struct MetadataCreateDirRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
     /// Directory mode (permissions)
     pub mode: u32,
 
     /// Path length
     pub path_len: u32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
 }
 
 impl MetadataCreateDirRequestHeader {
     pub fn new(mode: u32, path_len: usize) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
             mode,
             path_len: path_len as u32,
+            _padding: [0; 4],
         }
     }
 }
@@ -523,8 +539,8 @@ impl AmRpc for MetadataCreateDirRequest {
             }
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -548,6 +564,9 @@ impl AmRpc for MetadataCreateDirRequest {
     zerocopy::Immutable,
 )]
 pub struct MetadataDeleteRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
     /// Path length
     pub path_len: u32,
 
@@ -555,23 +574,25 @@ pub struct MetadataDeleteRequestHeader {
     pub entry_type: u8,
 
     /// Padding for alignment
-    _padding: [u8; 3],
+    _padding: [u8; 7],
 }
 
 impl MetadataDeleteRequestHeader {
     pub fn file(path_len: usize) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
             path_len: path_len as u32,
             entry_type: 1,
-            _padding: [0; 3],
+            _padding: [0; 7],
         }
     }
 
     pub fn directory(path_len: usize) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
             path_len: path_len as u32,
             entry_type: 2,
-            _padding: [0; 3],
+            _padding: [0; 7],
         }
     }
 }
@@ -723,8 +744,8 @@ impl AmRpc for MetadataDeleteRequest {
             MetadataDeleteResponseHeader::error(-22) // EINVAL
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -752,30 +773,34 @@ const UPDATE_MODE: u8 = 1 << 1; // Update file mode/permissions
     zerocopy::Immutable,
 )]
 pub struct MetadataUpdateRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
+    /// Path length
+    pub path_len: u32,
+
     /// New file size (if UPDATE_SIZE is set)
     pub new_size: u64,
 
     /// New file mode (if UPDATE_MODE is set)
     pub new_mode: u32,
 
-    /// Path length
-    pub path_len: u32,
-
     /// Update mask (which fields to update)
     pub update_mask: u8,
 
     /// Padding for alignment
-    _padding: [u8; 7],
+    _padding: [u8; 3],
 }
 
 impl MetadataUpdateRequestHeader {
     pub fn new(path_len: usize) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
+            path_len: path_len as u32,
             new_size: 0,
             new_mode: 0,
-            path_len: path_len as u32,
             update_mask: 0,
-            _padding: [0; 7],
+            _padding: [0; 3],
         }
     }
 
@@ -925,7 +950,9 @@ impl AmRpc for MetadataUpdateRequest {
             Ok(meta) => meta,
             Err(_) => {
                 let error_header = MetadataUpdateResponseHeader::error(-2); // ENOENT
-                return send_rpc_response_via_reply(
+                return send_rpc_response(
+                    &ctx,
+                    header.client_id,
                     Self::reply_stream_id(),
                     &error_header,
                     None,
@@ -949,8 +976,8 @@ impl AmRpc for MetadataUpdateRequest {
             Err(_e) => MetadataUpdateResponseHeader::error(-5), // EIO
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -1112,6 +1139,12 @@ mod tests {
     zerocopy::Immutable,
 )]
 pub struct ShutdownRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
+
     /// Magic number to verify request integrity
     pub magic: u64,
 }
@@ -1119,6 +1152,8 @@ pub struct ShutdownRequestHeader {
 impl ShutdownRequestHeader {
     pub fn new() -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
+            _padding: [0; 4],
             magic: SHUTDOWN_MAGIC,
         }
     }
@@ -1214,8 +1249,8 @@ impl AmRpc for ShutdownRequest {
 
         let response_header = ShutdownResponseHeader::new(true);
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

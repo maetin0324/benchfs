@@ -192,7 +192,7 @@ impl BenchFS {
         // If not local and in distributed mode, fetch from remote
         let metadata_node = self.get_metadata_node(path);
         if let Some(pool) = &self.connection_pool {
-            match pool.get_or_connect(&metadata_node).await {
+            match pool.connect_auto(&metadata_node).await {
                 Ok(client) => {
                     let request = MetadataLookupRequest::new(path.to_string());
                     match request.call(&*client).await {
@@ -249,7 +249,7 @@ impl BenchFS {
         } else {
             // Remote metadata lookup via RPC
             if let Some(pool) = &self.connection_pool {
-                match pool.get_or_connect(&metadata_node).await {
+                match pool.connect_auto(&metadata_node).await {
                     Ok(client) => {
                         let request = MetadataLookupRequest::new(path.to_string());
                         match request.call(&*client).await {
@@ -309,7 +309,7 @@ impl BenchFS {
                 } else {
                     // Remote truncate via RPC
                     if let Some(pool) = &self.connection_pool {
-                        match pool.get_or_connect(&metadata_node).await {
+                        match pool.connect_auto(&metadata_node).await {
                             Ok(client) => {
                                 use crate::rpc::metadata_ops::MetadataUpdateRequest;
                                 let request =
@@ -382,7 +382,7 @@ impl BenchFS {
             } else {
                 // Remote file creation via RPC
                 if let Some(pool) = &self.connection_pool {
-                    match pool.get_or_connect(&metadata_node).await {
+                    match pool.connect_auto(&metadata_node).await {
                         Ok(client) => {
                             let request =
                                 MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
@@ -487,7 +487,7 @@ impl BenchFS {
             } else {
                 // Query remote metadata for size
                 if let Some(pool) = &self.connection_pool {
-                    match pool.get_or_connect(&metadata_node).await {
+                    match pool.connect_auto(&metadata_node).await {
                         Ok(client) => {
                             let request = MetadataLookupRequest::new(path.to_string());
                             match request.call(&*client).await {
@@ -600,7 +600,7 @@ impl BenchFS {
                                         node_id
                                     );
 
-                                    match pool.get_or_connect(&node_id).await {
+                                    match pool.connect_auto(&node_id).await {
                                         Ok(client) => {
                                             let request = ReadChunkRequest::new(
                                                 chunk_index,
@@ -788,7 +788,7 @@ impl BenchFS {
                                 target_node
                             );
 
-                            match pool.get_or_connect(&target_node).await {
+                            match pool.connect_auto(&target_node).await {
                                 Ok(client) => {
                                     // Create RPC request
                                     let request = WriteChunkRequest::new(
@@ -890,7 +890,7 @@ impl BenchFS {
                         let mut timeout = Delay::new(timeout_duration).fuse();
 
                         // Try to connect with timeout
-                        let connect_future = pool.get_or_connect(&metadata_node).fuse();
+                        let connect_future = pool.connect_auto(&metadata_node).fuse();
                         futures::pin_mut!(connect_future);
 
                         let client_result = futures::select! {
@@ -1169,7 +1169,7 @@ impl BenchFS {
         } else {
             // Remote metadata lookup via RPC
             if let Some(pool) = &self.connection_pool {
-                match pool.get_or_connect(&metadata_node).await {
+                match pool.connect_auto(&metadata_node).await {
                     Ok(client) => {
                         let request = MetadataLookupRequest::new(path.to_string());
                         match request.call(&*client).await {

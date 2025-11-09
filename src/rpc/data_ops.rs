@@ -28,6 +28,12 @@ pub const RPC_WRITE_CHUNK: RpcId = 11;
     zerocopy::Immutable,
 )]
 pub struct ReadChunkRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
+
     /// Chunk index to read
     pub chunk_index: u64,
 
@@ -44,6 +50,8 @@ pub struct ReadChunkRequestHeader {
 impl ReadChunkRequestHeader {
     pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
+            _padding: [0; 4],
             chunk_index,
             offset,
             length,
@@ -233,7 +241,8 @@ impl AmRpc for ReadChunkRequest {
             "rpc_read_chunk",
             chunk = header.chunk_index,
             offset = header.offset,
-            len = header.length
+            len = header.length,
+            client_id = header.client_id
         )
         .entered();
 
@@ -290,68 +299,16 @@ impl AmRpc for ReadChunkRequest {
             }
         };
 
-        // Send response using reply_vectorized
-        if !am_msg.need_reply() {
-            tracing::error!("Message does not support reply");
-            return Err((
-                RpcError::HandlerError("Message does not support reply".to_string()),
-                am_msg,
-            ));
-        }
-
-        // Copy header bytes into an owned buffer so they live for the entire async send.
-        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
-        let header_bytes: &[u8] = &header_vec;
-
-        // Determine protocol based on data size
-        let proto = if let Some(ref data) = response_data {
-            if crate::rpc::should_use_rdma(data.len() as u64) {
-                Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Use reply_vectorized with IoSlice
-        let result = if let Some(ref data) = response_data {
-            let data_slices = [std::io::IoSlice::new(data)];
-            unsafe {
-                am_msg
-                    .reply_vectorized(
-                        Self::reply_stream_id() as u32,
-                        header_bytes,
-                        &data_slices,
-                        false, // need_reply
-                        proto,
-                    )
-                    .await
-            }
-        } else {
-            // No data, just send header
-            unsafe {
-                am_msg
-                    .reply_vectorized(
-                        Self::reply_stream_id() as u32,
-                        header_bytes,
-                        &[],
-                        false, // need_reply
-                        None,
-                    )
-                    .await
-            }
-        };
-
-        if let Err(e) = result {
-            tracing::error!("Failed to send reply: {:?}", e);
-            return Err((
-                RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
-                am_msg,
-            ));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        crate::rpc::helpers::send_rpc_response(
+            &ctx,
+            header.client_id,
+            Self::reply_stream_id(),
+            &response_header,
+            response_data.as_deref(),
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -382,6 +339,12 @@ impl AmRpc for ReadChunkRequest {
     zerocopy::Immutable,
 )]
 pub struct WriteChunkRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
+
     /// Chunk index to write
     pub chunk_index: u64,
 
@@ -398,6 +361,8 @@ pub struct WriteChunkRequestHeader {
 impl WriteChunkRequestHeader {
     pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
+            _padding: [0; 4],
             chunk_index,
             offset,
             length,
@@ -566,7 +531,8 @@ impl AmRpc for WriteChunkRequest<'_> {
             "rpc_write_chunk",
             chunk = header.chunk_index,
             offset = header.offset,
-            len = header.length
+            len = header.length,
+            client_id = header.client_id
         )
         .entered();
 
@@ -766,40 +732,16 @@ impl AmRpc for WriteChunkRequest<'_> {
             }
         };
 
-        // Send response using reply_vectorized
-        if !am_msg.need_reply() {
-            tracing::error!("Message does not support reply");
-            return Err((
-                RpcError::HandlerError("Message does not support reply".to_string()),
-                am_msg,
-            ));
-        }
-
-        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
-        let header_bytes: &[u8] = &header_vec;
-
-        // Send header only (no data payload for write response)
-        let result = unsafe {
-            am_msg
-                .reply_vectorized(
-                    Self::reply_stream_id() as u32,
-                    header_bytes,
-                    &[],
-                    false, // need_reply
-                    None,  // No data, so no protocol needed
-                )
-                .await
-        };
-
-        if let Err(e) = result {
-            tracing::error!("Failed to send reply: {:?}", e);
-            return Err((
-                RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
-                am_msg,
-            ));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        crate::rpc::helpers::send_rpc_response(
+            &ctx,
+            header.client_id,
+            Self::reply_stream_id(),
+            &response_header,
+            None, // No data payload for write response
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

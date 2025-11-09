@@ -535,9 +535,8 @@ impl SocketAcceptor {
                     consecutive_errors = 0; // Reset error counter on success
                     let endpoint = Rc::new(endpoint);
 
-                    // Generate client_id from connection count
-                    // TODO: In future, receive client_id from client via first message
-                    let client_id = format!("client_{}", connection_count);
+                    // Generate client_id from connection count (u32)
+                    let client_id = connection_count as u32;
 
                     tracing::info!(
                         "Accepted connection from client {} (total: {})",
@@ -545,8 +544,22 @@ impl SocketAcceptor {
                         connection_count
                     );
 
+                    // Send client_id to client via stream handshake
+                    tracing::debug!("About to send client_id {} via stream_send", client_id);
+                    let client_id_bytes = client_id.to_ne_bytes();
+                    match endpoint.stream_send(&client_id_bytes).await {
+                        Ok(_) => {
+                            tracing::debug!("Sent client_id {} to client", client_id);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to send client_id to client: {:?}", e);
+                            consecutive_errors += 1;
+                            continue;
+                        }
+                    }
+
                     // Register the client endpoint
-                    if let Some(evicted_id) = self.client_registry.register(client_id.clone(), endpoint) {
+                    if let Some(evicted_id) = self.client_registry.register(client_id, endpoint) {
                         tracing::warn!("Evicted client {} to make room for {}", evicted_id, client_id);
                     }
                 }

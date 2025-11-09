@@ -14,8 +14,8 @@ use pluvio_ucx::endpoint::Endpoint;
 
 /// Information about a registered client
 pub struct ClientInfo {
-    /// Unique client identifier
-    pub client_id: String,
+    /// Unique client identifier (u32 for efficient header packing)
+    pub client_id: u32,
     /// UCX endpoint for communication
     pub endpoint: Rc<Endpoint>,
     /// Last access time for LRU eviction
@@ -24,7 +24,7 @@ pub struct ClientInfo {
 
 impl ClientInfo {
     /// Create a new ClientInfo
-    pub fn new(client_id: String, endpoint: Rc<Endpoint>) -> Self {
+    pub fn new(client_id: u32, endpoint: Rc<Endpoint>) -> Self {
         Self {
             client_id,
             endpoint,
@@ -45,10 +45,10 @@ impl ClientInfo {
 pub struct ClientRegistry {
     /// Maximum number of clients to cache
     max_size: usize,
-    /// Map from client_id to ClientInfo
-    clients: RefCell<HashMap<String, ClientInfo>>,
+    /// Map from client_id (u32) to ClientInfo
+    clients: RefCell<HashMap<u32, ClientInfo>>,
     /// LRU queue (front = most recently used, back = least recently used)
-    lru_queue: RefCell<VecDeque<String>>,
+    lru_queue: RefCell<VecDeque<u32>>,
 }
 
 impl ClientRegistry {
@@ -70,22 +70,22 @@ impl ClientRegistry {
     /// If the cache is full, evict the least recently used client.
     ///
     /// # Arguments
-    /// * `client_id` - Unique client identifier
+    /// * `client_id` - Unique client identifier (u32)
     /// * `endpoint` - UCX endpoint for this client
     ///
     /// # Returns
     /// * `Some(client_id)` - The client_id that was evicted (if any)
     /// * `None` - No eviction occurred
-    pub fn register(&self, client_id: String, endpoint: Rc<Endpoint>) -> Option<String> {
+    pub fn register(&self, client_id: u32, endpoint: Rc<Endpoint>) -> Option<u32> {
         let mut clients = self.clients.borrow_mut();
         let mut lru_queue = self.lru_queue.borrow_mut();
 
         // If client already exists, update it and move to front
         if clients.contains_key(&client_id) {
             // Remove from current position in LRU queue
-            lru_queue.retain(|id| id != &client_id);
+            lru_queue.retain(|id| *id != client_id);
             // Add to front (most recently used)
-            lru_queue.push_front(client_id.clone());
+            lru_queue.push_front(client_id);
             // Update client info
             if let Some(info) = clients.get_mut(&client_id) {
                 info.endpoint = endpoint;
@@ -120,9 +120,9 @@ impl ClientRegistry {
         };
 
         // Register new client
-        let info = ClientInfo::new(client_id.clone(), endpoint);
-        clients.insert(client_id.clone(), info);
-        lru_queue.push_front(client_id.clone());
+        let info = ClientInfo::new(client_id, endpoint);
+        clients.insert(client_id, info);
+        lru_queue.push_front(client_id);
 
         tracing::info!(
             "Registered new client: {} (cache: {}/{})",
@@ -139,22 +139,22 @@ impl ClientRegistry {
     /// If the client exists, mark it as recently used and return its endpoint.
     ///
     /// # Arguments
-    /// * `client_id` - Client identifier
+    /// * `client_id` - Client identifier (u32)
     ///
     /// # Returns
     /// * `Some(endpoint)` - Endpoint if client is registered
     /// * `None` - Client not found
-    pub fn get(&self, client_id: &str) -> Option<Rc<Endpoint>> {
+    pub fn get(&self, client_id: u32) -> Option<Rc<Endpoint>> {
         let mut clients = self.clients.borrow_mut();
         let mut lru_queue = self.lru_queue.borrow_mut();
 
-        if let Some(info) = clients.get_mut(client_id) {
+        if let Some(info) = clients.get_mut(&client_id) {
             // Update last_used
             info.touch();
 
             // Move to front of LRU queue
-            lru_queue.retain(|id| id != client_id);
-            lru_queue.push_front(client_id.to_string());
+            lru_queue.retain(|id| *id != client_id);
+            lru_queue.push_front(client_id);
 
             tracing::debug!("Found client: {}", client_id);
             Some(info.endpoint.clone())
@@ -167,17 +167,17 @@ impl ClientRegistry {
     /// Remove a client from the registry
     ///
     /// # Arguments
-    /// * `client_id` - Client identifier
+    /// * `client_id` - Client identifier (u32)
     ///
     /// # Returns
     /// * `true` - Client was removed
     /// * `false` - Client not found
-    pub fn remove(&self, client_id: &str) -> bool {
+    pub fn remove(&self, client_id: u32) -> bool {
         let mut clients = self.clients.borrow_mut();
         let mut lru_queue = self.lru_queue.borrow_mut();
 
-        if clients.remove(client_id).is_some() {
-            lru_queue.retain(|id| id != client_id);
+        if clients.remove(&client_id).is_some() {
+            lru_queue.retain(|id| *id != client_id);
             tracing::info!("Removed client: {}", client_id);
             true
         } else {
@@ -187,8 +187,8 @@ impl ClientRegistry {
     }
 
     /// Check if a client is registered
-    pub fn contains(&self, client_id: &str) -> bool {
-        self.clients.borrow().contains_key(client_id)
+    pub fn contains(&self, client_id: u32) -> bool {
+        self.clients.borrow().contains_key(&client_id)
     }
 
     /// Get the number of registered clients
@@ -202,8 +202,8 @@ impl ClientRegistry {
     }
 
     /// Get all registered client IDs
-    pub fn client_ids(&self) -> Vec<String> {
-        self.clients.borrow().keys().cloned().collect()
+    pub fn client_ids(&self) -> Vec<u32> {
+        self.clients.borrow().keys().copied().collect()
     }
 
     /// Clear all clients from the registry
@@ -240,7 +240,7 @@ mod tests {
 
         // Initially empty
         assert_eq!(registry.len(), 0);
-        assert!(!registry.contains("client1"));
+        assert!(!registry.contains(1));
 
         // After operations (can't test without real endpoint)
         assert_eq!(registry.client_ids().len(), 0);

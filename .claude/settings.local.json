@@ -85,7 +85,8 @@
       "Bash(do docker cp:*)",
       "Bash(cargo add:*)",
       "Bash(docker system prune:*)",
-      "Bash(docker rmi:*)"
+      "Bash(docker rmi:*)",
+      "Bash(sha256sum:*)"
     ],
     "deny": [],
     "ask": []

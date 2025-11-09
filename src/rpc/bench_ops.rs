@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
-use crate::rpc::helpers::{parse_header, send_rpc_response_via_reply};
+use crate::rpc::helpers::{parse_header, send_rpc_response};
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, SHUTDOWN_MAGIC};
 
 /// RPC IDs for benchmark operations
@@ -27,6 +27,12 @@ pub const RPC_BENCH_SHUTDOWN: RpcId = 32;
     zerocopy::Immutable,
 )]
 pub struct BenchPingRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
+
     /// Sequence number for matching requests/responses
     pub sequence_number: u64,
 
@@ -37,6 +43,8 @@ pub struct BenchPingRequestHeader {
 impl BenchPingRequestHeader {
     pub fn new(sequence_number: u64, timestamp_ns: u64) -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
+            _padding: [0; 4],
             sequence_number,
             client_timestamp_ns: timestamp_ns,
         }
@@ -115,7 +123,7 @@ impl AmRpc for BenchPingRequest {
     }
 
     async fn server_handler(
-        _ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
@@ -133,8 +141,8 @@ impl AmRpc for BenchPingRequest {
         let response_header =
             BenchPingResponseHeader::new(header.sequence_number, server_timestamp_ns);
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -159,6 +167,12 @@ impl AmRpc for BenchPingRequest {
     zerocopy::Immutable,
 )]
 pub struct BenchShutdownRequestHeader {
+    /// Client identifier for endpoint lookup
+    pub client_id: u32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
+
     /// Magic number to verify request integrity
     pub magic: u64,
 }
@@ -166,6 +180,8 @@ pub struct BenchShutdownRequestHeader {
 impl BenchShutdownRequestHeader {
     pub fn new() -> Self {
         Self {
+            client_id: 0, // Will be set by RpcClient during execution
+            _padding: [0; 4],
             magic: SHUTDOWN_MAGIC,
         }
     }
@@ -261,8 +277,8 @@ impl AmRpc for BenchShutdownRequest {
 
         let response_header = BenchShutdownResponseHeader::new(true);
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response with automatic mode detection (Socket vs WorkerAddress)
+        send_rpc_response(&ctx, header.client_id, Self::reply_stream_id(), &response_header, None, am_msg).await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

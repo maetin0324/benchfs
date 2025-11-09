@@ -8,8 +8,10 @@
 
 use std::cell::UnsafeCell;
 use std::io::IoSlice;
+use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
+use pluvio_ucx::endpoint::Endpoint;
 use zerocopy::FromBytes;
 
 use super::RpcError;
@@ -249,6 +251,135 @@ where
         crate::rpc::ServerResponse::new(response_header.clone()),
         am_msg,
     ))
+}
+
+/// Send RPC response via persistent client endpoint (Socket mode)
+///
+/// This helper sends responses through pre-established persistent endpoints
+/// obtained from ClientRegistry, instead of using AmMsg's reply_ep.
+///
+/// # Arguments
+///
+/// * `endpoint` - The client's persistent endpoint from ClientRegistry
+/// * `reply_stream_id` - The reply stream ID for this RPC type
+/// * `response_header` - The response header to send
+/// * `response_data` - Optional response data payload as IoSlice array
+///
+/// # Returns
+///
+/// - `Ok(())` on success
+/// - `Err(RpcError)` if sending fails
+///
+/// # Example
+///
+/// ```ignore
+/// let endpoint = client_registry.get(client_id).ok_or(...)?;
+/// send_rpc_response_via_endpoint(
+///     &endpoint,
+///     ReadChunkRequest::reply_stream_id(),
+///     &response_header,
+///     &[IoSlice::new(&data)],
+/// ).await?;
+/// ```
+pub async fn send_rpc_response_via_endpoint<H>(
+    endpoint: &Rc<Endpoint>,
+    reply_stream_id: u16,
+    response_header: &H,
+    response_data: &[IoSlice<'_>],
+) -> Result<(), RpcError>
+where
+    H: zerocopy::IntoBytes + zerocopy::KnownLayout + zerocopy::Immutable,
+{
+    let header_bytes = zerocopy::IntoBytes::as_bytes(response_header);
+
+    // Calculate total data size
+    let total_data_len: usize = response_data.iter().map(|slice| slice.len()).sum();
+
+    // Determine protocol based on data size
+    let proto = if total_data_len == 0 {
+        None
+    } else if crate::rpc::should_use_rdma(total_data_len as u64) {
+        Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+    } else {
+        None
+    };
+
+    // Send AM message via endpoint
+    endpoint
+        .am_send_vectorized(
+            reply_stream_id as u32,
+            header_bytes,
+            response_data,
+            false, // need_reply
+            proto,
+        )
+        .await
+        .map_err(|e| {
+            RpcError::TransportError(format!("Failed to send via endpoint: {:?}", e))
+        })?;
+
+    Ok(())
+}
+
+/// Send RPC response with automatic mode detection (Socket vs WorkerAddress)
+///
+/// This helper automatically detects the connection mode and sends responses accordingly:
+/// - Socket mode: Uses persistent endpoint from ClientRegistry
+/// - WorkerAddress mode: Uses reply_ep mechanism
+///
+/// # Arguments
+///
+/// * `ctx` - RPC handler context containing optional ClientRegistry
+/// * `client_id` - Client identifier from request header
+/// * `reply_stream_id` - The reply stream ID for this RPC type
+/// * `response_header` - The response header to send
+/// * `response_data` - Optional response data payload
+/// * `am_msg` - The active message
+pub async fn send_rpc_response<H>(
+    ctx: &std::rc::Rc<crate::rpc::handlers::RpcHandlerContext>,
+    client_id: u32,
+    reply_stream_id: u16,
+    response_header: &H,
+    response_data: Option<&[u8]>,
+    am_msg: pluvio_ucx::async_ucx::ucp::AmMsg,
+) -> Result<
+    (
+        crate::rpc::ServerResponse<H>,
+        pluvio_ucx::async_ucx::ucp::AmMsg,
+    ),
+    (RpcError, pluvio_ucx::async_ucx::ucp::AmMsg),
+>
+where
+    H: zerocopy::IntoBytes + zerocopy::KnownLayout + zerocopy::Immutable + Clone,
+{
+    if let Some(client_registry) = &ctx.client_registry {
+        // Socket mode: Use persistent endpoint from ClientRegistry
+        let endpoint = match client_registry.get(client_id) {
+            Some(ep) => ep,
+            None => {
+                return Err((
+                    RpcError::HandlerError(format!("Unknown client_id: {}", client_id)),
+                    am_msg,
+                ));
+            }
+        };
+
+        let data_slices = if let Some(data) = response_data {
+            vec![std::io::IoSlice::new(data)]
+        } else {
+            vec![]
+        };
+
+        match send_rpc_response_via_endpoint(&endpoint, reply_stream_id, response_header, &data_slices)
+            .await
+        {
+            Ok(()) => Ok((crate::rpc::ServerResponse::new(response_header.clone()), am_msg)),
+            Err(e) => Err((e, am_msg)),
+        }
+    } else {
+        // WorkerAddress mode: Use reply method
+        send_rpc_response_via_reply(reply_stream_id, response_header, response_data, am_msg).await
+    }
 }
 
 #[cfg(test)]
