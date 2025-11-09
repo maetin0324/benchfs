@@ -146,8 +146,16 @@ fn main() {
     };
     setup_logging(log_level);
 
+    // Get hostname for debugging MPI node distribution
+    let hostname = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
     tracing::info!("Starting BenchFS MPI server");
-    tracing::info!("MPI Rank: {} / {}", mpi_rank, mpi_size);
+    tracing::info!("MPI Rank: {} / {} (Hostname: {})", mpi_rank, mpi_size, hostname);
     tracing::info!("Node ID: {}", config.node.node_id);
     tracing::info!("Data directory: {}", config.node.data_dir.display());
     tracing::info!("Registry directory: {}", registry_dir.display());
@@ -348,8 +356,11 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let mpi_size_clone = state.mpi_size;
     let client_registry_clone = client_registry.clone();  // For start_listener()
 
+    tracing::info!("About to spawn node_registration task for node {} (rank {})", node_id, state.mpi_rank);
+
     let _registration_handle = pluvio_runtime::spawn_with_name(
         async move {
+            tracing::info!("node_registration task started for node {} (rank {})", node_id_clone, mpi_rank_clone);
             // Wait for RPC handlers to be ready before publishing address
             tracing::info!("Waiting for RPC handlers to be ready...");
             let max_wait = std::time::Duration::from_secs(30);
@@ -459,18 +470,33 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                     "Registry directory path is not valid UTF-8",
                 ))?;
 
+            // Stagger listener creation to avoid potential timing issues
+            // Each rank waits for (rank * 200ms) before creating listener
+            // This ensures sequential listener creation and avoids race conditions
+            let stagger_delay_ms = mpi_rank_clone as u64 * 200;
+            if stagger_delay_ms > 0 {
+                tracing::info!(
+                    "Staggering listener creation: waiting {}ms before creating listener for rank {}",
+                    stagger_delay_ms,
+                    mpi_rank_clone
+                );
+                futures_timer::Delay::new(std::time::Duration::from_millis(stagger_delay_ms)).await;
+            }
+
+            tracing::info!("About to call start_listener() for node {} (rank {})", node_id_clone, mpi_rank_clone);
+
             if let Err(e) = rpc_server_clone
                 .start_listener(registry_dir_str, &node_id_clone, client_registry_clone)
                 .await
             {
-                tracing::error!("Failed to start listener: {:?}", e);
+                tracing::error!("Failed to start listener for node {} (rank {}): {:?}", node_id_clone, mpi_rank_clone, e);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("Listener start failed: {:?}", e),
                 ));
             }
 
-            tracing::info!("Listener started successfully for node {}", node_id_clone);
+            tracing::info!("Listener started successfully for node {} (rank {})", node_id_clone, mpi_rank_clone);
 
             Ok::<(), std::io::Error>(())
         },

@@ -65,6 +65,15 @@ impl RpcServer {
     ) -> Result<(), RpcError> {
         match &self.connection_mode {
             crate::rpc::ConnectionMode::Socket { bind_addr } => {
+                // Check if listener is already started (idempotency check)
+                if self.socket_acceptor.borrow().is_some() {
+                    tracing::warn!(
+                        "start_listener() called multiple times for node {}, ignoring duplicate call",
+                        node_id
+                    );
+                    return Ok(());
+                }
+
                 tracing::info!(
                     "Starting Socket listener on {} for node {}",
                     bind_addr,
@@ -72,9 +81,12 @@ impl RpcServer {
                 );
 
                 // Create UCX Listener
+                tracing::debug!("About to call worker.create_listener({}) for node {}", bind_addr, node_id);
                 let listener = self.worker.create_listener(*bind_addr).map_err(|e| {
+                    tracing::error!("worker.create_listener({}) failed for node {}: {:?}", bind_addr, node_id, e);
                     RpcError::ConnectionError(format!("Failed to create listener: {:?}", e))
                 })?;
+                tracing::debug!("worker.create_listener() succeeded for node {}", node_id);
 
                 // Get the actual bound address (important when using port 0 for dynamic allocation)
                 let actual_addr = listener.socket_addr().map_err(|e| {
