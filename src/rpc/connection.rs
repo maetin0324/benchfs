@@ -382,7 +382,10 @@ impl ConnectionPool {
         // Without this delay, stream_recv() may fail with:
         // - UCS_ERR_UNREACHABLE: no remote ep address for lane[N]
         // - UCS_ERR_CONNECTION_RESET: connection closed during incomplete wireup
-        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
+        //
+        // Note: Increased to 50ms as 10ms was insufficient in some HPC environments
+        // where InfiniBand RC wireup takes longer due to network latency or load.
+        futures_timer::Delay::new(std::time::Duration::from_millis(50)).await;
 
         // Receive client_id from server via stream handshake
         use std::mem::MaybeUninit;
