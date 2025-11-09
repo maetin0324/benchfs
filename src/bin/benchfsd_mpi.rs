@@ -114,11 +114,18 @@ fn main() {
 
     // Load configuration
     let mut config = match ServerConfig::from_file(config_path) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => {
+            if mpi_rank == 0 {
+                eprintln!("Successfully loaded configuration from: {}", config_path);
+                eprintln!("Config: use_socket_connection = {}", cfg.network.use_socket_connection);
+            }
+            cfg
+        }
         Err(e) => {
             if mpi_rank == 0 {
-                eprintln!("Failed to load configuration: {}", e);
+                eprintln!("Failed to load configuration from {}: {}", config_path, e);
                 eprintln!("Using default configuration");
+                eprintln!("Default config: use_socket_connection = {}", ServerConfig::default().network.use_socket_connection);
             }
             ServerConfig::default()
         }
@@ -144,6 +151,7 @@ fn main() {
     tracing::info!("Node ID: {}", config.node.node_id);
     tracing::info!("Data directory: {}", config.node.data_dir.display());
     tracing::info!("Registry directory: {}", registry_dir.display());
+    tracing::info!("Connection mode: use_socket_connection = {}", config.network.use_socket_connection);
 
     // Create data directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&config.node.data_dir) {
