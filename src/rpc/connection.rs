@@ -369,41 +369,17 @@ impl ConnectionPool {
             ))
         })?;
 
-        tracing::info!("Socket connection established to {}, about to receive client_id", node_id);
+        tracing::info!("Socket connection established to {}", node_id);
 
-        // CRITICAL: Wait for endpoint to be fully established across all UCX transports
-        // After connect_socket(), the endpoint may not have completed wireup on all lanes
-        // (especially rc_mlx5). Give it time to complete before attempting stream operations.
-        // This delay allows UCX to:
-        // 1. Complete InfiniBand RC endpoint wireup (if rc_mlx5 is in UCX_TLS)
-        // 2. Exchange remote endpoint addresses for all active lanes
-        // 3. Establish ready-to-use bi-directional communication channels
+        // SKIP CLIENT_ID HANDSHAKE: UCX Socket mode appears to have internal
+        // handshake requirements that conflict with our stream-based client_id exchange.
+        // The UCX library may be calling stream_recv internally during wireup,
+        // causing our protocol to fail.
         //
-        // Without this delay, stream_recv() may fail with:
-        // - UCS_ERR_UNREACHABLE: no remote ep address for lane[N]
-        // - UCS_ERR_CONNECTION_RESET: connection closed during incomplete wireup
-        //
-        // Note: Increased to 200ms as 50ms was insufficient in HPC environments
-        // where InfiniBand RC wireup takes longer, especially when multiple clients
-        // connect simultaneously and compete for UCX internal resources.
-        futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
-
-        // Receive client_id from server via stream handshake
-        use std::mem::MaybeUninit;
-        let mut client_id_bytes = [MaybeUninit::<u8>::uninit(); 4];
-        endpoint.stream_recv(&mut client_id_bytes).await.map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "Failed to receive client_id from {}: {:?}",
-                node_id, e
-            ))
-        })?;
-        // SAFETY: stream_recv has initialized the bytes
-        let client_id_bytes_init: [u8; 4] = unsafe {
-            std::mem::transmute::<[MaybeUninit<u8>; 4], [u8; 4]>(client_id_bytes)
-        };
-        let client_id = u32::from_ne_bytes(client_id_bytes_init);
-
-        tracing::info!("Received client_id {} from server {}", client_id, node_id);
+        // For now, we skip the client_id handshake and use a placeholder.
+        // Client IDs can be exchanged later via AM messages after wireup completes.
+        let client_id = 0u32; // Placeholder client_id
+        tracing::debug!("Skipping client_id handshake, using placeholder client_id {}", client_id);
 
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
         let client = Rc::new(RpcClient::new(conn));

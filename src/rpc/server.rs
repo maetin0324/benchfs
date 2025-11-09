@@ -556,36 +556,14 @@ impl SocketAcceptor {
                         connection_count
                     );
 
-                    // CRITICAL: Wait for endpoint to be fully established across all UCX transports
-                    // After accept(), the endpoint may not have completed wireup on all lanes
-                    // (especially rc_mlx5). Give it time to complete before attempting stream operations.
-                    // This delay allows UCX to:
-                    // 1. Complete InfiniBand RC endpoint wireup (if rc_mlx5 is in UCX_TLS)
-                    // 2. Exchange remote endpoint addresses for all active lanes
-                    // 3. Establish ready-to-use bi-directional communication channels
+                    // SKIP CLIENT_ID HANDSHAKE: UCX Socket mode appears to have internal
+                    // handshake requirements that conflict with our stream-based client_id exchange.
+                    // The UCX library may be calling stream_recv internally during wireup,
+                    // causing our protocol to fail.
                     //
-                    // Without this delay, stream_send() may fail with:
-                    // - UCS_ERR_UNREACHABLE: no remote ep address for lane[N]
-                    // - UCS_ERR_CONNECTION_RESET: connection closed during incomplete wireup
-                    //
-                    // Note: Increased to 200ms as 50ms was insufficient in HPC environments
-                    // where InfiniBand RC wireup takes longer, especially when multiple clients
-                    // connect simultaneously and compete for UCX internal resources.
-                    futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
-
-                    // Send client_id to client via stream handshake
-                    tracing::debug!("About to send client_id {} via stream_send", client_id);
-                    let client_id_bytes = client_id.to_ne_bytes();
-                    match endpoint.stream_send(&client_id_bytes).await {
-                        Ok(_) => {
-                            tracing::debug!("Sent client_id {} to client", client_id);
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to send client_id to client: {:?}", e);
-                            consecutive_errors += 1;
-                            continue;
-                        }
-                    }
+                    // For now, we skip the client_id handshake and use a simple counter.
+                    // Client IDs can be exchanged later via AM messages after wireup completes.
+                    tracing::debug!("Skipping client_id handshake for now, assigning client_id {}", client_id);
 
                     // Register the client endpoint
                     if let Some(evicted_id) = self.client_registry.register(client_id, endpoint) {
