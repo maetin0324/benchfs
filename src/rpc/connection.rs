@@ -371,6 +371,19 @@ impl ConnectionPool {
 
         tracing::info!("Socket connection established to {}, about to receive client_id", node_id);
 
+        // CRITICAL: Wait for endpoint to be fully established across all UCX transports
+        // After connect_socket(), the endpoint may not have completed wireup on all lanes
+        // (especially rc_mlx5). Give it time to complete before attempting stream operations.
+        // This delay allows UCX to:
+        // 1. Complete InfiniBand RC endpoint wireup (if rc_mlx5 is in UCX_TLS)
+        // 2. Exchange remote endpoint addresses for all active lanes
+        // 3. Establish ready-to-use bi-directional communication channels
+        //
+        // Without this delay, stream_recv() may fail with:
+        // - UCS_ERR_UNREACHABLE: no remote ep address for lane[N]
+        // - UCS_ERR_CONNECTION_RESET: connection closed during incomplete wireup
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
+
         // Receive client_id from server via stream handshake
         use std::mem::MaybeUninit;
         let mut client_id_bytes = [MaybeUninit::<u8>::uninit(); 4];
