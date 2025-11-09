@@ -387,6 +387,7 @@ for benchfs_chunk_size in "${benchfs_chunk_size_list[@]}"; do
           config_file="${JOB_OUTPUT_DIR}/benchfs_${runid}.toml"
           cat > "${config_file}" <<EOF
 [node]
+# Note: node_id is automatically overridden by benchfsd_mpi using MPI rank (node_0, node_1, ...)
 node_id = "node0"
 data_dir = "${BENCHFS_DATA_DIR}"
 log_level = "info"
@@ -401,6 +402,10 @@ bind_addr = "0.0.0.0:50051"
 timeout_secs = 30
 rdma_threshold_bytes = 32768
 registry_dir = "${BENCHFS_REGISTRY_DIR}"
+# Socket connection mode: Server creates Listener, clients connect via socket addresses from server_list.txt
+# - true (recommended): Persistent endpoints with Client ID handshake, LRU cache for up to 1024 clients
+# - false (legacy): WorkerAddress-based connections using reply_ep for each RPC request
+use_socket_connection = true
 
 [cache]
 metadata_cache_entries = 10000
