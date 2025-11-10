@@ -12,7 +12,9 @@ use std::os::raw::c_char;
 use std::rc::Rc;
 
 use super::error::*;
-use super::runtime::{block_on_with_name, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime};
+use super::runtime::{
+    block_on_with_name, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime,
+};
 use crate::api::file_ops::BenchFS;
 use crate::metadata::MetadataManager;
 use crate::rpc::connection::ConnectionPool;
@@ -21,6 +23,7 @@ use crate::rpc::server::RpcServer;
 use crate::storage::{IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
+use pluvio_timer::TimerReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
 
@@ -45,7 +48,10 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
 
     let registry_path = Path::new(registry_dir);
     if !registry_path.exists() {
-        return Err(format!("Registry directory does not exist: {}", registry_dir));
+        return Err(format!(
+            "Registry directory does not exist: {}",
+            registry_dir
+        ));
     }
 
     // Retry logic to handle race conditions when 256 clients simultaneously scan directory
@@ -111,10 +117,7 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
 
         // No nodes found, retry
         if attempt < MAX_RETRIES - 1 {
-            tracing::debug!(
-                "No nodes found in attempt {}, retrying...",
-                attempt + 1
-            );
+            tracing::debug!("No nodes found in attempt {}, retrying...", attempt + 1);
             thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
         }
     }
@@ -237,7 +240,6 @@ pub extern "C" fn benchfs_init(
     data_dir: *const c_char,
     is_server: i32,
 ) -> *mut benchfs_context_t {
-
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
 
@@ -321,15 +323,28 @@ pub extern "C" fn benchfs_init(
 
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
+        set_runtime(runtime.clone());
+
+        // Register timer reactor (required for Delay/timeout futures)
+        let timer_reactor = TimerReactor::current();
+        runtime.register_reactor("timer", timer_reactor.clone());
 
         // Create io_uring reactor
+        tracing::info!("Starting IoUringReactor initialization...");
+        let start = std::time::Instant::now();
+
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(2048)
-            .buffer_size(4 << 20) // 4 MiB (matches IOR transfer sizes, prevents buffer exhaustion)
-            .submit_depth(128)
+            .queue_size(512) // Reduced to prevent kernel resource contention
+            .buffer_size(1 << 20) // 1 MiB per buffer (512 × 1MiB = 512MiB total)
+            .submit_depth(64) // Reduced from 128
             .wait_submit_timeout(std::time::Duration::from_micros(1))
             .wait_complete_timeout(std::time::Duration::from_micros(1))
             .build();
+
+        tracing::info!(
+            "IoUringReactor initialization completed in {:?}",
+            start.elapsed()
+        );
 
         let allocator = uring_reactor.allocator.clone();
         runtime.register_reactor("io_uring", uring_reactor);
@@ -405,13 +420,15 @@ pub extern "C" fn benchfs_init(
         // Register all RPC handlers (spawn in background, don't block)
         // These handlers run perpetual listening loops, so we can't block_on() them
         let server_clone = rpc_server.clone();
-        let runtime_clone = runtime.clone();
-        runtime.spawn(async move {
-            match server_clone.register_all_handlers(runtime_clone).await {
-                Ok(_) => tracing::info!("RPC handlers registered successfully"),
-                Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
-            }
-        });
+        pluvio_runtime::spawn_with_name(
+            async move {
+                match server_clone.register_all_handlers().await {
+                    Ok(_) => tracing::info!("RPC handlers registered successfully"),
+                    Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
+                }
+            },
+            "ffi_rpc_handler_registration".to_string(),
+        );
         tracing::info!("RPC handler registration initiated");
 
         // Create BenchFS instance with distributed metadata
@@ -427,7 +444,6 @@ pub extern "C" fn benchfs_init(
         ));
 
         // Store in thread-local storage
-        set_runtime(runtime);
         set_rpc_server(rpc_server);
         set_connection_pool(connection_pool);
 
@@ -442,6 +458,13 @@ pub extern "C" fn benchfs_init(
 
         // Create runtime (Runtime::new() returns Rc<Runtime>)
         let runtime = Runtime::new(256);
+
+        // Set runtime in thread-local storage BEFORE any async operations
+        set_runtime(runtime.clone());
+
+        // Register timer reactor for client as well
+        let timer_reactor = TimerReactor::current();
+        runtime.register_reactor("timer", timer_reactor.clone());
 
         // Create UCX context and reactor
         let ucx_context = match UcxContext::new() {
@@ -498,7 +521,9 @@ pub extern "C" fn benchfs_init(
         // This prevents all 256 clients from connecting to node_0 simultaneously
         let target_node = if discovered_nodes.len() > 1 {
             // Hash the node_id to select a target node
-            let hash = node_id_str.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+            let hash = node_id_str
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
             let index = (hash as usize) % discovered_nodes.len();
             &discovered_nodes[index]
         } else {
@@ -514,9 +539,7 @@ pub extern "C" fn benchfs_init(
         let pool_clone = connection_pool.clone();
         let target_node_owned = target_node.to_string();
         let connect_result = block_on_with_name("connect_to_server", async move {
-            pool_clone
-                .wait_and_connect(&target_node_owned, 30)
-                .await
+            pool_clone.wait_and_connect(&target_node_owned, 30).await
         });
 
         match connect_result {
@@ -537,13 +560,21 @@ pub extern "C" fn benchfs_init(
         };
 
         // Create io_uring reactor (same as server)
+        tracing::info!("Starting IoUringReactor initialization...");
+        let start = std::time::Instant::now();
+
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(2048)
-            .buffer_size(4 << 20) // 4 MiB (matches IOR transfer sizes, prevents buffer exhaustion)
-            .submit_depth(128)
+            .queue_size(512) // Reduced from 2048 to prevent kernel resource contention
+            .buffer_size(1 << 20) // 1 MiB (512 × 1MiB = 512MiB total, reduced from 8GiB)
+            .submit_depth(64) // Reduced from 128
             .wait_submit_timeout(std::time::Duration::from_micros(1))
             .wait_complete_timeout(std::time::Duration::from_micros(1))
             .build();
+
+        tracing::info!(
+            "IoUringReactor initialization completed in {:?}",
+            start.elapsed()
+        );
 
         let allocator = uring_reactor.allocator.clone();
         runtime.register_reactor("io_uring", uring_reactor);
@@ -586,8 +617,7 @@ pub extern "C" fn benchfs_init(
             metadata_nodes,
         ));
 
-        // Store in thread-local storage
-        set_runtime(runtime);
+        // Runtime already stored in thread-local storage above
         set_connection_pool(connection_pool);
 
         benchfs
@@ -649,11 +679,29 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
 
     tracing::info!("benchfs_finalize: cleaning up resources");
 
+    // NOTE: We do NOT send shutdown RPCs from benchfs_finalize() because:
+    //
+    // 1. IOR Benchmark:
+    //    - Servers and clients are separate processes
+    //    - IOR clients call benchfs_finalize() when they finish
+    //    - Servers are terminated by the job script with 'kill' command
+    //    - Sending shutdown RPCs from IOR clients would interfere with servers
+    //
+    // 2. RPC Benchmark:
+    //    - Client explicitly sends shutdown RPCs in run_client() (benchfs_rpc_bench.rs:280)
+    //    - benchfs_finalize() is not called (not using C FFI)
+    //
+    // Therefore, benchfs_finalize() should only clean up local resources,
+    // not send shutdown RPCs to other nodes.
+
     // Convert back to Rc<BenchFS> and drop it
     // This will automatically trigger Drop implementations for all components
     unsafe {
         let _ = Box::from_raw(ctx as *mut Rc<BenchFS>);
     }
+
+    // Clean up thread-local storage
+    super::runtime::cleanup_runtime();
 
     tracing::info!("BenchFS finalized");
 }

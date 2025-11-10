@@ -5,6 +5,11 @@ use std::collections::HashMap;
 /// This module provides POSIX-like file operations that work with
 /// the distributed metadata and data storage.
 use std::rc::Rc;
+use std::time::Duration;
+
+use futures::FutureExt;
+use futures_timer::Delay;
+use pluvio_runtime::spawn_with_name;
 
 use crate::api::types::{ApiError, ApiResult, FileHandle, OpenFlags};
 use crate::cache::{ChunkCache, ChunkId};
@@ -45,6 +50,7 @@ pub struct BenchFS {
     chunk_manager: ChunkManager,
 
     /// Placement strategy
+    #[allow(dead_code)]
     placement: Rc<dyn PlacementStrategy>,
 
     /// Open file descriptors
@@ -154,13 +160,15 @@ impl BenchFS {
     fn get_chunk_node(&self, chunk_key: &str) -> String {
         // Priority 1: Use data node ring for chunk distribution
         if let Some(ring) = &self.data_ring {
-            return ring.get_node(chunk_key)
+            return ring
+                .get_node(chunk_key)
                 .unwrap_or_else(|| self.node_id.clone());
         }
 
         // Priority 2: Fall back to metadata ring (backward compatibility)
         if let Some(ring) = &self.metadata_ring {
-            return ring.get_node(chunk_key)
+            return ring
+                .get_node(chunk_key)
                 .unwrap_or_else(|| self.node_id.clone());
         }
 
@@ -548,6 +556,7 @@ impl BenchFS {
         // Collect futures for reading all chunks
         let file_path = file_meta.path.clone();
         // Note: In path-based KV design, chunk_locations are not tracked
+        let fs_ptr = self as *const BenchFS;
         let chunk_futures: Vec<_> = chunks
             .iter()
             .map(|(chunk_index, _chunk_offset, _read_size)| {
@@ -555,58 +564,51 @@ impl BenchFS {
                 let chunk_index = *chunk_index;
                 let file_path = file_path.clone();
 
-                async move {
-                    // Try to get full chunk from cache first
-                    if let Some(cached_chunk) = self.chunk_cache.get(&chunk_id) {
-                        // Cache hit
-                        tracing::trace!("Cache hit for chunk {}", chunk_index);
-                        return (chunk_index, Some(cached_chunk));
-                    }
+                spawn_with_name(
+                    async move {
+                        let fs = unsafe { &*fs_ptr };
 
-                    // Cache miss - need to fetch chunk
-                    tracing::trace!("Cache miss for chunk {}", chunk_index);
-
-                    // Try local chunk store first
-                    match self
-                        .chunk_store
-                        .read_chunk(
-                            &file_path,
-                            chunk_index,
-                            0, // Read full chunk for caching
-                            self.chunk_manager.chunk_size() as u64,
-                        )
-                        .await
-                    {
-                        Ok(full_chunk) => {
-                            // Cache the full chunk for future reads
-                            self.chunk_cache.put(chunk_id, full_chunk.clone());
-                            (chunk_index, Some(full_chunk))
+                        if let Some(cached_chunk) = fs.chunk_cache.get(&chunk_id) {
+                            tracing::trace!("Cache hit for chunk {}", chunk_index);
+                            return (chunk_index, Some(cached_chunk));
                         }
-                        Err(_) => {
-                            // Local read failed - try remote if distributed mode enabled
-                            if let Some(pool) = &self.connection_pool {
-                                // Determine chunk node using consistent hashing
-                                let chunk_key = format!("{}/{}", &file_path, chunk_index);
-                                let node_id = self.get_chunk_node(&chunk_key);
 
-                                tracing::debug!(
-                                    "Fetching chunk {} from remote node {}",
-                                    chunk_index,
-                                    node_id
-                                );
+                        tracing::trace!("Cache miss for chunk {}", chunk_index);
 
-                                // Connect to remote node using node_id
-                                match pool.get_or_connect(&node_id).await {
-                                    Ok(client) => {
-                                        // Create RPC request
-                                        let request = ReadChunkRequest::new(
-                                            chunk_index,
-                                            0,
-                                            self.chunk_manager.chunk_size() as u64,
-                                            file_path.clone(),
-                                        );
+                        match fs
+                            .chunk_store
+                            .read_chunk(
+                                &file_path,
+                                chunk_index,
+                                0,
+                                fs.chunk_manager.chunk_size() as u64,
+                            )
+                            .await
+                        {
+                            Ok(full_chunk) => {
+                                fs.chunk_cache.put(chunk_id, full_chunk.clone());
+                                (chunk_index, Some(full_chunk))
+                            }
+                            Err(_) => {
+                                if let Some(pool) = &fs.connection_pool {
+                                    let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                                    let node_id = fs.get_chunk_node(&chunk_key);
 
-                                            // Execute RPC
+                                    tracing::debug!(
+                                        "Fetching chunk {} from remote node {}",
+                                        chunk_index,
+                                        node_id
+                                    );
+
+                                    match pool.get_or_connect(&node_id).await {
+                                        Ok(client) => {
+                                            let request = ReadChunkRequest::new(
+                                                chunk_index,
+                                                0,
+                                                fs.chunk_manager.chunk_size() as u64,
+                                                file_path.clone(),
+                                            );
+
                                             match request.call(&*client).await {
                                                 Ok(response) if response.is_success() => {
                                                     let full_chunk = request.take_data();
@@ -614,9 +616,7 @@ impl BenchFS {
                                                         "Successfully fetched {} bytes from remote node",
                                                         full_chunk.len()
                                                     );
-
-                                                    // Cache for future reads
-                                                    self.chunk_cache.put(chunk_id, full_chunk.clone());
+                                                    fs.chunk_cache.put(chunk_id, full_chunk.clone());
                                                     (chunk_index, Some(full_chunk))
                                                 }
                                                 Ok(response) => {
@@ -641,18 +641,25 @@ impl BenchFS {
                                             (chunk_index, None)
                                         }
                                     }
-                            } else {
-                                // Not in distributed mode - treat as sparse
-                                (chunk_index, None)
+                                } else {
+                                    (chunk_index, None)
+                                }
                             }
                         }
-                    }
-                }
+                    },
+                    format!("benchfs_read_chunk_{}", chunk_index),
+                )
             })
             .collect();
 
         // Execute all reads concurrently
-        let chunk_results = join_all(chunk_futures).await;
+        let chunk_results_handles = join_all(chunk_futures).await;
+        let mut chunk_results = Vec::with_capacity(chunk_results_handles.len());
+        for result in chunk_results_handles {
+            chunk_results.push(
+                result.map_err(|e| ApiError::Internal(format!("Chunk read task failed: {}", e)))?,
+            );
+        }
 
         // Copy data to buffer in correct order
         tracing::trace!("Completed {} chunk reads", chunk_results.len());
@@ -734,6 +741,7 @@ impl BenchFS {
         tracing::trace!("Writing {} chunks concurrently", chunks.len());
         use futures::future::join_all;
 
+        let fs_ptr = self as *const BenchFS;
         let chunk_write_futures: Vec<_> = chunks
             .iter()
             .enumerate()
@@ -752,77 +760,90 @@ impl BenchFS {
                 let target_node = self.get_chunk_node(&chunk_key);
                 let is_local = target_node == self.metadata_manager.self_node_id();
 
-                async move {
-                    if is_local {
-                        // Write to local chunk store
-                        self.chunk_store
-                            .write_chunk(&file_path, chunk_index, chunk_offset, &chunk_data)
-                            .await
-                            .map_err(|e| {
-                                ApiError::IoError(format!(
-                                    "Failed to write chunk {}: {:?}",
-                                    chunk_index, e
-                                ))
-                            })?;
-                        Ok::<usize, ApiError>(data_len)
-                    } else if let Some(pool) = &self.connection_pool {
-                        // Write to remote node using node_id
-                        tracing::debug!(
-                            "Writing chunk {} to remote node {}",
-                            chunk_index,
-                            target_node
-                        );
-
-                        match pool.get_or_connect(&target_node).await {
-                            Ok(client) => {
-                                // Create RPC request
-                                let request = WriteChunkRequest::new(
+                spawn_with_name(
+                    async move {
+                        let fs = unsafe { &*fs_ptr };
+                        if is_local {
+                            // Write to local chunk store
+                            fs.chunk_store
+                                .write_chunk(
+                                    &file_path,
                                     chunk_index,
                                     chunk_offset,
-                                    chunk_data,
-                                    file_path.clone(),
-                                );
+                                    chunk_data.as_slice(),
+                                )
+                                .await
+                                .map_err(|e| {
+                                    ApiError::IoError(format!(
+                                        "Failed to write chunk {}: {:?}",
+                                        chunk_index, e
+                                    ))
+                                })?;
+                            Ok::<usize, ApiError>(data_len)
+                        } else if let Some(pool) = &fs.connection_pool {
+                            // Write to remote node using node_id
+                            tracing::debug!(
+                                "Writing chunk {} to remote node {}",
+                                chunk_index,
+                                target_node
+                            );
 
-                                // Execute RPC
-                                match request.call(&*client).await {
-                                    Ok(response) if response.is_success() => {
-                                        tracing::debug!(
-                                            "Successfully wrote {} bytes to remote node",
-                                            response.bytes_written
-                                        );
-                                        Ok(data_len)
+                            match pool.get_or_connect(&target_node).await {
+                                Ok(client) => {
+                                    // Create RPC request
+                                    let request = WriteChunkRequest::new(
+                                        chunk_index,
+                                        chunk_offset,
+                                        chunk_data.as_slice(),
+                                        file_path.clone(),
+                                    );
+
+                                    // Execute RPC
+                                    match request.call(&*client).await {
+                                        Ok(response) if response.is_success() => {
+                                            tracing::debug!(
+                                                "Successfully wrote {} bytes to remote node",
+                                                response.bytes_written
+                                            );
+                                            Ok(data_len)
+                                        }
+                                        Ok(response) => Err(ApiError::IoError(format!(
+                                            "Remote write failed with status {}",
+                                            response.status
+                                        ))),
+                                        Err(e) => {
+                                            Err(ApiError::IoError(format!("RPC error: {:?}", e)))
+                                        }
                                     }
-                                    Ok(response) => Err(ApiError::IoError(format!(
-                                        "Remote write failed with status {}",
-                                        response.status
-                                    ))),
-                                    Err(e) => Err(ApiError::IoError(format!("RPC error: {:?}", e))),
                                 }
+                                Err(e) => Err(ApiError::IoError(format!(
+                                    "Failed to connect to {}: {:?}",
+                                    target_node, e
+                                ))),
                             }
-                            Err(e) => Err(ApiError::IoError(format!(
-                                "Failed to connect to {}: {:?}",
-                                target_node, e
-                            ))),
+                        } else {
+                            // Not in distributed mode but chunk should be on a different node
+                            Err(ApiError::Internal(format!(
+                                "Chunk {} should be on node {} but distributed mode is not enabled",
+                                chunk_index, target_node
+                            )))
                         }
-                    } else {
-                        // Not in distributed mode but chunk should be on a different node
-                        Err(ApiError::Internal(format!(
-                            "Chunk {} should be on node {} but distributed mode is not enabled",
-                            chunk_index, target_node
-                        )))
-                    }
-                }
+                    },
+                    format!("benchfs_write_chunk_{}", chunk_index),
+                )
             })
             .collect();
 
         // Execute all writes concurrently
-        let write_results = join_all(chunk_write_futures).await;
+        let write_results_handles = join_all(chunk_write_futures).await;
 
         // Check results and calculate total bytes written
-        tracing::trace!("Completed {} chunk writes", write_results.len());
+        tracing::trace!("Completed {} chunk writes", write_results_handles.len());
         let mut bytes_written = 0;
-        for result in write_results {
-            bytes_written += result?;
+        for result in write_results_handles {
+            let chunk_result = result
+                .map_err(|e| ApiError::Internal(format!("Chunk write task failed: {}", e)))??;
+            bytes_written += chunk_result;
         }
 
         // Update file size if we wrote past the end
@@ -864,38 +885,72 @@ impl BenchFS {
                 if let Ok(file_meta) = self.metadata_manager.get_file_metadata(path_ref) {
                     // Sync to remote metadata server
                     if let Some(pool) = &self.connection_pool {
-                        match pool.get_or_connect(&metadata_node).await {
-                            Ok(client) => {
-                                use crate::rpc::metadata_ops::MetadataUpdateRequest;
-                                let request = MetadataUpdateRequest::new(handle.path.clone())
-                                    .with_size(file_meta.size);
+                        // Use timeout to prevent hanging on close
+                        let timeout_duration = Duration::from_secs(5);
+                        let mut timeout = Delay::new(timeout_duration).fuse();
 
-                                match request.call(&*client).await {
-                                    Ok(response) if response.is_success() => {
-                                        tracing::debug!(
-                                            "Synced metadata on close: {} (size: {})",
-                                            handle.path,
-                                            file_meta.size
-                                        );
-                                    }
-                                    Ok(response) => {
-                                        tracing::warn!(
-                                            "Failed to sync metadata on close: {} (status: {})",
-                                            handle.path,
-                                            response.status
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Metadata sync RPC error on close: {:?}", e);
-                                    }
+                        // Try to connect with timeout
+                        let connect_future = pool.get_or_connect(&metadata_node).fuse();
+                        futures::pin_mut!(connect_future);
+
+                        let client_result = futures::select! {
+                            result = connect_future => Some(result),
+                            _ = timeout => {
+                                tracing::warn!(
+                                    "Connection timeout for metadata sync on close: {} (timeout: {:?})",
+                                    handle.path,
+                                    timeout_duration
+                                );
+                                None
+                            }
+                        };
+
+                        if let Some(Ok(client)) = client_result {
+                            use crate::rpc::metadata_ops::MetadataUpdateRequest;
+                            let request = MetadataUpdateRequest::new(handle.path.clone())
+                                .with_size(file_meta.size);
+
+                            // Also use timeout for RPC call
+                            let mut rpc_timeout = Delay::new(timeout_duration).fuse();
+                            let rpc_future = request.call(&*client).fuse();
+                            futures::pin_mut!(rpc_future);
+
+                            let rpc_result = futures::select! {
+                                result = rpc_future => Some(result),
+                                _ = rpc_timeout => {
+                                    tracing::warn!(
+                                        "Metadata sync RPC timeout on close: {} (timeout: {:?})",
+                                        handle.path,
+                                        timeout_duration
+                                    );
+                                    None
+                                }
+                            };
+
+                            match rpc_result {
+                                Some(Ok(response)) if response.is_success() => {
+                                    tracing::debug!(
+                                        "Synced metadata on close: {} (size: {})",
+                                        handle.path,
+                                        file_meta.size
+                                    );
+                                }
+                                Some(Ok(response)) => {
+                                    tracing::warn!(
+                                        "Failed to sync metadata on close: {} (status: {})",
+                                        handle.path,
+                                        response.status
+                                    );
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!("Metadata sync RPC error on close: {:?}", e);
+                                }
+                                None => {
+                                    // Already logged timeout
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to connect for metadata sync on close: {:?}",
-                                    e
-                                );
-                            }
+                        } else if let Some(Err(e)) = client_result {
+                            tracing::warn!("Failed to connect for metadata sync on close: {:?}", e);
                         }
                     }
                 }
@@ -1531,7 +1586,7 @@ mod tests {
         let runtime = Runtime::new(256);
         let chunk_store = create_test_chunk_store(&runtime);
         let future = test(runtime.clone(), chunk_store);
-        runtime.run(future);
+        runtime.run_with_name_and_runtime("benchfs_file_ops_test", future);
     }
 
     #[test]

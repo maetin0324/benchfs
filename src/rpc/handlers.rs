@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
+use crate::rpc::buffer_pool::{PathBufferLease, PathBufferPool};
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 use crate::storage::ChunkStore;
 
@@ -14,6 +16,9 @@ pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+    path_buffer_pool: Rc<PathBufferPool>,
+    /// Shutdown flag for graceful termination
+    shutdown_flag: RefCell<bool>,
 }
 
 impl RpcHandlerContext {
@@ -26,7 +31,52 @@ impl RpcHandlerContext {
             metadata_manager,
             chunk_store,
             allocator,
+            path_buffer_pool: Rc::new(PathBufferPool::new(64)),
+            shutdown_flag: RefCell::new(false),
         }
+    }
+
+    /// Create a minimal context for benchmark (no storage/metadata)
+    pub fn new_bench() -> Self {
+        use crate::metadata::MetadataManager;
+        use crate::storage::InMemoryChunkStore;
+
+        // Create dummy metadata manager
+        let metadata_manager = Rc::new(MetadataManager::new("bench".to_string()));
+
+        // Create dummy chunk store
+        let chunk_store: Rc<dyn ChunkStore> = Rc::new(InMemoryChunkStore::new());
+
+        // Create dummy allocator (won't be used in benchmark)
+        // We need to create a minimal IoUring instance to initialize the allocator
+        // Leak the ring to keep it alive for the lifetime of the program
+        // This is acceptable for benchmark programs
+        let ring = Box::new(io_uring::IoUring::new(1).expect("Failed to create placeholder ring"));
+        let ring: &'static mut io_uring::IoUring = Box::leak(ring);
+        let allocator = pluvio_uring::allocator::FixedBufferAllocator::new(1, 4096, ring);
+
+        Self {
+            metadata_manager,
+            chunk_store,
+            allocator,
+            path_buffer_pool: Rc::new(PathBufferPool::new(16)),
+            shutdown_flag: RefCell::new(false),
+        }
+    }
+
+    /// Set the shutdown flag to signal graceful termination
+    pub fn set_shutdown_flag(&self) {
+        *self.shutdown_flag.borrow_mut() = true;
+        tracing::info!("Shutdown flag set");
+    }
+
+    /// Check if shutdown has been requested
+    pub fn should_shutdown(&self) -> bool {
+        *self.shutdown_flag.borrow()
+    }
+
+    pub fn acquire_path_buffer(&self) -> PathBufferLease {
+        self.path_buffer_pool.acquire()
     }
 }
 
@@ -226,7 +276,13 @@ pub async fn handle_write_chunk(
     if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
         // Use zero-copy write with registered buffer
         match io_uring_store
-            .write_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer, data_len)
+            .write_chunk_fixed(
+                &path,
+                header.chunk_index,
+                header.offset,
+                fixed_buffer,
+                data_len,
+            )
             .await
         {
             Ok(bytes_written) => {

@@ -34,17 +34,18 @@ COPY pluvio /build/pluvio
 COPY benchfs/Cargo.toml benchfs/Cargo.lock /build/
 COPY benchfs/src /build/src/
 COPY benchfs/build.rs /build/
+COPY benchfs/lib /build/lib/
 COPY benchfs/ior_integration /build/ior_integration
 
 # Build BenchFS library and binaries with MPI support
-RUN cargo build --release --features mpi-support
+RUN cargo build --features mpi-support
 
 # Install BenchFS library for IOR integration
 RUN set -x && \
     echo "=== Installing BenchFS library ===" && \
     PREFIX=/usr/local && \
     mkdir -p $PREFIX/lib $PREFIX/include $PREFIX/lib/pkgconfig && \
-    cp -v target/release/libbenchfs.so $PREFIX/lib/ && \
+    cp -v target/debug/libbenchfs.so $PREFIX/lib/ && \
     cp -rv ior_integration/benchfs_backend/include/* $PREFIX/include/ && \
     printf '# BenchFS pkg-config file\nprefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: BenchFS\nDescription: BenchFS distributed filesystem library\nVersion: 0.1.0\nLibs: -L${libdir} -lbenchfs -lpthread -ldl -lm\nCflags: -I${includedir}\n' > $PREFIX/lib/pkgconfig/benchfs.pc && \
     ldconfig
@@ -59,7 +60,7 @@ RUN set -x && \
     ./sync-benchfs.sh && \
     cd ior && \
     ./bootstrap && \
-    ./configure --prefix=/usr/local && \
+    ./configure CFLAGS="-O0 -g3 -ggdb3 -fno-omit-frame-pointer -UNDEBUG" LD_FLAGS="-Wl,-rdynamic" --prefix=/usr/local && \
     make -j$(nproc) && \
     make install && \
     ldconfig && \
@@ -71,8 +72,8 @@ RUN set -x && \
 FROM benchfs/ucx-mpi-base:1.0
 
 # Copy BenchFS binaries from builder
-COPY --from=builder /build/target/release/benchfsd /usr/local/bin/
-COPY --from=builder /build/target/release/benchfsd_mpi /usr/local/bin/
+COPY --from=builder /build/target/debug/benchfsd /usr/local/bin/
+COPY --from=builder /build/target/debug/benchfsd_mpi /usr/local/bin/
 
 # Copy BenchFS library and IOR
 COPY --from=builder /usr/local/lib/libbenchfs.so /usr/local/lib/
@@ -83,6 +84,11 @@ COPY --from=builder /usr/local/bin/mdtest /usr/local/bin/
 
 # Update library cache
 RUN ldconfig
+
+# Install debugging tools
+RUN apt-get update && apt-get install -y \
+    gdb \
+    procps
 
 # Set library paths
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig

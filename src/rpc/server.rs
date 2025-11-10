@@ -1,7 +1,6 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use pluvio_runtime::executor::Runtime;
 use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress};
 
 use crate::rpc::handlers::RpcHandlerContext;
@@ -50,7 +49,7 @@ impl RpcServer {
     ///
     /// server.listen::<ReadChunkRequest, _, _>(runtime.clone()).await?;
     /// ```
-    pub async fn listen<Rpc, ReqH, ResH>(&self, _runtime: Rc<Runtime>) -> Result<(), RpcError>
+    pub async fn listen<Rpc, ReqH, ResH>(&self) -> Result<(), RpcError>
     where
         ResH: Serializable + 'static,
         ReqH: Serializable + 'static,
@@ -69,6 +68,15 @@ impl RpcServer {
         let ctx = self.handler_context.clone();
 
         loop {
+            // Check shutdown flag before waiting for next message
+            if ctx.should_shutdown() {
+                tracing::info!(
+                    "RpcServer: Handler terminating due to shutdown for RPC ID {}",
+                    Rpc::rpc_id()
+                );
+                break;
+            }
+
             tracing::debug!("RpcServer: Waiting for message on RPC ID {}", Rpc::rpc_id());
             let msg = stream.wait_msg().await;
             if msg.is_none() {
@@ -86,105 +94,26 @@ impl RpcServer {
 
             let ctx_clone = ctx.clone();
 
-            // Call the unified server_handler
+            // Call the unified server_handler with span for tracking
+            let _handler_span =
+                tracing::debug_span!("rpc_server_handler", rpc_id = Rpc::rpc_id()).entered();
+
             match Rpc::server_handler(ctx_clone, am_msg).await {
-                Ok((response, am_msg)) => {
-                    // Send response back to client via reply when the client expects one
-                    if am_msg.need_reply() {
-                        let reply_stream_id = Rpc::reply_stream_id();
-
-                        // Serialize response header
-                        let response_bytes = zerocopy::IntoBytes::as_bytes(&response.header);
-
-                        // Prepare data payload if present
-                        let data_payload: &[u8] = if let Some(ref data) = response.data {
-                            data.as_slice()
-                        } else {
-                            &[]
-                        };
-
-                        // Determine protocol: use Rendezvous if we have data, otherwise None
-                        let proto = if data_payload.is_empty() {
-                            None
-                        } else {
-                            Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
-                        };
-
-                        // Send reply
-                        // SAFETY: reply() requires unsafe because it deals with raw UCX operations
-                        // We ensure safety by:
-                        // 1. response_bytes is a valid byte slice from zerocopy
-                        // 2. The reply_stream_id is valid (from Rpc::reply_stream_id())
-                        // 3. The am_msg is still valid (not dropped)
-                        unsafe {
-                            if let Err(e) = am_msg
-                                .reply(
-                                    reply_stream_id as u32,
-                                    response_bytes,
-                                    data_payload,
-                                    false, // Not eager
-                                    proto,
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    "Failed to send reply for RPC ID {}: {:?}",
-                                    Rpc::rpc_id(),
-                                    e
-                                );
-                            } else {
-                                tracing::debug!(
-                                    "Successfully sent reply for RPC ID {} (reply_stream_id: {}, data_len: {})",
-                                    Rpc::rpc_id(),
-                                    reply_stream_id,
-                                    data_payload.len()
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            "Skipping reply for RPC ID {} (fire-and-forget)",
-                            Rpc::rpc_id()
-                        );
-                    }
+                Ok((_response, _am_msg)) => {
+                    // Response was already sent within server_handler via reply_ep
+                    // reply_ep使用を回避するため、ここでは何もしない
+                    tracing::debug!(
+                        "RPC handler completed successfully for RPC ID {} (response sent directly)",
+                        Rpc::rpc_id()
+                    );
                 }
-                Err((e, am_msg)) => {
+                Err((e, _am_msg)) => {
+                    // エラーレスポンスもserver_handler内で送信済み（またはハンドラーがエラーを返した）
                     tracing::error!("Handler failed for RPC ID {}: {:?}", Rpc::rpc_id(), e);
-
-                    // Send an error response to the client if they expect a reply
-                    if am_msg.need_reply() {
-                        let reply_stream_id = Rpc::reply_stream_id();
-                        let error_response = Rpc::error_response(&e);
-                        let response_bytes = zerocopy::IntoBytes::as_bytes(&error_response);
-
-                        // SAFETY: Same safety considerations as the success case above
-                        unsafe {
-                            if let Err(reply_err) = am_msg
-                                .reply(
-                                    reply_stream_id as u32,
-                                    response_bytes,
-                                    &[],   // No additional data payload
-                                    false, // Not eager
-                                    None,  // No special proto
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    "Failed to send error reply for RPC ID {}: {:?}",
-                                    Rpc::rpc_id(),
-                                    reply_err
-                                );
-                            } else {
-                                tracing::debug!(
-                                    "Successfully sent error reply for RPC ID {} (status: {:?})",
-                                    Rpc::rpc_id(),
-                                    e
-                                );
-                            }
-                        }
-                    }
                 }
             }
+
+            drop(_handler_span);
         }
 
         Ok(())
@@ -207,10 +136,9 @@ impl RpcServer {
     /// ```ignore
     /// use pluvio_runtime::executor::Runtime;
     ///
-    /// let runtime = Rc::new(Runtime::new());
-    /// server.register_all_handlers(runtime.clone()).await?;
+    /// server.register_all_handlers().await?;
     /// ```
-    pub async fn register_all_handlers(&self, runtime: Rc<Runtime>) -> Result<(), RpcError> {
+    pub async fn register_all_handlers(&self) -> Result<(), RpcError> {
         use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
         use crate::rpc::metadata_ops::{
             MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
@@ -222,81 +150,145 @@ impl RpcServer {
         // Spawn ReadChunk handler with polling priority
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_polling(async move {
-                if let Err(e) = server.listen::<ReadChunkRequest, _, _>(rt).await {
-                    tracing::error!("ReadChunk handler error: {:?}", e);
-                }
-            });
+            pluvio_runtime::spawn_polling_with_name(
+                async move {
+                    if let Err(e) = server.listen::<ReadChunkRequest, _, _>().await {
+                        tracing::error!("ReadChunk handler error: {:?}", e);
+                    }
+                },
+                "rpc_read_chunk_handler".to_string(),
+            );
         }
 
         // Spawn WriteChunk handler with polling priority
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn_polling(async move {
-                if let Err(e) = server.listen::<WriteChunkRequest, _, _>(rt).await {
-                    tracing::error!("WriteChunk handler error: {:?}", e);
-                }
-            });
+            pluvio_runtime::spawn_polling_with_name(
+                async move {
+                    if let Err(e) = server.listen::<WriteChunkRequest, _, _>().await {
+                        tracing::error!("WriteChunk handler error: {:?}", e);
+                    }
+                },
+                "rpc_write_chunk_handler".to_string(),
+            );
         }
 
         // Spawn MetadataLookup handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataLookupRequest, _, _>(rt).await {
-                    tracing::error!("MetadataLookup handler error: {:?}", e);
-                }
-            });
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataLookupRequest, _, _>().await {
+                        tracing::error!("MetadataLookup handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_lookup_handler".to_string(),
+            );
         }
 
         // Spawn MetadataCreateFile handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataCreateFileRequest, _, _>(rt).await {
-                    tracing::error!("MetadataCreateFile handler error: {:?}", e);
-                }
-            });
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataCreateFileRequest, _, _>().await {
+                        tracing::error!("MetadataCreateFile handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_create_file_handler".to_string(),
+            );
         }
 
         // Spawn MetadataCreateDir handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataCreateDirRequest, _, _>(rt).await {
-                    tracing::error!("MetadataCreateDir handler error: {:?}", e);
-                }
-            });
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataCreateDirRequest, _, _>().await {
+                        tracing::error!("MetadataCreateDir handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_create_dir_handler".to_string(),
+            );
         }
 
         // Spawn MetadataDelete handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataDeleteRequest, _, _>(rt).await {
-                    tracing::error!("MetadataDelete handler error: {:?}", e);
-                }
-            });
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataDeleteRequest, _, _>().await {
+                        tracing::error!("MetadataDelete handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_delete_handler".to_string(),
+            );
         }
 
         // Spawn MetadataUpdate handler
         {
             let server = self.clone_for_handler();
-            let rt = runtime.clone();
-            runtime.spawn(async move {
-                if let Err(e) = server.listen::<MetadataUpdateRequest, _, _>(rt).await {
-                    tracing::error!("MetadataUpdate handler error: {:?}", e);
-                }
-            });
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<MetadataUpdateRequest, _, _>().await {
+                        tracing::error!("MetadataUpdate handler error: {:?}", e);
+                    }
+                },
+                "rpc_metadata_update_handler".to_string(),
+            );
+        }
+
+        // Spawn Shutdown handler
+        {
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    use crate::rpc::metadata_ops::ShutdownRequest;
+                    if let Err(e) = server.listen::<ShutdownRequest, _, _>().await {
+                        tracing::error!("Shutdown handler error: {:?}", e);
+                    }
+                },
+                "rpc_shutdown_handler".to_string(),
+            );
         }
 
         tracing::info!("All RPC handlers registered successfully");
+        Ok(())
+    }
+
+    /// Register only benchmark RPC handlers (Ping-Pong, Throughput, etc.)
+    pub async fn register_bench_handlers(&self) -> Result<(), RpcError> {
+        use crate::rpc::bench_ops::{BenchPingRequest, BenchShutdownRequest};
+
+        tracing::info!("Registering benchmark RPC handlers...");
+
+        // Spawn BenchPing handler
+        {
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<BenchPingRequest, _, _>().await {
+                        tracing::error!("BenchPing handler error: {:?}", e);
+                    }
+                },
+                "bench_ping_handler".to_string(),
+            );
+        }
+
+        // Spawn BenchShutdown handler
+        {
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<BenchShutdownRequest, _, _>().await {
+                        tracing::error!("BenchShutdown handler error: {:?}", e);
+                    }
+                },
+                "bench_shutdown_handler".to_string(),
+            );
+        }
+
+        tracing::info!("Benchmark RPC handlers registered successfully");
         Ok(())
     }
 

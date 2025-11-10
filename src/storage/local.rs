@@ -413,19 +413,21 @@ mod tests {
         let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
-        runtime.clone().run(async move {
-            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
+        runtime
+            .clone()
+            .run_with_name("local_fs_test_create_directory", async move {
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
-            let dir_path = Path::new("/testdir");
+                let dir_path = Path::new("/testdir");
 
-            // ディレクトリを作成
-            fs.create_directory(dir_path, 0o755).await.unwrap();
+                // ディレクトリを作成
+                fs.create_directory(dir_path, 0o755).await.unwrap();
 
-            // メタデータを確認
-            let metadata = fs.get_dir_metadata(2).unwrap();
-            assert_eq!(metadata.path, "/testdir");
-            assert_eq!(metadata.inode, 2);
-        });
+                // メタデータを確認
+                let metadata = fs.get_dir_metadata(2).unwrap();
+                assert_eq!(metadata.path, "/testdir");
+                assert_eq!(metadata.inode, 2);
+            });
     }
 
     #[test]
@@ -433,20 +435,22 @@ mod tests {
         let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
-        runtime.clone().run(async move {
-            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
+        runtime
+            .clone()
+            .run_with_name("local_fs_test_list_directory", async move {
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
-            // ディレクトリを作成
-            fs.create_directory(Path::new("/dir1"), 0o755)
-                .await
-                .unwrap();
+                // ディレクトリを作成
+                fs.create_directory(Path::new("/dir1"), 0o755)
+                    .await
+                    .unwrap();
 
-            // ルートディレクトリの内容を一覧
-            let entries = fs.list_directory(Path::new("/")).await.unwrap();
+                // ルートディレクトリの内容を一覧
+                let entries = fs.list_directory(Path::new("/")).await.unwrap();
 
-            assert_eq!(entries.len(), 1);
-            assert!(entries.contains(&("dir1".to_string(), InodeType::Directory)));
-        });
+                assert_eq!(entries.len(), 1);
+                assert!(entries.contains(&("dir1".to_string(), InodeType::Directory)));
+            });
     }
 
     #[test]
@@ -454,27 +458,29 @@ mod tests {
         let (runtime, allocator) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
-        runtime.clone().run(async move {
-            let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
+        runtime
+            .clone()
+            .run_with_name("local_fs_test_create_and_open_file", async move {
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
-            let file_path = Path::new("/test.txt");
+                let file_path = Path::new("/test.txt");
 
-            // ファイルを作成
-            let handle = fs.create_file(file_path, 0o644).await.unwrap();
-            fs.backend().close(handle).await.unwrap();
+                // ファイルを作成
+                let handle = fs.create_file(file_path, 0o644).await.unwrap();
+                fs.backend().close(handle).await.unwrap();
 
-            // ファイルを開く
-            let handle = fs
-                .open_file(file_path, OpenFlags::read_only())
-                .await
-                .unwrap();
-            fs.backend().close(handle).await.unwrap();
+                // ファイルを開く
+                let handle = fs
+                    .open_file(file_path, OpenFlags::read_only())
+                    .await
+                    .unwrap();
+                fs.backend().close(handle).await.unwrap();
 
-            // メタデータを確認
-            let metadata = fs.get_file_metadata(2).unwrap(); // inode=2 (1はルート)
-            assert_eq!(metadata.path, "/test.txt");
-            assert_eq!(metadata.size, 0);
-        });
+                // メタデータを確認
+                let metadata = fs.get_file_metadata(2).unwrap(); // inode=2 (1はルート)
+                assert_eq!(metadata.path, "/test.txt");
+                assert_eq!(metadata.size, 0);
+            });
     }
 
     #[test]

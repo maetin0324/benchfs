@@ -70,6 +70,7 @@ mpirun \
     --mca btl_tcp_if_include eth0 \
     -x UCX_TLS=tcp,sm,self \
     -x RUST_LOG=debug \
+    -x RUST_BACKTRACE=1 \
     benchfsd_mpi ${REGISTRY_DIR} ${CONFIG_FILE} \
     > ${RESULTS_DIR}/server_stdout.log 2> ${RESULTS_DIR}/server_stderr.log &
 
@@ -123,6 +124,9 @@ case "$TEST_NAME" in
             -np ${NNODES} \
             --mca btl tcp,self \
             --mca btl_tcp_if_include eth0 \
+            -x RUST_LOG \
+            -x BENCHFS_OPERATION_TIMEOUT \
+            -x RUST_BACKTRACE=1 \
             ${IOR_BIN} \
                 -a BENCHFS \
                 --benchfs.registry ${REGISTRY_DIR} \

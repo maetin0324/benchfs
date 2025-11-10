@@ -3,7 +3,7 @@
 //! This module manages the async runtime and global state required for executing
 //! BenchFS async operations from C code. It provides:
 //!
-//! - **Thread-local Runtime**: Each thread maintains its own async runtime instance
+//! - **Thread-local Runtime**: Each thread maintains its own async runtime instance (via pluvio_runtime TLS)
 //! - **BenchFS Context Storage**: Thread-local storage for BenchFS instances
 //! - **RPC Components**: Storage for RPC server and connection pool in distributed mode
 //! - **Async-to-Sync Conversion**: [`block_on`] helper for executing async functions synchronously
@@ -26,7 +26,7 @@
 //!              ▼
 //! ┌─────────────────────────────────────┐
 //! │  Thread-Local Runtime & Context     │
-//! │  - LOCAL_RUNTIME                    │
+//! │  - pluvio_runtime TLS (Runtime)     │
 //! │  - BENCHFS_CTX                      │
 //! │  - RPC_SERVER (server mode)         │
 //! │  - CONNECTION_POOL (distributed)    │
@@ -42,23 +42,14 @@
 use crate::api::file_ops::BenchFS;
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::server::RpcServer;
-use pluvio_runtime::executor::Runtime;
 use std::cell::RefCell;
 use std::rc::Rc;
-use futures::{select, FutureExt};
-use futures_timer::Delay;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-thread_local! {
-    /// Thread-local async runtime
-    ///
-    /// Each thread maintains its own runtime instance because `Runtime` contains
-    /// `RefCell` which is not `Sync`. For distributed mode, this runtime is
-    /// initialized in `benchfs_init()` with UCX and io_uring reactors registered.
-    ///
-    /// In local mode (non-distributed), a basic runtime is created on-demand.
-    static LOCAL_RUNTIME: RefCell<Option<Rc<Runtime>>> = RefCell::new(None);
-}
+// Re-export pluvio_runtime's TLS-based runtime functions
+use pluvio_runtime::executor::Runtime;
+pub use pluvio_runtime::executor::{
+    get_runtime as get_pluvio_runtime, set_runtime as set_pluvio_runtime,
+};
 
 thread_local! {
     /// Thread-local BenchFS context
@@ -88,7 +79,7 @@ thread_local! {
 
 /// Set the async runtime for the current thread
 ///
-/// This function stores the runtime instance in thread-local storage.
+/// This function stores the runtime instance in pluvio_runtime's thread-local storage.
 /// The runtime is initialized in `benchfs_init()` with appropriate reactors
 /// (io_uring, UCX) registered for the mode (client or server).
 ///
@@ -96,9 +87,7 @@ thread_local! {
 ///
 /// * `runtime` - Shared reference to the runtime instance
 pub fn set_runtime(runtime: Rc<Runtime>) {
-    LOCAL_RUNTIME.with(|rt| {
-        *rt.borrow_mut() = Some(runtime);
-    });
+    set_pluvio_runtime(runtime);
 }
 
 /// Set the BenchFS context for the current thread
@@ -217,8 +206,7 @@ where
 /// Execute an async function synchronously with operation name for debugging
 ///
 /// This is similar to [`block_on`] but includes an operation name for better
-/// debugging and timeout tracking. When a timeout occurs, the operation name
-/// is included in the error message to help identify which operation failed.
+/// debugging. The operation name is logged for tracking purposes.
 ///
 /// # Arguments
 ///
@@ -228,10 +216,6 @@ where
 /// # Returns
 ///
 /// The output of the future once it completes
-///
-/// # Panics
-///
-/// Exits the process if the operation times out
 ///
 /// # Example
 ///
@@ -245,81 +229,70 @@ where
     F: std::future::Future + 'static,
     F::Output: 'static,
 {
-    LOCAL_RUNTIME.with(|runtime_cell| {
-        let runtime = runtime_cell.borrow();
-
-        // Get or create runtime
-        let rt: Rc<Runtime> = if let Some(ref rt) = *runtime {
-            rt.clone()
-        } else {
-            // Fallback: create a basic runtime if not initialized
-            // This should only happen in local mode
-            drop(runtime);
-            let new_runtime_rc: Rc<Runtime> = Runtime::new(256); // Runtime::new() returns Rc<Runtime>
-            *runtime_cell.borrow_mut() = Some(new_runtime_rc.clone());
-            new_runtime_rc
-        };
-
-        // Get timeout from environment or use default of 120 seconds
-        let timeout_secs = std::env::var("BENCHFS_OPERATION_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120);
-
-        // Debug logging
-        tracing::debug!(
-            "Starting operation '{}' with {}s timeout",
-            operation_name,
-            timeout_secs
+    let rt: Rc<Runtime> = if let Some(rt) = get_pluvio_runtime() {
+        rt
+    } else {
+        tracing::error!(
+            "BenchFS runtime is not initialized on this thread. \
+             Call benchfs_init (or the appropriate thread attach API) before invoking BenchFS operations."
         );
+        panic!("BenchFS runtime not initialized on this thread");
+    };
 
-        // Create a holder for the result and timeout flag
-        let result_holder = Rc::new(RefCell::new(None));
-        let result_holder_clone = result_holder.clone();
-        let timed_out = std::sync::Arc::new(AtomicBool::new(false));
-        let timed_out_clone = timed_out.clone();
+    // Debug logging
+    tracing::debug!("Starting operation '{}'", operation_name);
 
-        // Create timeout future
-        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-        let op_name = operation_name.to_string();
+    // Create a holder for the result
+    let result_holder = Rc::new(RefCell::new(None));
+    let result_holder_clone = result_holder.clone();
 
-        // Combine the original future with timeout using select!
-        let combined_future = async move {
-            // Pin the future to make it work with select!
-            futures::pin_mut!(future);
-            let mut user_future = future.fuse();
-            let mut timeout_future = Delay::new(timeout_duration).fuse();
+    // Wrap the future to capture its result
+    let wrapped_future = async move {
+        let result = future.await;
+        *result_holder_clone.borrow_mut() = Some(result);
+    };
 
-            select! {
-                result = user_future => {
-                    tracing::debug!("Operation '{}' completed successfully", op_name);
-                    *result_holder_clone.borrow_mut() = Some(result);
-                },
-                _ = timeout_future => {
-                    tracing::error!(
-                        "Operation '{}' timed out after {} seconds. Aborting to prevent hang.",
-                        op_name, timeout_secs
-                    );
-                    timed_out_clone.store(true, Ordering::Relaxed);
-                    // Don't abort immediately, let runtime finish cleanly
-                }
-            }
-        };
+    // Execute the future with the provided operation name using the thread-local runtime
+    rt.run_with_name_and_runtime(operation_name, wrapped_future);
 
-        rt.run(combined_future);
+    // Extract the result
+    result_holder
+        .borrow_mut()
+        .take()
+        .expect("Future did not complete")
+}
 
-        // Check if timeout occurred
-        if timed_out.load(Ordering::Relaxed) {
-            tracing::error!("Exiting due to timeout in operation '{}'", operation_name);
-            std::process::exit(1);
-        }
+/// Clean up thread-local runtime and context
+///
+/// This function clears all thread-local storage used by BenchFS:
+/// - Runtime instance (via pluvio_runtime TLS)
+/// - BenchFS context
+/// - RPC server (if in server mode)
+/// - Connection pool (if in distributed mode)
+///
+/// This should be called from `benchfs_finalize()` to ensure proper cleanup.
+///
+/// # Note
+///
+/// This is a best-effort cleanup. The actual resources will be cleaned up
+/// when the Rc references are dropped.
+pub fn cleanup_runtime() {
+    tracing::debug!("Cleaning up thread-local runtime and context");
 
-        // Extract the result
-        result_holder
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| {
-                panic!("Future for operation '{}' did not complete", operation_name)
-            })
-    })
+    BENCHFS_CTX.with(|ctx| {
+        *ctx.borrow_mut() = None;
+    });
+
+    RPC_SERVER.with(|srv| {
+        *srv.borrow_mut() = None;
+    });
+
+    CONNECTION_POOL.with(|pool| {
+        *pool.borrow_mut() = None;
+    });
+
+    // Clear the pluvio_runtime TLS
+    pluvio_runtime::clear_runtime();
+
+    tracing::debug!("Thread-local cleanup complete");
 }

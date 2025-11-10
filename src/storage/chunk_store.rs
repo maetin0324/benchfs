@@ -678,11 +678,7 @@ impl IOUringChunkStore {
 
         let handle = self.backend.open(&chunk_file_path, flags).await?;
 
-        tracing::debug!(
-            "Opened file: {:?} with fd={:?}",
-            chunk_file_path,
-            handle
-        );
+        tracing::debug!("Opened file: {:?} with fd={:?}", chunk_file_path, handle);
 
         // Insert into LRU cache. If cache is full, this will evict the least-recently-used entry.
         let mut cache = self.open_handles.borrow_mut();
@@ -703,7 +699,9 @@ impl IOUringChunkStore {
             );
 
             // Store for deferred cleanup to prevent file descriptor leaks
-            self.evicted_handles.borrow_mut().push((evicted_key, evicted_handle));
+            self.evicted_handles
+                .borrow_mut()
+                .push((evicted_key, evicted_handle));
         }
 
         Ok(handle)
@@ -733,7 +731,14 @@ impl IOUringChunkStore {
         offset: u64,
         data: &[u8],
     ) -> ChunkStoreResult<usize> {
-        let _span = tracing::trace_span!("chunk_write", path = file_path, chunk = chunk_index, offset, len = data.len()).entered();
+        let _span = tracing::trace_span!(
+            "chunk_write",
+            path = file_path,
+            chunk = chunk_index,
+            offset,
+            len = data.len()
+        )
+        .entered();
 
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
@@ -767,7 +772,14 @@ impl IOUringChunkStore {
         offset: u64,
         length: u64,
     ) -> ChunkStoreResult<Vec<u8>> {
-        let _span = tracing::trace_span!("chunk_read", path = file_path, chunk = chunk_index, offset, len = length).entered();
+        let _span = tracing::trace_span!(
+            "chunk_read",
+            path = file_path,
+            chunk = chunk_index,
+            offset,
+            len = length
+        )
+        .entered();
 
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
@@ -871,7 +883,8 @@ impl IOUringChunkStore {
     /// Close all open file handles
     pub async fn close_all(&self) -> ChunkStoreResult<()> {
         // First, close all evicted handles that were deferred to prevent deadlock
-        let evicted: Vec<(ChunkKey, FileHandle)> = self.evicted_handles.borrow_mut().drain(..).collect();
+        let evicted: Vec<(ChunkKey, FileHandle)> =
+            self.evicted_handles.borrow_mut().drain(..).collect();
         for (key, handle) in evicted {
             if let Err(e) = self.backend.close(handle).await {
                 tracing::warn!(
@@ -1007,7 +1020,9 @@ mod tests {
         F: std::future::Future<Output = ()> + 'static,
     {
         let runtime = Runtime::new(256);
-        runtime.clone().run(test);
+        runtime
+            .clone()
+            .run_with_name_and_runtime("chunk_store_test", test);
     }
 
     #[test]

@@ -97,6 +97,9 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Create pluvio runtime
     let runtime = Runtime::new(256);
 
+    // Set runtime in TLS for TLS-based APIs
+    pluvio_runtime::set_runtime(runtime.clone());
+
     // Create io_uring reactor with minimal timeouts for low latency
     let uring_reactor = IoUringReactor::builder()
         .queue_size(2048)
@@ -161,19 +164,15 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
     // Start server main loop
     let server_handle = {
-        let runtime_clone = runtime.clone();
         let rpc_server_clone = rpc_server.clone();
         let state_clone = state.clone();
 
-        runtime.spawn_with_name(
+        pluvio_runtime::spawn_with_name(
             async move {
                 tracing::info!("RPC server listening for requests");
 
                 // Register all RPC handlers
-                if let Err(e) = rpc_server_clone
-                    .register_all_handlers(runtime_clone.clone())
-                    .await
-                {
+                if let Err(e) = rpc_server_clone.register_all_handlers().await {
                     tracing::error!("Failed to register RPC handlers: {:?}", e);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -203,7 +202,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Run the runtime
     tracing::info!("Server is running (Press Ctrl+C to stop)");
 
-    runtime.clone().run(async move {
+    pluvio_runtime::run_with_name("benchfsd_server_main", async move {
         match server_handle.await {
             Ok(_) => {
                 tracing::info!("Server shutdown complete");

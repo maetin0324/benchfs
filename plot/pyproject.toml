@@ -3,21 +3,24 @@ name = "plot"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
-	"matplotlib>=3.8",
-	"polars>=0.20",
-	"pandas>=2.2",
-	"notebook>=7.1",
-	"pyarrow>=21.0.0",
+    "altair>=5.5.0",
+    "matplotlib>=3.10.7",
+    "pandas>=2.3.3",
+    "polars>=1.35.1",
+    "pyarrow>=22.0.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-	"ipykernel>=6.29",
-	"jupyterlab>=4.2",
-]
+[tool.setuptools.packages.find]
+include = ["plot*"]
+exclude = ["fig*", "processed*"]
 
 [tool.uv]
 package = true
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+]
 

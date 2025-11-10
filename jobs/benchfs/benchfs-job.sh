@@ -36,6 +36,118 @@ BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 
+# ==============================================================================
+# 1. トランスポート層設定（最優先）
+# ==============================================================================
+# UD/DC を許可すると DCI QP で Input/output error が発生し、返信が
+# 捨てられて RPC がハングする。GPU (cuda_copy) も無効化し CPU 専用にする。
+
+detect_active_ib() {
+  command -v ibstat >/dev/null 2>&1 || return 1
+  ibstat 2>/dev/null | grep -q "State:.*Active"
+}
+
+if [[ -z "${UCX_TLS:-}" ]]; then
+  if detect_active_ib; then
+    # RC + 共有メモリのみを使用し、UD/DC/cuda 系を完全に除外
+    export UCX_TLS="rc_mlx5,rc_verbs,sm,self"
+  else
+    # IB が無い場合は TCP にフォールバック
+    export UCX_TLS="tcp,sm,self"
+  fi
+fi
+
+# UCX が GPU メモリタイプを誤検出しないように memtype cache を無効化
+export UCX_MEMTYPE_CACHE="n"
+
+# UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
+if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
+  if [[ "${UCX_TLS}" == *rc* ]]; then
+    export UCX_NET_DEVICES="mlx5_0:1"
+  else
+    export UCX_NET_DEVICES="all"
+  fi
+fi
+
+# 明示的に UD/DC を使わせない
+export UCX_PROTOS="^ud,dc"
+
+# ==============================================================================
+# 2. タイムアウトとリトライ設定
+# ==============================================================================
+# UCXのデフォルト値では不十分な場合があるため、増加
+
+export UCX_RC_TIMEOUT=2.0s               # タイムアウト時間（デフォルト: 1.0s）
+export UCX_RC_RETRY_COUNT=16             # リトライ回数（デフォルト: 7）
+export UCX_RC_TIMEOUT_MULTIPLIER=4.0     # タイムアウト乗数（デフォルト: 2.0）
+
+# ==============================================================================
+# 3. Active Message設定
+# ==============================================================================
+# Active Messageのバッファサイズとプロトコル閾値を最適化
+
+export UCX_AM_MAX_SHORT=128              # Short AMの最大サイズ (デフォルト: 128B)
+export UCX_AM_MAX_EAGER=8192             # Eager AMの最大サイズ (8KB)
+# export UCX_RNDV_THRESH=16384             # Rendezvous閾値 (16KB)
+export UCX_RNDV_THRESH=inf              # Rendezvousプロトコル無効化（全てEagerに）
+
+# AMストリームのキューサイズ
+export UCX_AM_SEND_QUEUE_SIZE=1024       # 送信キューサイズ
+export UCX_AM_RECV_QUEUE_SIZE=1024       # 受信キューサイズ
+
+# ==============================================================================
+# 4. RDMA設定
+# ==============================================================================
+# ゼロコピーとRendezvousプロトコルの最適化
+
+export UCX_ZCOPY_THRESH=0                # ゼロコピー常時有効（0 = 常時）
+export UCX_RNDV_SCHEME=get_zcopy         # Rendezvous方式: GET with zero-copy
+
+# InfiniBand固有設定
+export UCX_IB_NUM_PATHS=2                # IBパス数
+export UCX_RC_MLX5_TM_ENABLE=y           # タグマッチングハードウェア加速
+export UCX_RC_MLX5_RX_QUEUE_LEN=4096     # 受信キューの長さ（デフォルト: 1024）
+
+# ==============================================================================
+# 5. メモリ登録キャッシュ
+# ==============================================================================
+# memtype cache は GPU 誤検出を避けるためセクション1で n に設定済み
+export UCX_RCACHE_ENABLE=y               # 登録キャッシュ有効
+
+# ==============================================================================
+# 6. フロー制御
+# ==============================================================================
+export UCX_RC_FC_ENABLE=y                # フロー制御有効化
+export UCX_RC_MAX_NUM_EPS=-1             # エンドポイント数無制限
+
+# ==============================================================================
+# 7. ネットワーク層設定
+# ==============================================================================
+export UCX_IB_SEG_SIZE=8192              # IBセグメントサイズ (8KB)
+export UCX_RC_PATH_MTU=4096              # Path MTU (4KB推奨)
+
+# RoCE使用時（必要に応じて有効化）
+# export UCX_IB_GID_INDEX=0              # GIDインデックス
+
+# ==============================================================================
+# 8. プログレス設定
+# ==============================================================================
+export UCX_ADAPTIVE_PROGRESS=y           # アダプティブプログレス
+export UCX_ASYNC_MAX_EVENTS=256          # 非同期イベント最大数
+
+# シングルスレッドの場合（MPIプロセス内でスレッド不使用）
+export UCX_USE_MT_MUTEX=n                # マルチスレッドmutex無効
+
+# UCX Configuration for avoiding Rendezvous protocol issues
+# - UCX_TLS: Use only TCP, shared memory, and self transports (avoid InfiniBand)
+# - UCX_RNDV_THRESH: Set to inf to disable Rendezvous protocol completely
+#   This forces all messages to use Eager protocol, which is compatible
+#   with current implementation
+UCX_LOG_LEVEL="DEBUG"
+
+export UCX_LOG_LEVEL
+export UCX_RNDV_THRESH
+
 # Calculate project root from SCRIPT_DIR and set LD_LIBRARY_PATH dynamically
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:${LD_LIBRARY_PATH:-}"
@@ -124,54 +236,59 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
+export RUST_LOG=Trace
+export RUST_BACKTRACE=full
+
 # MPI Configuration Fix for UCX Transport Layer Issues
 # ==================================================
-# FIX: UCX couldn't find InfiniBand device (mlx5_0:1) causing "Destination is unreachable"
-# SOLUTION: Using TCP-only transport for stability, with alternative configs for optimization
-#
-# CURRENT: TCP-only mode (most stable, works across all environments)
-cmd_mpirun_common=(
-  mpirun
-  "${nqsii_mpiopts_array[@]}"
-  --mca pml ob1                           # Use standard ob1 PML
-  --mca btl tcp,vader,self                # TCP + shared memory + loopback
-  --mca btl_openib_allow_ib 0             # Explicitly disable openib BTL
-  -x PATH
-  -x LD_LIBRARY_PATH
-)
+# Automatically detect whether UCX PML is available; fall back to TCP/ob1 if not.
 
-# ALTERNATIVE 1: UCX with automatic transport detection (try after TCP works)
-# cmd_mpirun_common=(
-#   mpirun
-#   "${nqsii_mpiopts_array[@]}"
-#   --mca pml ucx                         # UCX for MPI communication
-#   --mca btl self                        # Minimal BTL when using UCX
-#   --mca osc ucx                          # OSC also uses UCX
-#   -x "UCX_TLS=all"                      # Auto-detect available transports
-#   -x "UCX_NET_DEVICES=all"              # Auto-detect available devices
-#   -x "UCX_RC_TIMEOUT=10s"               # Timeout to prevent hangs
-#   -x "UCX_RC_RETRY_COUNT=7"             # Retry count
-#   -x "UCX_LOG_LEVEL=info"               # Info level for debugging
-#   -x PATH
-#   -x LD_LIBRARY_PATH
-# )
+supports_ucx_pml() {
+  command -v ompi_info >/dev/null 2>&1 || return 1
+  ompi_info --param pml all --level 9 2>/dev/null | grep -q "mca:pml:.*ucx"
+}
 
-# ALTERNATIVE 2: UCX with explicit InfiniBand (only if IB is confirmed working)
-# cmd_mpirun_common=(
-#   mpirun
-#   "${nqsii_mpiopts_array[@]}"
-#   --mca pml ucx
-#   --mca btl self,vader
-#   --mca osc ucx
-#   -x "UCX_TLS=rc_mlx5,sm,self"
-#   -x "UCX_NET_DEVICES=mlx5_0:1"
-#   -x "UCX_RC_TIMEOUT=10s"
-#   -x "UCX_RC_RETRY_COUNT=7"
-#   -x "UCX_LOG_LEVEL=error"
-#   -x "UCX_WARN_UNUSED_ENV_VARS=n"
-#   -x PATH
-#   -x LD_LIBRARY_PATH
-# )
+if supports_ucx_pml; then
+  USE_UCX_PML=1
+  echo "UCX PML detected – using --mca pml ucx configuration"
+else
+  USE_UCX_PML=0
+  echo "WARNING: UCX PML not available – falling back to ob1/tcp configuration"
+fi
+
+if [[ "${USE_UCX_PML}" -eq 1 ]]; then
+  cmd_mpirun_common=(
+    mpirun
+    "${nqsii_mpiopts_array[@]}"
+    --mca pml ucx
+    --mca btl self
+    --mca osc ucx
+    -x UCX_TLS
+    -x UCX_NET_DEVICES
+    -x UCX_MEMTYPE_CACHE
+    -x UCX_PROTOS
+    # -x UCX_LOG_LEVEL
+    -x UCX_RNDV_THRESH
+    -x UCX_RNDV_SCHEME
+    -x UCX_RC_TIMEOUT
+    -x UCX_RC_RETRY_COUNT
+    -x UCX_RC_TIMEOUT_MULTIPLIER
+    -x UCX_AM_MAX_SHORT
+    -x UCX_AM_MAX_EAGER
+    -x PATH
+    -x LD_LIBRARY_PATH
+  )
+else
+  cmd_mpirun_common=(
+    mpirun
+    "${nqsii_mpiopts_array[@]}"
+    --mca pml ob1
+    --mca btl tcp,vader,self
+    --mca btl_openib_allow_ib 0
+    -x PATH
+    -x LD_LIBRARY_PATH
+  )
+fi
 
 # Kill any previous benchfsd instances
 cmd_mpirun_kill=(
@@ -329,8 +446,8 @@ EOF
             -np "$NNODES"
             --bind-to none
             -map-by ppr:1:node
-            -x "RUST_LOG=Trace"
-            -x "RUST_BACKTRACE=1"
+            -x RUST_LOG
+            -x RUST_BACKTRACE
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${BENCHFS_PREFIX}/benchfsd_mpi"
             "${BENCHFS_REGISTRY_DIR}"
@@ -379,8 +496,8 @@ EOF
 
           # Run IOR benchmark
           echo "Running IOR benchmark..."
-          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
-          ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.txt"
+          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.txt"
+          ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
 
           cmd_ior=(
             time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
@@ -388,10 +505,11 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
-            -x "UCX_LOG_LEVEL=error"              # Suppress verbose UCX debug logs
-            -x "RUST_LOG=Trace"
+            -x RUST_LOG
+            -x RUST_BACKTRACE
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
+            -vvv
             -a BENCHFS
             -t "$transfer_size"
             -b "$block_size"
@@ -399,7 +517,7 @@ EOF
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"
             -o "${BENCHFS_DATA_DIR}/testfile"
-            -O summaryFormat=JSON
+            # -O summaryFormat=JSON
             -O summaryFile="${ior_json_file}"
           )
 
@@ -409,7 +527,7 @@ EOF
           # NOTE: Use simple redirection instead of process substitution to avoid FD leak
           "${cmd_ior[@]}" \
             > "${ior_stdout_file}" \
-            2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.txt" || true
+            2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || true
 
           # Stop BenchFS servers
           echo "Stopping BenchFS servers..."

@@ -10,14 +10,46 @@ pub struct RpcClient {
     // Store reply stream opaquely since pluvio_ucx may not export AmStream
     #[allow(dead_code)]
     reply_stream_id: RefCell<Option<u16>>,
+    /// Client's own WorkerAddress for direct response
+    worker_address: Vec<u8>,
 }
 
 impl RpcClient {
     pub fn new(conn: Connection) -> Self {
+        // Get worker address from the connection
+        let worker_address = conn
+            .worker()
+            .address()
+            .map(|addr| {
+                let addr_vec = addr.as_ref().to_vec();
+                tracing::debug!(
+                    "RpcClient: Got worker address, length={}, first_32_bytes={:?}",
+                    addr_vec.len(),
+                    &addr_vec.get(0..32.min(addr_vec.len())).unwrap_or(&[])
+                );
+                addr_vec
+            })
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to get worker address: {:?}", e);
+                tracing::error!("RpcClient: Returning empty worker address due to error");
+                vec![]
+            });
+
         Self {
             conn,
             reply_stream_id: RefCell::new(None),
+            worker_address,
         }
+    }
+
+    /// Get the client's WorkerAddress
+    pub fn worker_address(&self) -> &[u8] {
+        &self.worker_address
+    }
+
+    /// Get the underlying connection
+    pub fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     /// Initialize the reply stream for receiving RPC responses
@@ -51,7 +83,13 @@ impl RpcClient {
         let need_reply = request.need_reply();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        tracing::trace!("Reply stream: {}, has_data: {}", reply_stream_id, !data.is_empty());
+        tracing::debug!(
+            "RPC call: rpc_id={}, reply_stream_id={}, has_data={}, data_len={}",
+            rpc_id,
+            reply_stream_id,
+            !data.is_empty(),
+            data.iter().map(|s| s.len()).sum::<usize>()
+        );
 
         let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
@@ -59,6 +97,8 @@ impl RpcClient {
                 e.to_string()
             ))
         })?;
+
+        tracing::trace!("Created reply stream: stream_id={}", reply_stream_id);
 
         if !need_reply {
             // No reply expected
@@ -68,7 +108,14 @@ impl RpcClient {
         }
 
         // Send the RPC request (proto is set to None for now)
-        tracing::trace!("Sending AM request");
+        tracing::debug!(
+            "Sending AM request: rpc_id={}, header_size={}, need_reply={}, proto={:?}",
+            rpc_id,
+            std::mem::size_of_val(zerocopy::IntoBytes::as_bytes(header)),
+            need_reply,
+            proto
+        );
+
         self.conn
             .endpoint()
             .am_send_vectorized(
@@ -79,17 +126,36 @@ impl RpcClient {
                 proto,
             )
             .await
-            .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;
+            .map_err(|e| {
+                tracing::error!(
+                    "Failed to send AM request: rpc_id={}, error={:?}",
+                    rpc_id,
+                    e
+                );
+                RpcError::TransportError(format!("Failed to send AM: {:?}", e))
+            })?;
 
-        tracing::trace!("Waiting for reply");
+        tracing::debug!(
+            "Waiting for reply on stream_id={}, rpc_id={}",
+            reply_stream_id,
+            rpc_id
+        );
 
         // Wait for reply
-        let mut msg = reply_stream
-            .wait_msg()
-            .await
-            .ok_or_else(|| RpcError::Timeout)?;
+        let mut msg = reply_stream.wait_msg().await.ok_or_else(|| {
+            tracing::error!(
+                "RPC timeout: no reply received (rpc_id={}, reply_stream_id={})",
+                rpc_id,
+                reply_stream_id
+            );
+            RpcError::Timeout
+        })?;
 
-        tracing::trace!("Received reply message");
+        tracing::debug!(
+            "Received reply message: rpc_id={}, reply_stream_id={}",
+            rpc_id,
+            reply_stream_id
+        );
 
         // Deserialize the response header
         let response_header = msg

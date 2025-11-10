@@ -5,41 +5,34 @@ source "${SCRIPT_DIR}/common.sh"
 TIMESTAMP="$(timestamp)"
 
 # default params
-: ${ELAPSTIM_REQ:="0:05:00"}
+: ${ELAPSTIM_REQ:="4:00:00"}
 : ${LABEL:=default}
+: ${PING_ITERATIONS:=1000000}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
-OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
-BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
-BENCHFS_PREFIX="${PROJECT_ROOT}/target/debug"
-IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
+OUTPUT_DIR="$PROJECT_ROOT/results/rpc_bench/${TIMESTAMP}-${LABEL}"
+BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 
 # Debug: Print paths
 echo "=========================================="
-echo "BenchFS Job Submission"
+echo "BenchFS RPC Benchmark Job Submission"
 echo "=========================================="
 echo "PROJECT_ROOT: $PROJECT_ROOT"
 echo "BENCHFS_PREFIX: $BENCHFS_PREFIX"
-echo "IOR_PREFIX: $IOR_PREFIX"
+echo "PING_ITERATIONS: $PING_ITERATIONS"
 echo ""
 echo "Checking binary:"
-ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
-echo ""
-echo "Checking IOR:"
-ls -la "${IOR_PREFIX}/src/ior" || echo "ERROR: IOR not found at ${IOR_PREFIX}/src/ior"
+ls -la "${BENCHFS_PREFIX}/benchfs_rpc_bench" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfs_rpc_bench"
 echo "=========================================="
 
 mkdir -p "${OUTPUT_DIR}"
 cd "${OUTPUT_DIR}"
-mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
-  # 1 2 4 8
-  4
-  # 2 4 8 16
-  # 32
-  # 64
+  # 4
+  # 4 8 16 32
+  32 64
 )
 niter=1
 
@@ -57,19 +50,17 @@ for nnodes in "${nnodes_list[@]}"; do
       cmd_qsub=(
         qsub
         -A NBBG
-        -q gen_S
-        # -q gen_M
-        # -q gen_L
+        # -q gen_S
+        -q gen_M
         -l elapstim_req="${ELAPSTIM_REQ}"
         -T openmpi
         -v NQSV_MPI_VER="${NQSV_MPI_VER}"
         -b "$nnodes"
         -v OUTPUT_DIR="$OUTPUT_DIR"
         -v SCRIPT_DIR="$SCRIPT_DIR"
-        -v BACKEND_DIR="$BACKEND_DIR"
         -v LABEL="$LABEL"
         -v BENCHFS_PREFIX="$BENCHFS_PREFIX"
-        -v IOR_PREFIX="$IOR_PREFIX"
+        -v PING_ITERATIONS="$PING_ITERATIONS"
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

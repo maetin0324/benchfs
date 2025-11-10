@@ -186,6 +186,9 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Create pluvio runtime
     let runtime = Runtime::new(256);
 
+    // Set runtime in TLS for TLS-based APIs
+    pluvio_runtime::set_runtime(runtime.clone());
+
     // Create UCX context and reactor
     let ucx_context = Rc::new(UcxContext::new()?);
     let ucx_reactor = UCXReactor::current();
@@ -216,7 +219,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         return Err(format!("Failed to create chunk store directory: {}", e).into());
     }
 
-    let (chunk_store, allocator): (Rc<dyn ChunkStore>, Rc<pluvio_uring::allocator::FixedBufferAllocator>) = if config.storage.use_iouring {
+    let (chunk_store, allocator): (
+        Rc<dyn ChunkStore>,
+        Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+    ) = if config.storage.use_iouring {
         tracing::info!("Using io_uring for storage backend");
 
         // Create io_uring reactor
@@ -276,24 +282,77 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
     // Registration will be done after runtime starts (moved to async task below)
 
-    // Spawn node registration task (must run after runtime starts for UCX reactor to progress)
+    // Register all RPC handlers FIRST (before publishing address)
+    // This ensures that when clients connect, the server is ready to handle requests
+    let server_clone = rpc_server.clone();
+
+    let handler_ready = std::rc::Rc::new(std::cell::RefCell::new(false));
+    let handler_ready_clone = handler_ready.clone();
+
+    pluvio_runtime::spawn_with_name(
+        async move {
+            tracing::info!("Registering RPC handlers...");
+            match server_clone.register_all_handlers().await {
+                Ok(_) => {
+                    tracing::info!("RPC handlers registered successfully");
+                    *handler_ready_clone.borrow_mut() = true;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to register RPC handlers: {:?}", e);
+                }
+            }
+        },
+        "rpc_handler_registration".to_string(),
+    );
+
+    // Spawn node registration task (must run after RPC handlers are ready)
     let pool_clone = connection_pool.clone();
     let node_id_clone = node_id.clone();
     let registry_dir_clone = PathBuf::from(registry_dir);
     let mpi_rank_clone = state.mpi_rank;
     let mpi_size_clone = state.mpi_size;
 
-    let registration_handle = runtime.spawn_with_name(
+    let _registration_handle = pluvio_runtime::spawn_with_name(
         async move {
+            // Wait for RPC handlers to be ready before publishing address
+            tracing::info!("Waiting for RPC handlers to be ready...");
+            let max_wait = std::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+
+            loop {
+                if *handler_ready.borrow() {
+                    tracing::info!("RPC handlers confirmed ready");
+                    break;
+                }
+
+                if start.elapsed() > max_wait {
+                    tracing::error!("RPC handler registration timeout");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "RPC handler registration timeout",
+                    ));
+                }
+
+                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+            }
+
+            tracing::info!("RPC handlers ready, now registering node address");
+
+            // Small delay to ensure AM streams are fully established
+            futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
+
             // Register this node's worker address
             if let Err(e) = pool_clone.register_self(&node_id_clone) {
                 tracing::error!("Failed to register node address: {:?}", e);
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Registration failed: {:?}", e)));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Registration failed: {:?}", e),
+                ));
             }
             tracing::info!("Node {} registered to registry", node_id_clone);
 
             // Wait for all nodes to register
-            let max_wait_secs = 120;  // Increased timeout for large-scale deployments
+            let max_wait_secs = 120; // Increased timeout for large-scale deployments
             let start_time = std::time::Instant::now();
 
             tracing::info!("Waiting for {} nodes to register...", mpi_size_clone);
@@ -306,7 +365,8 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                 for rank in 0..mpi_size_clone {
                     if rank != mpi_rank_clone {
                         let other_node_id = format!("node_{}", rank);
-                        let registry_file = registry_dir_clone.join(format!("{}.addr", other_node_id));
+                        let registry_file =
+                            registry_dir_clone.join(format!("{}.addr", other_node_id));
                         if registry_file.exists() {
                             registered_count += 1;
                         }
@@ -337,10 +397,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                         }
                     }
 
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        error_msg
-                    ));
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error_msg));
                 }
 
                 if registered_count % 4 == 0 || start_time.elapsed().as_secs() % 10 == 0 {
@@ -360,22 +417,11 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         "node_registration".to_string(),
     );
 
-    // Register all RPC handlers (spawn in background)
-    let server_clone = rpc_server.clone();
-    let runtime_clone = runtime.clone();
-    runtime.spawn(async move {
-        match server_clone.register_all_handlers(runtime_clone).await {
-            Ok(_) => tracing::info!("RPC handlers registered successfully"),
-            Err(e) => tracing::error!("Failed to register RPC handlers: {:?}", e),
-        }
-    });
-    tracing::info!("RPC handler registration initiated");
-
     // Start server main loop
     let server_handle = {
         let state_clone = state.clone();
 
-        runtime.spawn_with_name(
+        pluvio_runtime::spawn_with_name(
             async move {
                 tracing::info!("RPC server listening for requests");
 
@@ -402,18 +448,11 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         tracing::info!("Storage server {} is running", node_id);
     }
 
-    runtime.clone().run(async move {
-        // Wait for registration to complete first
-        if let Err(e) = registration_handle.await {
-            tracing::error!("Node registration failed: {:?}", e);
-            tracing::error!("Stopping server due to registration failure");
-            state.stop();
-            return Err(e);
-        }
-
-        tracing::info!("Node registration completed successfully, server is now ready");
-
-        // Then wait for server to complete
+    // Run the runtime with the server handle
+    // Note: We don't await registration_handle here because it would create a deadlock.
+    // The registration task is spawned and will run concurrently with the server.
+    pluvio_runtime::run_with_name("benchfsd_mpi_server_main", async move {
+        // Wait for server to complete
         match server_handle.await {
             Ok(_) => {
                 tracing::info!("Server shutdown complete");

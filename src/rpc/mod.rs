@@ -7,26 +7,23 @@ use crate::rpc::client::RpcClient;
 use crate::rpc::handlers::RpcHandlerContext;
 
 pub mod address_registry;
+pub mod bench_ops;
+pub mod buffer_pool;
 pub mod client;
 pub mod connection;
 pub mod data_ops;
 pub mod handlers;
+pub mod helpers;
 pub mod metadata_ops;
 pub mod server;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
 
-/// RDMA threshold in bytes (32KB, same as CHFS)
-/// Data transfers larger than this will use Rendezvous (RDMA) protocol
-/// Smaller transfers will use Eager protocol for lower latency
-pub const RDMA_THRESHOLD: u64 = 32768;
-
-/// Determine whether to use RDMA based on data size
-#[inline]
-pub fn should_use_rdma(data_size: u64) -> bool {
-    data_size >= RDMA_THRESHOLD
-}
+// Re-export commonly used constants from the constants module
+pub use crate::constants::{
+    RDMA_THRESHOLD, SHUTDOWN_MAGIC, WORKER_ADDRESS_BUFFER_SIZE, should_use_rdma,
+};
 
 /// Unified server response structure
 /// Contains response header and optional data payload
