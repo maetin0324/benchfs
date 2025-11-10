@@ -16,6 +16,12 @@ pub mod handlers;
 pub mod helpers;
 pub mod metadata_ops;
 pub mod server;
+pub mod stream_client;
+pub mod stream_data_ops;
+pub mod stream_helpers;
+pub mod stream_metadata_ops;
+pub mod stream_rpc;
+pub mod stream_server;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;
