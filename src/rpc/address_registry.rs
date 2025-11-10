@@ -222,9 +222,126 @@ impl WorkerAddressRegistry {
         Ok(())
     }
 
+    /// Register Stream RPC port for a node
+    ///
+    /// # Arguments
+    /// * `node_id` - Unique identifier for this node
+    /// * `port` - Stream RPC port number
+    pub fn register_stream_port(&self, node_id: &str, port: u16) -> Result<(), RpcError> {
+        let file_path = self.stream_port_file_path(node_id);
+
+        // Write port as string to file
+        fs::write(&file_path, port.to_string()).map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Failed to write stream port for {}: {}",
+                node_id, e
+            ))
+        })?;
+
+        tracing::info!(
+            "Registered stream RPC port {} for {} at {:?}",
+            port,
+            node_id,
+            file_path
+        );
+
+        Ok(())
+    }
+
+    /// Lookup Stream RPC port for a node
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier to lookup
+    ///
+    /// # Returns
+    /// The Stream RPC port for the specified node, or an error if not found
+    pub fn lookup_stream_port(&self, node_id: &str) -> Result<u16, RpcError> {
+        let file_path = self.stream_port_file_path(node_id);
+
+        // Check if file exists
+        if !file_path.exists() {
+            return Err(RpcError::ConnectionError(format!(
+                "Stream port file not found for node {}: {:?}",
+                node_id, file_path
+            )));
+        }
+
+        // Read port from file
+        let port_str = fs::read_to_string(&file_path).map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Failed to read stream port for {}: {}",
+                node_id, e
+            ))
+        })?;
+
+        let port = port_str.trim().parse::<u16>().map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Failed to parse stream port for {}: {}",
+                node_id, e
+            ))
+        })?;
+
+        tracing::debug!("Looked up stream RPC port {} for {}", port, node_id);
+
+        Ok(port)
+    }
+
+    /// Wait for Stream RPC port to become available
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier to wait for
+    /// * `timeout_secs` - Maximum time to wait in seconds (0 = no timeout)
+    pub async fn wait_for_stream_port(
+        &self,
+        node_id: &str,
+        timeout_secs: u64,
+    ) -> Result<u16, RpcError> {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let timeout = if timeout_secs > 0 {
+            Some(Duration::from_secs(timeout_secs))
+        } else {
+            None
+        };
+
+        let mut check_count = 0;
+        loop {
+            // Try to lookup port
+            if let Ok(port) = self.lookup_stream_port(node_id) {
+                return Ok(port);
+            }
+
+            // Check timeout
+            if let Some(timeout_duration) = timeout {
+                if start.elapsed() > timeout_duration {
+                    return Err(RpcError::Timeout);
+                }
+            }
+
+            // Use short blocking sleep
+            std::thread::sleep(Duration::from_millis(10));
+            check_count += 1;
+
+            // Log every 100 checks (= 1 second at 10ms intervals)
+            if check_count % 100 == 0 {
+                tracing::debug!(
+                    "Still waiting for stream port for {} (elapsed: {:?})",
+                    node_id,
+                    start.elapsed()
+                );
+            }
+        }
+    }
+
     /// Get the file path for a node's worker address
     fn address_file_path(&self, node_id: &str) -> PathBuf {
         self.registry_dir.join(format!("{}.addr", node_id))
+    }
+
+    /// Get the file path for a node's Stream RPC port
+    fn stream_port_file_path(&self, node_id: &str) -> PathBuf {
+        self.registry_dir.join(format!("{}.stream_port", node_id))
     }
 
     /// Get the registry directory path

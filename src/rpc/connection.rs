@@ -6,20 +6,25 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::rpc::address_registry::WorkerAddressRegistry;
+use crate::rpc::stream_client::StreamRpcClient;
 use crate::rpc::{RpcClient, RpcError};
-use pluvio_ucx::Worker;
+use pluvio_ucx::{Context, Worker};
 
 /// Connection pool for managing RPC client connections to remote nodes
 ///
 /// Uses WorkerAddress exchange via shared filesystem to avoid socket_bind overhead
 pub struct ConnectionPool {
     worker: Rc<Worker>,
+    context: Arc<Context>,
     registry: WorkerAddressRegistry,
     connections: RefCell<HashMap<String, Rc<RpcClient>>>,
     /// Cache of worker address bytes (needed to keep the memory valid for WorkerAddressInner)
     address_cache: RefCell<HashMap<String, Vec<u8>>>,
+    /// Stream RPC client connections
+    stream_connections: RefCell<HashMap<String, Rc<StreamRpcClient>>>,
 }
 
 impl ConnectionPool {
@@ -27,18 +32,22 @@ impl ConnectionPool {
     ///
     /// # Arguments
     /// * `worker` - UCX worker for creating connections
+    /// * `context` - UCX context for creating Stream connections
     /// * `registry_dir` - Shared filesystem directory for WorkerAddress exchange
     pub fn new<P: AsRef<std::path::Path>>(
         worker: Rc<Worker>,
+        context: Arc<Context>,
         registry_dir: P,
     ) -> Result<Self, RpcError> {
         let registry = WorkerAddressRegistry::new(registry_dir)?;
 
         Ok(Self {
             worker,
+            context,
             registry,
             connections: RefCell::new(HashMap::new()),
             address_cache: RefCell::new(HashMap::new()),
+            stream_connections: RefCell::new(HashMap::new()),
         })
     }
 
@@ -222,6 +231,117 @@ impl ConnectionPool {
     /// Get all connected node addresses
     pub fn connected_nodes(&self) -> Vec<String> {
         self.connections.borrow().keys().cloned().collect()
+    }
+
+    /// Get the underlying registry
+    pub fn registry(&self) -> &WorkerAddressRegistry {
+        &self.registry
+    }
+
+    /// Get or create a Stream RPC connection to a remote node
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier (must be registered in the registry)
+    ///
+    /// # Returns
+    /// Stream RPC client for the specified node
+    pub async fn get_or_connect_stream(
+        &self,
+        node_id: &str,
+    ) -> Result<Rc<StreamRpcClient>, RpcError> {
+        // Check if connection already exists
+        {
+            let connections = self.stream_connections.borrow();
+            if let Some(client) = connections.get(node_id) {
+                tracing::debug!("Reusing existing Stream RPC connection to {}", node_id);
+                return Ok(client.clone());
+            }
+        }
+
+        tracing::info!(
+            "Creating new Stream RPC connection to node {}",
+            node_id
+        );
+
+        // Lookup Stream RPC port
+        let stream_port = self.registry.lookup_stream_port(node_id)?;
+
+        // Convert node_id to hostname (e.g., node_0 -> benchfs_server1 in Docker)
+        // In Docker environment, container names follow pattern benchfs_serverN
+        // where N = rank + 1, so node_0 -> benchfs_server1
+        let hostname = if node_id.starts_with("node_") {
+            let rank: i32 = node_id
+                .trim_start_matches("node_")
+                .parse()
+                .map_err(|_| {
+                    RpcError::ConnectionError(format!("Invalid node_id format: {}", node_id))
+                })?;
+            format!("benchfs_server{}", rank + 1)
+        } else {
+            node_id.to_string()
+        };
+
+        let stream_addr = format!("{}:{}", hostname, stream_port)
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "Failed to parse Stream RPC address for {}: {}",
+                    node_id, e
+                ))
+            })?;
+
+        tracing::debug!(
+            "Connecting to Stream RPC server at {} (port {})",
+            stream_addr,
+            stream_port
+        );
+
+        // Create Stream connection
+        let endpoint = self
+            .worker
+            .connect_socket(stream_addr)
+            .await
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "Failed to connect to {} via Stream RPC: {:?}",
+                    node_id, e
+                ))
+            })?;
+
+        let client = Rc::new(StreamRpcClient::new(
+            endpoint,
+            self.worker.clone(),
+            self.context.clone(),
+        ));
+
+        // Store in cache
+        self.stream_connections
+            .borrow_mut()
+            .insert(node_id.to_string(), client.clone());
+
+        tracing::info!("Stream RPC connection to {} established", node_id);
+
+        Ok(client)
+    }
+
+    /// Wait for a node to register and then create Stream RPC connection
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier to wait for
+    /// * `timeout_secs` - Maximum time to wait in seconds (0 = no timeout)
+    pub async fn wait_and_connect_stream(
+        &self,
+        node_id: &str,
+        timeout_secs: u64,
+    ) -> Result<Rc<StreamRpcClient>, RpcError> {
+        // Wait for Stream RPC port to be available
+        let _stream_port = self
+            .registry
+            .wait_for_stream_port(node_id, timeout_secs)
+            .await?;
+
+        // Create connection
+        self.get_or_connect_stream(node_id).await
     }
 }
 

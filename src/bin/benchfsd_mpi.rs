@@ -16,6 +16,7 @@ use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
+use benchfs::rpc::stream_server::StreamRpcServer;
 use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
@@ -190,7 +191,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     pluvio_runtime::set_runtime(runtime.clone());
 
     // Create UCX context and reactor
-    let ucx_context = Rc::new(UcxContext::new()?);
+    let ucx_context = Arc::new(UcxContext::new()?);
     let ucx_reactor = UCXReactor::current();
     runtime.register_reactor("ucx", ucx_reactor.clone());
 
@@ -274,11 +275,37 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         allocator,
     ));
 
-    // Create RPC server
-    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
+    // Create RPC server (Active Message based - legacy support)
+    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));
+
+    // Create Stream RPC server (Stream + RMA based)
+    let stream_rpc_server = Rc::new(StreamRpcServer::new(worker.clone(), handler_context.clone()));
+
+    // Create Stream RPC listener on a specific port
+    // Extract base port from bind_addr and add 1000 for Stream RPC
+    let base_port: u16 = config
+        .network
+        .bind_addr
+        .split(':')
+        .last()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50051);
+    let stream_port = base_port + 1000; // e.g., 50051 + 1000 = 51051
+
+    let stream_listen_addr = format!("0.0.0.0:{}", stream_port)
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("Invalid stream listen address: {}", e))?;
+
+    tracing::info!("Stream RPC server will listen on {}", stream_listen_addr);
+
+    let stream_listener = worker.create_listener(stream_listen_addr)?;
 
     // Create connection pool for inter-node communication
-    let connection_pool = Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?);
+    let connection_pool = Rc::new(ConnectionPool::new(
+        worker.clone(),
+        ucx_context.clone(),
+        registry_dir,
+    )?);
 
     // Registration will be done after runtime starts (moved to async task below)
 
@@ -311,6 +338,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let registry_dir_clone = PathBuf::from(registry_dir);
     let mpi_rank_clone = state.mpi_rank;
     let mpi_size_clone = state.mpi_size;
+    let stream_port_clone = stream_port;
 
     let _registration_handle = pluvio_runtime::spawn_with_name(
         async move {
@@ -350,6 +378,23 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                 ));
             }
             tracing::info!("Node {} registered to registry", node_id_clone);
+
+            // Register Stream RPC port
+            if let Err(e) = pool_clone
+                .registry()
+                .register_stream_port(&node_id_clone, stream_port_clone)
+            {
+                tracing::error!("Failed to register stream RPC port: {:?}", e);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Stream port registration failed: {:?}", e),
+                ));
+            }
+            tracing::info!(
+                "Stream RPC port {} registered for node {}",
+                stream_port_clone,
+                node_id_clone
+            );
 
             // Wait for all nodes to register
             let max_wait_secs = 120; // Increased timeout for large-scale deployments
@@ -417,7 +462,58 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         "node_registration".to_string(),
     );
 
-    // Start server main loop
+    // Start Stream RPC server connection acceptor
+    let stream_server_handle = {
+        let stream_server_clone = stream_rpc_server.clone();
+        let state_clone = state.clone();
+        let mut stream_listener_mut = stream_listener;
+        let worker_clone = worker.clone();
+
+        pluvio_runtime::spawn_with_name(
+            async move {
+                tracing::info!("Stream RPC server accepting connections on {}", stream_listen_addr);
+
+                loop {
+                    if !state_clone.is_running() {
+                        break;
+                    }
+
+                    // Accept incoming connection
+                    let connection = stream_listener_mut.next().await;
+
+                    match worker_clone.accept(connection).await {
+                        Ok(endpoint) => {
+                            tracing::info!("Stream RPC: accepted new client connection");
+
+                            // Spawn a task to serve this connection
+                            let server_clone = stream_server_clone.clone();
+
+                            pluvio_runtime::spawn_with_name(
+                                async move {
+                                    if let Err(e) = server_clone.serve(endpoint).await {
+                                        tracing::error!("Stream RPC connection error: {:?}", e);
+                                    }
+                                    Ok::<(), std::io::Error>(())
+                                },
+                                format!("stream_rpc_connection"),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Stream RPC accept error: {:?}", e);
+                            // Brief delay before retrying
+                            futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+
+                tracing::info!("Stream RPC server stopped accepting connections");
+                Ok::<(), std::io::Error>(())
+            },
+            "stream_rpc_acceptor".to_string(),
+        )
+    };
+
+    // Start server main loop (AM-based legacy server)
     let server_handle = {
         let state_clone = state.clone();
 

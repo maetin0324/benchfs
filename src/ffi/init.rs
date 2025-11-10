@@ -10,6 +10,7 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::error::*;
 use super::runtime::{
@@ -351,7 +352,7 @@ pub extern "C" fn benchfs_init(
 
         // Create UCX context and reactor
         let ucx_context = match UcxContext::new() {
-            Ok(ctx) => Rc::new(ctx),
+            Ok(ctx) => Arc::new(ctx),
             Err(e) => {
                 set_error_message(&format!("Failed to create UCX context: {:?}", e));
                 return std::ptr::null_mut();
@@ -402,7 +403,11 @@ pub extern "C" fn benchfs_init(
         let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
 
         // Create connection pool
-        let connection_pool = match ConnectionPool::new(worker.clone(), registry_dir_str) {
+        let connection_pool = match ConnectionPool::new(
+            worker.clone(),
+            ucx_context.clone(),
+            registry_dir_str,
+        ) {
             Ok(pool) => Rc::new(pool),
             Err(e) => {
                 set_error_message(&format!("Failed to create connection pool: {:?}", e));
@@ -468,7 +473,7 @@ pub extern "C" fn benchfs_init(
 
         // Create UCX context and reactor
         let ucx_context = match UcxContext::new() {
-            Ok(ctx) => Rc::new(ctx),
+            Ok(ctx) => Arc::new(ctx),
             Err(e) => {
                 set_error_message(&format!("Failed to create UCX context: {:?}", e));
                 return std::ptr::null_mut();
@@ -490,7 +495,11 @@ pub extern "C" fn benchfs_init(
         ucx_reactor.register_worker(worker.clone());
 
         // Create connection pool
-        let connection_pool = match ConnectionPool::new(worker, registry_dir_str) {
+        let connection_pool = match ConnectionPool::new(
+            worker,
+            ucx_context.clone(),
+            registry_dir_str,
+        ) {
             Ok(pool) => Rc::new(pool),
             Err(e) => {
                 set_error_message(&format!("Failed to create connection pool: {:?}", e));

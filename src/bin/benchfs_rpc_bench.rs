@@ -25,6 +25,7 @@ use mpi::traits::*;
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -207,7 +208,7 @@ fn main() {
     pluvio_runtime::set_runtime(runtime.clone());
 
     // Create UCX context and reactor
-    let ucx_context = Rc::new(UcxContext::new().expect("Failed to create UCX context"));
+    let ucx_context = Arc::new(UcxContext::new().expect("Failed to create UCX context"));
     let ucx_reactor = UCXReactor::current();
     runtime.register_reactor("ucx", ucx_reactor.clone());
 
@@ -228,7 +229,7 @@ fn main() {
 
     // Create connection pool
     let connection_pool = Rc::new(
-        ConnectionPool::new(worker.clone(), &registry_dir)
+        ConnectionPool::new(worker.clone(), ucx_context.clone(), &registry_dir)
             .expect("Failed to create connection pool"),
     );
 
