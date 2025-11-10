@@ -57,7 +57,7 @@ mkdir -p "$PREFIX/lib/pkgconfig"
 
 # Install library
 echo -e "${YELLOW}Installing library files...${NC}"
-cp -v target/debug/libbenchfs.so "$PREFIX/lib/" || {
+cp -v target/release/libbenchfs.so "$PREFIX/lib/" || {
     echo -e "${RED}Error: Failed to copy library file${NC}"
     exit 1
 }
