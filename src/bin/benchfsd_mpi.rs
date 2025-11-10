@@ -283,6 +283,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
     // Create Stream RPC listener on a specific port
     // Extract base port from bind_addr and add 1000 for Stream RPC
+    // Each rank gets a unique port by adding its rank number
     let base_port: u16 = config
         .network
         .bind_addr
@@ -290,7 +291,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         .last()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50051);
-    let stream_port = base_port + 1000; // e.g., 50051 + 1000 = 51051
+    let stream_port = base_port + 1000 + state.mpi_rank as u16; // e.g., Rank 0: 51051, Rank 1: 51052, etc.
 
     let stream_listen_addr = format!("0.0.0.0:{}", stream_port)
         .parse::<std::net::SocketAddr>()

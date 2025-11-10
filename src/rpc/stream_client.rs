@@ -14,7 +14,7 @@ use zerocopy::FromBytes;
 
 use super::stream_helpers::{
     stream_recv, stream_recv_completion, stream_recv_header, stream_recv_u64, stream_send,
-    stream_send_completion, stream_send_header, stream_send_u64,
+    stream_send_completion, stream_send_header, stream_send_rpc_id, stream_send_u64,
 };
 use super::stream_rpc::{
     ClientGetRequestMessage, ClientPutRequestMessage, RpcPattern, StreamRpc,
@@ -97,7 +97,12 @@ impl StreamRpcClient {
             path_bytes.len()
         );
 
-        // 2. Send request message
+        // 2. Send RPC ID first
+        stream_send_rpc_id(&self.endpoint, T::rpc_id()).await?;
+
+        tracing::trace!("execute_no_rma: sent RPC ID {}", T::rpc_id());
+
+        // 3. Send request message
         stream_send(&self.endpoint, &msg_bytes).await?;
 
         tracing::trace!("execute_no_rma: sent request message");
@@ -144,10 +149,9 @@ impl StreamRpcClient {
         );
 
         // 1. Register memory for RMA
-        let mut data_copy = data.to_vec();
-        let mem_handle = MemoryHandle::register(self.context.inner(), &mut data_copy);
+        let mem_handle = MemoryHandle::register(self.context.inner(), data);
         let rkey_buf = mem_handle.pack();
-        let data_addr = data_copy.as_ptr() as u64;
+        let data_addr = data.as_ptr() as u64;
 
         tracing::trace!(
             "execute_client_put: registered memory, data_addr={:#x}, rkey_len={}",
@@ -155,9 +159,13 @@ impl StreamRpcClient {
             rkey_buf.as_ref().len()
         );
 
-        // 2. Build and send request message (header + path + rkey + addr + size)
+        // 2. Send RPC ID first
+        stream_send_rpc_id(&self.endpoint, T::rpc_id()).await?;
+
+        tracing::trace!("execute_client_put: sent RPC ID {}", T::rpc_id());
+
+        // 3. Build and send request message (header + path + rkey + addr + size)
         let req_msg = ClientPutRequestMessage {
-            rpc_id: T::rpc_id(),
             header_bytes: zerocopy::IntoBytes::as_bytes(request.request_header()).to_vec(),
             path_bytes: request.path_bytes(),
             data_addr,
@@ -180,7 +188,7 @@ impl StreamRpcClient {
         // 4. PUT data to server
         let rkey = RKey::unpack(&self.endpoint.endpoint, rkey_buf.as_ref());
         self.endpoint
-            .put(&data_copy, server_buffer_addr, &rkey)
+            .put(data, server_buffer_addr, &rkey)
             .await
             .map_err(|e| RpcError::TransportError(format!("Failed to PUT data: {:?}", e)))?;
 
@@ -243,9 +251,13 @@ impl StreamRpcClient {
             rkey_buf.as_ref().len()
         );
 
-        // 2. Build and send request message (header + path + rkey + addr + size)
+        // 2. Send RPC ID first
+        stream_send_rpc_id(&self.endpoint, T::rpc_id()).await?;
+
+        tracing::trace!("execute_client_get: sent RPC ID {}", T::rpc_id());
+
+        // 3. Build and send request message (header + path + rkey + addr + size)
         let req_msg = ClientGetRequestMessage {
-            rpc_id: T::rpc_id(),
             header_bytes: zerocopy::IntoBytes::as_bytes(request.request_header()).to_vec(),
             path_bytes: request.path_bytes(),
             buffer_addr,

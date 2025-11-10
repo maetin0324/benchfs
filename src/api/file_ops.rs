@@ -17,10 +17,13 @@ use crate::data::{ChunkManager, PlacementStrategy, RoundRobinPlacement};
 use crate::metadata::{
     ConsistentHashRing, DirectoryMetadata, FileMetadata, InodeType, MetadataManager,
 };
-use crate::rpc::AmRpc;
 use crate::rpc::connection::ConnectionPool;
-use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
-use crate::rpc::metadata_ops::{MetadataCreateFileRequest, MetadataLookupRequest};
+use crate::rpc::stream_client::StreamRpcClient;
+use crate::rpc::stream_data_ops::{StreamReadChunkRequest, StreamWriteChunkRequest};
+use crate::rpc::stream_metadata_ops::{
+    StreamMetadataCreateFileRequest, StreamMetadataLookupRequest, StreamMetadataUpdateRequest,
+};
+use crate::rpc::stream_rpc::StreamRpc;
 use crate::storage::IOUringChunkStore;
 
 /// BenchFS Filesystem Client
@@ -191,32 +194,28 @@ impl BenchFS {
 
         // If not local and in distributed mode, fetch from remote
         let metadata_node = self.get_metadata_node(path);
-        if let Some(pool) = &self.connection_pool {
-            match pool.get_or_connect(&metadata_node).await {
-                Ok(client) => {
-                    let request = MetadataLookupRequest::new(path.to_string());
-                    match request.call(&*client).await {
-                        Ok(response) if response.is_success() && response.is_file() => {
-                            let meta = FileMetadata::new(path.to_string(), response.size);
-                            // Note: In path-based KV design, chunk locations are not tracked in metadata
+        match self.get_stream_client(&metadata_node).await {
+            Ok(stream_client) => {
+                let request = StreamMetadataLookupRequest::new(path.to_string());
+                match request.call(&*stream_client).await {
+                    Ok(response) if response.is_success() && response.is_file() => {
+                        let meta = FileMetadata::new(path.to_string(), response.size);
+                        // Note: In path-based KV design, chunk locations are not tracked in metadata
 
-                            // Cache locally for future access
-                            if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone())
-                            {
-                                tracing::warn!("Failed to cache metadata locally: {:?}", e);
-                            } else {
-                                tracing::debug!("Cached metadata for {} locally", path);
-                            }
-                            Ok(meta)
+                        // Cache locally for future access
+                        if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone())
+                        {
+                            tracing::warn!("Failed to cache metadata locally: {:?}", e);
+                        } else {
+                            tracing::debug!("Cached metadata for {} locally", path);
                         }
-                        Ok(_) => Err(ApiError::NotFound(path.to_string())),
-                        Err(e) => Err(ApiError::Internal(format!("Remote lookup failed: {:?}", e))),
+                        Ok(meta)
                     }
+                    Ok(_) => Err(ApiError::NotFound(path.to_string())),
+                    Err(e) => Err(ApiError::Internal(format!("Remote lookup failed: {:?}", e))),
                 }
-                Err(e) => Err(ApiError::Internal(format!("Connection failed: {:?}", e))),
             }
-        } else {
-            Err(ApiError::NotFound(path.to_string()))
+            Err(e) => Err(e),
         }
     }
 
@@ -248,45 +247,36 @@ impl BenchFS {
             }
         } else {
             // Remote metadata lookup via RPC
-            if let Some(pool) = &self.connection_pool {
-                match pool.get_or_connect(&metadata_node).await {
-                    Ok(client) => {
-                        let request = MetadataLookupRequest::new(path.to_string());
-                        match request.call(&*client).await {
-                            Ok(response) if response.is_success() && response.is_file() => {
-                                // File found on remote server - create local cache entry
-                                let meta = FileMetadata::new(path.to_string(), response.size);
-                                // Cache locally for future access
-                                if let Err(e) =
-                                    self.metadata_manager.store_file_metadata(meta.clone())
-                                {
-                                    tracing::warn!(
-                                        "Failed to cache metadata in benchfs_open: {:?}",
-                                        e
-                                    );
-                                } else {
-                                    tracing::debug!("Cached metadata for {} in benchfs_open", path);
-                                }
-                                Some(meta)
+            match self.get_stream_client(&metadata_node).await {
+                Ok(stream_client) => {
+                    let request = StreamMetadataLookupRequest::new(path.to_string());
+                    match request.call(&*stream_client).await {
+                        Ok(response) if response.is_success() && response.is_file() => {
+                            // File found on remote server - create local cache entry
+                            let meta = FileMetadata::new(path.to_string(), response.size);
+                            // Cache locally for future access
+                            if let Err(e) =
+                                self.metadata_manager.store_file_metadata(meta.clone())
+                            {
+                                tracing::warn!(
+                                    "Failed to cache metadata in benchfs_open: {:?}",
+                                    e
+                                );
+                            } else {
+                                tracing::debug!("Cached metadata for {} in benchfs_open", path);
                             }
-                            Ok(_) => None, // Not found or is directory
-                            Err(e) => {
-                                tracing::warn!("Remote metadata lookup failed: {:?}", e);
-                                None
-                            }
+                            Some(meta)
+                        }
+                        Ok(_) => None, // Not found or is directory
+                        Err(e) => {
+                            tracing::warn!("Remote metadata lookup failed: {:?}", e);
+                            None
                         }
                     }
-                    Err(e) => {
-                        return Err(ApiError::Internal(format!(
-                            "Failed to connect to metadata server {}: {:?}",
-                            metadata_node, e
-                        )));
-                    }
                 }
-            } else {
-                return Err(ApiError::Internal(
-                    "Distributed mode not enabled but metadata is remote".to_string(),
-                ));
+                Err(e) => {
+                    return Err(e);
+                }
             }
         };
 
@@ -308,55 +298,49 @@ impl BenchFS {
                         .map_err(|e| ApiError::Internal(format!("Failed to truncate: {:?}", e)))?;
                 } else {
                     // Remote truncate via RPC
-                    if let Some(pool) = &self.connection_pool {
-                        match pool.get_or_connect(&metadata_node).await {
-                            Ok(client) => {
-                                use crate::rpc::metadata_ops::MetadataUpdateRequest;
-                                let request =
-                                    MetadataUpdateRequest::new(path.to_string()).with_size(0);
-                                match request.call(&*client).await {
-                                    Ok(response) if response.is_success() => {
-                                        tracing::debug!("Remote truncate succeeded for {}", path);
+                    match self.get_stream_client(&metadata_node).await {
+                        Ok(stream_client) => {
+                            let request =
+                                StreamMetadataUpdateRequest::new(path.to_string()).with_size(0);
+                            match request.call(&*stream_client).await {
+                                Ok(response) if response.is_success() => {
+                                    tracing::debug!("Remote truncate succeeded for {}", path);
 
-                                        // Update local cache after successful remote truncate
-                                        let mut truncated_meta = meta.clone();
-                                        truncated_meta.size = 0;
-                                        // chunk_count and chunk_locations are not tracked in path-based KV design
-                                        if let Err(e) = self
-                                            .metadata_manager
-                                            .update_file_metadata(truncated_meta)
-                                        {
-                                            tracing::warn!(
-                                                "Failed to update local cache after remote truncate: {:?}",
-                                                e
-                                            );
-                                        } else {
-                                            tracing::debug!(
-                                                "Updated local cache after remote truncate for {}",
-                                                path
-                                            );
-                                        }
-                                    }
-                                    Ok(response) => {
-                                        return Err(ApiError::Internal(format!(
-                                            "Remote truncate failed with status {}",
-                                            response.status
-                                        )));
-                                    }
-                                    Err(e) => {
-                                        return Err(ApiError::Internal(format!(
-                                            "Remote truncate RPC error: {:?}",
+                                    // Update local cache after successful remote truncate
+                                    let mut truncated_meta = meta.clone();
+                                    truncated_meta.size = 0;
+                                    // chunk_count and chunk_locations are not tracked in path-based KV design
+                                    if let Err(e) = self
+                                        .metadata_manager
+                                        .update_file_metadata(truncated_meta)
+                                    {
+                                        tracing::warn!(
+                                            "Failed to update local cache after remote truncate: {:?}",
                                             e
-                                        )));
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "Updated local cache after remote truncate for {}",
+                                            path
+                                        );
                                     }
                                 }
+                                Ok(response) => {
+                                    return Err(ApiError::Internal(format!(
+                                        "Remote truncate failed with status {}",
+                                        response.status
+                                    )));
+                                }
+                                Err(e) => {
+                                    return Err(ApiError::Internal(format!(
+                                        "Remote truncate RPC error: {:?}",
+                                        e
+                                    )));
+                                }
                             }
-                            Err(e) => {
-                                return Err(ApiError::Internal(format!(
-                                    "Failed to connect for truncate: {:?}",
-                                    e
-                                )));
-                            }
+                        }
+                        Err(e) => {
+                            return Err(e);
                         }
                     }
                 }
@@ -381,58 +365,49 @@ impl BenchFS {
                 0 // Dummy inode
             } else {
                 // Remote file creation via RPC
-                if let Some(pool) = &self.connection_pool {
-                    match pool.get_or_connect(&metadata_node).await {
-                        Ok(client) => {
-                            let request =
-                                MetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
-                            match request.call(&*client).await {
-                                Ok(response) if response.is_success() => {
-                                    tracing::debug!("Remote file created: {}", path);
+                match self.get_stream_client(&metadata_node).await {
+                    Ok(stream_client) => {
+                        let request =
+                            StreamMetadataCreateFileRequest::new(path.to_string(), 0, 0o644);
+                        match request.call(&*stream_client).await {
+                            Ok(response) if response.is_success() => {
+                                tracing::debug!("Remote file created: {}", path);
 
-                                    // Cache newly created file metadata locally
-                                    let file_meta = FileMetadata::new(path.to_string(), 0);
-                                    if let Err(e) =
-                                        self.metadata_manager.store_file_metadata(file_meta)
-                                    {
-                                        tracing::warn!(
-                                            "Failed to cache metadata after remote create: {:?}",
-                                            e
-                                        );
-                                    } else {
-                                        tracing::debug!(
-                                            "Cached metadata for newly created file {} locally",
-                                            path
-                                        );
-                                    }
-
-                                    0 // Dummy inode
-                                }
-                                Ok(response) => {
-                                    return Err(ApiError::Internal(format!(
-                                        "Remote create failed with status {}",
-                                        response.status
-                                    )));
-                                }
-                                Err(e) => {
-                                    return Err(ApiError::Internal(format!(
-                                        "Remote create RPC error: {:?}",
+                                // Cache newly created file metadata locally
+                                let file_meta = FileMetadata::new(path.to_string(), 0);
+                                if let Err(e) =
+                                    self.metadata_manager.store_file_metadata(file_meta)
+                                {
+                                    tracing::warn!(
+                                        "Failed to cache metadata after remote create: {:?}",
                                         e
-                                    )));
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Cached metadata for newly created file {} locally",
+                                        path
+                                    );
                                 }
+
+                                0 // Dummy inode
+                            }
+                            Ok(response) => {
+                                return Err(ApiError::Internal(format!(
+                                    "Remote create failed with status {}",
+                                    response.status
+                                )));
+                            }
+                            Err(e) => {
+                                return Err(ApiError::Internal(format!(
+                                    "Remote create RPC error: {:?}",
+                                    e
+                                )));
                             }
                         }
-                        Err(e) => {
-                            return Err(ApiError::Internal(format!(
-                                "Failed to connect for create: {:?}",
-                                e
-                            )));
-                        }
                     }
-                } else {
-                    return Err(ApiError::Internal(
-                        "Distributed mode not enabled but metadata is remote".to_string(),
-                    ));
+                    Err(e) => {
+                        return Err(e);
+                    }
                 }
             };
 
@@ -486,21 +461,17 @@ impl BenchFS {
                 }
             } else {
                 // Query remote metadata for size
-                if let Some(pool) = &self.connection_pool {
-                    match pool.get_or_connect(&metadata_node).await {
-                        Ok(client) => {
-                            let request = MetadataLookupRequest::new(path.to_string());
-                            match request.call(&*client).await {
-                                Ok(response) if response.is_success() && response.is_file() => {
-                                    response.size
-                                }
-                                _ => 0,
+                match self.get_stream_client(&metadata_node).await {
+                    Ok(stream_client) => {
+                        let request = StreamMetadataLookupRequest::new(path.to_string());
+                        match request.call(&*stream_client).await {
+                            Ok(response) if response.is_success() && response.is_file() => {
+                                response.size
                             }
+                            _ => 0,
                         }
-                        _ => 0,
                     }
-                } else {
-                    0
+                    _ => 0,
                 }
             };
             handle.seek(file_size);
@@ -590,59 +561,59 @@ impl BenchFS {
                                 (chunk_index, Some(full_chunk))
                             }
                             Err(_) => {
-                                if let Some(pool) = &fs.connection_pool {
-                                    let chunk_key = format!("{}/{}", &file_path, chunk_index);
-                                    let node_id = fs.get_chunk_node(&chunk_key);
+                                let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                                let node_id = fs.get_chunk_node(&chunk_key);
 
-                                    tracing::debug!(
-                                        "Fetching chunk {} from remote node {}",
-                                        chunk_index,
-                                        node_id
-                                    );
+                                tracing::debug!(
+                                    "Fetching chunk {} from remote node {}",
+                                    chunk_index,
+                                    node_id
+                                );
 
-                                    match pool.get_or_connect(&node_id).await {
-                                        Ok(client) => {
-                                            let request = ReadChunkRequest::new(
-                                                chunk_index,
-                                                0,
-                                                fs.chunk_manager.chunk_size() as u64,
-                                                file_path.clone(),
-                                            );
+                                match fs.get_stream_client(&node_id).await {
+                                    Ok(stream_client) => {
+                                        let request = StreamReadChunkRequest::new(
+                                            chunk_index,
+                                            0,
+                                            fs.chunk_manager.chunk_size() as u64,
+                                            file_path.clone(),
+                                        );
 
-                                            match request.call(&*client).await {
-                                                Ok(response) if response.is_success() => {
-                                                    let full_chunk = request.take_data();
-                                                    tracing::debug!(
-                                                        "Successfully fetched {} bytes from remote node",
-                                                        full_chunk.len()
-                                                    );
-                                                    fs.chunk_cache.put(chunk_id, full_chunk.clone());
-                                                    (chunk_index, Some(full_chunk))
-                                                }
-                                                Ok(response) => {
-                                                    tracing::warn!(
-                                                        "Remote read failed with status {}",
-                                                        response.status
-                                                    );
-                                                    (chunk_index, None)
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!("RPC error: {:?}", e);
-                                                    (chunk_index, None)
-                                                }
+                                        // Allocate buffer for receiving data
+                                        let mut buffer = vec![0u8; fs.chunk_manager.chunk_size()];
+
+                                        match stream_client.execute_client_get(&request, &mut buffer).await {
+                                            Ok((response, bytes_read)) if response.is_success() => {
+                                                // Truncate buffer to actual bytes read
+                                                buffer.truncate(bytes_read);
+                                                tracing::debug!(
+                                                    "Successfully fetched {} bytes from remote node",
+                                                    bytes_read
+                                                );
+                                                fs.chunk_cache.put(chunk_id, buffer.clone());
+                                                (chunk_index, Some(buffer))
+                                            }
+                                            Ok((response, _)) => {
+                                                tracing::warn!(
+                                                    "Remote read failed with status {}",
+                                                    response.status
+                                                );
+                                                (chunk_index, None)
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("RPC error: {:?}", e);
+                                                (chunk_index, None)
                                             }
                                         }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to connect to {}: {:?}",
-                                                node_id,
-                                                e
-                                            );
-                                            (chunk_index, None)
-                                        }
                                     }
-                                } else {
-                                    (chunk_index, None)
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to connect to {}: {:?}",
+                                            node_id,
+                                            e
+                                        );
+                                        (chunk_index, None)
+                                    }
                                 }
                             }
                         }
@@ -780,7 +751,7 @@ impl BenchFS {
                                     ))
                                 })?;
                             Ok::<usize, ApiError>(data_len)
-                        } else if let Some(pool) = &fs.connection_pool {
+                        } else {
                             // Write to remote node using node_id
                             tracing::debug!(
                                 "Writing chunk {} to remote node {}",
@@ -788,10 +759,10 @@ impl BenchFS {
                                 target_node
                             );
 
-                            match pool.get_or_connect(&target_node).await {
-                                Ok(client) => {
+                            match fs.get_stream_client(&target_node).await {
+                                Ok(stream_client) => {
                                     // Create RPC request
-                                    let request = WriteChunkRequest::new(
+                                    let request = StreamWriteChunkRequest::new(
                                         chunk_index,
                                         chunk_offset,
                                         chunk_data.as_slice(),
@@ -799,7 +770,7 @@ impl BenchFS {
                                     );
 
                                     // Execute RPC
-                                    match request.call(&*client).await {
+                                    match stream_client.execute_client_put(&request, chunk_data.as_slice()).await {
                                         Ok(response) if response.is_success() => {
                                             tracing::debug!(
                                                 "Successfully wrote {} bytes to remote node",
@@ -816,17 +787,8 @@ impl BenchFS {
                                         }
                                     }
                                 }
-                                Err(e) => Err(ApiError::IoError(format!(
-                                    "Failed to connect to {}: {:?}",
-                                    target_node, e
-                                ))),
+                                Err(e) => Err(e),
                             }
-                        } else {
-                            // Not in distributed mode but chunk should be on a different node
-                            Err(ApiError::Internal(format!(
-                                "Chunk {} should be on node {} but distributed mode is not enabled",
-                                chunk_index, target_node
-                            )))
                         }
                     },
                     format!("benchfs_write_chunk_{}", chunk_index),
@@ -884,20 +846,40 @@ impl BenchFS {
                 // Get final file metadata from local cache
                 if let Ok(file_meta) = self.metadata_manager.get_file_metadata(path_ref) {
                     // Sync to remote metadata server
-                    if let Some(pool) = &self.connection_pool {
-                        // Use timeout to prevent hanging on close
-                        let timeout_duration = Duration::from_secs(5);
-                        let mut timeout = Delay::new(timeout_duration).fuse();
+                    // Use timeout to prevent hanging on close
+                    let timeout_duration = Duration::from_secs(5);
+                    let mut timeout = Delay::new(timeout_duration).fuse();
 
-                        // Try to connect with timeout
-                        let connect_future = pool.get_or_connect(&metadata_node).fuse();
-                        futures::pin_mut!(connect_future);
+                    // Try to connect with timeout
+                    let connect_future = self.get_stream_client(&metadata_node).fuse();
+                    futures::pin_mut!(connect_future);
 
-                        let client_result = futures::select! {
-                            result = connect_future => Some(result),
-                            _ = timeout => {
+                    let client_result = futures::select! {
+                        result = connect_future => Some(result),
+                        _ = timeout => {
+                            tracing::warn!(
+                                "Connection timeout for metadata sync on close: {} (timeout: {:?})",
+                                handle.path,
+                                timeout_duration
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some(Ok(stream_client)) = client_result {
+                        let request = StreamMetadataUpdateRequest::new(handle.path.clone())
+                            .with_size(file_meta.size);
+
+                        // Also use timeout for RPC call
+                        let mut rpc_timeout = Delay::new(timeout_duration).fuse();
+                        let rpc_future = request.call(&*stream_client).fuse();
+                        futures::pin_mut!(rpc_future);
+
+                        let rpc_result = futures::select! {
+                            result = rpc_future => Some(result),
+                            _ = rpc_timeout => {
                                 tracing::warn!(
-                                    "Connection timeout for metadata sync on close: {} (timeout: {:?})",
+                                    "Metadata sync RPC timeout on close: {} (timeout: {:?})",
                                     handle.path,
                                     timeout_duration
                                 );
@@ -905,53 +887,30 @@ impl BenchFS {
                             }
                         };
 
-                        if let Some(Ok(client)) = client_result {
-                            use crate::rpc::metadata_ops::MetadataUpdateRequest;
-                            let request = MetadataUpdateRequest::new(handle.path.clone())
-                                .with_size(file_meta.size);
-
-                            // Also use timeout for RPC call
-                            let mut rpc_timeout = Delay::new(timeout_duration).fuse();
-                            let rpc_future = request.call(&*client).fuse();
-                            futures::pin_mut!(rpc_future);
-
-                            let rpc_result = futures::select! {
-                                result = rpc_future => Some(result),
-                                _ = rpc_timeout => {
-                                    tracing::warn!(
-                                        "Metadata sync RPC timeout on close: {} (timeout: {:?})",
-                                        handle.path,
-                                        timeout_duration
-                                    );
-                                    None
-                                }
-                            };
-
-                            match rpc_result {
-                                Some(Ok(response)) if response.is_success() => {
-                                    tracing::debug!(
-                                        "Synced metadata on close: {} (size: {})",
-                                        handle.path,
-                                        file_meta.size
-                                    );
-                                }
-                                Some(Ok(response)) => {
-                                    tracing::warn!(
-                                        "Failed to sync metadata on close: {} (status: {})",
-                                        handle.path,
-                                        response.status
-                                    );
-                                }
-                                Some(Err(e)) => {
-                                    tracing::warn!("Metadata sync RPC error on close: {:?}", e);
-                                }
-                                None => {
-                                    // Already logged timeout
-                                }
+                        match rpc_result {
+                            Some(Ok(response)) if response.is_success() => {
+                                tracing::debug!(
+                                    "Synced metadata on close: {} (size: {})",
+                                    handle.path,
+                                    file_meta.size
+                                );
                             }
-                        } else if let Some(Err(e)) = client_result {
-                            tracing::warn!("Failed to connect for metadata sync on close: {:?}", e);
+                            Some(Ok(response)) => {
+                                tracing::warn!(
+                                    "Failed to sync metadata on close: {} (status: {})",
+                                    handle.path,
+                                    response.status
+                                );
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("Metadata sync RPC error on close: {:?}", e);
+                            }
+                            None => {
+                                // Already logged timeout
+                            }
                         }
+                    } else if let Some(Err(e)) = client_result {
+                        tracing::warn!("Failed to connect for metadata sync on close: {:?}", e);
                     }
                 }
             }
@@ -1168,38 +1127,29 @@ impl BenchFS {
             Err(ApiError::NotFound(path.to_string()))
         } else {
             // Remote metadata lookup via RPC
-            if let Some(pool) = &self.connection_pool {
-                match pool.get_or_connect(&metadata_node).await {
-                    Ok(client) => {
-                        let request = MetadataLookupRequest::new(path.to_string());
-                        match request.call(&*client).await {
-                            Ok(response) if response.is_success() && response.is_file() => {
-                                // File found
-                                let meta = FileMetadata::new(path.to_string(), response.size);
-                                Ok(FileStat::from_file_metadata(&meta))
-                            }
-                            Ok(response) if response.is_success() && response.is_directory() => {
-                                // Directory found
-                                let dir_meta =
-                                    DirectoryMetadata::new(response.inode, path.to_string());
-                                Ok(FileStat::from_dir_metadata(&dir_meta))
-                            }
-                            Ok(_) => Err(ApiError::NotFound(path.to_string())),
-                            Err(e) => Err(ApiError::Internal(format!(
-                                "Remote stat RPC error: {:?}",
-                                e
-                            ))),
+            match self.get_stream_client(&metadata_node).await {
+                Ok(stream_client) => {
+                    let request = StreamMetadataLookupRequest::new(path.to_string());
+                    match request.call(&*stream_client).await {
+                        Ok(response) if response.is_success() && response.is_file() => {
+                            // File found
+                            let meta = FileMetadata::new(path.to_string(), response.size);
+                            Ok(FileStat::from_file_metadata(&meta))
                         }
+                        Ok(response) if response.is_success() && response.is_directory() => {
+                            // Directory found
+                            let dir_meta =
+                                DirectoryMetadata::new(response.inode, path.to_string());
+                            Ok(FileStat::from_dir_metadata(&dir_meta))
+                        }
+                        Ok(_) => Err(ApiError::NotFound(path.to_string())),
+                        Err(e) => Err(ApiError::Internal(format!(
+                            "Remote stat RPC error: {:?}",
+                            e
+                        ))),
                     }
-                    Err(e) => Err(ApiError::Internal(format!(
-                        "Failed to connect to metadata server {}: {:?}",
-                        metadata_node, e
-                    ))),
                 }
-            } else {
-                Err(ApiError::Internal(
-                    "Distributed mode not enabled but metadata is remote".to_string(),
-                ))
+                Err(e) => Err(e),
             }
         }
     }
@@ -1417,6 +1367,24 @@ impl BenchFS {
             Some(path[last_slash + 1..].to_string())
         } else {
             Some(path.to_string())
+        }
+    }
+
+    /// Get Stream RPC client for a node
+    ///
+    /// Helper method to get StreamRpcClient from connection pool.
+    /// This centralizes error handling and connection management.
+    async fn get_stream_client(&self, node_id: &str) -> ApiResult<Rc<StreamRpcClient>> {
+        if let Some(pool) = &self.connection_pool {
+            pool.get_or_connect_stream(node_id)
+                .await
+                .map_err(|e| {
+                    ApiError::Internal(format!("Failed to connect to {}: {:?}", node_id, e))
+                })
+        } else {
+            Err(ApiError::Internal(
+                "Distributed mode not enabled".to_string(),
+            ))
         }
     }
 }

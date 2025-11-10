@@ -206,11 +206,9 @@ pub trait StreamRpc {
 /// Request message for Client PUT pattern
 ///
 /// Contains the request header, path, memory location info, and rkey for RMA.
+/// Note: RPC ID is sent separately before this message.
 #[derive(Debug, Clone)]
 pub struct ClientPutRequestMessage {
-    /// RPC ID
-    pub rpc_id: RpcId,
-
     /// Request header bytes
     pub header_bytes: Vec<u8>,
 
@@ -229,11 +227,9 @@ pub struct ClientPutRequestMessage {
 
 impl ClientPutRequestMessage {
     /// Serialize to bytes for stream transmission
+    /// Note: RPC ID is sent separately before this message
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-
-        // RPC ID (2 bytes)
-        bytes.extend_from_slice(&self.rpc_id.to_le_bytes());
 
         // Header length (4 bytes)
         bytes.extend_from_slice(&(self.header_bytes.len() as u32).to_le_bytes());
@@ -263,18 +259,15 @@ impl ClientPutRequestMessage {
     }
 
     /// Deserialize from bytes
+    /// Note: RPC ID is received separately before this message
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RpcError> {
-        if bytes.len() < 2 + 4 {
+        if bytes.len() < 4 {
             return Err(RpcError::TransportError(
                 "Message too short for ClientPutRequestMessage".to_string(),
             ));
         }
 
         let mut offset = 0;
-
-        // RPC ID
-        let rpc_id = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
-        offset += 2;
 
         // Header length
         let header_len = u32::from_le_bytes([
@@ -359,7 +352,6 @@ impl ClientPutRequestMessage {
         let rkey = bytes[offset..offset + rkey_len].to_vec();
 
         Ok(Self {
-            rpc_id,
             header_bytes,
             path_bytes,
             data_addr,
@@ -372,11 +364,9 @@ impl ClientPutRequestMessage {
 /// Request message for Client GET pattern
 ///
 /// Contains the request header, path, buffer location info, and rkey for RMA.
+/// Note: RPC ID is sent separately before this message.
 #[derive(Debug, Clone)]
 pub struct ClientGetRequestMessage {
-    /// RPC ID
-    pub rpc_id: RpcId,
-
     /// Request header bytes
     pub header_bytes: Vec<u8>,
 
@@ -395,11 +385,9 @@ pub struct ClientGetRequestMessage {
 
 impl ClientGetRequestMessage {
     /// Serialize to bytes for stream transmission
+    /// Note: RPC ID is sent separately before this message
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-
-        // RPC ID (2 bytes)
-        bytes.extend_from_slice(&self.rpc_id.to_le_bytes());
 
         // Header length (4 bytes)
         bytes.extend_from_slice(&(self.header_bytes.len() as u32).to_le_bytes());
@@ -429,18 +417,15 @@ impl ClientGetRequestMessage {
     }
 
     /// Deserialize from bytes
+    /// Note: RPC ID is received separately before this message
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RpcError> {
-        if bytes.len() < 2 + 4 {
+        if bytes.len() < 4 {
             return Err(RpcError::TransportError(
                 "Message too short for ClientGetRequestMessage".to_string(),
             ));
         }
 
         let mut offset = 0;
-
-        // RPC ID
-        let rpc_id = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
-        offset += 2;
 
         // Header length
         let header_len = u32::from_le_bytes([
@@ -525,7 +510,6 @@ impl ClientGetRequestMessage {
         let rkey = bytes[offset..offset + rkey_len].to_vec();
 
         Ok(Self {
-            rpc_id,
             header_bytes,
             path_bytes,
             buffer_addr,
@@ -542,7 +526,6 @@ mod tests {
     #[test]
     fn test_client_put_request_message_serialization() {
         let msg = ClientPutRequestMessage {
-            rpc_id: 10,
             header_bytes: vec![1, 2, 3, 4],
             path_bytes: b"/test/file.txt".to_vec(),
             data_addr: 0x1000,
@@ -553,7 +536,6 @@ mod tests {
         let bytes = msg.to_bytes();
         let deserialized = ClientPutRequestMessage::from_bytes(&bytes).unwrap();
 
-        assert_eq!(deserialized.rpc_id, 10);
         assert_eq!(deserialized.header_bytes, vec![1, 2, 3, 4]);
         assert_eq!(deserialized.path_bytes, b"/test/file.txt".to_vec());
         assert_eq!(deserialized.data_addr, 0x1000);
@@ -564,7 +546,6 @@ mod tests {
     #[test]
     fn test_client_get_request_message_serialization() {
         let msg = ClientGetRequestMessage {
-            rpc_id: 11,
             header_bytes: vec![5, 6, 7, 8],
             path_bytes: b"/test/read.txt".to_vec(),
             buffer_addr: 0x2000,
@@ -575,7 +556,6 @@ mod tests {
         let bytes = msg.to_bytes();
         let deserialized = ClientGetRequestMessage::from_bytes(&bytes).unwrap();
 
-        assert_eq!(deserialized.rpc_id, 11);
         assert_eq!(deserialized.header_bytes, vec![5, 6, 7, 8]);
         assert_eq!(deserialized.path_bytes, b"/test/read.txt".to_vec());
         assert_eq!(deserialized.buffer_addr, 0x2000);

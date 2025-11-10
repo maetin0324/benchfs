@@ -281,18 +281,30 @@ impl ConnectionPool {
             node_id.to_string()
         };
 
-        let stream_addr = format!("{}:{}", hostname, stream_port)
-            .parse::<std::net::SocketAddr>()
+        // Resolve hostname to SocketAddr using ToSocketAddrs
+        use std::net::ToSocketAddrs;
+        let addr_str = format!("{}:{}", hostname, stream_port);
+        let stream_addr = addr_str
+            .to_socket_addrs()
             .map_err(|e| {
                 RpcError::ConnectionError(format!(
-                    "Failed to parse Stream RPC address for {}: {}",
-                    node_id, e
+                    "Failed to resolve hostname {} for {}: {}",
+                    hostname, node_id, e
+                ))
+            })?
+            .next()
+            .ok_or_else(|| {
+                RpcError::ConnectionError(format!(
+                    "No addresses found for hostname {} (node {})",
+                    hostname, node_id
                 ))
             })?;
 
         tracing::debug!(
-            "Connecting to Stream RPC server at {} (port {})",
+            "Connecting to Stream RPC server at {} (resolved from {}:{}, port {})",
             stream_addr,
+            hostname,
+            stream_port,
             stream_port
         );
 
