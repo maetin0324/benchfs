@@ -145,7 +145,7 @@ export UCX_USE_MT_MUTEX=n                # マルチスレッドmutex無効
 #   with current implementation
 UCX_LOG_LEVEL="DEBUG"
 
-# export UCX_LOG_LEVEL
+export UCX_LOG_LEVEL
 export UCX_RNDV_THRESH
 
 # Calculate project root from SCRIPT_DIR and set LD_LIBRARY_PATH dynamically
