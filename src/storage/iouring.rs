@@ -491,7 +491,7 @@ mod tests {
 
         runtime
             .clone()
-            .run_with_name("iouring_backend_test_create_write", async move {
+            .run_with_name_and_runtime("iouring_backend_test_create_write", async move {
                 let backend = IOUringBackend::new(allocator);
 
                 // ファイルを作成
