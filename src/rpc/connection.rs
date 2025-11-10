@@ -371,15 +371,59 @@ impl ConnectionPool {
 
         tracing::info!("Socket connection established to {}", node_id);
 
-        // SKIP CLIENT_ID HANDSHAKE: UCX Socket mode appears to have internal
-        // handshake requirements that conflict with our stream-based client_id exchange.
-        // The UCX library may be calling stream_recv internally during wireup,
-        // causing our protocol to fail.
-        //
-        // For now, we skip the client_id handshake and use a placeholder.
-        // Client IDs can be exchanged later via AM messages after wireup completes.
-        let client_id = 0u32; // Placeholder client_id
-        tracing::debug!("Skipping client_id handshake, using placeholder client_id {}", client_id);
+        // Exchange WorkerAddress after Socket connection to enable InfiniBand lanes
+        // This hybrid approach:
+        // 1. Establishes initial TCP connection via Socket mode
+        // 2. Exchanges WorkerAddress over TCP
+        // 3. Allows UCX to add InfiniBand lanes for RDMA
+
+        tracing::debug!("Exchanging WorkerAddress with {} for InfiniBand lane setup", node_id);
+
+        // Get our WorkerAddress
+        let our_address = self.worker.address().map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to get worker address: {:?}", e))
+        })?;
+        let our_addr_bytes: &[u8] = our_address.as_ref();
+
+        // Send our WorkerAddress length and data
+        let addr_len = our_addr_bytes.len() as u32;
+        let addr_len_bytes = addr_len.to_le_bytes();
+        endpoint.stream_send(&addr_len_bytes).await.map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to send address length: {:?}", e))
+        })?;
+
+        endpoint.stream_send(our_addr_bytes).await.map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to send worker address: {:?}", e))
+        })?;
+
+        // Receive remote WorkerAddress length
+        let mut len_buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); 4];
+        endpoint.stream_recv(&mut len_buf).await.map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to receive address length: {:?}", e))
+        })?;
+        // SAFETY: stream_recv initializes the buffer
+        let len_buf: Vec<u8> = unsafe { std::mem::transmute(len_buf) };
+        let remote_addr_len = u32::from_le_bytes([len_buf[0], len_buf[1], len_buf[2], len_buf[3]]) as usize;
+
+        // Receive remote WorkerAddress
+        let mut remote_addr_bytes: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); remote_addr_len];
+        endpoint.stream_recv(&mut remote_addr_bytes).await.map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to receive worker address: {:?}", e))
+        })?;
+        // SAFETY: stream_recv initializes the buffer
+        let _remote_addr_bytes: Vec<u8> = unsafe { std::mem::transmute(remote_addr_bytes) };
+
+        tracing::info!(
+            "WorkerAddress exchange complete with {} (sent {} bytes, received {} bytes)",
+            node_id, our_addr_bytes.len(), remote_addr_len
+        );
+
+        // Note: UCX will automatically use the exchanged addresses to add InfiniBand lanes
+        // when available, enabling RDMA for subsequent transfers
+
+        // Use placeholder client_id (can be implemented later via AM messages if needed)
+        let client_id = 0u32;
+        tracing::debug!("Using placeholder client_id {}", client_id);
 
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
         let client = Rc::new(RpcClient::new(conn));

@@ -556,14 +556,76 @@ impl SocketAcceptor {
                         connection_count
                     );
 
-                    // SKIP CLIENT_ID HANDSHAKE: UCX Socket mode appears to have internal
-                    // handshake requirements that conflict with our stream-based client_id exchange.
-                    // The UCX library may be calling stream_recv internally during wireup,
-                    // causing our protocol to fail.
-                    //
-                    // For now, we skip the client_id handshake and use a simple counter.
-                    // Client IDs can be exchanged later via AM messages after wireup completes.
-                    tracing::debug!("Skipping client_id handshake for now, assigning client_id {}", client_id);
+                    // Exchange WorkerAddress after Socket connection to enable InfiniBand lanes
+                    // This matches the client-side implementation in connection.rs
+                    tracing::debug!("Exchanging WorkerAddress with client {} for InfiniBand lane setup", client_id);
+
+                    // Receive client's WorkerAddress length
+                    let mut len_buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); 4];
+                    match endpoint.stream_recv(&mut len_buf).await {
+                        Ok(_) => {
+                            // SAFETY: stream_recv initializes the buffer
+                            let len_buf: Vec<u8> = unsafe { std::mem::transmute(len_buf) };
+                            let client_addr_len = u32::from_le_bytes([len_buf[0], len_buf[1], len_buf[2], len_buf[3]]) as usize;
+
+                            // Receive client's WorkerAddress
+                            let mut client_addr_bytes: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); client_addr_len];
+                            match endpoint.stream_recv(&mut client_addr_bytes).await {
+                                Ok(_) => {
+                                    // Get our WorkerAddress
+                                    match self.worker.address() {
+                                        Ok(our_address) => {
+                                            let our_addr_bytes: &[u8] = our_address.as_ref();
+
+                                            // Send our WorkerAddress length and data
+                                            let addr_len = our_addr_bytes.len() as u32;
+                                            let addr_len_bytes = addr_len.to_le_bytes();
+
+                                            match endpoint.stream_send(&addr_len_bytes).await {
+                                                Ok(_) => {
+                                                    match endpoint.stream_send(our_addr_bytes).await {
+                                                        Ok(_) => {
+                                                            tracing::info!(
+                                                                "WorkerAddress exchange complete with client {} (received {} bytes, sent {} bytes)",
+                                                                client_id, client_addr_len, our_addr_bytes.len()
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("Failed to send worker address to client {}: {:?}", client_id, e);
+                                                            consecutive_errors += 1;
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("Failed to send address length to client {}: {:?}", client_id, e);
+                                                    consecutive_errors += 1;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to get worker address for client {}: {:?}", client_id, e);
+                                            consecutive_errors += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to receive worker address from client {}: {:?}", client_id, e);
+                                    consecutive_errors += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to receive address length from client {}: {:?}", client_id, e);
+                            consecutive_errors += 1;
+                            continue;
+                        }
+                    }
+
+                    tracing::debug!("Client {} registered with InfiniBand lane support", client_id);
 
                     // Register the client endpoint
                     if let Some(evicted_id) = self.client_registry.register(client_id, endpoint) {

@@ -252,54 +252,41 @@ export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
 # ==================================================
-# Automatically detect whether UCX PML is available; fall back to TCP/ob1 if not.
+# IMPORTANT: benchfs directly manages UCX for Socket connection mode.
+# Using MPI UCX PML causes dual UCX context conflicts that break InfiniBand lanes.
+# Solution: Force MPI to use ob1/tcp and let benchfs handle UCX directly.
+#
+# This fixes the issue where:
+# - io_uring benchmarks succeed (no UCX conflict)
+# - MPI-less 2-node UCX communication succeeds (single UCX context)
+# - MPI + UCX + benchfs fails (dual UCX contexts conflict)
 
-supports_ucx_pml() {
-  command -v ompi_info >/dev/null 2>&1 || return 1
-  ompi_info --param pml all --level 9 2>/dev/null | grep -q "mca:pml:.*ucx"
-}
+# Always use ob1/tcp for MPI to avoid UCX context conflicts with benchfs
+# benchfs will handle UCX directly for InfiniBand RDMA communication
+cmd_mpirun_common=(
+  mpirun
+  "${nqsii_mpiopts_array[@]}"
+  --mca pml ob1
+  --mca btl tcp,vader,self
+  --mca btl_openib_allow_ib 0
+  -x UCX_TLS
+  -x UCX_NET_DEVICES
+  -x UCX_MEMTYPE_CACHE
+  -x UCX_PROTOS
+  -x UCX_LOG_LEVEL
+  -x UCX_RNDV_THRESH
+  -x UCX_RNDV_SCHEME
+  -x UCX_RC_TIMEOUT
+  -x UCX_RC_RETRY_COUNT
+  -x UCX_RC_TIMEOUT_MULTIPLIER
+  -x UCX_AM_MAX_SHORT
+  -x UCX_AM_MAX_EAGER
+  -x PATH
+  -x LD_LIBRARY_PATH
+)
 
-if supports_ucx_pml; then
-  USE_UCX_PML=1
-  echo "UCX PML detected – using --mca pml ucx configuration"
-else
-  USE_UCX_PML=0
-  echo "WARNING: UCX PML not available – falling back to ob1/tcp configuration"
-fi
-
-if [[ "${USE_UCX_PML}" -eq 1 ]]; then
-  cmd_mpirun_common=(
-    mpirun
-    "${nqsii_mpiopts_array[@]}"
-    --mca pml ucx
-    --mca btl self
-    --mca osc ucx
-    -x UCX_TLS
-    -x UCX_NET_DEVICES
-    -x UCX_MEMTYPE_CACHE
-    -x UCX_PROTOS
-    -x UCX_LOG_LEVEL
-    -x UCX_RNDV_THRESH
-    -x UCX_RNDV_SCHEME
-    -x UCX_RC_TIMEOUT
-    -x UCX_RC_RETRY_COUNT
-    -x UCX_RC_TIMEOUT_MULTIPLIER
-    -x UCX_AM_MAX_SHORT
-    -x UCX_AM_MAX_EAGER
-    -x PATH
-    -x LD_LIBRARY_PATH
-  )
-else
-  cmd_mpirun_common=(
-    mpirun
-    "${nqsii_mpiopts_array[@]}"
-    --mca pml ob1
-    --mca btl tcp,vader,self
-    --mca btl_openib_allow_ib 0
-    -x PATH
-    -x LD_LIBRARY_PATH
-  )
-fi
+echo "MPI Configuration: Using ob1/tcp to avoid UCX context conflicts"
+echo "benchfs will handle UCX directly for InfiniBand RDMA communication"
 
 # Kill any previous benchfsd instances
 cmd_mpirun_kill=(
