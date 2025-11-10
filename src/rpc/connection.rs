@@ -121,6 +121,11 @@ impl ConnectionPool {
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
         let client = Rc::new(RpcClient::new(conn));
 
+        // Use placeholder client_id (can be implemented later via AM messages if needed)
+        let client_id = 0u32;
+        client.set_client_id(client_id);
+        tracing::debug!("Set client_id {} for WorkerAddress connection to {}", client_id, node_id);
+
         // Initialize reply stream
         if let Err(e) = client.init_reply_stream(100) {
             tracing::warn!("Failed to initialize reply stream: {:?}", e);
@@ -177,6 +182,11 @@ impl ConnectionPool {
 
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
         let client = Rc::new(RpcClient::new(conn));
+
+        // Use placeholder client_id (can be implemented later via AM messages if needed)
+        let client_id = 0u32;
+        client.set_client_id(client_id);
+        tracing::debug!("Set client_id {} for WorkerAddress connection to {}", client_id, node_id);
 
         // Initialize reply stream
         if let Err(e) = client.init_reply_stream(100) {
@@ -284,11 +294,11 @@ impl ConnectionPool {
         )))
     }
 
-    /// Automatically detect connection mode and connect to a remote node
+    /// Automatically connect to a remote node with fallback mechanism
     ///
-    /// This method checks for server_list.txt in the registry directory:
-    /// - If found: Uses Socket connection mode (reads socket address from server_list.txt)
-    /// - If not found: Uses WorkerAddress connection mode (reads .addr file)
+    /// This method prioritizes WorkerAddress mode for efficiency, with Socket mode as fallback:
+    /// 1. Priority 1: Try WorkerAddress mode (.addr file) - more efficient, no epoll_wait overhead
+    /// 2. Priority 2: Fallback to Socket mode (server_list.txt) - for compatibility
     ///
     /// # Arguments
     /// * `node_id` - Node identifier to connect to
@@ -296,27 +306,46 @@ impl ConnectionPool {
     /// # Returns
     /// RPC client for the specified node
     pub async fn connect_auto(&self, node_id: &str) -> Result<Rc<RpcClient>, RpcError> {
-        let mode = self.detect_connection_mode()?;
+        // Priority 1: Try WorkerAddress mode (.addr file)
+        let addr_file = self.registry.registry_dir().join(format!("{}.addr", node_id));
 
-        match mode {
-            ConnectionMode::Socket { .. } => {
-                // Socket mode: parse server_list.txt to get socket address
-                let socket_addr = self.parse_server_list(node_id)?;
-                tracing::info!(
-                    "Auto-detected Socket mode, connecting to {} at {}",
-                    node_id,
-                    socket_addr
-                );
-                self.connect_via_socket(node_id, socket_addr).await
+        if addr_file.exists() {
+            tracing::debug!("Found .addr file for {}, attempting WorkerAddress connection", node_id);
+
+            match self.get_or_connect(node_id).await {
+                Ok(client) => {
+                    tracing::info!("Successfully connected to {} using WorkerAddress mode", node_id);
+                    return Ok(client);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "WorkerAddress connection to {} failed: {:?}, will try Socket mode",
+                        node_id, e
+                    );
+                }
             }
-            ConnectionMode::WorkerAddress => {
-                // WorkerAddress mode: use get_or_connect with .addr files
-                tracing::info!(
-                    "Auto-detected WorkerAddress mode, connecting to {}",
-                    node_id
-                );
-                self.get_or_connect(node_id).await
-            }
+        } else {
+            tracing::debug!(".addr file not found for {}, will try Socket mode", node_id);
+        }
+
+        // Priority 2: Fallback to Socket mode (server_list.txt)
+        let server_list_path = self.registry.registry_dir().join("server_list.txt");
+
+        if server_list_path.exists() {
+            tracing::debug!("Found server_list.txt, attempting Socket connection for {}", node_id);
+
+            let socket_addr = self.parse_server_list(node_id)?;
+            tracing::info!(
+                "Connecting to {} via Socket mode at {}",
+                node_id,
+                socket_addr
+            );
+            self.connect_via_socket(node_id, socket_addr).await
+        } else {
+            Err(RpcError::ConnectionError(format!(
+                "No connection method available for {}: neither .addr file nor server_list.txt found",
+                node_id
+            )))
         }
     }
 
