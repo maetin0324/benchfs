@@ -341,127 +341,125 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let mpi_size_clone = state.mpi_size;
     let stream_port_clone = stream_port;
 
-    let _registration_handle = pluvio_runtime::spawn_with_name(
-        async move {
-            // Wait for RPC handlers to be ready before publishing address
-            tracing::info!("Waiting for RPC handlers to be ready...");
-            let max_wait = std::time::Duration::from_secs(30);
-            let start = std::time::Instant::now();
+    // Registration will be done synchronously before starting the main loop
+    let registration_future = async move {
+        // Wait for RPC handlers to be ready before publishing address
+        tracing::info!("Waiting for RPC handlers to be ready...");
+        let max_wait = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
 
-            loop {
-                if *handler_ready.borrow() {
-                    tracing::info!("RPC handlers confirmed ready");
-                    break;
-                }
-
-                if start.elapsed() > max_wait {
-                    tracing::error!("RPC handler registration timeout");
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "RPC handler registration timeout",
-                    ));
-                }
-
-                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+        loop {
+            if *handler_ready.borrow() {
+                tracing::info!("RPC handlers confirmed ready");
+                break;
             }
 
-            tracing::info!("RPC handlers ready, now registering node address");
-
-            // Small delay to ensure AM streams are fully established
-            futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
-
-            // Register this node's worker address
-            if let Err(e) = pool_clone.register_self(&node_id_clone) {
-                tracing::error!("Failed to register node address: {:?}", e);
+            if start.elapsed() > max_wait {
+                tracing::error!("RPC handler registration timeout");
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Registration failed: {:?}", e),
+                    std::io::ErrorKind::TimedOut,
+                    "RPC handler registration timeout",
                 ));
             }
-            tracing::info!("Node {} registered to registry", node_id_clone);
 
-            // Register Stream RPC port
-            if let Err(e) = pool_clone
-                .registry()
-                .register_stream_port(&node_id_clone, stream_port_clone)
-            {
-                tracing::error!("Failed to register stream RPC port: {:?}", e);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Stream port registration failed: {:?}", e),
-                ));
+            futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+        }
+
+        tracing::info!("RPC handlers ready, now registering node address");
+
+        // Small delay to ensure AM streams are fully established
+        futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
+
+        // Register this node's worker address
+        if let Err(e) = pool_clone.register_self(&node_id_clone) {
+            tracing::error!("Failed to register node address: {:?}", e);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Registration failed: {:?}", e),
+            ));
+        }
+        tracing::info!("Node {} registered to registry", node_id_clone);
+
+        // Register Stream RPC port
+        if let Err(e) = pool_clone
+            .registry()
+            .register_stream_port(&node_id_clone, stream_port_clone)
+        {
+            tracing::error!("Failed to register stream RPC port: {:?}", e);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Stream port registration failed: {:?}", e),
+            ));
+        }
+        tracing::info!(
+            "Stream RPC port {} registered for node {}",
+            stream_port_clone,
+            node_id_clone
+        );
+
+        // Wait for all nodes to register
+        let max_wait_secs = 120; // Increased timeout for large-scale deployments
+        let start_time = std::time::Instant::now();
+
+        tracing::info!("Waiting for {} nodes to register...", mpi_size_clone);
+
+        let mut registered_count;
+        loop {
+            // Count how many nodes are currently registered (including self)
+            registered_count = 1; // This node is already registered
+
+            for rank in 0..mpi_size_clone {
+                if rank != mpi_rank_clone {
+                    let other_node_id = format!("node_{}", rank);
+                    let registry_file =
+                        registry_dir_clone.join(format!("{}.addr", other_node_id));
+                    if registry_file.exists() {
+                        registered_count += 1;
+                    }
+                }
             }
-            tracing::info!(
-                "Stream RPC port {} registered for node {}",
-                stream_port_clone,
-                node_id_clone
-            );
 
-            // Wait for all nodes to register
-            let max_wait_secs = 120; // Increased timeout for large-scale deployments
-            let start_time = std::time::Instant::now();
+            if registered_count >= mpi_size_clone {
+                tracing::info!("All {} nodes registered successfully", mpi_size_clone);
+                break;
+            }
 
-            tracing::info!("Waiting for {} nodes to register...", mpi_size_clone);
+            if start_time.elapsed().as_secs() >= max_wait_secs {
+                let error_msg = format!(
+                    "Only {}/{} nodes registered after {} seconds. Missing {} nodes.",
+                    registered_count,
+                    mpi_size_clone,
+                    max_wait_secs,
+                    mpi_size_clone - registered_count
+                );
+                tracing::error!("{}", error_msg);
 
-            let mut registered_count;
-            loop {
-                // Count how many nodes are currently registered (including self)
-                registered_count = 1; // This node is already registered
-
+                // Log which nodes are missing for debugging
                 for rank in 0..mpi_size_clone {
-                    if rank != mpi_rank_clone {
-                        let other_node_id = format!("node_{}", rank);
-                        let registry_file =
-                            registry_dir_clone.join(format!("{}.addr", other_node_id));
-                        if registry_file.exists() {
-                            registered_count += 1;
-                        }
+                    let node_id = format!("node_{}", rank);
+                    let registry_file = registry_dir_clone.join(format!("{}.addr", node_id));
+                    if !registry_file.exists() {
+                        tracing::error!("Missing node: {}", node_id);
                     }
                 }
 
-                if registered_count >= mpi_size_clone {
-                    tracing::info!("All {} nodes registered successfully", mpi_size_clone);
-                    break;
-                }
-
-                if start_time.elapsed().as_secs() >= max_wait_secs {
-                    let error_msg = format!(
-                        "Only {}/{} nodes registered after {} seconds. Missing {} nodes.",
-                        registered_count,
-                        mpi_size_clone,
-                        max_wait_secs,
-                        mpi_size_clone - registered_count
-                    );
-                    tracing::error!("{}", error_msg);
-
-                    // Log which nodes are missing for debugging
-                    for rank in 0..mpi_size_clone {
-                        let node_id = format!("node_{}", rank);
-                        let registry_file = registry_dir_clone.join(format!("{}.addr", node_id));
-                        if !registry_file.exists() {
-                            tracing::error!("Missing node: {}", node_id);
-                        }
-                    }
-
-                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error_msg));
-                }
-
-                if registered_count % 4 == 0 || start_time.elapsed().as_secs() % 10 == 0 {
-                    tracing::info!(
-                        "Registration progress: {}/{} nodes ({}s elapsed)",
-                        registered_count,
-                        mpi_size_clone,
-                        start_time.elapsed().as_secs()
-                    );
-                }
-
-                futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error_msg));
             }
 
-            Ok::<(), std::io::Error>(())
-        },
-        "node_registration".to_string(),
-    );
+            if registered_count % 4 == 0 || start_time.elapsed().as_secs() % 10 == 0 {
+                tracing::info!(
+                    "Registration progress: {}/{} nodes ({}s elapsed)",
+                    registered_count,
+                    mpi_size_clone,
+                    start_time.elapsed().as_secs()
+                );
+            }
+
+            futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
+        }
+
+        Ok::<(), std::io::Error>(())
+    };
 
     // Start Stream RPC server connection acceptor
     let stream_server_handle = {
@@ -545,19 +543,27 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         tracing::info!("Storage server {} is running", node_id);
     }
 
-    // Run the runtime with the server handle
-    // Note: We don't await registration_handle here because it would create a deadlock.
-    // The registration task is spawned and will run concurrently with the server.
+    // Run the runtime with proper initialization sequence
+    // First complete registration, then start the server
     pluvio_runtime::run_with_name("benchfsd_mpi_server_main", async move {
-        // Wait for server to complete
+        // Execute registration synchronously before starting the server
+        tracing::info!("Starting node registration...");
+        if let Err(e) = registration_future.await {
+            tracing::error!("Registration failed: {:?}", e);
+            return Err(e);
+        }
+        tracing::info!("Node registration completed successfully");
+
+        // Now wait for server to complete
         match server_handle.await {
             Ok(_) => {
                 tracing::info!("Server shutdown complete");
                 Ok(())
             }
             Err(e) => {
-                tracing::error!("Server error: {:?}", e);
-                Err(e)
+                let error_msg = format!("Server error: {}", e);
+                tracing::error!("{}", error_msg);
+                Err(std::io::Error::new(std::io::ErrorKind::Other, error_msg))
             }
         }
     });
