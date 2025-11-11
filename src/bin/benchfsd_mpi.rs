@@ -17,6 +17,7 @@ use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
 use benchfs::rpc::stream_server::StreamRpcServer;
+use benchfs::rpc::RpcError;
 use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
@@ -360,16 +361,61 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
         tracing::info!("Attempting to bind AM RPC socket at {}", listen_addr);
 
-        let bound_addr = match pool_clone.bind_and_register(&node_id_clone, listen_addr) {
-            Ok(addr) => {
-                tracing::info!("Node {} bound and registered at {}", node_id_clone, addr);
-                addr
+        const MAX_PORT_RETRIES: u16 = 5;
+        let mut last_error: Option<RpcError> = None;
+        let mut bound_addr: Option<std::net::SocketAddr> = None;
+
+        for attempt in 0..MAX_PORT_RETRIES {
+            let port_offset = attempt * (mpi_size_clone as u16); // 同一ランクが別ポートを試す際に重複しないよう mpi サイズでシフト
+            let candidate_port = listen_port.saturating_add(port_offset);
+            let candidate_addr = std::net::SocketAddr::from(([0, 0, 0, 0], candidate_port));
+
+            tracing::info!(
+                "Attempting to bind AM RPC socket at {} (attempt {}/{})",
+                candidate_addr,
+                attempt + 1,
+                MAX_PORT_RETRIES
+            );
+
+            match pool_clone.bind_and_register(&node_id_clone, candidate_addr) {
+                Ok(addr) => {
+                    tracing::info!(
+                        "Node {} bound and registered at {} (attempt {}/{})",
+                        node_id_clone,
+                        addr,
+                        attempt + 1,
+                        MAX_PORT_RETRIES
+                    );
+                    bound_addr = Some(addr);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to bind node {} at {}: {:?}",
+                        node_id_clone,
+                        candidate_addr,
+                        e
+                    );
+                    last_error = Some(e);
+                    futures_timer::Delay::new(std::time::Duration::from_millis(250)).await;
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to bind and register node address: {:?}", e);
+        }
+
+        let bound_addr = match bound_addr {
+            Some(addr) => addr,
+            None => {
+                let err = last_error.unwrap_or_else(|| {
+                    RpcError::ConnectionError("Unknown error during port binding".to_string())
+                });
+                tracing::error!(
+                    "Failed to bind and register node address after {} attempts: {:?}",
+                    MAX_PORT_RETRIES,
+                    err
+                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Bind and registration failed: {:?}", e),
+                    format!("Bind and registration failed: {:?}", err),
                 ));
             }
         };

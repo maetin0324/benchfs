@@ -7,6 +7,7 @@ use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use futures::lock::Mutex;
 use pluvio_ucx::async_ucx::ucp::{MemoryHandle, RKey};
 use pluvio_ucx::endpoint::Endpoint;
 use pluvio_ucx::{Context, Worker};
@@ -28,6 +29,8 @@ pub struct StreamRpcClient {
     endpoint: Endpoint,
     worker: Rc<Worker>,
     context: Arc<Context>,
+    /// 単一の UCX ストリーム上で複数 RPC が競合しないようにするロック
+    request_lock: Mutex<()>,
 }
 
 impl StreamRpcClient {
@@ -37,6 +40,7 @@ impl StreamRpcClient {
             endpoint,
             worker,
             context,
+            request_lock: Mutex::new(()),
         }
     }
 
@@ -65,6 +69,10 @@ impl StreamRpcClient {
         &self,
         request: &T,
     ) -> Result<T::ResponseHeader, RpcError> {
+        // UCX stream は順序保証はあるがメッセージ境界が無いので、
+        // 1 接続上の RPC を逐次化してプロトコル破綻を防ぐ。
+        let _guard = self.request_lock.lock().await;
+
         tracing::trace!(
             "execute_no_rma: rpc_id={}, pattern={:?}",
             T::rpc_id(),
@@ -128,6 +136,8 @@ impl StreamRpcClient {
         request: &T,
         data: &[u8],
     ) -> Result<T::ResponseHeader, RpcError> {
+        let _guard = self.request_lock.lock().await;
+
         let RpcPattern::ClientPut { data_size } = request.pattern() else {
             return Err(RpcError::HandlerError(
                 "Request pattern is not ClientPut".to_string(),
@@ -220,6 +230,8 @@ impl StreamRpcClient {
         request: &T,
         buffer: &mut [u8],
     ) -> Result<(T::ResponseHeader, usize), RpcError> {
+        let _guard = self.request_lock.lock().await;
+
         let RpcPattern::ClientGet { buffer_size } = request.pattern() else {
             return Err(RpcError::HandlerError(
                 "Request pattern is not ClientGet".to_string(),
