@@ -49,11 +49,11 @@ detect_active_ib() {
 
 if [[ -z "${UCX_TLS:-}" ]]; then
   if detect_active_ib; then
-    # RC + 共有メモリのみを使用し、UD/DC/cuda 系を完全に除外
-    export UCX_TLS="rc_mlx5,rc_verbs,sm,self"
+    # RC トランスポートのみ。複数ノード構成では shm lane が wireup を壊すため除外
+    export UCX_TLS="rc_mlx5,rc_verbs,self"
   else
-    # IB が無い場合は TCP にフォールバック
-    export UCX_TLS="tcp,sm,self"
+    # TCP fallback でも shm を無効化し、lane 不整合による "no remote ep address" を防ぐ
+    export UCX_TLS="tcp,self"
   fi
 fi
 
