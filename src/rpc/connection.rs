@@ -112,6 +112,12 @@ impl ConnectionPool {
         self.am_listener.borrow().is_some()
     }
 
+    /// Take the listener from the connection pool
+    /// This is used to move the listener to the acceptor loop
+    pub fn take_listener(&self) -> Option<Listener> {
+        self.am_listener.borrow_mut().take()
+    }
+
     /// Get or create a connection to a remote node using socket address
     ///
     /// # Arguments
@@ -152,15 +158,24 @@ impl ConnectionPool {
 
         tracing::info!("Connecting to {}:{}", hostname, port);
 
-        // Create SocketAddr from hostname and port
-        let socket_addr = format!("{}:{}", hostname, port)
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "Failed to parse socket address {}:{}: {:?}",
-                    hostname, port, e
-                ))
-            })?;
+        // Resolve hostname to SocketAddr using DNS
+        use std::net::ToSocketAddrs;
+        let addr_string = format!("{}:{}", hostname, port);
+        let mut socket_addrs = addr_string.to_socket_addrs().map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Failed to resolve hostname {}:{}: {:?}",
+                hostname, port, e
+            ))
+        })?;
+
+        let socket_addr = socket_addrs.next().ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "No IP addresses found for hostname {}:{}",
+                hostname, port
+            ))
+        })?;
+
+        tracing::info!("Resolved {}:{} to {}", hostname, port, socket_addr);
 
         // Create endpoint using connect_socket()
         let endpoint = self
@@ -290,15 +305,24 @@ impl ConnectionPool {
 
         tracing::info!("Connecting Stream RPC to {}:{}", hostname, port);
 
-        // Create SocketAddr from hostname and port
-        let socket_addr = format!("{}:{}", hostname, port)
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "Failed to parse socket address {}:{}: {:?}",
-                    hostname, port, e
-                ))
-            })?;
+        // Resolve hostname to SocketAddr using DNS
+        use std::net::ToSocketAddrs;
+        let addr_string = format!("{}:{}", hostname, port);
+        let mut socket_addrs = addr_string.to_socket_addrs().map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Failed to resolve Stream RPC hostname {}:{}: {:?}",
+                hostname, port, e
+            ))
+        })?;
+
+        let socket_addr = socket_addrs.next().ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "No IP addresses found for Stream RPC hostname {}:{}",
+                hostname, port
+            ))
+        })?;
+
+        tracing::info!("Resolved Stream RPC {}:{} to {}", hostname, port, socket_addr);
 
         // Create endpoint using connect_socket()
         let endpoint = self
