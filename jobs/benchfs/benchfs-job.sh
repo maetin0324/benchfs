@@ -43,16 +43,48 @@ IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 # 捨てられて RPC がハングする。GPU (cuda_copy) も無効化し CPU 専用にする。
 
 detect_active_ib() {
-  command -v ibstat >/dev/null 2>&1 || return 1
-  ibstat 2>/dev/null | grep -q "State:.*Active"
+  if command -v ibstat >/dev/null 2>&1; then
+    if ibstat 2>/dev/null | grep -q "State:.*Active"; then
+      return 0
+    fi
+  fi
+
+  if command -v ibv_devinfo >/dev/null 2>&1; then
+    if ibv_devinfo 2>/dev/null | grep -q "state:.*PORT_ACTIVE"; then
+      return 0
+    fi
+  fi
+
+  if compgen -G "/sys/class/infiniband/*/ports/*/state" >/dev/null; then
+    while IFS= read -r state_file; do
+      if grep -q "ACTIVE" "$state_file" 2>/dev/null; then
+        return 0
+      fi
+    done < <(find /sys/class/infiniband -maxdepth 3 -name state -print)
+  fi
+
+  return 1
+}
+
+detect_ib_netdev() {
+  if command -v ibdev2netdev >/dev/null 2>&1; then
+    ibdev2netdev 2>/dev/null | awk 'NR==1 {print $2; exit}'
+  else
+    find /sys/class/infiniband -maxdepth 3 -path '*/ports/*/gid_attrs/ndevs/*' -print -quit \
+      | xargs -r basename
+  fi
+}
+
+detect_primary_netdev() {
+  command -v ip >/dev/null 2>&1 || return
+  ip route get 1.1.1.1 2>/dev/null \
+    | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
 }
 
 if [[ -z "${UCX_TLS:-}" ]]; then
   if detect_active_ib; then
-    # RC トランスポートのみ。複数ノード構成では shm lane が wireup を壊すため除外
     export UCX_TLS="rc_mlx5,rc_verbs,self"
   else
-    # TCP fallback でも shm を無効化し、lane 不整合による "no remote ep address" を防ぐ
     export UCX_TLS="tcp,self"
   fi
 fi
@@ -63,9 +95,19 @@ export UCX_MEMTYPE_CACHE="n"
 # UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
 if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
   if [[ "${UCX_TLS}" == *rc* ]]; then
-    export UCX_NET_DEVICES="mlx5_0:1"
+    ib_netdev=$(detect_ib_netdev)
+    if [[ -n "${ib_netdev}" ]]; then
+      export UCX_NET_DEVICES="${ib_netdev}"
+    else
+      export UCX_NET_DEVICES="all"
+    fi
   else
-    export UCX_NET_DEVICES="all"
+    primary_netdev=$(detect_primary_netdev)
+    if [[ -n "${primary_netdev}" ]]; then
+      export UCX_NET_DEVICES="${primary_netdev}"
+    else
+      export UCX_NET_DEVICES="all"
+    fi
   fi
 fi
 

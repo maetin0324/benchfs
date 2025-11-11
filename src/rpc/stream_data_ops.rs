@@ -69,7 +69,7 @@ impl StreamRpc for StreamReadChunkRequest {
 
     async fn call(
         &self,
-        client: &StreamRpcClient,
+        _client: &StreamRpcClient,
     ) -> Result<Self::ResponseHeader, RpcError> {
         // Note: This method is not directly used for Client GET pattern
         // Instead, use execute_client_get which returns both header and data
@@ -211,7 +211,7 @@ impl StreamRpc for StreamWriteChunkRequest<'_> {
 
     async fn call(
         &self,
-        client: &StreamRpcClient,
+        _client: &StreamRpcClient,
     ) -> Result<Self::ResponseHeader, RpcError> {
         // Note: This method is not directly used for Client PUT pattern
         // Instead, use execute_client_put which takes data parameter

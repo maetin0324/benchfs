@@ -80,7 +80,8 @@
       "Bash(do)",
       "Bash(echo:*)",
       "Bash(docker build:*)",
-      "Bash(timeout 300 make:*)"
+      "Bash(timeout 300 make:*)",
+      "Bash(cargo fix:*)"
     ],
     "deny": [],
     "ask": []

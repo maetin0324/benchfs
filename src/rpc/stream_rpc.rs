@@ -161,7 +161,7 @@ pub trait StreamRpc {
         ctx: Rc<RpcHandlerContext>,
         endpoint: &Endpoint,
         header: Self::RequestHeader,
-        path: &str,
+        _path: &str,
     ) -> Result<Self::ResponseHeader, RpcError> {
         Self::server_handler(ctx, endpoint, header).await
     }
@@ -176,7 +176,7 @@ pub trait StreamRpc {
         endpoint: &Endpoint,
         header: Self::RequestHeader,
         path: &str,
-        data: &[u8],
+        _data: &[u8],
     ) -> Result<Self::ResponseHeader, RpcError> {
         Self::server_handler_with_path(ctx, endpoint, header, path).await
     }
@@ -191,7 +191,7 @@ pub trait StreamRpc {
         endpoint: &Endpoint,
         header: Self::RequestHeader,
         path: &str,
-        buffer_size: u64,
+        _buffer_size: u64,
     ) -> Result<(Self::ResponseHeader, Vec<u8>), RpcError> {
         let response = Self::server_handler_with_path(ctx, endpoint, header, path).await?;
         Ok((response, Vec::new()))

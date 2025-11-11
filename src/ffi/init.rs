@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use super::error::*;
 use super::runtime::{
-    block_on_with_name, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime,
+    set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime,
 };
 use crate::api::file_ops::BenchFS;
 use crate::metadata::MetadataManager;

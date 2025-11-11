@@ -12,18 +12,18 @@ use pluvio_ucx::Worker;
 use zerocopy::FromBytes;
 
 use super::stream_helpers::{
-    stream_recv, stream_recv_completion, stream_recv_header, stream_recv_rpc_id, stream_send,
+    stream_recv, stream_recv_completion, stream_recv_rpc_id,
     stream_send_completion, stream_send_header, stream_send_u64, MAX_HEADER_SIZE,
 };
-use super::stream_rpc::{ClientGetRequestMessage, ClientPutRequestMessage, RpcPattern, StreamRpc};
-use super::{RpcError, Serializable};
+use super::stream_rpc::{ClientGetRequestMessage, ClientPutRequestMessage, StreamRpc};
+use super::RpcError;
 use crate::rpc::handlers::RpcHandlerContext;
 
 /// Stream-based RPC server
 ///
 /// Handles incoming RPCs using Stream + RMA protocol.
 pub struct StreamRpcServer {
-    worker: Rc<Worker>,
+    _worker: Rc<Worker>,
     handler_context: Rc<RpcHandlerContext>,
 }
 
@@ -31,7 +31,7 @@ impl StreamRpcServer {
     /// Create a new StreamRpcServer
     pub fn new(worker: Rc<Worker>, handler_context: Rc<RpcHandlerContext>) -> Self {
         Self {
-            worker,
+            _worker: worker,
             handler_context,
         }
     }
@@ -49,6 +49,10 @@ impl StreamRpcServer {
     /// - An unrecoverable error occurs
     pub async fn serve(&self, endpoint: Endpoint) -> Result<(), RpcError> {
         tracing::info!("StreamRpcServer: starting to serve endpoint");
+
+        // Print endpoint debug info
+        endpoint.print_to_stderr();
+        tracing::info!("StreamRpcServer: endpoint debug info printed");
 
         // Connection reset retry configuration
         const MAX_RETRY_ATTEMPTS: usize = 3;
@@ -113,7 +117,7 @@ impl StreamRpcServer {
                 StreamMetadataDeleteRequest, StreamMetadataLookupRequest,
                 StreamMetadataUpdateRequest, StreamShutdownRequest,
             };
-            use super::stream_rpc::StreamRpc;
+            
 
             let result = match rpc_id {
                 // Data operations
@@ -348,7 +352,7 @@ impl StreamRpcServer {
             .map_err(|e| RpcError::TransportError(format!("Invalid path UTF-8: {:?}", e)))?;
 
         // 3. Prepare buffer for receiving data
-        let mut buffer = self
+        let buffer = self
             .handler_context
             .allocator
             .acquire()

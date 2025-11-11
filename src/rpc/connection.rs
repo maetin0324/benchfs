@@ -427,6 +427,10 @@ impl ConnectionPool {
             ))
         })?;
 
+        // Print endpoint debug info
+        endpoint.print_to_stderr();
+        tracing::info!("Stream RPC client endpoint created for node {}", node_id);
+
         let client = Rc::new(StreamRpcClient::new(
             endpoint,
             self.worker.clone(),

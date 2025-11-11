@@ -3,7 +3,6 @@
 //! Provides client-side RPC execution using UCX Stream for control messages
 //! and RMA for data transfer.
 
-use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -14,13 +13,13 @@ use pluvio_ucx::{Context, Worker};
 use zerocopy::FromBytes;
 
 use super::stream_helpers::{
-    stream_recv, stream_recv_completion, stream_recv_header, stream_recv_u64, stream_send,
-    stream_send_completion, stream_send_header, stream_send_rpc_id, stream_send_u64,
+    stream_recv_completion, stream_recv_header, stream_recv_u64, stream_send,
+    stream_send_completion, stream_send_rpc_id,
 };
 use super::stream_rpc::{
     ClientGetRequestMessage, ClientPutRequestMessage, RpcPattern, StreamRpc,
 };
-use super::{RpcError, Serializable};
+use super::RpcError;
 
 /// Stream-based RPC client
 ///
