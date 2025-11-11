@@ -33,12 +33,12 @@ echo "  pkg-config: $PREFIX/lib/pkgconfig"
 echo ""
 
 # Ask for confirmation
-read -p "Continue with installation? [Y/n] " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
-    echo "Installation cancelled."
-    exit 0
-fi
+# read -p "Continue with installation? [Y/n] " -n 1 -r
+# echo
+# if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
+#     echo "Installation cancelled."
+#     exit 0
+# fi
 
 # Build BenchFS library
 echo -e "${YELLOW}Building BenchFS library...${NC}"
