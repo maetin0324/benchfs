@@ -93,12 +93,18 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
                 None => continue, // Skip non-UTF8 filenames
             };
 
-            // Match pattern: node_*.addr
-            if filename_str.starts_with("node_") && filename_str.ends_with(".addr") {
+            // Match pattern: node_*.stream_hostname (new socket-based registration)
+            // or node_*.addr (legacy WorkerAddress-based registration)
+            if filename_str.starts_with("node_") && filename_str.ends_with(".stream_hostname") {
+                // Extract node ID: "node_0.stream_hostname" -> "node_0"
+                let node_id = &filename_str[..filename_str.len() - 16]; // Remove ".stream_hostname" suffix
+                node_ids.push(node_id.to_string());
+                tracing::debug!("Discovered data node: {}", node_id);
+            } else if filename_str.starts_with("node_") && filename_str.ends_with(".addr") {
                 // Extract node ID: "node_0.addr" -> "node_0"
                 let node_id = &filename_str[..filename_str.len() - 5]; // Remove ".addr" suffix
                 node_ids.push(node_id.to_string());
-                tracing::debug!("Discovered data node: {}", node_id);
+                tracing::debug!("Discovered data node (legacy): {}", node_id);
             }
         }
 
