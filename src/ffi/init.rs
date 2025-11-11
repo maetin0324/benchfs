@@ -542,40 +542,18 @@ pub extern "C" fn benchfs_init(
             }
         };
 
-        // Distribute initial connections across nodes using client node_id hash
-        // This prevents all 256 clients from connecting to node_0 simultaneously
-        let target_node = if discovered_nodes.len() > 1 {
-            // Hash the node_id to select a target node
-            let hash = node_id_str
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
-            let index = (hash as usize) % discovered_nodes.len();
-            &discovered_nodes[index]
+        // 旧 AM RPC ではここで先行接続してサーバ起動を検証していたが、
+        // Stream RPC では初回 RPC 時に遅延接続する設計に切り替える。
+        // （大量クライアントによる同時接続集中やプロトコル不一致を避けるため）
+        if !discovered_nodes.is_empty() {
+            tracing::info!(
+                "Skipping eager wait_and_connect; {} nodes will be connected lazily",
+                discovered_nodes.len()
+            );
         } else {
-            &discovered_nodes[0]
-        };
-
-        tracing::info!(
-            "Connecting to distributed node: {} (selected from {} nodes)",
-            target_node,
-            discovered_nodes.len()
-        );
-
-        let pool_clone = connection_pool.clone();
-        let target_node_owned = target_node.to_string();
-        let connect_result = block_on_with_name("connect_to_server", async move {
-            pool_clone.wait_and_connect(&target_node_owned, 30).await
-        });
-
-        match connect_result {
-            Ok(_) => tracing::info!("Successfully connected to server: {}", target_node),
-            Err(e) => {
-                set_error_message(&format!(
-                    "Failed to connect to server {}: {:?}",
-                    target_node, e
-                ));
-                return std::ptr::null_mut();
-            }
+            tracing::warn!(
+                "No data nodes discovered; Stream connections will be attempted lazily"
+            );
         }
 
         // Get data_dir for client (use temp dir if not specified)
