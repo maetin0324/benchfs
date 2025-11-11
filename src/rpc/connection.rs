@@ -187,8 +187,8 @@ impl ConnectionPool {
 
         // Create endpoint using connect_socket() with retries in case the server
         // is still warming up (replaces the eager wait_and_connect() used before).
-        const STREAM_CONNECT_MAX_RETRIES: u32 = 5;
-        const STREAM_CONNECT_RETRY_DELAY_MS: u64 = 200;
+        const STREAM_CONNECT_MAX_RETRIES: u32 = 10;
+        const STREAM_CONNECT_RETRY_DELAY_MS: u64 = 1000;
 
         let mut last_error: Option<String> = None;
         let mut endpoint_opt = None;
