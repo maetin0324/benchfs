@@ -266,20 +266,9 @@ impl ConnectionPool {
         // Lookup Stream RPC port
         let stream_port = self.registry.lookup_stream_port(node_id)?;
 
-        // Convert node_id to hostname (e.g., node_0 -> benchfs_server1 in Docker)
-        // In Docker environment, container names follow pattern benchfs_serverN
-        // where N = rank + 1, so node_0 -> benchfs_server1
-        let hostname = if node_id.starts_with("node_") {
-            let rank: i32 = node_id
-                .trim_start_matches("node_")
-                .parse()
-                .map_err(|_| {
-                    RpcError::ConnectionError(format!("Invalid node_id format: {}", node_id))
-                })?;
-            format!("benchfs_server{}", rank + 1)
-        } else {
-            node_id.to_string()
-        };
+        // Lookup Stream RPC hostname from registry
+        // The actual hostname was registered by the server at startup
+        let hostname = self.registry.lookup_stream_hostname(node_id)?;
 
         // Resolve hostname to SocketAddr using ToSocketAddrs
         use std::net::ToSocketAddrs;

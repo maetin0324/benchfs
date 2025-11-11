@@ -380,6 +380,19 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         }
         tracing::info!("Node {} registered to registry", node_id_clone);
 
+        // Get current hostname
+        let hostname = hostname::get()
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to get hostname: {}", e),
+                )
+            })?
+            .into_string()
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "Hostname is not valid UTF-8")
+            })?;
+
         // Register Stream RPC port
         if let Err(e) = pool_clone
             .registry()
@@ -394,6 +407,23 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         tracing::info!(
             "Stream RPC port {} registered for node {}",
             stream_port_clone,
+            node_id_clone
+        );
+
+        // Register Stream RPC hostname
+        if let Err(e) = pool_clone
+            .registry()
+            .register_stream_hostname(&node_id_clone, &hostname)
+        {
+            tracing::error!("Failed to register stream RPC hostname: {:?}", e);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Stream hostname registration failed: {:?}", e),
+            ));
+        }
+        tracing::info!(
+            "Stream RPC hostname {} registered for node {}",
+            hostname,
             node_id_clone
         );
 
