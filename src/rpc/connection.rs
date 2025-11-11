@@ -88,7 +88,14 @@ impl ConnectionPool {
                 .into_owned()
         });
 
-        // Register hostname and port separately for compatibility with existing registry methods
+        // Register WorkerAddress for backward compatibility (needed for registration waiting loop)
+        let worker_addr = self.worker.address().map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to get worker address: {:?}", e))
+        })?;
+        let worker_addr_bytes = worker_addr.as_ref();
+        self.registry.register(node_id, worker_addr_bytes)?;
+
+        // Register hostname and port separately for socket-based connections
         self.registry
             .register_stream_hostname(node_id, &hostname)?;
         self.registry
