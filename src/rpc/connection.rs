@@ -331,10 +331,24 @@ impl ConnectionPool {
     ) -> Result<Rc<StreamRpcClient>, RpcError> {
         // Check if connection already exists
         {
-            let connections = self.stream_connections.borrow();
-            if let Some(client) = connections.get(node_id) {
-                tracing::debug!("Reusing existing Stream RPC connection to {}", node_id);
-                return Ok(client.clone());
+            let mut needs_remove = false;
+            {
+                let connections = self.stream_connections.borrow();
+                if let Some(client) = connections.get(node_id) {
+                    if !client.endpoint().is_closed() {
+                        tracing::debug!("Reusing existing Stream RPC connection to {}", node_id);
+                        return Ok(client.clone());
+                    } else {
+                        tracing::warn!(
+                            "Existing Stream RPC connection to {} is closed, reconnecting",
+                            node_id
+                        );
+                        needs_remove = true;
+                    }
+                }
+            }
+            if needs_remove {
+                self.stream_connections.borrow_mut().remove(node_id);
             }
         }
 
@@ -368,17 +382,50 @@ impl ConnectionPool {
 
         tracing::info!("Resolved Stream RPC {}:{} to {}", hostname, port, socket_addr);
 
-        // Create endpoint using connect_socket()
-        let endpoint = self
-            .worker
-            .connect_socket(socket_addr)
-            .await
-            .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "Failed to connect Stream RPC to {} (node {}): {:?}",
-                    socket_addr, node_id, e
-                ))
-            })?;
+        // Retry connecting in case the server-side listener is still warming up.
+        const STREAM_CONNECT_MAX_RETRIES: u32 = 5;
+        const STREAM_CONNECT_RETRY_DELAY_MS: u64 = 200;
+
+        let mut endpoint_opt = None;
+        let mut last_error: Option<String> = None;
+
+        for attempt in 1..=STREAM_CONNECT_MAX_RETRIES {
+            match self.worker.connect_socket(socket_addr).await {
+                Ok(endpoint) => {
+                    endpoint_opt = Some(endpoint);
+                    break;
+                }
+                Err(e) => {
+                    let err_string = format!("{:?}", e);
+                    tracing::warn!(
+                        "Failed to connect Stream RPC to {} (node {}) attempt {}/{}: {:?}",
+                        socket_addr,
+                        node_id,
+                        attempt,
+                        STREAM_CONNECT_MAX_RETRIES,
+                        e
+                    );
+                    last_error = Some(err_string);
+
+                    if attempt < STREAM_CONNECT_MAX_RETRIES {
+                        pluvio_timer::sleep(Duration::from_millis(
+                            STREAM_CONNECT_RETRY_DELAY_MS,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        let endpoint = endpoint_opt.ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "Failed to connect Stream RPC to {} (node {}) after {} attempts: {}",
+                socket_addr,
+                node_id,
+                STREAM_CONNECT_MAX_RETRIES,
+                last_error.unwrap_or_else(|| "unknown error".to_string())
+            ))
+        })?;
 
         let client = Rc::new(StreamRpcClient::new(
             endpoint,
