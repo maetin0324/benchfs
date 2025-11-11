@@ -50,6 +50,10 @@ impl StreamRpcServer {
     pub async fn serve(&self, endpoint: Endpoint) -> Result<(), RpcError> {
         tracing::info!("StreamRpcServer: starting to serve endpoint");
 
+        // Connection reset retry configuration
+        const MAX_RETRY_ATTEMPTS: usize = 3;
+        const RETRY_DELAY_MS: u64 = 100;
+
         loop {
             // Check shutdown flag
             if self.handler_context.should_shutdown() {
@@ -57,12 +61,41 @@ impl StreamRpcServer {
                 break;
             }
 
-            // Receive RPC ID
-            let rpc_id = match stream_recv_rpc_id(&endpoint).await {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!("StreamRpcServer: failed to receive RPC ID: {:?}", e);
-                    break; // Connection likely closed
+            // Receive RPC ID with retry on connection reset
+            let rpc_id = {
+                let mut retry_count = 0;
+                loop {
+                    match stream_recv_rpc_id(&endpoint).await {
+                        Ok(id) => break id,
+                        Err(e) => {
+                            // Check if error is connection reset
+                            let is_connection_reset = matches!(
+                                e,
+                                RpcError::TransportError(ref msg) if msg.contains("ConnectionReset")
+                            );
+
+                            if is_connection_reset && retry_count < MAX_RETRY_ATTEMPTS {
+                                retry_count += 1;
+                                tracing::warn!(
+                                    "StreamRpcServer: Connection Reset detected (attempt {}/{}), retrying...",
+                                    retry_count,
+                                    MAX_RETRY_ATTEMPTS
+                                );
+
+                                // Brief delay before retry
+                                pluvio_timer::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                                continue;
+                            } else {
+                                // Non-retryable error or max retries exceeded
+                                tracing::warn!(
+                                    "StreamRpcServer: failed to receive RPC ID after {} attempts: {:?}",
+                                    retry_count + 1,
+                                    e
+                                );
+                                return Ok(()); // Exit serve loop gracefully
+                            }
+                        }
+                    }
                 }
             };
 

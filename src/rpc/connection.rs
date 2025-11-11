@@ -285,9 +285,9 @@ impl ConnectionPool {
     /// Stream RPC client for the specified node
     ///
     /// # Implementation Note
-    /// Uses WorkerAddress-based connection instead of connect_socket() to avoid
-    /// RDMA CM transport selection issues in HPC environments. This ensures
-    /// TCP-only transport is used consistently with UCX_TLS=tcp,sm,self.
+    /// Uses socket-based connection (connect_socket). If Connection Reset errors occur
+    /// in HPC environments, the StreamRpcServer implements automatic retry logic to
+    /// handle transient connection issues.
     pub async fn get_or_connect_stream(
         &self,
         node_id: &str,
@@ -354,7 +354,7 @@ impl ConnectionPool {
             .borrow_mut()
             .insert(node_id.to_string(), client.clone());
 
-        tracing::info!("Stream RPC connection to {} established via WorkerAddress", node_id);
+        tracing::info!("Stream RPC connection to {} established via socket", node_id);
 
         Ok(client)
     }
