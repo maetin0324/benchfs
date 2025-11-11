@@ -309,9 +309,13 @@ fn run_client(
         // Note: Client does not need to register handlers as it only sends requests,
         // not receives them. This avoids having idle handler tasks that need cleanup.
 
-        // Register self in connection pool
-        if let Err(e) = connection_pool.register_self(&node_id) {
-            tracing::error!("Failed to register self: {:?}", e);
+        // Bind to socket and register this client's address
+        let base_port = 50051u16;
+        let listen_port = base_port + mpi_rank as u16;
+        let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
+
+        if let Err(e) = connection_pool.bind_and_register(&node_id, listen_addr) {
+            tracing::error!("Failed to bind and register client: {:?}", e);
             return;
         }
 
@@ -518,9 +522,13 @@ fn run_server(
             return;
         }
 
-        // Register self in connection pool
-        if let Err(e) = connection_pool.register_self(&node_id) {
-            tracing::error!("Failed to register self: {:?}", e);
+        // Bind to socket and register this server's address
+        let base_port = 50051u16;
+        let listen_port = base_port + mpi_rank as u16;
+        let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
+
+        if let Err(e) = connection_pool.bind_and_register(&node_id, listen_addr) {
+            tracing::error!("Failed to bind and register server: {:?}", e);
             return;
         }
 

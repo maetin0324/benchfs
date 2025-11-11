@@ -1,7 +1,8 @@
 //! RPC connection management for distributed operations
 //!
-//! This module provides WorkerAddress-based connection management to avoid
-//! the epoll_wait overhead of socket_bind when ucp_worker_progress is called frequently.
+//! This module provides socket address-based connection management for RPC operations.
+//! Server binds to a socket and publishes hostname:port to shared filesystem.
+//! Clients lookup hostname:port and connect using connect_socket().
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -11,29 +12,29 @@ use std::sync::Arc;
 use crate::rpc::address_registry::WorkerAddressRegistry;
 use crate::rpc::stream_client::StreamRpcClient;
 use crate::rpc::{RpcClient, RpcError};
-use pluvio_ucx::{Context, Worker};
+use pluvio_ucx::{listener::Listener, Context, Worker};
 
 /// Connection pool for managing RPC client connections to remote nodes
 ///
-/// Uses WorkerAddress exchange via shared filesystem to avoid socket_bind overhead
+/// Uses socket address (hostname:port) exchange via shared filesystem
 pub struct ConnectionPool {
     worker: Rc<Worker>,
     context: Arc<Context>,
     registry: WorkerAddressRegistry,
     connections: RefCell<HashMap<String, Rc<RpcClient>>>,
-    /// Cache of worker address bytes (needed to keep the memory valid for WorkerAddressInner)
-    address_cache: RefCell<HashMap<String, Vec<u8>>>,
+    /// Socket listener for AM RPC (server mode only)
+    am_listener: RefCell<Option<Listener>>,
     /// Stream RPC client connections
     stream_connections: RefCell<HashMap<String, Rc<StreamRpcClient>>>,
 }
 
 impl ConnectionPool {
-    /// Create a new connection pool with WorkerAddress registry
+    /// Create a new connection pool with socket address registry
     ///
     /// # Arguments
     /// * `worker` - UCX worker for creating connections
     /// * `context` - UCX context for creating Stream connections
-    /// * `registry_dir` - Shared filesystem directory for WorkerAddress exchange
+    /// * `registry_dir` - Shared filesystem directory for address exchange
     pub fn new<P: AsRef<std::path::Path>>(
         worker: Rc<Worker>,
         context: Arc<Context>,
@@ -46,32 +47,72 @@ impl ConnectionPool {
             context,
             registry,
             connections: RefCell::new(HashMap::new()),
-            address_cache: RefCell::new(HashMap::new()),
+            am_listener: RefCell::new(None),
             stream_connections: RefCell::new(HashMap::new()),
         })
     }
 
-    /// Register this worker's address in the shared filesystem
+    /// Bind to a socket and register the address in the shared filesystem
+    ///
+    /// This method binds to a UCX socket listener and publishes the hostname:port
+    /// to the shared filesystem registry for other nodes to discover.
     ///
     /// # Arguments
     /// * `node_id` - Unique identifier for this node
-    pub fn register_self(&self, node_id: &str) -> Result<(), RpcError> {
-        let address = self.worker.address().map_err(|e| {
-            RpcError::ConnectionError(format!("Failed to get worker address: {:?}", e))
+    /// * `listen_addr` - Socket address to bind to (e.g., "0.0.0.0:50051")
+    ///
+    /// # Returns
+    /// The actual socket address that was bound (useful when port 0 was specified)
+    pub fn bind_and_register(
+        &self,
+        node_id: &str,
+        listen_addr: std::net::SocketAddr,
+    ) -> Result<std::net::SocketAddr, RpcError> {
+        // Create socket listener
+        let listener = self.worker.create_listener(listen_addr).map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to bind socket {}: {:?}", listen_addr, e))
         })?;
 
-        // Convert WorkerAddress to bytes using AsRef<[u8]>
-        let address_bytes: &[u8] = address.as_ref();
-        self.registry.register(node_id, address_bytes)?;
+        // Get the actual bound address
+        let bound_addr = listener.socket_addr().map_err(|e| {
+            RpcError::ConnectionError(format!("Failed to get socket address: {:?}", e))
+        })?;
+
+        tracing::info!("AM RPC listener bound to {}", bound_addr);
+
+        // Get hostname for registration
+        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
+            // Fallback: try to get hostname from system
+            gethostname::gethostname()
+                .to_string_lossy()
+                .into_owned()
+        });
+
+        // Register hostname and port separately for compatibility with existing registry methods
+        self.registry
+            .register_stream_hostname(node_id, &hostname)?;
+        self.registry
+            .register_stream_port(node_id, bound_addr.port())?;
+
+        // Store listener
+        *self.am_listener.borrow_mut() = Some(listener);
+
         tracing::info!(
-            "Registered worker address for node {} ({} bytes)",
-            node_id,
-            address_bytes.len()
+            "Registered AM RPC address {}:{} for node {}",
+            hostname,
+            bound_addr.port(),
+            node_id
         );
-        Ok(())
+
+        Ok(bound_addr)
     }
 
-    /// Get or create a connection to a remote node using WorkerAddress
+    /// Get the AM RPC listener (for accepting connections in server mode)
+    pub fn am_listener(&self) -> bool {
+        self.am_listener.borrow().is_some()
+    }
+
+    /// Get or create a connection to a remote node using socket address
     ///
     /// # Arguments
     /// * `node_id` - Node identifier (must be registered in the registry)
@@ -100,32 +141,38 @@ impl ConnectionPool {
         // Remove closed connection if it exists
         self.connections.borrow_mut().remove(node_id);
 
-        // Lookup worker address
+        // Lookup hostname and port from registry
         tracing::info!(
-            "Creating new connection to node {} using WorkerAddress",
+            "Creating new connection to node {} using socket address",
             node_id
         );
 
-        let worker_address_bytes = self.registry.lookup(node_id)?;
+        let hostname = self.registry.lookup_stream_hostname(node_id)?;
+        let port = self.registry.lookup_stream_port(node_id)?;
 
-        // Store address bytes in cache to ensure the memory remains valid
-        self.address_cache
-            .borrow_mut()
-            .insert(node_id.to_string(), worker_address_bytes);
+        tracing::info!("Connecting to {}:{}", hostname, port);
 
-        // Get reference to cached bytes
-        let addr_cache = self.address_cache.borrow();
-        let cached_bytes = addr_cache
-            .get(node_id)
-            .ok_or_else(|| RpcError::ConnectionError("Address cache error".to_string()))?;
+        // Create SocketAddr from hostname and port
+        let socket_addr = format!("{}:{}", hostname, port)
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "Failed to parse socket address {}:{}: {:?}",
+                    hostname, port, e
+                ))
+            })?;
 
-        // Convert bytes to WorkerAddressInner using the cached bytes
-        let worker_address = pluvio_ucx::WorkerAddressInner::from(cached_bytes.as_slice());
-
-        // Create endpoint from WorkerAddress
-        let endpoint = self.worker.connect_addr(&worker_address).map_err(|e| {
-            RpcError::ConnectionError(format!("Failed to connect to {}: {:?}", node_id, e))
-        })?;
+        // Create endpoint using connect_socket()
+        let endpoint = self
+            .worker
+            .connect_socket(socket_addr)
+            .await
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "Failed to connect to {} (node {}): {:?}",
+                    socket_addr, node_id, e
+                ))
+            })?;
 
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
         let client = Rc::new(RpcClient::new(conn));
@@ -139,6 +186,8 @@ impl ConnectionPool {
         self.connections
             .borrow_mut()
             .insert(node_id.to_string(), client.clone());
+
+        tracing::info!("Connected to node {} at {}:{}", node_id, hostname, port);
 
         Ok(client)
     }
@@ -153,51 +202,18 @@ impl ConnectionPool {
         node_id: &str,
         timeout_secs: u64,
     ) -> Result<Rc<RpcClient>, RpcError> {
-        // Wait for address to be available
-        let worker_address_bytes = self.registry.wait_for(node_id, timeout_secs).await?;
+        // Wait for hostname and port to be available
+        let _hostname = self
+            .registry
+            .wait_for_stream_hostname(node_id, timeout_secs)
+            .await?;
+        let _port = self
+            .registry
+            .wait_for_stream_port(node_id, timeout_secs)
+            .await?;
 
-        // Check if connection already exists
-        {
-            let connections = self.connections.borrow();
-            if let Some(client) = connections.get(node_id) {
-                tracing::debug!("Reusing existing connection to {}", node_id);
-                return Ok(client.clone());
-            }
-        }
-
-        // Store address bytes in cache to ensure the memory remains valid
-        self.address_cache
-            .borrow_mut()
-            .insert(node_id.to_string(), worker_address_bytes);
-
-        // Get reference to cached bytes
-        let addr_cache = self.address_cache.borrow();
-        let cached_bytes = addr_cache
-            .get(node_id)
-            .ok_or_else(|| RpcError::ConnectionError("Address cache error".to_string()))?;
-
-        // Convert bytes to WorkerAddressInner using the cached bytes
-        let worker_address = pluvio_ucx::WorkerAddressInner::from(cached_bytes.as_slice());
-
-        // Create endpoint from WorkerAddress
-        let endpoint = self.worker.connect_addr(&worker_address).map_err(|e| {
-            RpcError::ConnectionError(format!("Failed to connect to {}: {:?}", node_id, e))
-        })?;
-
-        let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
-        let client = Rc::new(RpcClient::new(conn));
-
-        // Initialize reply stream
-        if let Err(e) = client.init_reply_stream(100) {
-            tracing::warn!("Failed to initialize reply stream: {:?}", e);
-        }
-
-        // Store in cache
-        self.connections
-            .borrow_mut()
-            .insert(node_id.to_string(), client.clone());
-
-        Ok(client)
+        // Use get_or_connect() which will lookup and connect
+        self.get_or_connect(node_id).await
     }
 
     /// Get an existing connection without creating a new one
@@ -245,6 +261,11 @@ impl ConnectionPool {
     ///
     /// # Returns
     /// Stream RPC client for the specified node
+    ///
+    /// # Implementation Note
+    /// Uses WorkerAddress-based connection instead of connect_socket() to avoid
+    /// RDMA CM transport selection issues in HPC environments. This ensures
+    /// TCP-only transport is used consistently with UCX_TLS=tcp,sm,self.
     pub async fn get_or_connect_stream(
         &self,
         node_id: &str,
@@ -259,53 +280,35 @@ impl ConnectionPool {
         }
 
         tracing::info!(
-            "Creating new Stream RPC connection to node {}",
+            "Creating new Stream RPC connection to node {} using socket address",
             node_id
         );
 
-        // Lookup Stream RPC port
-        let stream_port = self.registry.lookup_stream_port(node_id)?;
-
-        // Lookup Stream RPC hostname from registry
-        // The actual hostname was registered by the server at startup
+        // Lookup hostname and port (same as AM RPC)
         let hostname = self.registry.lookup_stream_hostname(node_id)?;
+        let port = self.registry.lookup_stream_port(node_id)?;
 
-        // Resolve hostname to SocketAddr using ToSocketAddrs
-        use std::net::ToSocketAddrs;
-        let addr_str = format!("{}:{}", hostname, stream_port);
-        let stream_addr = addr_str
-            .to_socket_addrs()
+        tracing::info!("Connecting Stream RPC to {}:{}", hostname, port);
+
+        // Create SocketAddr from hostname and port
+        let socket_addr = format!("{}:{}", hostname, port)
+            .parse::<std::net::SocketAddr>()
             .map_err(|e| {
                 RpcError::ConnectionError(format!(
-                    "Failed to resolve hostname {} for {}: {}",
-                    hostname, node_id, e
-                ))
-            })?
-            .next()
-            .ok_or_else(|| {
-                RpcError::ConnectionError(format!(
-                    "No addresses found for hostname {} (node {})",
-                    hostname, node_id
+                    "Failed to parse socket address {}:{}: {:?}",
+                    hostname, port, e
                 ))
             })?;
 
-        tracing::debug!(
-            "Connecting to Stream RPC server at {} (resolved from {}:{}, port {})",
-            stream_addr,
-            hostname,
-            stream_port,
-            stream_port
-        );
-
-        // Create Stream connection
+        // Create endpoint using connect_socket()
         let endpoint = self
             .worker
-            .connect_socket(stream_addr)
+            .connect_socket(socket_addr)
             .await
             .map_err(|e| {
                 RpcError::ConnectionError(format!(
-                    "Failed to connect to {} via Stream RPC: {:?}",
-                    node_id, e
+                    "Failed to connect Stream RPC to {} (node {}): {:?}",
+                    socket_addr, node_id, e
                 ))
             })?;
 
@@ -320,7 +323,7 @@ impl ConnectionPool {
             .borrow_mut()
             .insert(node_id.to_string(), client.clone());
 
-        tracing::info!("Stream RPC connection to {} established", node_id);
+        tracing::info!("Stream RPC connection to {} established via WorkerAddress", node_id);
 
         Ok(client)
     }
@@ -335,13 +338,10 @@ impl ConnectionPool {
         node_id: &str,
         timeout_secs: u64,
     ) -> Result<Rc<StreamRpcClient>, RpcError> {
-        // Wait for Stream RPC port to be available
-        let _stream_port = self
-            .registry
-            .wait_for_stream_port(node_id, timeout_secs)
-            .await?;
+        // Wait for worker address to be available (same as AM RPC)
+        let _worker_address_bytes = self.registry.wait_for(node_id, timeout_secs).await?;
 
-        // Create connection
+        // Create connection using WorkerAddress
         self.get_or_connect_stream(node_id).await
     }
 }

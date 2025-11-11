@@ -415,12 +415,22 @@ pub extern "C" fn benchfs_init(
             }
         };
 
-        // Register server's worker address
-        if let Err(e) = connection_pool.register_self(node_id_str) {
-            set_error_message(&format!("Failed to register server address: {:?}", e));
-            return std::ptr::null_mut();
+        // Bind to socket and register this server's address
+        let base_port = 50051u16;
+        // For FFI init, we use a fixed port since there's no MPI rank
+        let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], base_port));
+
+        tracing::info!("Attempting to bind AM RPC socket at {}", listen_addr);
+
+        match connection_pool.bind_and_register(node_id_str, listen_addr) {
+            Ok(addr) => {
+                tracing::info!("Server {} bound and registered at {}", node_id_str, addr);
+            }
+            Err(e) => {
+                set_error_message(&format!("Failed to bind and register server address: {:?}", e));
+                return std::ptr::null_mut();
+            }
         }
-        tracing::info!("Server worker address registered to {}", registry_dir_str);
 
         // Register all RPC handlers (spawn in background, don't block)
         // These handlers run perpetual listening loops, so we can't block_on() them

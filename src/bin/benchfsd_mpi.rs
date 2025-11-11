@@ -281,25 +281,28 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Create Stream RPC server (Stream + RMA based)
     let stream_rpc_server = Rc::new(StreamRpcServer::new(worker.clone(), handler_context.clone()));
 
+    // TEMPORARY: Stream RPC disabled due to EBUSY/Unreachable errors in Docker/HPC environments
+    // TODO: Re-enable after fixing WorkerAddress-based Stream RPC connection issues
+    //
     // Create Stream RPC listener on a specific port
     // Extract base port from bind_addr and add 1000 for Stream RPC
     // Each rank gets a unique port by adding its rank number
-    let base_port: u16 = config
-        .network
-        .bind_addr
-        .split(':')
-        .last()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50051);
-    let stream_port = base_port + 1000 + state.mpi_rank as u16; // e.g., Rank 0: 51051, Rank 1: 51052, etc.
+    // let base_port: u16 = config
+    //     .network
+    //     .bind_addr
+    //     .split(':')
+    //     .last()
+    //     .and_then(|s| s.parse().ok())
+    //     .unwrap_or(50051);
+    // let stream_port = base_port + 1000 + state.mpi_rank as u16; // e.g., Rank 0: 51051, Rank 1: 51052, etc.
 
-    let stream_listen_addr = format!("0.0.0.0:{}", stream_port)
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| format!("Invalid stream listen address: {}", e))?;
+    // let stream_listen_addr = format!("0.0.0.0:{}", stream_port)
+    //     .parse::<std::net::SocketAddr>()
+    //     .map_err(|e| format!("Invalid stream listen address: {}", e))?;
 
-    tracing::info!("Stream RPC server will listen on {}", stream_listen_addr);
+    // tracing::info!("Stream RPC server will listen on {}", stream_listen_addr);
 
-    let stream_listener = worker.create_listener(stream_listen_addr)?;
+    // let stream_listener = worker.create_listener(stream_listen_addr)?;
 
     // Create connection pool for inter-node communication
     let connection_pool = Rc::new(ConnectionPool::new(
@@ -339,7 +342,6 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let registry_dir_clone = PathBuf::from(registry_dir);
     let mpi_rank_clone = state.mpi_rank;
     let mpi_size_clone = state.mpi_size;
-    let stream_port_clone = stream_port;
 
     // Registration will be done synchronously before starting the main loop
     let registration_future = async move {
@@ -367,65 +369,31 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
 
         tracing::info!("RPC handlers ready, now registering node address");
 
-        // Small delay to ensure AM streams are fully established
+        // Small delay to ensure runtime is fully initialized
         futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
 
-        // Register this node's worker address
-        if let Err(e) = pool_clone.register_self(&node_id_clone) {
-            tracing::error!("Failed to register node address: {:?}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Registration failed: {:?}", e),
-            ));
-        }
-        tracing::info!("Node {} registered to registry", node_id_clone);
+        // Bind to a socket and register this node's address
+        let base_port = 50051u16;
+        let listen_port = base_port + mpi_rank_clone as u16;
+        let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
 
-        // Get current hostname
-        let hostname = hostname::get()
-            .map_err(|e| {
-                std::io::Error::new(
+        tracing::info!("Attempting to bind AM RPC socket at {}", listen_addr);
+
+        let bound_addr = match pool_clone.bind_and_register(&node_id_clone, listen_addr) {
+            Ok(addr) => {
+                tracing::info!("Node {} bound and registered at {}", node_id_clone, addr);
+                addr
+            }
+            Err(e) => {
+                tracing::error!("Failed to bind and register node address: {:?}", e);
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Failed to get hostname: {}", e),
-                )
-            })?
-            .into_string()
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "Hostname is not valid UTF-8")
-            })?;
+                    format!("Bind and registration failed: {:?}", e),
+                ));
+            }
+        };
 
-        // Register Stream RPC port
-        if let Err(e) = pool_clone
-            .registry()
-            .register_stream_port(&node_id_clone, stream_port_clone)
-        {
-            tracing::error!("Failed to register stream RPC port: {:?}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Stream port registration failed: {:?}", e),
-            ));
-        }
-        tracing::info!(
-            "Stream RPC port {} registered for node {}",
-            stream_port_clone,
-            node_id_clone
-        );
-
-        // Register Stream RPC hostname
-        if let Err(e) = pool_clone
-            .registry()
-            .register_stream_hostname(&node_id_clone, &hostname)
-        {
-            tracing::error!("Failed to register stream RPC hostname: {:?}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Stream hostname registration failed: {:?}", e),
-            ));
-        }
-        tracing::info!(
-            "Stream RPC hostname {} registered for node {}",
-            hostname,
-            node_id_clone
-        );
+        tracing::info!("Node {} registered with address {}", node_id_clone, bound_addr);
 
         // Wait for all nodes to register
         let max_wait_secs = 120; // Increased timeout for large-scale deployments
@@ -491,56 +459,56 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         Ok::<(), std::io::Error>(())
     };
 
-    // Start Stream RPC server connection acceptor
-    let stream_server_handle = {
-        let stream_server_clone = stream_rpc_server.clone();
-        let state_clone = state.clone();
-        let mut stream_listener_mut = stream_listener;
-        let worker_clone = worker.clone();
+    // TEMPORARY: Stream RPC acceptor disabled (listener creation is commented out above)
+    // let _stream_server_handle = {
+    //     let stream_server_clone = stream_rpc_server.clone();
+    //     let state_clone = state.clone();
+    //     let mut stream_listener_mut = stream_listener;
+    //     let worker_clone = worker.clone();
 
-        pluvio_runtime::spawn_with_name(
-            async move {
-                tracing::info!("Stream RPC server accepting connections on {}", stream_listen_addr);
+    //     pluvio_runtime::spawn_with_name(
+    //         async move {
+    //             tracing::info!("Stream RPC server accepting connections on {}", stream_listen_addr);
 
-                loop {
-                    if !state_clone.is_running() {
-                        break;
-                    }
+    //             loop {
+    //                 if !state_clone.is_running() {
+    //                     break;
+    //                 }
 
-                    // Accept incoming connection
-                    let connection = stream_listener_mut.next().await;
+    //                 // Accept incoming connection
+    //                 let connection = stream_listener_mut.next().await;
 
-                    match worker_clone.accept(connection).await {
-                        Ok(endpoint) => {
-                            tracing::info!("Stream RPC: accepted new client connection");
+    //                 match worker_clone.accept(connection).await {
+    //                     Ok(endpoint) => {
+    //                         tracing::info!("Stream RPC: accepted new client connection");
 
-                            // Spawn a task to serve this connection
-                            let server_clone = stream_server_clone.clone();
+    //                         // Spawn a task to serve this connection
+    //                         let server_clone = stream_server_clone.clone();
 
-                            pluvio_runtime::spawn_with_name(
-                                async move {
-                                    if let Err(e) = server_clone.serve(endpoint).await {
-                                        tracing::error!("Stream RPC connection error: {:?}", e);
-                                    }
-                                    Ok::<(), std::io::Error>(())
-                                },
-                                format!("stream_rpc_connection"),
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!("Stream RPC accept error: {:?}", e);
-                            // Brief delay before retrying
-                            futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
-                        }
-                    }
-                }
+    //                         pluvio_runtime::spawn_with_name(
+    //                             async move {
+    //                                 if let Err(e) = server_clone.serve(endpoint).await {
+    //                                     tracing::error!("Stream RPC connection error: {:?}", e);
+    //                                 }
+    //                                 Ok::<(), std::io::Error>(())
+    //                             },
+    //                             format!("stream_rpc_connection"),
+    //                         );
+    //                     }
+    //                     Err(e) => {
+    //                         tracing::error!("Stream RPC accept error: {:?}", e);
+    //                         // Brief delay before retrying
+    //                         futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+    //                     }
+    //                 }
+    //             }
 
-                tracing::info!("Stream RPC server stopped accepting connections");
-                Ok::<(), std::io::Error>(())
-            },
-            "stream_rpc_acceptor".to_string(),
-        )
-    };
+    //             tracing::info!("Stream RPC server stopped accepting connections");
+    //             Ok::<(), std::io::Error>(())
+    //         },
+    //         "stream_rpc_acceptor".to_string(),
+    //     )
+    // };
 
     // Start server main loop (AM-based legacy server)
     let server_handle = {

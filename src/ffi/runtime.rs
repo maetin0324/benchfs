@@ -252,7 +252,10 @@ where
         *result_holder_clone.borrow_mut() = Some(result);
     };
 
-    // Execute the future with the provided operation name using the thread-local runtime
+    // Execute the future with the runtime
+    // Note: This is safe for client-side FFI calls because the client does not have
+    // a background runtime loop. For server-side, RPC handlers use async functions directly
+    // and do not call FFI functions, so no nesting occurs.
     rt.run_with_name_and_runtime(operation_name, wrapped_future);
 
     // Extract the result
