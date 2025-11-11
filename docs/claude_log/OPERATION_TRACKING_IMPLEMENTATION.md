@@ -90,7 +90,7 @@ export RUST_LOG=info
 
 ## Testing
 
-Created test script: `/home/rmaeda/workspace/rust/benchfs/test_operation_tracking.sh`
+Created test script: `/home/rmaeda/workspace/rust/benchfs/scripts/test_operation_tracking.sh`
 
 The script:
 1. Builds release binaries
