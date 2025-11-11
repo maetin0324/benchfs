@@ -42,7 +42,7 @@ fi
 
 # Build BenchFS library
 echo -e "${YELLOW}Building BenchFS library...${NC}"
-cargo build --lib
+cargo build --release --lib
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Failed to build BenchFS library${NC}"
