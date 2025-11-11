@@ -12,7 +12,7 @@ JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
 OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
-BENCHFS_PREFIX="${PROJECT_ROOT}/target/debug"
+BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 # Debug: Print paths
