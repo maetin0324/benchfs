@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::rpc::address_registry::WorkerAddressRegistry;
 use crate::rpc::stream_client::StreamRpcClient;
@@ -184,17 +185,53 @@ impl ConnectionPool {
 
         tracing::info!("Resolved {}:{} to {}", hostname, port, socket_addr);
 
-        // Create endpoint using connect_socket()
-        let endpoint = self
-            .worker
-            .connect_socket(socket_addr)
-            .await
-            .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "Failed to connect to {} (node {}): {:?}",
-                    socket_addr, node_id, e
-                ))
-            })?;
+        // Create endpoint using connect_socket() with retries in case the server
+        // is still warming up (replaces the eager wait_and_connect() used before).
+        const STREAM_CONNECT_MAX_RETRIES: u32 = 5;
+        const STREAM_CONNECT_RETRY_DELAY_MS: u64 = 200;
+
+        let mut last_error: Option<String> = None;
+        let mut endpoint_opt = None;
+
+        for attempt in 1..=STREAM_CONNECT_MAX_RETRIES {
+            match self.worker.connect_socket(socket_addr).await {
+                Ok(endpoint) => {
+                    endpoint_opt = Some(endpoint);
+                    break;
+                }
+                Err(e) => {
+                    let err_msg = format!("{:?}", e);
+                    tracing::warn!(
+                        "Failed to connect Stream RPC to {} (node {}) (attempt {}/{}): {:?}",
+                        socket_addr,
+                        node_id,
+                        attempt,
+                        STREAM_CONNECT_MAX_RETRIES,
+                        e
+                    );
+                    last_error = Some(err_msg);
+
+                    if attempt == STREAM_CONNECT_MAX_RETRIES {
+                        break;
+                    }
+
+                    pluvio_timer::sleep(Duration::from_millis(
+                        STREAM_CONNECT_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        let endpoint = endpoint_opt.ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "Failed to connect Stream RPC to {} (node {}) after {} attempts: {}",
+                socket_addr,
+                node_id,
+                STREAM_CONNECT_MAX_RETRIES,
+                last_error.unwrap_or_else(|| "unknown error".to_string())
+            ))
+        })?;
 
         let conn = crate::rpc::Connection::new(self.worker.clone(), endpoint);
         let client = Rc::new(RpcClient::new(conn));
