@@ -6,17 +6,17 @@
 use std::mem::MaybeUninit;
 use std::rc::Rc;
 
+use pluvio_ucx::Worker;
 use pluvio_ucx::async_ucx::ucp::RKey;
 use pluvio_ucx::endpoint::Endpoint;
-use pluvio_ucx::Worker;
 use zerocopy::FromBytes;
 
+use super::RpcError;
 use super::stream_helpers::{
-    stream_recv, stream_recv_completion, stream_recv_rpc_id,
-    stream_send_completion, stream_send_header, stream_send_u64, MAX_HEADER_SIZE,
+    MAX_HEADER_SIZE, stream_recv, stream_recv_completion, stream_recv_rpc_id,
+    stream_send_completion, stream_send_header, stream_send_u64,
 };
 use super::stream_rpc::{ClientGetRequestMessage, ClientPutRequestMessage, StreamRpc};
-use super::RpcError;
 use crate::rpc::handlers::RpcHandlerContext;
 
 /// Stream-based RPC server
@@ -87,7 +87,10 @@ impl StreamRpcServer {
                                 );
 
                                 // Brief delay before retry
-                                pluvio_timer::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                                pluvio_timer::sleep(std::time::Duration::from_millis(
+                                    RETRY_DELAY_MS,
+                                ))
+                                .await;
                                 continue;
                             } else {
                                 // Non-retryable error or max retries exceeded
@@ -117,7 +120,6 @@ impl StreamRpcServer {
                 StreamMetadataDeleteRequest, StreamMetadataLookupRequest,
                 StreamMetadataUpdateRequest, StreamShutdownRequest,
             };
-            
 
             let result = match rpc_id {
                 // Data operations
@@ -181,7 +183,11 @@ impl StreamRpcServer {
 
             // Handle RPC result
             if let Err(e) = result {
-                tracing::error!("StreamRpcServer: Handler error for RPC ID {}: {:?}", rpc_id, e);
+                tracing::error!(
+                    "StreamRpcServer: Handler error for RPC ID {}: {:?}",
+                    rpc_id,
+                    e
+                );
                 // Continue serving despite errors
             }
         }
@@ -194,10 +200,7 @@ impl StreamRpcServer {
     ///
     /// Generic handler that works with any StreamRpc implementing NoRma pattern.
     /// Handles both path-based and path-less RPCs.
-    pub async fn handle_no_rma<T: StreamRpc>(
-        &self,
-        endpoint: &Endpoint,
-    ) -> Result<(), RpcError> {
+    pub async fn handle_no_rma<T: StreamRpc>(&self, endpoint: &Endpoint) -> Result<(), RpcError> {
         tracing::trace!(
             "handle_no_rma: rpc_id={}, receiving request message",
             T::rpc_id()
@@ -212,7 +215,8 @@ impl StreamRpcServer {
         let msg_len = stream_recv(endpoint, &mut buffer).await?;
 
         // SAFETY: We just received msg_len bytes
-        let msg_bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, msg_len) };
+        let msg_bytes =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, msg_len) };
 
         // 2. Parse message: header_len (4) + header + path_len (4) + path
         if msg_bytes.len() < 8 {
@@ -272,16 +276,14 @@ impl StreamRpcServer {
             let path = std::str::from_utf8(&msg_bytes[offset..offset + path_len])
                 .map_err(|e| RpcError::TransportError(format!("Invalid path UTF-8: {:?}", e)))?;
 
-            tracing::trace!("handle_no_rma: calling server_handler_with_path, path={}", path);
+            tracing::trace!(
+                "handle_no_rma: calling server_handler_with_path, path={}",
+                path
+            );
 
             // Call path-aware handler
-            match T::server_handler_with_path(
-                self.handler_context.clone(),
-                endpoint,
-                header,
-                path,
-            )
-            .await
+            match T::server_handler_with_path(self.handler_context.clone(), endpoint, header, path)
+                .await
             {
                 Ok(res) => res,
                 Err(e) => {
@@ -343,8 +345,8 @@ impl StreamRpcServer {
             )));
         }
 
-        let header: T::RequestHeader =
-            T::RequestHeader::read_from_bytes(&req_msg.header_bytes).map_err(|e| {
+        let header: T::RequestHeader = T::RequestHeader::read_from_bytes(&req_msg.header_bytes)
+            .map_err(|e| {
                 RpcError::TransportError(format!("Failed to parse request header: {:?}", e))
             })?;
 
@@ -352,11 +354,7 @@ impl StreamRpcServer {
             .map_err(|e| RpcError::TransportError(format!("Invalid path UTF-8: {:?}", e)))?;
 
         // 3. Prepare buffer for receiving data
-        let buffer = self
-            .handler_context
-            .allocator
-            .acquire()
-            .await;
+        let buffer = self.handler_context.allocator.acquire().await;
 
         if req_msg.data_size as usize > buffer.len() {
             return Err(RpcError::TransportError(format!(
@@ -385,12 +383,8 @@ impl StreamRpcServer {
 
         // 6. Call handler with received data and path
         // SAFETY: buffer.as_ptr() returns a valid pointer, and we know data_size bytes were written
-        let data_slice = unsafe {
-            std::slice::from_raw_parts(
-                buffer.as_ptr(),
-                req_msg.data_size as usize,
-            )
-        };
+        let data_slice =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr(), req_msg.data_size as usize) };
         let response = match T::server_handler_with_data(
             self.handler_context.clone(),
             endpoint,
@@ -448,8 +442,8 @@ impl StreamRpcServer {
             )));
         }
 
-        let header: T::RequestHeader =
-            T::RequestHeader::read_from_bytes(&req_msg.header_bytes).map_err(|e| {
+        let header: T::RequestHeader = T::RequestHeader::read_from_bytes(&req_msg.header_bytes)
+            .map_err(|e| {
                 RpcError::TransportError(format!("Failed to parse request header: {:?}", e))
             })?;
 
@@ -515,7 +509,10 @@ impl StreamRpcServer {
     }
 
     /// Helper: Receive ClientPutRequestMessage
-    async fn recv_client_put_request_message(&self, endpoint: &Endpoint) -> Result<Vec<u8>, RpcError> {
+    async fn recv_client_put_request_message(
+        &self,
+        endpoint: &Endpoint,
+    ) -> Result<Vec<u8>, RpcError> {
         // For simplicity, receive up to 4KB for the message
         // Format: rpc_id (2) + header_len (4) + header + data_addr (8) + data_size (8) + rkey_len (4) + rkey
         let max_size = 4096;
@@ -530,7 +527,10 @@ impl StreamRpcServer {
     }
 
     /// Helper: Receive ClientGetRequestMessage
-    async fn recv_client_get_request_message(&self, endpoint: &Endpoint) -> Result<Vec<u8>, RpcError> {
+    async fn recv_client_get_request_message(
+        &self,
+        endpoint: &Endpoint,
+    ) -> Result<Vec<u8>, RpcError> {
         // Same as ClientPutRequestMessage for now
         self.recv_client_put_request_message(endpoint).await
     }

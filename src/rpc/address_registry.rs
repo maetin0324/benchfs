@@ -268,10 +268,7 @@ impl WorkerAddressRegistry {
 
         // Read port from file
         let port_str = fs::read_to_string(&file_path).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "Failed to read stream port for {}: {}",
-                node_id, e
-            ))
+            RpcError::ConnectionError(format!("Failed to read stream port for {}: {}", node_id, e))
         })?;
 
         let port = port_str.trim().parse::<u16>().map_err(|e| {
@@ -452,7 +449,8 @@ impl WorkerAddressRegistry {
 
     /// Get the file path for a node's Stream RPC hostname
     fn stream_hostname_file_path(&self, node_id: &str) -> PathBuf {
-        self.registry_dir.join(format!("{}.stream_hostname", node_id))
+        self.registry_dir
+            .join(format!("{}.stream_hostname", node_id))
     }
 
     /// Get the registry directory path

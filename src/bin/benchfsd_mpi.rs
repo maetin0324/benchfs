@@ -13,11 +13,11 @@
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
 use benchfs::metadata::MetadataManager;
+use benchfs::rpc::RpcError;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
 use benchfs::rpc::stream_server::StreamRpcServer;
-use benchfs::rpc::RpcError;
 use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
@@ -280,7 +280,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));
 
     // Create Stream RPC server (Stream + RMA based)
-    let stream_rpc_server = Rc::new(StreamRpcServer::new(worker.clone(), handler_context.clone()));
+    let stream_rpc_server = Rc::new(StreamRpcServer::new(
+        worker.clone(),
+        handler_context.clone(),
+    ));
 
     // Create connection pool for inter-node communication
     // Note: bind_and_register() will be called later to create the socket listener
@@ -420,7 +423,11 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
             }
         };
 
-        tracing::info!("Node {} registered with address {}", node_id_clone, bound_addr);
+        tracing::info!(
+            "Node {} registered with address {}",
+            node_id_clone,
+            bound_addr
+        );
 
         // Start Stream RPC acceptor loop now that listener is bound
         // Take the listener from the connection pool
@@ -464,7 +471,8 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                             Err(e) => {
                                 tracing::error!("Stream RPC accept error: {:?}", e);
                                 // Brief delay before retrying
-                                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                                futures_timer::Delay::new(std::time::Duration::from_millis(100))
+                                    .await;
                             }
                         }
                     }
@@ -492,8 +500,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
             for rank in 0..mpi_size_clone {
                 if rank != mpi_rank_clone {
                     let other_node_id = format!("node_{}", rank);
-                    let registry_file =
-                        registry_dir_clone.join(format!("{}.addr", other_node_id));
+                    let registry_file = registry_dir_clone.join(format!("{}.addr", other_node_id));
                     if registry_file.exists() {
                         registered_count += 1;
                     }

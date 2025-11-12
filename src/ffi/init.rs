@@ -13,9 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use super::error::*;
-use super::runtime::{
-    set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime,
-};
+use super::runtime::{set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime};
 use crate::api::file_ops::BenchFS;
 use crate::metadata::MetadataManager;
 use crate::rpc::connection::ConnectionPool;
@@ -409,17 +407,14 @@ pub extern "C" fn benchfs_init(
         let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
 
         // Create connection pool
-        let connection_pool = match ConnectionPool::new(
-            worker.clone(),
-            ucx_context.clone(),
-            registry_dir_str,
-        ) {
-            Ok(pool) => Rc::new(pool),
-            Err(e) => {
-                set_error_message(&format!("Failed to create connection pool: {:?}", e));
-                return std::ptr::null_mut();
-            }
-        };
+        let connection_pool =
+            match ConnectionPool::new(worker.clone(), ucx_context.clone(), registry_dir_str) {
+                Ok(pool) => Rc::new(pool),
+                Err(e) => {
+                    set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                    return std::ptr::null_mut();
+                }
+            };
 
         // Bind to socket and register this server's address
         let base_port = 50051u16;
@@ -433,7 +428,10 @@ pub extern "C" fn benchfs_init(
                 tracing::info!("Server {} bound and registered at {}", node_id_str, addr);
             }
             Err(e) => {
-                set_error_message(&format!("Failed to bind and register server address: {:?}", e));
+                set_error_message(&format!(
+                    "Failed to bind and register server address: {:?}",
+                    e
+                ));
                 return std::ptr::null_mut();
             }
         }
@@ -511,17 +509,14 @@ pub extern "C" fn benchfs_init(
         ucx_reactor.register_worker(worker.clone());
 
         // Create connection pool
-        let connection_pool = match ConnectionPool::new(
-            worker,
-            ucx_context.clone(),
-            registry_dir_str,
-        ) {
-            Ok(pool) => Rc::new(pool),
-            Err(e) => {
-                set_error_message(&format!("Failed to create connection pool: {:?}", e));
-                return std::ptr::null_mut();
-            }
-        };
+        let connection_pool =
+            match ConnectionPool::new(worker, ucx_context.clone(), registry_dir_str) {
+                Ok(pool) => Rc::new(pool),
+                Err(e) => {
+                    set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                    return std::ptr::null_mut();
+                }
+            };
 
         // Discover data nodes BEFORE connecting (critical for load distribution)
         tracing::info!("Discovering data nodes from registry...");
@@ -551,9 +546,7 @@ pub extern "C" fn benchfs_init(
                 discovered_nodes.len()
             );
         } else {
-            tracing::warn!(
-                "No data nodes discovered; Stream connections will be attempted lazily"
-            );
+            tracing::warn!("No data nodes discovered; Stream connections will be attempted lazily");
         }
 
         // Get data_dir for client (use temp dir if not specified)

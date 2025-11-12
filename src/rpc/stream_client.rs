@@ -12,14 +12,12 @@ use pluvio_ucx::endpoint::Endpoint;
 use pluvio_ucx::{Context, Worker};
 use zerocopy::FromBytes;
 
+use super::RpcError;
 use super::stream_helpers::{
     stream_recv_completion, stream_recv_header, stream_recv_u64, stream_send,
     stream_send_completion, stream_send_rpc_id,
 };
-use super::stream_rpc::{
-    ClientGetRequestMessage, ClientPutRequestMessage, RpcPattern, StreamRpc,
-};
-use super::RpcError;
+use super::stream_rpc::{ClientGetRequestMessage, ClientPutRequestMessage, RpcPattern, StreamRpc};
 
 /// Stream-based RPC client
 ///
@@ -300,9 +298,9 @@ impl StreamRpcClient {
         // 5. Buffer now contains the data
         // Create a success response header (actual header comes from server via response)
         // For now, we return a default response indicating success
-        let response = T::ResponseHeader::read_from_bytes(&[0u8; 256][..std::mem::size_of::<
-            T::ResponseHeader,
-        >()])
+        let response = T::ResponseHeader::read_from_bytes(
+            &[0u8; 256][..std::mem::size_of::<T::ResponseHeader>()],
+        )
         .map_err(|e| {
             RpcError::TransportError(format!("Failed to create response header: {:?}", e))
         })?;

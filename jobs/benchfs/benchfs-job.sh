@@ -98,15 +98,19 @@ if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
     ib_netdev=$(detect_ib_netdev)
     if [[ -n "${ib_netdev}" ]]; then
       export UCX_NET_DEVICES="${ib_netdev}"
+      export BENCHFS_STREAM_INTERFACE="${ib_netdev}"
     else
       export UCX_NET_DEVICES="all"
+      unset BENCHFS_STREAM_INTERFACE
     fi
   else
     primary_netdev=$(detect_primary_netdev)
     if [[ -n "${primary_netdev}" ]]; then
       export UCX_NET_DEVICES="${primary_netdev}"
+      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
     else
       export UCX_NET_DEVICES="all"
+      unset BENCHFS_STREAM_INTERFACE
     fi
   fi
 fi

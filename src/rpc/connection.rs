@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,8 @@ use std::time::Duration;
 use crate::rpc::address_registry::WorkerAddressRegistry;
 use crate::rpc::stream_client::StreamRpcClient;
 use crate::rpc::{RpcClient, RpcError};
-use pluvio_ucx::{listener::Listener, Context, Worker};
+use gethostname::gethostname;
+use pluvio_ucx::{Context, Worker, listener::Listener};
 
 /// Connection pool for managing RPC client connections to remote nodes
 ///
@@ -81,13 +83,9 @@ impl ConnectionPool {
 
         tracing::info!("AM RPC listener bound to {}", bound_addr);
 
-        // Get hostname for registration
-        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
-            // Fallback: try to get hostname from system
-            gethostname::gethostname()
-                .to_string_lossy()
-                .into_owned()
-        });
+        // Determine hostname/IP for stream registration. Prefer explicit overrides,
+        // then interface-based detection, and finally fall back to the system hostname.
+        let hostname = Self::determine_stream_hostname();
 
         // Register WorkerAddress for backward compatibility (needed for registration waiting loop)
         let worker_addr = self.worker.address().map_err(|e| {
@@ -97,8 +95,7 @@ impl ConnectionPool {
         self.registry.register(node_id, worker_addr_bytes)?;
 
         // Register hostname and port separately for socket-based connections
-        self.registry
-            .register_stream_hostname(node_id, &hostname)?;
+        self.registry.register_stream_hostname(node_id, &hostname)?;
         self.registry
             .register_stream_port(node_id, bound_addr.port())?;
 
@@ -215,10 +212,7 @@ impl ConnectionPool {
                         break;
                     }
 
-                    pluvio_timer::sleep(Duration::from_millis(
-                        STREAM_CONNECT_RETRY_DELAY_MS,
-                    ))
-                    .await;
+                    pluvio_timer::sleep(Duration::from_millis(STREAM_CONNECT_RETRY_DELAY_MS)).await;
                 }
             }
         }
@@ -380,7 +374,12 @@ impl ConnectionPool {
             ))
         })?;
 
-        tracing::info!("Resolved Stream RPC {}:{} to {}", hostname, port, socket_addr);
+        tracing::info!(
+            "Resolved Stream RPC {}:{} to {}",
+            hostname,
+            port,
+            socket_addr
+        );
 
         // Retry connecting in case the server-side listener is still warming up.
         const STREAM_CONNECT_MAX_RETRIES: u32 = 5;
@@ -408,10 +407,8 @@ impl ConnectionPool {
                     last_error = Some(err_string);
 
                     if attempt < STREAM_CONNECT_MAX_RETRIES {
-                        pluvio_timer::sleep(Duration::from_millis(
-                            STREAM_CONNECT_RETRY_DELAY_MS,
-                        ))
-                        .await;
+                        pluvio_timer::sleep(Duration::from_millis(STREAM_CONNECT_RETRY_DELAY_MS))
+                            .await;
                     }
                 }
             }
@@ -442,7 +439,10 @@ impl ConnectionPool {
             .borrow_mut()
             .insert(node_id.to_string(), client.clone());
 
-        tracing::info!("Stream RPC connection to {} established via socket", node_id);
+        tracing::info!(
+            "Stream RPC connection to {} established via socket",
+            node_id
+        );
 
         Ok(client)
     }
@@ -462,6 +462,101 @@ impl ConnectionPool {
 
         // Create connection using WorkerAddress
         self.get_or_connect_stream(node_id).await
+    }
+}
+
+impl ConnectionPool {
+    fn determine_stream_hostname() -> String {
+        if let Ok(explicit) = std::env::var("BENCHFS_STREAM_HOSTNAME") {
+            if !explicit.trim().is_empty() {
+                return explicit.trim().to_string();
+            }
+        }
+
+        if let Some(iface_host) = Self::hostname_from_interfaces() {
+            return iface_host;
+        }
+
+        std::env::var("HOSTNAME").unwrap_or_else(|_| gethostname().to_string_lossy().into_owned())
+    }
+
+    fn hostname_from_interfaces() -> Option<String> {
+        if let Ok(iface) = std::env::var("BENCHFS_STREAM_INTERFACE") {
+            if let Some(ip) = Self::ipv4_for_interface(iface.trim()) {
+                tracing::info!(
+                    "Using IPv4 {} from BENCHFS_STREAM_INTERFACE={} for Stream RPC",
+                    ip,
+                    iface
+                );
+                return Some(ip);
+            } else {
+                tracing::warn!(
+                    "BENCHFS_STREAM_INTERFACE={} set but no IPv4 address was found",
+                    iface
+                );
+            }
+        }
+
+        if let Ok(devices) = std::env::var("UCX_NET_DEVICES") {
+            for dev in devices.split(',') {
+                let dev = dev.trim();
+                if dev.is_empty() {
+                    continue;
+                }
+
+                // UCX syntax like mlx5_0:1 refers to an IB device/port without
+                // a direct OS netdev. Ignore those here (mapping them reliably
+                // requires additional system introspection). If the value looks
+                // like a regular interface name, use it.
+                if dev.contains(':') {
+                    continue;
+                }
+
+                if let Some(ip) = Self::ipv4_for_interface(dev) {
+                    tracing::info!(
+                        "Using IPv4 {} from UCX_NET_DEVICES entry {} for Stream RPC",
+                        ip,
+                        dev
+                    );
+                    return Some(ip);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn ipv4_for_interface(interface: &str) -> Option<String> {
+        if interface.is_empty() {
+            return None;
+        }
+
+        let output = Command::new("ip")
+            .args(["-o", "-4", "addr", "show", "dev", interface])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let mut parts = line.split_whitespace();
+            while let Some(token) = parts.next() {
+                if token == "inet" {
+                    if let Some(addr) = parts.next() {
+                        if let Some((ip, _)) = addr.split_once('/') {
+                            if !ip.is_empty() {
+                                return Some(ip.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 }
 

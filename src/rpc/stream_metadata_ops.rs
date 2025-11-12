@@ -10,12 +10,12 @@ use std::rc::Rc;
 use pluvio_ucx::endpoint::Endpoint;
 
 use super::metadata_ops::{
-    MetadataCreateDirRequestHeader, MetadataCreateDirResponseHeader, MetadataCreateFileRequestHeader,
-    MetadataCreateFileResponseHeader, MetadataDeleteRequestHeader, MetadataDeleteResponseHeader,
-    MetadataLookupRequestHeader, MetadataLookupResponseHeader, MetadataUpdateRequestHeader,
-    MetadataUpdateResponseHeader, ShutdownRequestHeader, ShutdownResponseHeader,
-    RPC_METADATA_CREATE_DIR, RPC_METADATA_CREATE_FILE, RPC_METADATA_DELETE, RPC_METADATA_LOOKUP,
-    RPC_METADATA_UPDATE, RPC_SHUTDOWN,
+    MetadataCreateDirRequestHeader, MetadataCreateDirResponseHeader,
+    MetadataCreateFileRequestHeader, MetadataCreateFileResponseHeader, MetadataDeleteRequestHeader,
+    MetadataDeleteResponseHeader, MetadataLookupRequestHeader, MetadataLookupResponseHeader,
+    MetadataUpdateRequestHeader, MetadataUpdateResponseHeader, RPC_METADATA_CREATE_DIR,
+    RPC_METADATA_CREATE_FILE, RPC_METADATA_DELETE, RPC_METADATA_LOOKUP, RPC_METADATA_UPDATE,
+    RPC_SHUTDOWN, ShutdownRequestHeader, ShutdownResponseHeader,
 };
 use super::stream_client::StreamRpcClient;
 use super::stream_rpc::{RpcPattern, StreamRpc};
@@ -65,10 +65,7 @@ impl StreamRpc for StreamMetadataLookupRequest {
         self.path.as_bytes().to_vec()
     }
 
-    async fn call(
-        &self,
-        client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute_no_rma(self).await
     }
 
@@ -170,10 +167,7 @@ impl StreamRpc for StreamMetadataCreateFileRequest {
         self.path.as_bytes().to_vec()
     }
 
-    async fn call(
-        &self,
-        client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute_no_rma(self).await
     }
 
@@ -274,10 +268,7 @@ impl StreamRpc for StreamMetadataCreateDirRequest {
         self.path.as_bytes().to_vec()
     }
 
-    async fn call(
-        &self,
-        client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute_no_rma(self).await
     }
 
@@ -299,14 +290,16 @@ impl StreamRpc for StreamMetadataCreateDirRequest {
         header: Self::RequestHeader,
         path: &str,
     ) -> Result<Self::ResponseHeader, RpcError> {
-        tracing::debug!("StreamMetadataCreateDir: path={}, mode={:#o}", path, header.mode);
+        tracing::debug!(
+            "StreamMetadataCreateDir: path={}, mode={:#o}",
+            path,
+            header.mode
+        );
 
         // Create directory metadata
         use crate::metadata::DirectoryMetadata;
-        let dir_meta = DirectoryMetadata::new(
-            ctx.metadata_manager.generate_inode(),
-            path.to_string(),
-        );
+        let dir_meta =
+            DirectoryMetadata::new(ctx.metadata_manager.generate_inode(), path.to_string());
 
         let inode = dir_meta.inode;
 
@@ -393,10 +386,7 @@ impl StreamRpc for StreamMetadataDeleteRequest {
         self.path.as_bytes().to_vec()
     }
 
-    async fn call(
-        &self,
-        client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute_no_rma(self).await
     }
 
@@ -516,10 +506,7 @@ impl StreamRpc for StreamMetadataUpdateRequest {
         self.path.as_bytes().to_vec()
     }
 
-    async fn call(
-        &self,
-        client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute_no_rma(self).await
     }
 
@@ -642,10 +629,7 @@ impl StreamRpc for StreamShutdownRequest {
         &self.header
     }
 
-    async fn call(
-        &self,
-        client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute_no_rma(self).await
     }
 
@@ -741,10 +725,7 @@ mod tests {
 
     #[test]
     fn test_rpc_ids() {
-        assert_eq!(
-            StreamMetadataLookupRequest::rpc_id(),
-            RPC_METADATA_LOOKUP
-        );
+        assert_eq!(StreamMetadataLookupRequest::rpc_id(), RPC_METADATA_LOOKUP);
         assert_eq!(
             StreamMetadataCreateFileRequest::rpc_id(),
             RPC_METADATA_CREATE_FILE

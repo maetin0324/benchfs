@@ -71,9 +71,7 @@ pub async fn stream_recv_header<H: Serializable>(endpoint: &Endpoint) -> Result<
     }
 
     // SAFETY: We just received exactly header_size bytes
-    let bytes = unsafe {
-        std::slice::from_raw_parts(buffer.as_ptr() as *const u8, header_size)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, header_size) };
 
     H::read_from_bytes(bytes)
         .map_err(|e| RpcError::TransportError(format!("Failed to deserialize header: {:?}", e)))

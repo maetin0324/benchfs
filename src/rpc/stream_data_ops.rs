@@ -8,8 +8,8 @@ use std::rc::Rc;
 use pluvio_ucx::endpoint::Endpoint;
 
 use super::data_ops::{
-    ReadChunkRequestHeader, ReadChunkResponseHeader, WriteChunkRequestHeader,
-    WriteChunkResponseHeader, RPC_READ_CHUNK, RPC_WRITE_CHUNK,
+    RPC_READ_CHUNK, RPC_WRITE_CHUNK, ReadChunkRequestHeader, ReadChunkResponseHeader,
+    WriteChunkRequestHeader, WriteChunkResponseHeader,
 };
 use super::stream_client::StreamRpcClient;
 use super::stream_rpc::{RpcPattern, StreamRpc};
@@ -67,10 +67,7 @@ impl StreamRpc for StreamReadChunkRequest {
         self.path.as_bytes().to_vec()
     }
 
-    async fn call(
-        &self,
-        _client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, _client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         // Note: This method is not directly used for Client GET pattern
         // Instead, use execute_client_get which returns both header and data
         Err(RpcError::HandlerError(
@@ -209,10 +206,7 @@ impl StreamRpc for StreamWriteChunkRequest<'_> {
         self.path.as_bytes().to_vec()
     }
 
-    async fn call(
-        &self,
-        _client: &StreamRpcClient,
-    ) -> Result<Self::ResponseHeader, RpcError> {
+    async fn call(&self, _client: &StreamRpcClient) -> Result<Self::ResponseHeader, RpcError> {
         // Note: This method is not directly used for Client PUT pattern
         // Instead, use execute_client_put which takes data parameter
         Err(RpcError::HandlerError(

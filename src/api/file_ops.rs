@@ -203,8 +203,7 @@ impl BenchFS {
                         // Note: In path-based KV design, chunk locations are not tracked in metadata
 
                         // Cache locally for future access
-                        if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone())
-                        {
+                        if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone()) {
                             tracing::warn!("Failed to cache metadata locally: {:?}", e);
                         } else {
                             tracing::debug!("Cached metadata for {} locally", path);
@@ -255,13 +254,9 @@ impl BenchFS {
                             // File found on remote server - create local cache entry
                             let meta = FileMetadata::new(path.to_string(), response.size);
                             // Cache locally for future access
-                            if let Err(e) =
-                                self.metadata_manager.store_file_metadata(meta.clone())
+                            if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone())
                             {
-                                tracing::warn!(
-                                    "Failed to cache metadata in benchfs_open: {:?}",
-                                    e
-                                );
+                                tracing::warn!("Failed to cache metadata in benchfs_open: {:?}", e);
                             } else {
                                 tracing::debug!("Cached metadata for {} in benchfs_open", path);
                             }
@@ -310,9 +305,8 @@ impl BenchFS {
                                     let mut truncated_meta = meta.clone();
                                     truncated_meta.size = 0;
                                     // chunk_count and chunk_locations are not tracked in path-based KV design
-                                    if let Err(e) = self
-                                        .metadata_manager
-                                        .update_file_metadata(truncated_meta)
+                                    if let Err(e) =
+                                        self.metadata_manager.update_file_metadata(truncated_meta)
                                     {
                                         tracing::warn!(
                                             "Failed to update local cache after remote truncate: {:?}",
@@ -375,8 +369,7 @@ impl BenchFS {
 
                                 // Cache newly created file metadata locally
                                 let file_meta = FileMetadata::new(path.to_string(), 0);
-                                if let Err(e) =
-                                    self.metadata_manager.store_file_metadata(file_meta)
+                                if let Err(e) = self.metadata_manager.store_file_metadata(file_meta)
                                 {
                                     tracing::warn!(
                                         "Failed to cache metadata after remote create: {:?}",
@@ -770,7 +763,10 @@ impl BenchFS {
                                     );
 
                                     // Execute RPC
-                                    match stream_client.execute_client_put(&request, chunk_data.as_slice()).await {
+                                    match stream_client
+                                        .execute_client_put(&request, chunk_data.as_slice())
+                                        .await
+                                    {
                                         Ok(response) if response.is_success() => {
                                             tracing::debug!(
                                                 "Successfully wrote {} bytes to remote node",
@@ -1138,8 +1134,7 @@ impl BenchFS {
                         }
                         Ok(response) if response.is_success() && response.is_directory() => {
                             // Directory found
-                            let dir_meta =
-                                DirectoryMetadata::new(response.inode, path.to_string());
+                            let dir_meta = DirectoryMetadata::new(response.inode, path.to_string());
                             Ok(FileStat::from_dir_metadata(&dir_meta))
                         }
                         Ok(_) => Err(ApiError::NotFound(path.to_string())),
@@ -1376,11 +1371,9 @@ impl BenchFS {
     /// This centralizes error handling and connection management.
     async fn get_stream_client(&self, node_id: &str) -> ApiResult<Rc<StreamRpcClient>> {
         if let Some(pool) = &self.connection_pool {
-            pool.get_or_connect_stream(node_id)
-                .await
-                .map_err(|e| {
-                    ApiError::Internal(format!("Failed to connect to {}: {:?}", node_id, e))
-                })
+            pool.get_or_connect_stream(node_id).await.map_err(|e| {
+                ApiError::Internal(format!("Failed to connect to {}: {:?}", node_id, e))
+            })
         } else {
             Err(ApiError::Internal(
                 "Distributed mode not enabled".to_string(),
