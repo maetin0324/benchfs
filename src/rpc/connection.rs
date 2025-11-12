@@ -604,12 +604,51 @@ impl ConnectionPool {
         let (device, port) = entry.split_once(':').unwrap_or((entry, "1"));
         let port = port.split('.').next().unwrap_or(port);
 
-        let mut interfaces = Self::ib_netdevs_from_sysfs(device, port);
+        let mut interfaces = Self::interfaces_for_ib_device(device, port);
+        if interfaces.is_empty() {
+            interfaces = Self::ib_netdevs_from_sysfs(device, port);
+        }
         if interfaces.is_empty() {
             interfaces = Self::ib_netdevs_from_ibdev2netdev(device, port);
         }
 
         interfaces
+    }
+
+    fn interfaces_for_ib_device(device: &str, port: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let target_port = port.parse::<u32>().ok();
+
+        if let Ok(entries) = fs::read_dir("/sys/class/net") {
+            for entry in entries.flatten() {
+                let iface_os = match entry.file_name().into_string() {
+                    Ok(name) => name,
+                    Err(_) => continue,
+                };
+
+                let iface_path = entry.path();
+                let device_path = iface_path.join("device");
+                let infiniband_path = device_path.join("infiniband").join(device);
+                if !infiniband_path.exists() {
+                    continue;
+                }
+
+                if let Some(target_port) = target_port {
+                    if let Ok(dev_port_str) = fs::read_to_string(iface_path.join("dev_port")) {
+                        if let Ok(dev_port) = dev_port_str.trim().parse::<u32>() {
+                            // dev_port is zero-indexed
+                            if dev_port + 1 != target_port {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                names.push(iface_os);
+            }
+        }
+
+        names
     }
 
     fn ib_netdevs_from_sysfs(device: &str, port: &str) -> Vec<String> {
