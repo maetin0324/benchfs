@@ -66,12 +66,39 @@ detect_active_ib() {
   return 1
 }
 
-detect_ib_netdev() {
+detect_ib_device() {
   if command -v ibdev2netdev >/dev/null 2>&1; then
-    ibdev2netdev 2>/dev/null | awk 'NR==1 {print $2; exit}'
-  else
-    find /sys/class/infiniband -maxdepth 3 -path '*/ports/*/gid_attrs/ndevs/*' -print -quit \
-      | xargs -r basename
+    local selection
+    selection=$(
+      ibdev2netdev 2>/dev/null | awk '
+        /==>/ {
+          last_dev=$1;
+          last_port=$3;
+          if ($0 ~ /\(Up\)/) {
+            printf "%s:%s\n", $1, $3;
+            exit;
+          }
+        }
+        END {
+          if (NR > 0 && last_dev != "" && last_port != "") {
+            printf "%s:%s\n", last_dev, last_port;
+          }
+        }'
+    )
+    if [[ -n "${selection}" ]]; then
+      echo "${selection}"
+      return
+    fi
+  fi
+
+  local first_device
+  first_device=$(ls /sys/class/infiniband 2>/dev/null | head -n 1)
+  if [[ -n "${first_device}" ]]; then
+    if [[ -d "/sys/class/infiniband/${first_device}/ports/1" ]]; then
+      echo "${first_device}:1"
+    else
+      echo "${first_device}"
+    fi
   fi
 }
 
@@ -79,6 +106,20 @@ detect_primary_netdev() {
   command -v ip >/dev/null 2>&1 || return
   ip route get 1.1.1.1 2>/dev/null \
     | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+
+should_override_ucx_net_devices() {
+  local current="${UCX_NET_DEVICES:-}"
+  if [[ -z "${current}" ]]; then
+    return 0
+  fi
+
+  local lower=${current,,}
+  if [[ "${lower}" == "all" || "${lower}" == "auto" ]]; then
+    return 0
+  fi
+
+  return 1
 }
 
 if [[ -z "${UCX_TLS:-}" ]]; then
@@ -93,26 +134,31 @@ fi
 export UCX_MEMTYPE_CACHE="n"
 
 # UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
-if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
+if should_override_ucx_net_devices; then
   if [[ "${UCX_TLS}" == *rc* ]]; then
-    ib_netdev=$(detect_ib_netdev)
-    if [[ -n "${ib_netdev}" ]]; then
-      export UCX_NET_DEVICES="${ib_netdev}"
-      export BENCHFS_STREAM_INTERFACE="${ib_netdev}"
+    ib_device=$(detect_ib_device)
+    if [[ -n "${ib_device}" ]]; then
+      export UCX_NET_DEVICES="${ib_device}"
     else
-      export UCX_NET_DEVICES="all"
-      unset BENCHFS_STREAM_INTERFACE
+      primary_netdev=$(detect_primary_netdev)
+      if [[ -n "${primary_netdev}" ]]; then
+        export UCX_NET_DEVICES="${primary_netdev}"
+      else
+        export UCX_NET_DEVICES="all"
+      fi
     fi
   else
     primary_netdev=$(detect_primary_netdev)
     if [[ -n "${primary_netdev}" ]]; then
       export UCX_NET_DEVICES="${primary_netdev}"
-      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
     else
       export UCX_NET_DEVICES="all"
-      unset BENCHFS_STREAM_INTERFACE
     fi
   fi
+
+  echo "Auto-selected UCX_NET_DEVICES=${UCX_NET_DEVICES}"
+else
+  echo "UCX_NET_DEVICES preset to ${UCX_NET_DEVICES}, leaving unchanged"
 fi
 
 # 明示的に UD/DC を使わせない

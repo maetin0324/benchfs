@@ -6,6 +6,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -497,6 +499,8 @@ impl ConnectionPool {
             }
         }
 
+        let mut candidates = Vec::new();
+
         if let Ok(devices) = std::env::var("UCX_NET_DEVICES") {
             for dev in devices.split(',') {
                 let dev = dev.trim();
@@ -504,22 +508,41 @@ impl ConnectionPool {
                     continue;
                 }
 
-                // UCX syntax like mlx5_0:1 refers to an IB device/port without
-                // a direct OS netdev. Ignore those here (mapping them reliably
-                // requires additional system introspection). If the value looks
-                // like a regular interface name, use it.
-                if dev.contains(':') {
+                let dev_lower = dev.to_ascii_lowercase();
+                if dev_lower == "all" || dev_lower == "auto" {
                     continue;
                 }
 
-                if let Some(ip) = Self::ipv4_for_interface(dev) {
-                    tracing::info!(
-                        "Using IPv4 {} from UCX_NET_DEVICES entry {} for Stream RPC",
-                        ip,
-                        dev
-                    );
-                    return Some(ip);
+                let resolved = Self::resolve_ucx_device_entry(dev);
+                if resolved.is_empty() {
+                    Self::push_interface_candidate(&mut candidates, dev.to_string());
+                } else {
+                    for iface in resolved {
+                        Self::push_interface_candidate(&mut candidates, iface);
+                    }
                 }
+            }
+        }
+
+        if candidates.is_empty() {
+            candidates.extend(Self::prefer_ib_interfaces());
+        }
+
+        // Always append every IPv4-capable interface as a last resort so we
+        // eventually fall back to something routable.
+        for iface in Self::all_ipv4_interfaces() {
+            Self::push_interface_candidate(&mut candidates, iface);
+        }
+
+        for iface in candidates {
+            if let Some(ip) = Self::ipv4_for_interface(&iface) {
+                tracing::info!("Using IPv4 {} from interface {} for Stream RPC", ip, iface);
+                return Some(ip);
+            } else {
+                tracing::debug!(
+                    "Interface {} did not expose an IPv4 address for Stream RPC",
+                    iface
+                );
             }
         }
 
@@ -557,6 +580,136 @@ impl ConnectionPool {
         }
 
         None
+    }
+
+    fn push_interface_candidate(candidates: &mut Vec<String>, iface: String) {
+        if iface.is_empty() {
+            return;
+        }
+
+        if !candidates.iter().any(|existing| existing == &iface) {
+            candidates.push(iface);
+        }
+    }
+
+    fn resolve_ucx_device_entry(entry: &str) -> Vec<String> {
+        // Entries like mlx5_0:1 refer to an IB device + port. Try to map them
+        // to the corresponding IPoIB netdev so we can discover an IPv4 address.
+        let looks_like_ib =
+            entry.contains(':') || entry.starts_with("mlx") || entry.starts_with("ib");
+        if !looks_like_ib {
+            return Vec::new();
+        }
+
+        let (device, port) = entry.split_once(':').unwrap_or((entry, "1"));
+        let port = port.split('.').next().unwrap_or(port);
+
+        let mut interfaces = Self::ib_netdevs_from_sysfs(device, port);
+        if interfaces.is_empty() {
+            interfaces = Self::ib_netdevs_from_ibdev2netdev(device, port);
+        }
+
+        interfaces
+    }
+
+    fn ib_netdevs_from_sysfs(device: &str, port: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let path = Path::new("/sys/class/infiniband")
+            .join(device)
+            .join("ports")
+            .join(port)
+            .join("gid_attrs/ndevs");
+
+        if let Ok(entries) = fs::read_dir(&path) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+
+        names
+    }
+
+    fn ib_netdevs_from_ibdev2netdev(device: &str, port: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let output = Command::new("ibdev2netdev").output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let tokens: Vec<_> = line.split_whitespace().collect();
+                    if tokens.len() < 5 {
+                        continue;
+                    }
+
+                    if tokens[0] != device {
+                        continue;
+                    }
+
+                    if tokens[1] != "port" || tokens[2] != port {
+                        continue;
+                    }
+
+                    let iface = tokens[4].trim_matches(|c| c == '(' || c == ')');
+                    if !iface.is_empty() {
+                        names.push(iface.to_string());
+                    }
+                }
+            }
+        }
+
+        names
+    }
+
+    fn prefer_ib_interfaces() -> Vec<String> {
+        let mut preferred = Vec::new();
+        let all = Self::all_ipv4_interfaces();
+
+        for iface in &all {
+            if Self::looks_like_ib(iface) {
+                Self::push_interface_candidate(&mut preferred, iface.clone());
+            }
+        }
+
+        for iface in &all {
+            if Self::looks_like_ethernet(iface) {
+                Self::push_interface_candidate(&mut preferred, iface.clone());
+            }
+        }
+
+        preferred
+    }
+
+    fn all_ipv4_interfaces() -> Vec<String> {
+        let mut interfaces = Vec::new();
+        let output = Command::new("ip")
+            .args(["-o", "-4", "addr", "show"])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let mut parts = line.split_whitespace();
+                    let _idx = parts.next();
+                    if let Some(iface_token) = parts.next() {
+                        let iface = iface_token.trim_end_matches(':').to_string();
+                        Self::push_interface_candidate(&mut interfaces, iface);
+                    }
+                }
+            }
+        }
+
+        interfaces
+    }
+
+    fn looks_like_ib(iface: &str) -> bool {
+        iface.starts_with("ib")
+    }
+
+    fn looks_like_ethernet(iface: &str) -> bool {
+        iface.starts_with("en") || iface.starts_with("eth") || iface.starts_with("bond")
     }
 }
 
