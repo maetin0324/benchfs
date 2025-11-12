@@ -100,6 +100,54 @@ pub async fn stream_recv_u64(endpoint: &Endpoint) -> Result<u64, RpcError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+/// Send a u32 value via stream
+pub async fn stream_send_u32(endpoint: &Endpoint, value: u32) -> Result<usize, RpcError> {
+    stream_send(endpoint, &value.to_le_bytes()).await
+}
+
+/// Receive a u32 value via stream
+pub async fn stream_recv_u32(endpoint: &Endpoint) -> Result<u32, RpcError> {
+    let mut buffer = [MaybeUninit::<u8>::uninit(); 4];
+    let len = stream_recv(endpoint, &mut buffer).await?;
+
+    if len != 4 {
+        return Err(RpcError::TransportError(format!(
+            "Expected 4 bytes for u32, received {}",
+            len
+        )));
+    }
+
+    // SAFETY: We just received exactly 4 bytes
+    let bytes = unsafe { std::mem::transmute::<[MaybeUninit<u8>; 4], [u8; 4]>(buffer) };
+
+    Ok(u32::from_le_bytes(bytes))
+}
+
+/// Receive exactly `len` bytes from stream.
+pub async fn stream_recv_exact(endpoint: &Endpoint, len: usize) -> Result<Vec<u8>, RpcError> {
+    let mut output = vec![0u8; len];
+    let mut offset = 0usize;
+
+    while offset < len {
+        let remaining = len - offset;
+        let mut buffer = vec![MaybeUninit::<u8>::uninit(); remaining];
+        let received = stream_recv(endpoint, &mut buffer).await?;
+
+        if received == 0 {
+            return Err(RpcError::TransportError(
+                "Stream closed while receiving data".to_string(),
+            ));
+        }
+
+        // SAFETY: `received` bytes were initialized by stream_recv.
+        let chunk = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, received) };
+        output[offset..offset + received].copy_from_slice(chunk);
+        offset += received;
+    }
+
+    Ok(output)
+}
+
 /// Send a completion notification via stream
 pub async fn stream_send_completion(endpoint: &Endpoint) -> Result<usize, RpcError> {
     stream_send(endpoint, b"DONE").await

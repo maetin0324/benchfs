@@ -283,6 +283,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let stream_rpc_server = Rc::new(StreamRpcServer::new(
         worker.clone(),
         handler_context.clone(),
+        ucx_context.clone(),
     ));
 
     // Create connection pool for inter-node communication

@@ -7,15 +7,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use futures::lock::Mutex;
-use pluvio_ucx::async_ucx::ucp::{MemoryHandle, RKey};
+use pluvio_ucx::async_ucx::ucp::RKey;
 use pluvio_ucx::endpoint::Endpoint;
 use pluvio_ucx::{Context, Worker};
 use zerocopy::FromBytes;
 
 use super::RpcError;
 use super::stream_helpers::{
-    stream_recv_completion, stream_recv_header, stream_recv_u64, stream_send,
-    stream_send_completion, stream_send_rpc_id,
+    stream_recv_completion, stream_recv_exact, stream_recv_header, stream_recv_u32,
+    stream_recv_u64, stream_send, stream_send_completion, stream_send_rpc_id,
 };
 use super::stream_rpc::{ClientGetRequestMessage, ClientPutRequestMessage, RpcPattern, StreamRpc};
 
@@ -155,18 +155,7 @@ impl StreamRpcClient {
             data_size
         );
 
-        // 1. Register memory for RMA
-        let mem_handle = MemoryHandle::register(self.context.inner(), data);
-        let rkey_buf = mem_handle.pack();
-        let data_addr = data.as_ptr() as u64;
-
-        tracing::trace!(
-            "execute_client_put: registered memory, data_addr={:#x}, rkey_len={}",
-            data_addr,
-            rkey_buf.as_ref().len()
-        );
-
-        // 2. Send RPC ID first
+        // 1. Send RPC ID first
         stream_send_rpc_id(&self.endpoint, T::rpc_id()).await?;
 
         tracing::trace!("execute_client_put: sent RPC ID {}", T::rpc_id());
@@ -175,9 +164,9 @@ impl StreamRpcClient {
         let req_msg = ClientPutRequestMessage {
             header_bytes: zerocopy::IntoBytes::as_bytes(request.request_header()).to_vec(),
             path_bytes: request.path_bytes(),
-            data_addr,
+            data_addr: data.as_ptr() as u64,
             data_size,
-            rkey: rkey_buf.as_ref().to_vec(),
+            rkey: Vec::new(),
         };
 
         stream_send(&self.endpoint, &req_msg.to_bytes()).await?;
@@ -192,8 +181,19 @@ impl StreamRpcClient {
             server_buffer_addr
         );
 
-        // 4. PUT data to server
-        let rkey = RKey::unpack(&self.endpoint.endpoint, rkey_buf.as_ref());
+        // 4. Receive server rkey
+        let rkey_len = stream_recv_u32(&self.endpoint).await? as usize;
+        if rkey_len > super::stream_helpers::MAX_RKEY_SIZE {
+            return Err(RpcError::TransportError(format!(
+                "Server rkey exceeds max size: {} > {}",
+                rkey_len,
+                super::stream_helpers::MAX_RKEY_SIZE
+            )));
+        }
+        let server_rkey_bytes = stream_recv_exact(&self.endpoint, rkey_len).await?;
+        let rkey = RKey::unpack(&self.endpoint.endpoint, &server_rkey_bytes);
+
+        // 5. PUT data to server
         self.endpoint
             .put(data, server_buffer_addr, &rkey)
             .await
@@ -201,12 +201,12 @@ impl StreamRpcClient {
 
         tracing::trace!("execute_client_put: PUT completed");
 
-        // 5. Send completion notification
+        // 6. Send completion notification
         stream_send_completion(&self.endpoint).await?;
 
         tracing::trace!("execute_client_put: sent completion notification");
 
-        // 6. Receive response header
+        // 7. Receive response header
         let response: T::ResponseHeader = stream_recv_header(&self.endpoint).await?;
 
         tracing::trace!("execute_client_put: received response header");

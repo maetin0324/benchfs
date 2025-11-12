@@ -5,16 +5,17 @@
 
 use std::mem::MaybeUninit;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use pluvio_ucx::Worker;
-use pluvio_ucx::async_ucx::ucp::RKey;
+use pluvio_ucx::async_ucx::ucp::{MemoryHandle, RKey};
 use pluvio_ucx::endpoint::Endpoint;
+use pluvio_ucx::{Context, Worker};
 use zerocopy::FromBytes;
 
 use super::RpcError;
 use super::stream_helpers::{
-    MAX_HEADER_SIZE, stream_recv, stream_recv_completion, stream_recv_rpc_id,
-    stream_send_completion, stream_send_header, stream_send_u64,
+    MAX_HEADER_SIZE, MAX_RKEY_SIZE, stream_recv, stream_recv_completion, stream_recv_rpc_id,
+    stream_send, stream_send_completion, stream_send_header, stream_send_u32, stream_send_u64,
 };
 use super::stream_rpc::{ClientGetRequestMessage, ClientPutRequestMessage, StreamRpc};
 use crate::rpc::handlers::RpcHandlerContext;
@@ -25,14 +26,20 @@ use crate::rpc::handlers::RpcHandlerContext;
 pub struct StreamRpcServer {
     _worker: Rc<Worker>,
     handler_context: Rc<RpcHandlerContext>,
+    ucx_context: Arc<Context>,
 }
 
 impl StreamRpcServer {
     /// Create a new StreamRpcServer
-    pub fn new(worker: Rc<Worker>, handler_context: Rc<RpcHandlerContext>) -> Self {
+    pub fn new(
+        worker: Rc<Worker>,
+        handler_context: Rc<RpcHandlerContext>,
+        ucx_context: Arc<Context>,
+    ) -> Self {
         Self {
             _worker: worker,
             handler_context,
+            ucx_context,
         }
     }
 
@@ -354,7 +361,7 @@ impl StreamRpcServer {
             .map_err(|e| RpcError::TransportError(format!("Invalid path UTF-8: {:?}", e)))?;
 
         // 3. Prepare buffer for receiving data
-        let buffer = self.handler_context.allocator.acquire().await;
+        let mut buffer = self.handler_context.allocator.acquire().await;
 
         if req_msg.data_size as usize > buffer.len() {
             return Err(RpcError::TransportError(format!(
@@ -371,8 +378,21 @@ impl StreamRpcServer {
             buffer_addr
         );
 
-        // 4. Send buffer address to client
+        // 4. Register buffer for RMA and send buffer info to client
+        let mem_handle = MemoryHandle::register(self.ucx_context.inner(), buffer.as_ref());
+        let rkey_buf = mem_handle.pack();
+        if rkey_buf.as_ref().len() > MAX_RKEY_SIZE {
+            return Err(RpcError::TransportError(format!(
+                "Server rkey size {} exceeds limit {}",
+                rkey_buf.as_ref().len(),
+                MAX_RKEY_SIZE
+            )));
+        }
+
+        // Send address and rkey
         stream_send_u64(endpoint, buffer_addr).await?;
+        stream_send_u32(endpoint, rkey_buf.as_ref().len() as u32).await?;
+        stream_send(endpoint, rkey_buf.as_ref()).await?;
 
         tracing::trace!("handle_client_put: sent buffer address, waiting for PUT");
 
