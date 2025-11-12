@@ -103,9 +103,26 @@ detect_ib_device() {
 }
 
 detect_primary_netdev() {
-  command -v ip >/dev/null 2>&1 || return
-  ip route get 1.1.1.1 2>/dev/null \
-    | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+  if command -v ip >/dev/null 2>&1; then
+    local dev
+    dev=$(
+      ip route get 1.1.1.1 2>/dev/null \
+        | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+    )
+    if [[ -n "${dev}" ]]; then
+      echo "${dev}"
+      return
+    fi
+  fi
+
+  if [[ -r /proc/net/route ]]; then
+    awk '
+      $2 == "00000000" && $3 != "00000000" {
+        print $1
+        exit
+      }
+    ' /proc/net/route
+  fi
 }
 
 should_override_ucx_net_devices() {
