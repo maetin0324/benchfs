@@ -622,6 +622,14 @@ impl ConnectionPool {
 
         if let Ok(entries) = fs::read_dir(&path) {
             for entry in entries.flatten() {
+                let link = entry.path();
+                if let Ok(target) = fs::read_link(&link) {
+                    if let Some(name) = target.file_name().and_then(|s| s.to_str()) {
+                        names.push(name.to_string());
+                        continue;
+                    }
+                }
+
                 if let Some(name) = entry.file_name().to_str() {
                     names.push(name.to_string());
                 }
