@@ -137,22 +137,29 @@ export UCX_MEMTYPE_CACHE="n"
 if should_override_ucx_net_devices; then
   if [[ "${UCX_TLS}" == *rc* ]]; then
     ib_device=$(detect_ib_device)
-    if [[ -n "${ib_device}" ]]; then
+    primary_netdev=$(detect_primary_netdev)
+
+    if [[ -n "${ib_device}" && -n "${primary_netdev}" ]]; then
+      export UCX_NET_DEVICES="${ib_device},${primary_netdev}"
+      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
+    elif [[ -n "${ib_device}" ]]; then
       export UCX_NET_DEVICES="${ib_device}"
+      unset BENCHFS_STREAM_INTERFACE
+    elif [[ -n "${primary_netdev}" ]]; then
+      export UCX_NET_DEVICES="${primary_netdev}"
+      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
     else
-      primary_netdev=$(detect_primary_netdev)
-      if [[ -n "${primary_netdev}" ]]; then
-        export UCX_NET_DEVICES="${primary_netdev}"
-      else
-        export UCX_NET_DEVICES="all"
-      fi
+      export UCX_NET_DEVICES="all"
+      unset BENCHFS_STREAM_INTERFACE
     fi
   else
     primary_netdev=$(detect_primary_netdev)
     if [[ -n "${primary_netdev}" ]]; then
       export UCX_NET_DEVICES="${primary_netdev}"
+      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
     else
       export UCX_NET_DEVICES="all"
+      unset BENCHFS_STREAM_INTERFACE
     fi
   fi
 
