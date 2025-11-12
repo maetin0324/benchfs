@@ -1,7 +1,25 @@
 #!/bin/bash
 #------- qsub option -----------
+#PBS -W group_list="xg24i002"
+#PBS -q debug-g
+#PBS -V
 #------- Program execution -----------
 set -euo pipefail
+
+cleanup_exported_bash_functions() {
+  # PBS -V exports bash functions (module/ml) as environment variables.
+  # Open MPI spawns /bin/sh on remote nodes, which fails to import them and
+  # causes launches like the one in miyabi-benchfs-job.sh.e1074667 to abort.
+  local entry var_name func_name
+  while IFS= read -r -d '' entry; do
+    var_name=${entry%%=*}
+    [[ "${var_name}" == BASH_FUNC_*%% ]] || continue
+    func_name=${var_name#BASH_FUNC_}
+    func_name=${func_name%%%}
+    unset -f "${func_name}" 2>/dev/null || true
+    unset "${var_name}" 2>/dev/null || true
+  done < <(env -0)
+}
 
 # Increase file descriptor limit for large-scale MPI jobs
 # This prevents FD exhaustion when running with high ppn values
@@ -11,6 +29,17 @@ set -euo pipefail
 module purge
 module load gcc-toolset/14
 module load ompi-cuda/4.1.6-12.6
+cleanup_exported_bash_functions
+
+unset OMPI_MCA_mca_base_env_list
+
+SCRIPT_DIR="/work/xg24i002/x10043/workspace/rust/benchfs/jobs/benchfs"
+JOB_FILE="/work/xg24i002/x10043/workspace/rust/benchfs/jobs/benchfs/miyabi-benchfs-job.sh"
+PROJECT_ROOT="/work/xg24i002/x10043/workspace/rust/benchfs"
+OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${PBS_JOBID}"
+BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
+BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
+IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 # Requires
 # - SCRIPT_DIR
@@ -27,7 +56,7 @@ source "$SCRIPT_DIR/common.sh"
 JOB_START=$(timestamp)
 NNODES=$(wc --lines "${PBS_NODEFILE}" | awk '{print $1}')
 JOBID=$(echo "$PBS_JOBID" | cut -d : -f 2)
-JOB_OUTPUT_DIR="${OUTPUT_DIR}/${JOB_START}-${JOBID}-${NNODES}"
+JOB_OUTPUT_DIR="${OUTPUT_DIR}/${JOB_START}-${PBS_JOBID}-${MPI_PROC}"
 JOB_BACKEND_DIR="${BACKEND_DIR}/$(basename -- "${JOB_OUTPUT_DIR}")"
 BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 BENCHFS_DATA_DIR="/local"
@@ -242,7 +271,7 @@ export UCX_RNDV_THRESH
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:${LD_LIBRARY_PATH:-}"
 
-IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
+# IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
 
 echo "prepare the output directory: ${JOB_OUTPUT_DIR}"
 mkdir -p "${JOB_OUTPUT_DIR}"
@@ -271,11 +300,11 @@ echo ""
 echo "=========================================="
 echo "MPI Configuration Diagnostics"
 echo "=========================================="
-echo "NQSII_MPIOPTS: ${NQSII_MPIOPTS:-<not set>}"
-echo "NQSII_MPIOPTS_ARRAY (${#nqsii_mpiopts_array[@]} elements):"
-for i in "${!nqsii_mpiopts_array[@]}"; do
-  echo "  [$i] = ${nqsii_mpiopts_array[$i]}"
-done
+# echo "NQSII_MPIOPTS: ${NQSII_MPIOPTS:-<not set>}"
+# echo "NQSII_MPIOPTS_ARRAY (${#nqsii_mpiopts_array[@]} elements):"
+# for i in "${!nqsii_mpiopts_array[@]}"; do
+#   echo "  [$i] = ${nqsii_mpiopts_array[$i]}"
+# done
 echo "=========================================="
 echo ""
 
@@ -349,7 +378,8 @@ fi
 if [[ "${USE_UCX_PML}" -eq 1 ]]; then
   cmd_mpirun_common=(
     mpirun
-    "${nqsii_mpiopts_array[@]}"
+    # "${nqsii_mpiopts_array[@]}"
+    --mca mca_base_env_list ""
     --mca pml ucx
     --mca btl self
     --mca osc ucx
@@ -468,7 +498,7 @@ for benchfs_chunk_size in "${benchfs_chunk_size_list[@]}"; do
 
           # Clean up previous run
           rm -rf "${BENCHFS_REGISTRY_DIR}"/*
-          rm -rf "${BENCHFS_DATA_DIR}"/*
+          # rm -rf "${BENCHFS_DATA_DIR}"/*
 
           run_log_dir="${BENCHFSD_LOG_BASE_DIR}/run_${runid}"
           mkdir -p "${run_log_dir}"

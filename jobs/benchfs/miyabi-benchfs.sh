@@ -15,6 +15,14 @@ BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
 BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
+export JOB_FILE
+export PROJECT_ROOT
+export OUTPUT_DIR
+export BACKEND_DIR
+export BENCHFS_PREFIX
+export IOR_PREFIX
+export TIMESTAMP
+
 # Debug: Print paths
 echo "=========================================="
 echo "BenchFS Job Submission"
@@ -60,13 +68,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -q debug-g
         -l select="$nnodes"
         -l walltime="${ELAPSTIM_REQ}"
-        -v NQSV_MPI_VER="${NQSV_MPI_VER}"
-        -v OUTPUT_DIR="$OUTPUT_DIR"
-        -v SCRIPT_DIR="$SCRIPT_DIR"
-        -v BACKEND_DIR="$BACKEND_DIR"
-        -v LABEL="$LABEL"
-        -v BENCHFS_PREFIX="$BENCHFS_PREFIX"
-        -v IOR_PREFIX="$IOR_PREFIX"
+        -V
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"
