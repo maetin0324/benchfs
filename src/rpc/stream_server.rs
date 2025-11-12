@@ -361,7 +361,7 @@ impl StreamRpcServer {
             .map_err(|e| RpcError::TransportError(format!("Invalid path UTF-8: {:?}", e)))?;
 
         // 3. Prepare buffer for receiving data
-        let mut buffer = self.handler_context.allocator.acquire().await;
+        let buffer = self.handler_context.allocator.acquire().await;
 
         if req_msg.data_size as usize > buffer.len() {
             return Err(RpcError::TransportError(format!(

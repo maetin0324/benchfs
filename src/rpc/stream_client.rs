@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use futures::lock::Mutex;
-use pluvio_ucx::async_ucx::ucp::RKey;
+use pluvio_ucx::async_ucx::ucp::{MemoryHandle, RKey};
 use pluvio_ucx::endpoint::Endpoint;
 use pluvio_ucx::{Context, Worker};
 use zerocopy::FromBytes;
