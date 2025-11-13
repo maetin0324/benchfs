@@ -1,0 +1,100 @@
+# BenchFS Mini Docker Image - Minimal Implementation for Debugging
+# This Dockerfile builds a minimal BenchFS environment for debugging Stream RPC issues
+#
+# Prerequisites:
+#   1. Build the base image first:
+#      cd ../docker && docker build -f Dockerfile.ucx-mpi-base -t benchfs/ucx-mpi-base:1.0 .
+#
+#   2. Then build this image:
+#      docker build -f Dockerfile.mini -t benchfs-mini:latest .
+#
+# The base image only needs to be rebuilt when UCX/MPI versions change.
+
+# ============================================================================
+# Stage 1: Builder with Rust
+# ============================================================================
+FROM benchfs/ucx-mpi-base:1.0 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Rust and build dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Copy pluvio runtime (required dependency)
+WORKDIR /build
+COPY lib/pluvio /build/pluvio
+
+# Copy BenchFS source
+COPY Cargo.toml Cargo.lock /build/
+COPY src /build/src/
+COPY build.rs /build/
+COPY lib /build/lib/
+COPY ior_integration /build/ior_integration
+
+# Build BenchFS Mini library and binary with MPI support
+RUN cargo build --bin benchfsd_mini --features mpi-support --lib
+
+# Install BenchFS library for IOR integration (same library, different binary)
+RUN set -x && \
+    echo "=== Installing BenchFS library ===" && \
+    PREFIX=/usr/local && \
+    mkdir -p $PREFIX/lib $PREFIX/include $PREFIX/lib/pkgconfig && \
+    cp -v target/debug/libbenchfs.so $PREFIX/lib/ && \
+    cp -rv ior_integration/benchfs_backend/include/* $PREFIX/include/ && \
+    printf '# BenchFS pkg-config file\nprefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: BenchFS\nDescription: BenchFS distributed filesystem library\nVersion: 0.1.0\nLibs: -L${libdir} -lbenchfs -lpthread -ldl -lm\nCflags: -I${includedir}\n' > $PREFIX/lib/pkgconfig/benchfs.pc && \
+    ldconfig
+
+# Set up pkg-config for IOR build
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# Build IOR with BENCHFSMINI support
+WORKDIR /build/ior_integration
+RUN set -x && \
+    ./sync-benchfs.sh && \
+    cd ior && \
+    ./bootstrap && \
+    ./configure CFLAGS="-O0 -g3 -ggdb3 -fno-omit-frame-pointer -UNDEBUG" LD_FLAGS="-Wl,-rdynamic" --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    echo "IOR built successfully" && \
+    (ior -h 2>&1 | grep -i benchfsmini || echo "Warning: BENCHFSMINI not found in ior -h, but continuing anyway")
+
+# ============================================================================
+# Stage 2: Runtime
+# ============================================================================
+FROM benchfs/ucx-mpi-base:1.0
+
+# Copy BenchFS Mini binary from builder
+COPY --from=builder /build/target/debug/benchfsd_mini /usr/local/bin/
+
+# Copy BenchFS library and IOR
+COPY --from=builder /usr/local/lib/libbenchfs.so /usr/local/lib/
+COPY --from=builder /usr/local/lib/pkgconfig/benchfs.pc /usr/local/lib/pkgconfig/
+COPY --from=builder /usr/local/include/benchfs_c_api.h /usr/local/include/
+COPY --from=builder /usr/local/bin/ior /usr/local/bin/
+COPY --from=builder /usr/local/bin/mdtest /usr/local/bin/
+
+# Update library cache
+RUN ldconfig
+
+# Install debugging tools
+RUN apt-get update && apt-get install -y \
+    gdb \
+    procps
+
+# Set library paths
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+WORKDIR /workspace
+
+# Inherit SSH, UCX, MPI setup from base image
+CMD ["/usr/sbin/sshd", "-D"]

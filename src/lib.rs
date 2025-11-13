@@ -61,6 +61,7 @@
 //! ```
 
 pub mod api;
+pub mod benchfs_mini_lib;
 pub mod cache;
 pub mod config;
 pub mod constants;
