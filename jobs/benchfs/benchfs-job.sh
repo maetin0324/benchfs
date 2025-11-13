@@ -151,39 +151,41 @@ fi
 export UCX_MEMTYPE_CACHE="n"
 
 # UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
-if should_override_ucx_net_devices; then
-  if [[ "${UCX_TLS}" == *rc* ]]; then
-    ib_device=$(detect_ib_device)
-    primary_netdev=$(detect_primary_netdev)
+# if should_override_ucx_net_devices; then
+#   if [[ "${UCX_TLS}" == *rc* ]]; then
+#     ib_device=$(detect_ib_device)
+#     primary_netdev=$(detect_primary_netdev)
 
-    if [[ -n "${ib_device}" && -n "${primary_netdev}" ]]; then
-      export UCX_NET_DEVICES="${ib_device},${primary_netdev}"
-      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
-    elif [[ -n "${ib_device}" ]]; then
-      export UCX_NET_DEVICES="${ib_device}"
-      unset BENCHFS_STREAM_INTERFACE
-    elif [[ -n "${primary_netdev}" ]]; then
-      export UCX_NET_DEVICES="${primary_netdev}"
-      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
-    else
-      export UCX_NET_DEVICES="all"
-      unset BENCHFS_STREAM_INTERFACE
-    fi
-  else
-    primary_netdev=$(detect_primary_netdev)
-    if [[ -n "${primary_netdev}" ]]; then
-      export UCX_NET_DEVICES="${primary_netdev}"
-      export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
-    else
-      export UCX_NET_DEVICES="all"
-      unset BENCHFS_STREAM_INTERFACE
-    fi
-  fi
+#     if [[ -n "${ib_device}" && -n "${primary_netdev}" ]]; then
+#       export UCX_NET_DEVICES="${ib_device},${primary_netdev}"
+#       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
+#     elif [[ -n "${ib_device}" ]]; then
+#       export UCX_NET_DEVICES="${ib_device}"
+#       unset BENCHFS_STREAM_INTERFACE
+#     elif [[ -n "${primary_netdev}" ]]; then
+#       export UCX_NET_DEVICES="${primary_netdev}"
+#       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
+#     else
+#       export UCX_NET_DEVICES="all"
+#       unset BENCHFS_STREAM_INTERFACE
+#     fi
+#   else
+#     primary_netdev=$(detect_primary_netdev)
+#     if [[ -n "${primary_netdev}" ]]; then
+#       export UCX_NET_DEVICES="${primary_netdev}"
+#       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
+#     else
+#       export UCX_NET_DEVICES="all"
+#       unset BENCHFS_STREAM_INTERFACE
+#     fi
+#   fi
 
-  echo "Auto-selected UCX_NET_DEVICES=${UCX_NET_DEVICES}"
-else
-  echo "UCX_NET_DEVICES preset to ${UCX_NET_DEVICES}, leaving unchanged"
-fi
+#   echo "Auto-selected UCX_NET_DEVICES=${UCX_NET_DEVICES}"
+# else
+#   echo "UCX_NET_DEVICES preset to ${UCX_NET_DEVICES}, leaving unchanged"
+# fi
+
+export UCX_NET_DEVICES="all"
 
 # 明示的に UD/DC を使わせない
 export UCX_PROTOS="^ud,dc"
