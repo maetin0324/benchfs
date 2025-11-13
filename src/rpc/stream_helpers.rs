@@ -79,7 +79,9 @@ pub async fn stream_recv_header<H: Serializable>(endpoint: &Endpoint) -> Result<
 
 /// Send a u64 value via stream
 pub async fn stream_send_u64(endpoint: &Endpoint, value: u64) -> Result<usize, RpcError> {
-    stream_send(endpoint, &value.to_le_bytes()).await
+    // Use Vec to ensure the buffer lives long enough for UCX zcopy operations
+    let buffer = value.to_le_bytes().to_vec();
+    stream_send(endpoint, &buffer).await
 }
 
 /// Receive a u64 value via stream
@@ -102,7 +104,9 @@ pub async fn stream_recv_u64(endpoint: &Endpoint) -> Result<u64, RpcError> {
 
 /// Send a u32 value via stream
 pub async fn stream_send_u32(endpoint: &Endpoint, value: u32) -> Result<usize, RpcError> {
-    stream_send(endpoint, &value.to_le_bytes()).await
+    // Use Vec to ensure the buffer lives long enough for UCX zcopy operations
+    let buffer = value.to_le_bytes().to_vec();
+    stream_send(endpoint, &buffer).await
 }
 
 /// Receive a u32 value via stream
@@ -150,7 +154,9 @@ pub async fn stream_recv_exact(endpoint: &Endpoint, len: usize) -> Result<Vec<u8
 
 /// Send a completion notification via stream
 pub async fn stream_send_completion(endpoint: &Endpoint) -> Result<usize, RpcError> {
-    stream_send(endpoint, b"DONE").await
+    // Use Vec to ensure the buffer lives long enough for UCX zcopy operations
+    let buffer = b"DONE".to_vec();
+    stream_send(endpoint, &buffer).await
 }
 
 /// Receive a completion notification via stream
@@ -180,7 +186,9 @@ pub async fn stream_recv_completion(endpoint: &Endpoint) -> Result<(), RpcError>
 
 /// Send an RPC ID via stream
 pub async fn stream_send_rpc_id(endpoint: &Endpoint, rpc_id: u16) -> Result<usize, RpcError> {
-    stream_send(endpoint, &rpc_id.to_le_bytes()).await
+    // Use Vec to ensure the buffer lives long enough for UCX zcopy operations
+    let buffer = rpc_id.to_le_bytes().to_vec();
+    stream_send(endpoint, &buffer).await
 }
 
 /// Receive an RPC ID via stream
