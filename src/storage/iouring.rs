@@ -14,8 +14,9 @@ use std::rc::Rc;
 ///
 /// Note: シングルスレッド設計のため、RefCellを使用
 pub struct IOUringBackend {
-    /// オープン中のファイル (fd -> DmaFile)
-    files: RefCell<HashMap<i32, DmaFile>>,
+    /// オープン中のファイル (fd -> Rc<DmaFile>)
+    /// Rc を使用することで、async境界を跨いでも安全にファイルを参照できる
+    files: RefCell<HashMap<i32, Rc<DmaFile>>>,
 
     /// 次のファイルディスクリプタID
     next_fd: RefCell<i32>,
@@ -81,10 +82,14 @@ impl IOUringBackend {
         fixed_buffer: pluvio_uring::allocator::FixedBuffer,
         data_len: usize,
     ) -> StorageResult<usize> {
-        let files = self.files.borrow();
-        let dma_file = files
-            .get(&handle.0)
-            .ok_or(StorageError::InvalidHandle(handle))?;
+        // Clone the DmaFile to avoid holding the borrow across await
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
 
         // Write data using write_fixed with registered buffer (zero-copy DMA)
         let (bytes_written_raw, _fixed_buffer) = dma_file
@@ -134,7 +139,7 @@ impl StorageBackend for IOUringBackend {
             _ => StorageError::IoError(e),
         })?;
 
-        let dma_file = DmaFile::new(file);
+        let dma_file = Rc::new(DmaFile::new(file));
         let fd = self.allocate_fd();
 
         let mut files = self.files.borrow_mut();
@@ -162,10 +167,14 @@ impl StorageBackend for IOUringBackend {
         offset: u64,
         buffer: &mut [u8],
     ) -> StorageResult<usize> {
-        let files = self.files.borrow();
-        let dma_file = files
-            .get(&handle.0)
-            .ok_or(StorageError::InvalidHandle(handle))?;
+        // Clone the Rc<DmaFile> to avoid holding the borrow across await
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
 
         // Acquire a registered buffer from the allocator
         let fixed_buffer = self.allocator.acquire().await;
@@ -205,10 +214,14 @@ impl StorageBackend for IOUringBackend {
     }
 
     async fn write(&self, handle: FileHandle, offset: u64, buffer: &[u8]) -> StorageResult<usize> {
-        let files = self.files.borrow();
-        let dma_file = files
-            .get(&handle.0)
-            .ok_or(StorageError::InvalidHandle(handle))?;
+        // Clone the Rc<DmaFile> to avoid holding the borrow across await
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
 
         // Acquire a registered buffer from the allocator
         let mut fixed_buffer = self.allocator.acquire().await;
@@ -269,7 +282,7 @@ impl StorageBackend for IOUringBackend {
             _ => StorageError::IoError(e),
         })?;
 
-        let dma_file = DmaFile::new(file);
+        let dma_file = Rc::new(DmaFile::new(file));
         let fd = self.allocate_fd();
 
         let mut files = self.files.borrow_mut();
@@ -383,10 +396,14 @@ impl StorageBackend for IOUringBackend {
     }
 
     async fn fsync(&self, handle: FileHandle) -> StorageResult<()> {
-        let files = self.files.borrow();
-        let dma_file = files
-            .get(&handle.0)
-            .ok_or(StorageError::InvalidHandle(handle))?;
+        // Clone the Rc<DmaFile> to avoid holding the borrow across await
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
 
         // Use DmaFile's fsync which uses io_uring's Fsync operation
         dma_file.fsync().await.map_err(StorageError::IoError)?;

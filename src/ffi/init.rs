@@ -10,11 +10,10 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::error::*;
-use super::runtime::{
-    block_on_with_name, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime,
-};
+use super::runtime::{set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime};
 use crate::api::file_ops::BenchFS;
 use crate::metadata::MetadataManager;
 use crate::rpc::connection::ConnectionPool;
@@ -92,12 +91,18 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
                 None => continue, // Skip non-UTF8 filenames
             };
 
-            // Match pattern: node_*.addr
-            if filename_str.starts_with("node_") && filename_str.ends_with(".addr") {
+            // Match pattern: node_*.stream_hostname (new socket-based registration)
+            // or node_*.addr (legacy WorkerAddress-based registration)
+            if filename_str.starts_with("node_") && filename_str.ends_with(".stream_hostname") {
+                // Extract node ID: "node_0.stream_hostname" -> "node_0"
+                let node_id = &filename_str[..filename_str.len() - 16]; // Remove ".stream_hostname" suffix
+                node_ids.push(node_id.to_string());
+                tracing::debug!("Discovered data node: {}", node_id);
+            } else if filename_str.starts_with("node_") && filename_str.ends_with(".addr") {
                 // Extract node ID: "node_0.addr" -> "node_0"
                 let node_id = &filename_str[..filename_str.len() - 5]; // Remove ".addr" suffix
                 node_ids.push(node_id.to_string());
-                tracing::debug!("Discovered data node: {}", node_id);
+                tracing::debug!("Discovered data node (legacy): {}", node_id);
             }
         }
 
@@ -351,7 +356,7 @@ pub extern "C" fn benchfs_init(
 
         // Create UCX context and reactor
         let ucx_context = match UcxContext::new() {
-            Ok(ctx) => Rc::new(ctx),
+            Ok(ctx) => Arc::new(ctx),
             Err(e) => {
                 set_error_message(&format!("Failed to create UCX context: {:?}", e));
                 return std::ptr::null_mut();
@@ -402,20 +407,34 @@ pub extern "C" fn benchfs_init(
         let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
 
         // Create connection pool
-        let connection_pool = match ConnectionPool::new(worker.clone(), registry_dir_str) {
-            Ok(pool) => Rc::new(pool),
+        let connection_pool =
+            match ConnectionPool::new(worker.clone(), ucx_context.clone(), registry_dir_str) {
+                Ok(pool) => Rc::new(pool),
+                Err(e) => {
+                    set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                    return std::ptr::null_mut();
+                }
+            };
+
+        // Bind to socket and register this server's address
+        let base_port = 50051u16;
+        // For FFI init, we use a fixed port since there's no MPI rank
+        let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], base_port));
+
+        tracing::info!("Attempting to bind AM RPC socket at {}", listen_addr);
+
+        match connection_pool.bind_and_register(node_id_str, listen_addr) {
+            Ok(addr) => {
+                tracing::info!("Server {} bound and registered at {}", node_id_str, addr);
+            }
             Err(e) => {
-                set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                set_error_message(&format!(
+                    "Failed to bind and register server address: {:?}",
+                    e
+                ));
                 return std::ptr::null_mut();
             }
-        };
-
-        // Register server's worker address
-        if let Err(e) = connection_pool.register_self(node_id_str) {
-            set_error_message(&format!("Failed to register server address: {:?}", e));
-            return std::ptr::null_mut();
         }
-        tracing::info!("Server worker address registered to {}", registry_dir_str);
 
         // Register all RPC handlers (spawn in background, don't block)
         // These handlers run perpetual listening loops, so we can't block_on() them
@@ -468,7 +487,7 @@ pub extern "C" fn benchfs_init(
 
         // Create UCX context and reactor
         let ucx_context = match UcxContext::new() {
-            Ok(ctx) => Rc::new(ctx),
+            Ok(ctx) => Arc::new(ctx),
             Err(e) => {
                 set_error_message(&format!("Failed to create UCX context: {:?}", e));
                 return std::ptr::null_mut();
@@ -490,13 +509,14 @@ pub extern "C" fn benchfs_init(
         ucx_reactor.register_worker(worker.clone());
 
         // Create connection pool
-        let connection_pool = match ConnectionPool::new(worker, registry_dir_str) {
-            Ok(pool) => Rc::new(pool),
-            Err(e) => {
-                set_error_message(&format!("Failed to create connection pool: {:?}", e));
-                return std::ptr::null_mut();
-            }
-        };
+        let connection_pool =
+            match ConnectionPool::new(worker, ucx_context.clone(), registry_dir_str) {
+                Ok(pool) => Rc::new(pool),
+                Err(e) => {
+                    set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                    return std::ptr::null_mut();
+                }
+            };
 
         // Discover data nodes BEFORE connecting (critical for load distribution)
         tracing::info!("Discovering data nodes from registry...");
@@ -517,40 +537,16 @@ pub extern "C" fn benchfs_init(
             }
         };
 
-        // Distribute initial connections across nodes using client node_id hash
-        // This prevents all 256 clients from connecting to node_0 simultaneously
-        let target_node = if discovered_nodes.len() > 1 {
-            // Hash the node_id to select a target node
-            let hash = node_id_str
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_add(b as u64));
-            let index = (hash as usize) % discovered_nodes.len();
-            &discovered_nodes[index]
+        // 旧 AM RPC ではここで先行接続してサーバ起動を検証していたが、
+        // Stream RPC では初回 RPC 時に遅延接続する設計に切り替える。
+        // （大量クライアントによる同時接続集中やプロトコル不一致を避けるため）
+        if !discovered_nodes.is_empty() {
+            tracing::info!(
+                "Skipping eager wait_and_connect; {} nodes will be connected lazily",
+                discovered_nodes.len()
+            );
         } else {
-            &discovered_nodes[0]
-        };
-
-        tracing::info!(
-            "Connecting to distributed node: {} (selected from {} nodes)",
-            target_node,
-            discovered_nodes.len()
-        );
-
-        let pool_clone = connection_pool.clone();
-        let target_node_owned = target_node.to_string();
-        let connect_result = block_on_with_name("connect_to_server", async move {
-            pool_clone.wait_and_connect(&target_node_owned, 30).await
-        });
-
-        match connect_result {
-            Ok(_) => tracing::info!("Successfully connected to server: {}", target_node),
-            Err(e) => {
-                set_error_message(&format!(
-                    "Failed to connect to server {}: {:?}",
-                    target_node, e
-                ));
-                return std::ptr::null_mut();
-            }
+            tracing::warn!("No data nodes discovered; Stream connections will be attempted lazily");
         }
 
         // Get data_dir for client (use temp dir if not specified)

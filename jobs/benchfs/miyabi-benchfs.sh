@@ -5,7 +5,7 @@ source "${SCRIPT_DIR}/common.sh"
 TIMESTAMP="$(timestamp)"
 
 # default params
-: ${ELAPSTIM_REQ:="0:30:00"}
+: ${ELAPSTIM_REQ:="0:05:00"}
 : ${LABEL:=default}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
@@ -14,6 +14,14 @@ OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
 BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
+
+export JOB_FILE
+export PROJECT_ROOT
+export OUTPUT_DIR
+export BACKEND_DIR
+export BENCHFS_PREFIX
+export IOR_PREFIX
+export TIMESTAMP
 
 # Debug: Print paths
 echo "=========================================="
@@ -56,20 +64,11 @@ for nnodes in "${nnodes_list[@]}"; do
 
       cmd_qsub=(
         qsub
-        -A NBBG
-        -q gen_S
-        # -q gen_M
-        # -q gen_L
-        -l elapstim_req="${ELAPSTIM_REQ}"
-        -T openmpi
-        -v NQSV_MPI_VER="${NQSV_MPI_VER}"
-        -b "$nnodes"
-        -v OUTPUT_DIR="$OUTPUT_DIR"
-        -v SCRIPT_DIR="$SCRIPT_DIR"
-        -v BACKEND_DIR="$BACKEND_DIR"
-        -v LABEL="$LABEL"
-        -v BENCHFS_PREFIX="$BENCHFS_PREFIX"
-        -v IOR_PREFIX="$IOR_PREFIX"
+        -W group_list="xg24i002"
+        -q debug-g
+        -l select="$nnodes"
+        -l walltime="${ELAPSTIM_REQ}"
+        -V
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

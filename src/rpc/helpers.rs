@@ -148,7 +148,7 @@ pub async fn receive_path(
         am_msg.data_len(),
         am_msg.data_type()
     );
-    
+
     // Try to get data directly first (for Eager/Data messages)
     if let Some(data) = am_msg.get_data() {
         tracing::debug!("receive_path: got data directly, len={}", data.len());
@@ -206,7 +206,6 @@ pub async fn receive_path(
         .map(|s| s.to_owned())
         .map_err(|e| RpcError::TransportError(format!("Invalid UTF-8 in path: {:?}", e)))
 }
-
 
 /// Send RPC response using AmMsg reply_ep mechanism
 ///

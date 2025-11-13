@@ -33,16 +33,16 @@ echo "  pkg-config: $PREFIX/lib/pkgconfig"
 echo ""
 
 # Ask for confirmation
-read -p "Continue with installation? [Y/n] " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
-    echo "Installation cancelled."
-    exit 0
-fi
+# read -p "Continue with installation? [Y/n] " -n 1 -r
+# echo
+# if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ ! -z $REPLY ]]; then
+#     echo "Installation cancelled."
+#     exit 0
+# fi
 
 # Build BenchFS library
 echo -e "${YELLOW}Building BenchFS library...${NC}"
-cargo build --lib
+cargo build --release --lib
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Failed to build BenchFS library${NC}"
@@ -57,7 +57,7 @@ mkdir -p "$PREFIX/lib/pkgconfig"
 
 # Install library
 echo -e "${YELLOW}Installing library files...${NC}"
-cp -v target/debug/libbenchfs.so "$PREFIX/lib/" || {
+cp -v target/release/libbenchfs.so "$PREFIX/lib/" || {
     echo -e "${RED}Error: Failed to copy library file${NC}"
     exit 1
 }
