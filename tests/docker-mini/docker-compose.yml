@@ -25,7 +25,7 @@ services:
       - RUST_LOG=debug
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=info
+      - UCX_LOG_LEVEL=trace
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -54,7 +54,7 @@ services:
       - RUST_LOG=debug
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=info
+      - UCX_LOG_LEVEL=trace
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -82,7 +82,7 @@ services:
       - RUST_LOG=debug
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=info
+      - UCX_LOG_LEVEL=trace
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -110,7 +110,7 @@ services:
       - RUST_LOG=debug
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=info
+      - UCX_LOG_LEVEL=trace
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -139,7 +139,7 @@ services:
       - RUST_LOG=debug
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=info
+      - UCX_LOG_LEVEL=trace
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     depends_on:

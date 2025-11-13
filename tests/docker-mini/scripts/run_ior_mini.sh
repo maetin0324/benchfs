@@ -92,7 +92,7 @@ sleep 2
 export RUST_LOG=debug
 export RUST_BACKTRACE=full
 export UCX_TLS=tcp,self
-export UCX_LOG_LEVEL=info
+export UCX_LOG_LEVEL=trace
 
 echo ""
 echo "========================================="

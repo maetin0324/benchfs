@@ -4,11 +4,11 @@
 //! All code is contained in this single module for simplicity.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::future::Future;
 
-use futures::executor::block_on;
 use futures::lock::Mutex as AsyncMutex;
 use pluvio_runtime::executor::Runtime;
 use pluvio_ucx::endpoint::Endpoint;
@@ -338,6 +338,79 @@ async fn rpc_read(endpoint: &Endpoint, path: &str, buffer: &mut [u8]) -> Result<
 }
 
 // ============================================================================
+// Pluvio Runtime Helper - Custom block_on implementation
+// ============================================================================
+
+/// Block on a future using the Pluvio runtime.
+///
+/// Unlike futures::executor::block_on which spawns a new thread and is incompatible
+/// with thread-local storage (TLS) based runtimes like Pluvio, this implementation
+/// uses a oneshot channel to retrieve the future's result after spawning it.
+///
+/// We cannot use JoinHandle with run_with_runtime because run_with_runtime spawns
+/// the future again and run_queue() loops while task_pool.len() > 0. A task awaiting
+/// a JoinHandle stays Pending in the pool, causing an infinite loop.
+///
+/// Instead, we spawn the wrapped future once, then manually drive the runtime with
+/// progress() until the result arrives via the oneshot channel.
+fn block_on_with_runtime<F, T>(runtime: &Rc<Runtime>, future: F) -> T
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    use futures::channel::oneshot;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // Create oneshot channel to receive the result
+    let (sender, receiver) = oneshot::channel::<T>();
+
+    // Wrap the future to send its result through the channel
+    let wrapper = async move {
+        let result = future.await;
+        let _ = sender.send(result);  // Ignore send error if channel is closed
+    };
+
+    // Spawn the wrapper future
+    runtime.spawn_with_runtime(wrapper);
+
+    // Pin the receiver to the stack so we can poll it
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Wake};
+    use std::sync::Arc;
+
+    struct DummyWaker;
+    impl Wake for DummyWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Arc::new(DummyWaker).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut receiver_boxed = Box::new(receiver);
+    let mut receiver = Pin::new(&mut *receiver_boxed);
+
+    // Drive the runtime until receiver is ready
+    loop {
+        // First, progress the runtime to process tasks
+        runtime.progress();
+
+        // Check if receiver has a value
+        match receiver.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => {
+                match result {
+                    Ok(value) => return value,
+                    Err(_) => panic!("Sender was dropped before sending result"),
+                }
+            }
+            Poll::Pending => {
+                // Not ready yet, continue driving the runtime
+                continue;
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Registry (Shared Filesystem)
 // ============================================================================
 
@@ -356,11 +429,30 @@ fn lookup_server(registry_dir: &str, rank: i32) -> Result<SocketAddr, String> {
         if std::path::Path::new(&path).exists() {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read registry: {:?}", e))?;
-            let addr: SocketAddr = content
-                .trim()
+
+            // Parse hostname:port format
+            let trimmed = content.trim();
+            let parts: Vec<&str> = trimmed.split(':').collect();
+            if parts.len() != 2 {
+                return Err(format!("Invalid address format: {}", trimmed));
+            }
+
+            let hostname = parts[0];
+            let port: u16 = parts[1]
                 .parse()
-                .map_err(|e| format!("Failed to parse address: {:?}", e))?;
-            return Ok(addr);
+                .map_err(|e| format!("Failed to parse port: {:?}", e))?;
+
+            // Resolve hostname to IP address using DNS
+            let addrs: Vec<SocketAddr> = format!("{}:{}", hostname, port)
+                .to_socket_addrs()
+                .map_err(|e| format!("Failed to resolve hostname {}: {:?}", hostname, e))?
+                .collect();
+
+            if let Some(addr) = addrs.first() {
+                return Ok(*addr);
+            } else {
+                return Err(format!("No addresses found for hostname: {}", hostname));
+            }
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -378,13 +470,28 @@ pub extern "C" fn benchfs_mini_init(
     is_server: bool,
 ) -> i32 {
     unsafe {
-        // Initialize MPI
-        let (rank, size) = {
-            let mut rank = 0;
-            let mut size = 0;
-            mpi_sys::MPI_Comm_rank(mpi_sys::RSMPI_COMM_WORLD, &mut rank);
-            mpi_sys::MPI_Comm_size(mpi_sys::RSMPI_COMM_WORLD, &mut size);
-            (rank, size)
+        // Check if MPI is already initialized
+        let mut flag: libc::c_int = 0;
+        mpi_sys::MPI_Initialized(&mut flag as *mut libc::c_int);
+
+        let (rank, size) = if flag == 0 {
+            // MPI not initialized yet, initialize it using mpi_sys
+            let mut argc: libc::c_int = 0;
+            let mut argv: *mut *mut libc::c_char = std::ptr::null_mut();
+            mpi_sys::MPI_Init(&mut argc as *mut libc::c_int, &mut argv as *mut *mut *mut libc::c_char);
+
+            let mut rank_raw: libc::c_int = 0;
+            let mut size_raw: libc::c_int = 0;
+            mpi_sys::MPI_Comm_rank(mpi_sys::RSMPI_COMM_WORLD, &mut rank_raw as *mut libc::c_int);
+            mpi_sys::MPI_Comm_size(mpi_sys::RSMPI_COMM_WORLD, &mut size_raw as *mut libc::c_int);
+            (rank_raw, size_raw)
+        } else {
+            // MPI already initialized, just get rank and size using mpi_sys
+            let mut rank_raw: libc::c_int = 0;
+            let mut size_raw: libc::c_int = 0;
+            mpi_sys::MPI_Comm_rank(mpi_sys::RSMPI_COMM_WORLD, &mut rank_raw as *mut libc::c_int);
+            mpi_sys::MPI_Comm_size(mpi_sys::RSMPI_COMM_WORLD, &mut size_raw as *mut libc::c_int);
+            (rank_raw, size_raw)
         };
 
         let registry_dir_str = std::ffi::CStr::from_ptr(registry_dir)
@@ -402,6 +509,7 @@ pub extern "C" fn benchfs_mini_init(
 
         // Create UCX context and worker
         let context = Arc::new(Context::new().unwrap());
+        // context.create_worker() internally calls Worker::new() which registers with UCXReactor
         let worker = context.create_worker().unwrap();
 
         let listener = if is_server {
@@ -460,7 +568,8 @@ pub extern "C" fn benchfs_mini_start_server() -> i32 {
 
                 eprintln!("[Rank {}] Starting server loop", rank);
 
-                // Spawn server task
+                // Spawn server task in the background
+                // The task will run when the runtime is driven by block_on calls
                 pluvio_runtime::spawn(async move {
                     run_server(worker, listener, storage).await;
                 });
@@ -486,9 +595,10 @@ pub extern "C" fn benchfs_mini_connect(server_rank: i32) -> i32 {
         let registry_dir = state.registry_dir.clone();
         let worker = state.worker.clone();
         let endpoints = state.server_endpoints.clone();
+        let runtime = state.runtime.clone();
 
-        // Use futures::executor::block_on
-        let result = block_on(async move {
+        // Use block_on_with_runtime to drive the Pluvio runtime
+        let result = block_on_with_runtime(&runtime, async move {
             // Lookup server address
             let server_addr = lookup_server(&registry_dir, server_rank)?;
             eprintln!("[Client] Connecting to {}", server_addr);
@@ -531,8 +641,9 @@ pub extern "C" fn benchfs_mini_write(
         let data_slice = std::slice::from_raw_parts(data, data_len);
 
         let endpoints = state.server_endpoints.clone();
+        let runtime = state.runtime.clone();
 
-        let result = block_on(async move {
+        let result = block_on_with_runtime(&runtime, async move {
             let endpoints_guard = endpoints.lock().await;
             if let Some(endpoint) = endpoints_guard.get(server_rank as usize) {
                 rpc_write(endpoint, &path_str, data_slice).await
@@ -564,8 +675,9 @@ pub extern "C" fn benchfs_mini_read(
         let buffer_slice = std::slice::from_raw_parts_mut(buffer, buffer_len);
 
         let endpoints = state.server_endpoints.clone();
+        let runtime = state.runtime.clone();
 
-        let result = block_on(async move {
+        let result = block_on_with_runtime(&runtime, async move {
             let endpoints_guard = endpoints.lock().await;
             if let Some(endpoint) = endpoints_guard.get(server_rank as usize) {
                 rpc_read(endpoint, &path_str, buffer_slice).await
@@ -594,6 +706,10 @@ pub extern "C" fn benchfs_mini_finalize() -> i32 {
             drop(state);
         }
 
+        // Explicitly finalize MPI using mpi_sys
+        // (since we used forget() on Universe, we need to manually finalize)
+        mpi_sys::MPI_Finalize();
+
         BENCHFS_MINI_SUCCESS
     }
 }
@@ -601,10 +717,24 @@ pub extern "C" fn benchfs_mini_finalize() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn benchfs_mini_progress() {
     unsafe {
-        if let Some(_state) = (*std::ptr::addr_of!(GLOBAL_STATE)).as_ref() {
-            // Progress function - in a minimal implementation, this might not do much
-            // The runtime drives itself when blocking on futures
-            // For now, this is a no-op
+        if let Some(state) = (*std::ptr::addr_of!(GLOBAL_STATE)).as_ref() {
+            // The runtime drives itself when block_on is called
+            // For server processes, we need to yield to allow spawned tasks to run
+            let _runtime = state.runtime.clone();
+            // The worker's progress is driven by block_on in other FFI functions
+            // For a minimal implementation, this can be a no-op
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn benchfs_mini_yield() {
+    unsafe {
+        if let Some(state) = (*std::ptr::addr_of!(GLOBAL_STATE)).as_ref() {
+            let runtime = state.runtime.clone();
+            // Use the new progress() method to drive runtime forward incrementally
+            // This polls reactors and processes pending tasks
+            runtime.progress();
         }
     }
 }
