@@ -1,0 +1,184 @@
+version: '3.8'
+
+# BenchFS Mini Docker Compose - Minimal cluster for debugging Stream RPC
+#
+# Topology:
+#   - 2 server nodes (ranks 0-1)
+#   - 2 client nodes (ranks 2-3)
+#   - 1 controller node (MPI launch point)
+
+services:
+  # Server node 1
+  server1:
+    image: benchfs-mini:latest
+    container_name: benchfs_mini_server1
+    hostname: server1
+    networks:
+      benchfs_mini_net:
+        ipv4_address: 172.21.0.11
+    volumes:
+      - shared_registry_mini:/shared/registry_mini:rw
+      - server1_data:/shared/data:rw
+      - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
+      - ./scripts:/scripts:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=full
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    command: /usr/sbin/sshd -D
+
+  # Server node 2
+  server2:
+    image: benchfs-mini:latest
+    container_name: benchfs_mini_server2
+    hostname: server2
+    networks:
+      benchfs_mini_net:
+        ipv4_address: 172.21.0.12
+    volumes:
+      - shared_registry_mini:/shared/registry_mini:rw
+      - server2_data:/shared/data:rw
+      - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
+      - ./scripts:/scripts:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=full
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    command: /usr/sbin/sshd -D
+
+  # Client node 1
+  client1:
+    image: benchfs-mini:latest
+    container_name: benchfs_mini_client1
+    hostname: client1
+    networks:
+      benchfs_mini_net:
+        ipv4_address: 172.21.0.21
+    volumes:
+      - shared_registry_mini:/shared/registry_mini:rw
+      - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
+      - ./scripts:/scripts:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=full
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    command: /usr/sbin/sshd -D
+
+  # Client node 2
+  client2:
+    image: benchfs-mini:latest
+    container_name: benchfs_mini_client2
+    hostname: client2
+    networks:
+      benchfs_mini_net:
+        ipv4_address: 172.21.0.22
+    volumes:
+      - shared_registry_mini:/shared/registry_mini:rw
+      - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
+      - ./scripts:/scripts:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=full
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    command: /usr/sbin/sshd -D
+
+  # MPI controller node
+  controller:
+    image: benchfs-mini:latest
+    container_name: benchfs_mini_controller
+    hostname: controller
+    networks:
+      benchfs_mini_net:
+        ipv4_address: 172.21.0.10
+    volumes:
+      - shared_registry_mini:/shared/registry_mini:rw
+      - controller_results:/shared/results:rw
+      - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
+      - ./scripts:/scripts:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=full
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    depends_on:
+      - server1
+      - server2
+      - client1
+      - client2
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    command: /usr/sbin/sshd -D
+
+volumes:
+  shared_registry_mini:
+    driver: local
+  server1_data:
+    driver: local
+  server2_data:
+    driver: local
+  controller_results:
+    driver: local
+
+networks:
+  benchfs_mini_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16

@@ -79,6 +79,7 @@ dependencies = [
  "libc",
  "lru",
  "mpi",
+ "mpi-sys",
  "once_cell",
  "pluvio_runtime",
  "pluvio_timer",

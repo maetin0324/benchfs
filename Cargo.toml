@@ -12,7 +12,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 pluvio_runtime = { path = "lib/pluvio/pluvio_runtime" }
 pluvio_uring = { path = "lib/pluvio/pluvio_uring" }
 pluvio_timer = { path = "lib/pluvio/pluvio_timer" }
-pluvio_ucx = { path = "lib/pluvio/pluvio_ucx" }
+pluvio_ucx = { path = "lib/pluvio/pluvio_ucx", features = ["am"] }
 
 # Serialization
 zerocopy = { version = "0.8.27", features = ["std", "derive"] }
@@ -51,6 +51,7 @@ once_cell = "1.19"
 
 # MPI support
 mpi = { version = "0.8", features = ["derive"], optional = true }
+mpi-sys = "0.2"
 
 [dev-dependencies]
 tempfile = "3.0"
@@ -74,6 +75,11 @@ required-features = ["mpi-support"]
 [[bin]]
 name = "benchfs_rpc_bench"
 path = "src/bin/benchfs_rpc_bench.rs"
+required-features = ["mpi-support"]
+
+[[bin]]
+name = "benchfsd_mini"
+path = "src/bin/benchfsd_mini.rs"
 required-features = ["mpi-support"]
 
 # Benchmark configuration - currently disabled as benches/small.rs does not exist
