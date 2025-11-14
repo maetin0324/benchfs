@@ -82,7 +82,9 @@
       "Bash(docker build:*)",
       "Bash(timeout 300 make:*)",
       "Bash(cargo fix:*)",
-      "Bash(timeout 600 make:*)"
+      "Bash(timeout 600 make:*)",
+      "Bash(timeout 30 make:*)",
+      "Read(//usr/include/**)"
     ],
     "deny": [],
     "ask": []

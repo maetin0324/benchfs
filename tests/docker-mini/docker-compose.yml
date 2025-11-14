@@ -22,10 +22,12 @@ services:
       - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
       - ./scripts:/scripts:ro
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=trace
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -51,10 +53,12 @@ services:
       - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
       - ./scripts:/scripts:ro
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=trace
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -79,10 +83,12 @@ services:
       - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
       - ./scripts:/scripts:ro
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=trace
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -107,10 +113,12 @@ services:
       - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
       - ./scripts:/scripts:ro
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=trace
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     cap_add:
@@ -136,10 +144,12 @@ services:
       - ../../target/debug/benchfsd_mini:/usr/local/bin/benchfsd_mini:ro
       - ./scripts:/scripts:ro
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
       - RUST_BACKTRACE=full
       - UCX_TLS=tcp,self
-      - UCX_LOG_LEVEL=trace
+      - UCX_LOG_LEVEL=fatal
+      - UCS_LOG_LEVEL=fatal
+      - UCX_LOG_FILE=/dev/null
       - OMPI_ALLOW_RUN_AS_ROOT=1
       - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
     depends_on:

@@ -1,35 +1,20 @@
 #!/bin/bash
-# IOR Test Script for BenchFS Mini with Separate Server/Client Processes
+# Test script for BenchFS Mini C Client
 #
-# Architecture:
-#   - Servers: Run as standalone Rust processes (2 processes with mpirun)
-#   - Clients: Run IOR benchmark (2 processes with mpirun)
-#   - Servers and clients communicate via shared registry
+# This script starts BenchFS servers and runs the C client test
 
 set -e
 
 # Configuration
 REGISTRY_DIR="/shared/registry_mini"
 NUM_SERVERS=2
-NUM_CLIENTS=2
-
-# IOR parameters (small values for debugging)
-TRANSFER_SIZE="1m"    # 1 MB per transfer
-BLOCK_SIZE="4m"       # 4 MB per process
-SEGMENTS=2            # 2 segments
 
 echo "========================================="
-echo "BenchFS Mini - IOR Test"
+echo "BenchFS Mini - C Client Test"
 echo "========================================="
 echo "Cluster Configuration:"
-echo "  Servers:         $NUM_SERVERS (separate processes)"
-echo "  Clients:         $NUM_CLIENTS (IOR processes)"
+echo "  Servers:         $NUM_SERVERS"
 echo "  Registry dir:    $REGISTRY_DIR"
-echo ""
-echo "IOR Configuration:"
-echo "  Transfer size:   $TRANSFER_SIZE"
-echo "  Block size:      $BLOCK_SIZE"
-echo "  Segments:        $SEGMENTS"
 echo "========================================="
 
 # Clean registry directory
@@ -47,19 +32,8 @@ server1 slots=1
 server2 slots=1
 EOF
 
-# Generate MPI hostfile for clients
-CLIENT_HOSTFILE="/tmp/hostfile_clients"
-echo "[Setup] Generating client hostfile..."
-cat > $CLIENT_HOSTFILE << EOF
-client1 slots=1
-client2 slots=1
-EOF
-
 echo "[Setup] Server hostfile contents:"
 cat $SERVER_HOSTFILE
-echo ""
-echo "[Setup] Client hostfile contents:"
-cat $CLIENT_HOSTFILE
 
 # Set up SSH known_hosts
 echo ""
@@ -67,18 +41,18 @@ echo "[Setup] Setting up SSH known_hosts..."
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
 
-for host in server1 server2 client1 client2; do
+for host in server1 server2; do
     ssh-keyscan -H $host >> ~/.ssh/known_hosts 2>/dev/null || true
 done
 
 # Test SSH connectivity
 echo ""
 echo "[Setup] Testing SSH connectivity..."
-for host in server1 server2 client1 client2; do
+for host in server1 server2; do
     if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $host "echo OK" >/dev/null 2>&1; then
-        echo "  ✓ $host: SSH OK"
+        echo "   $host: SSH OK"
     else
-        echo "  ✗ $host: SSH FAILED"
+        echo "   $host: SSH FAILED"
         exit 1
     fi
 done
@@ -102,7 +76,6 @@ echo "Step 1: Starting BenchFS Mini Servers"
 echo "========================================="
 
 # Start servers in background using mpirun
-# Each server process will register itself in the shared registry
 SERVER_LOG="/tmp/benchfs_servers.log"
 mpirun \
   --allow-run-as-root \
@@ -169,42 +142,15 @@ sleep 3
 
 echo ""
 echo "========================================="
-echo "Step 2: Running IOR Benchmark (Clients)"
+echo "Step 2: Running C Client Test"
 echo "========================================="
 
-# IOR command
-IOR_CMD="ior \
-  -a BENCHFSMINI \
-  -t $TRANSFER_SIZE \
-  -b $BLOCK_SIZE \
-  -s $SEGMENTS \
-  -F \
-  -e \
-  -w \
-  -r \
-  -C \
-  -v \
-  --benchfs.registry=$REGISTRY_DIR"
-
+# Run C client test
 echo ""
-echo "[IOR] Command: $IOR_CMD"
-echo ""
+echo "[Test] Launching C client test..."
+benchfs_c_test $REGISTRY_DIR
 
-# Run IOR with mpirun
-mpirun \
-  --allow-run-as-root \
-  --hostfile $CLIENT_HOSTFILE \
-  -np $NUM_CLIENTS \
-  --map-by node \
-  --bind-to none \
-  -x RUST_LOG \
-  -x RUST_BACKTRACE \
-  -x UCX_TLS \
-  -x UCX_LOG_LEVEL \
-  -x UCS_LOG_LEVEL \
-  $IOR_CMD
-
-IOR_EXIT_CODE=$?
+TEST_EXIT_CODE=$?
 
 echo ""
 echo "========================================="
@@ -218,8 +164,8 @@ kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 echo "[Cleanup] Servers stopped"
 
-# Show server logs if IOR failed
-if [ $IOR_EXIT_CODE -ne 0 ]; then
+# Show server logs if test failed
+if [ $TEST_EXIT_CODE -ne 0 ]; then
     echo ""
     echo "[Debug] Server logs:"
     cat $SERVER_LOG
@@ -227,11 +173,11 @@ fi
 
 echo ""
 echo "========================================="
-if [ $IOR_EXIT_CODE -eq 0 ]; then
-    echo "IOR Test: SUCCESS"
+if [ $TEST_EXIT_CODE -eq 0 ]; then
+    echo "C Client Test: SUCCESS"
 else
-    echo "IOR Test: FAILED (exit code: $IOR_EXIT_CODE)"
+    echo "C Client Test: FAILED (exit code: $TEST_EXIT_CODE)"
 fi
 echo "========================================="
 
-exit $IOR_EXIT_CODE
+exit $TEST_EXIT_CODE
