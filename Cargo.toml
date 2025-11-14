@@ -12,7 +12,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 pluvio_runtime = { path = "lib/pluvio/pluvio_runtime" }
 pluvio_uring = { path = "lib/pluvio/pluvio_uring" }
 pluvio_timer = { path = "lib/pluvio/pluvio_timer" }
-pluvio_ucx = { path = "lib/pluvio/pluvio_ucx" }
+pluvio_ucx = { path = "lib/pluvio/pluvio_ucx", features = ["am"] }
 
 # Serialization
 zerocopy = { version = "0.8.27", features = ["std", "derive"] }

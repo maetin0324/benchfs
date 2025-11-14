@@ -2,7 +2,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g
-LDFLAGS = -lucp -lucs
+LDFLAGS = -lucp -lucs -lpthread
 
 # UCX paths (adjust if needed)
 UCX_INCLUDE = /usr/local/include

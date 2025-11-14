@@ -1,6 +1,7 @@
-//! Minimal BenchFS library for debugging Stream RPC
+//! Minimal BenchFS library using Active Message API
 //!
-//! This is a minimal implementation to isolate and debug Stream RPC connection issues.
+//! This implementation uses UCX Active Message API instead of Stream API
+//! to avoid message boundary issues with small sends.
 //! All code is contained in this single module for simplicity.
 
 use std::collections::HashMap;
@@ -8,14 +9,13 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::future::Future;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::fd::AsRawFd;
 
 use futures::lock::Mutex as AsyncMutex;
+use futures::FutureExt;
 use pluvio_runtime::executor::Runtime;
 use pluvio_ucx::endpoint::Endpoint;
 use pluvio_ucx::{Context, Worker};
+use pluvio_ucx::async_ucx::ucp::AmMsg;
 use pluvio_uring::file::DmaFile;
 use pluvio_uring::reactor::IoUringReactor;
 
@@ -42,76 +42,36 @@ struct GlobalState {
     uring_reactor: Rc<IoUringReactor>,
     worker: Rc<Worker>,
     context: Arc<Context>,
-    listener: Option<pluvio_ucx::listener::Listener>,
     server_started: bool,
     rank: i32,
     size: i32,
     registry_dir: String,
     storage_dir: String,
-    server_endpoints: Arc<AsyncMutex<Vec<Endpoint>>>,
+    // For client: map from server_rank to endpoint
+    server_endpoints: Arc<AsyncMutex<HashMap<i32, Endpoint>>>,
+    // For server: listener (must be kept alive for clients to connect)
+    listener: Option<pluvio_ucx::listener::Listener>,
 }
 
 static mut GLOBAL_STATE: Option<Box<GlobalState>> = None;
 
 // ============================================================================
-// Stream RPC Helpers
+// Active Message Protocol
 // ============================================================================
-
-async fn stream_send(endpoint: &Endpoint, data: &[u8]) -> Result<(), String> {
-    eprintln!("[stream_send] Sending {} bytes", data.len());
-    endpoint
-        .stream_send(data)
-        .await
-        .map(|_bytes_sent| {
-            eprintln!("[stream_send] Successfully sent {} bytes", data.len());
-        })
-        .map_err(|e| format!("stream_send failed: {:?}", e))
-}
-
-/// Receive exactly `buffer.len()` bytes from the stream.
-/// This function loops until all requested bytes are received or an error occurs.
-/// UCX stream_recv may return 0 bytes if data is not yet available, so we retry.
-async fn stream_recv(endpoint: &Endpoint, buffer: &mut [u8]) -> Result<usize, String> {
-    use std::mem::MaybeUninit;
-
-    let total_len = buffer.len();
-    let mut received = 0;
-
-    while received < total_len {
-        let remaining = &mut buffer[received..];
-        let uninit_buffer = unsafe {
-            std::slice::from_raw_parts_mut(
-                remaining.as_mut_ptr() as *mut MaybeUninit<u8>,
-                remaining.len()
-            )
-        };
-
-        let bytes_received = endpoint
-            .stream_recv(uninit_buffer)
-            .await
-            .map_err(|e| format!("stream_recv failed: {:?}", e))?;
-
-        eprintln!(
-            "[stream_recv] Requested {} bytes, received {} bytes (total: {}/{})",
-            remaining.len(),
-            bytes_received,
-            received + bytes_received,
-            total_len
-        );
-
-        // UCX may return 0 bytes if data is not yet available
-        // In this case, we should yield and retry
-        if bytes_received == 0 {
-            // Yield to allow runtime to progress
-            pluvio_timer::sleep(std::time::Duration::from_micros(100)).await;
-            continue;
-        }
-
-        received += bytes_received;
-    }
-
-    Ok(received)
-}
+//
+// AM ID 1 (RPC_WRITE):
+//   Header: [path_len(4)] [data_len(4)] [path(variable)]
+//   Data: [file_data(variable)] or immediate data in header if small
+//   Reply: [status(4)]
+//
+// AM ID 2 (RPC_READ):
+//   Header: [path_len(4)] [buffer_len(4)] [path(variable)]
+//   Data: none
+//   Reply Header: [status(4)] [data_len(4)]
+//   Reply Data: [file_data(variable)]
+//
+// Note: We use AM ID 1 and 2 directly (no need for RPC_REPLY_WRITE/READ IDs,
+// as replies are handled through AmMsg::reply() mechanism)
 
 // ============================================================================
 // File-based Storage using pluvio-uring
@@ -220,7 +180,7 @@ impl FileStorage {
             return Ok(0);
         }
 
-        let mut read_buffer = vec![0u8; read_size];
+        let read_buffer = vec![0u8; read_size];
         let bytes_read = dma_file.read(read_buffer.clone(), 0)
             .await
             .map_err(|e| format!("Read failed: {:?}", e))?;
@@ -236,11 +196,12 @@ impl FileStorage {
 }
 
 // ============================================================================
-// Simple RPC Protocol
+// Simple RPC Protocol - Fixed-length header
 // ============================================================================
 
 const RPC_WRITE: u16 = 1;
 const RPC_READ: u16 = 2;
+const MAX_PATH_LEN: usize = 1024;
 
 #[repr(C)]
 struct WriteRequest {
@@ -266,237 +227,272 @@ struct ReadResponse {
 }
 
 // ============================================================================
-// Server Implementation
+// Server Implementation - Active Message Based
 // ============================================================================
 
-async fn handle_client(endpoint: Endpoint, storage: Rc<FileStorage>) {
-    eprintln!("[Server] New client connection");
-    endpoint.print_to_stderr();
-
-    loop {
-        // Read RPC ID
-        let mut rpc_id_buf = [0u8; 2];
-        if let Err(e) = stream_recv(&endpoint, &mut rpc_id_buf).await {
-            eprintln!("[Server] Failed to receive RPC ID: {}", e);
-            break;
-        }
-        let rpc_id = u16::from_le_bytes(rpc_id_buf);
-
-        eprintln!("[Server] Received RPC ID: {}", rpc_id);
-
-        match rpc_id {
-            RPC_WRITE => {
-                if let Err(e) = handle_write(&endpoint, &storage).await {
-                    eprintln!("[Server] Write handler error: {}", e);
-                }
-            }
-            RPC_READ => {
-                if let Err(e) = handle_read(&endpoint, &storage).await {
-                    eprintln!("[Server] Read handler error: {}", e);
-                }
-            }
-            _ => {
-                eprintln!("[Server] Unknown RPC ID: {}", rpc_id);
-                break;
-            }
-        }
-    }
-
-    eprintln!("[Server] Client disconnected");
-}
-
-async fn handle_write(endpoint: &Endpoint, storage: &FileStorage) -> Result<(), String> {
+/// Handle Write Active Messages (AM ID = RPC_WRITE = 1)
+async fn handle_write_am(mut msg: AmMsg, storage: Rc<FileStorage>) -> Result<(), String> {
     let start = std::time::Instant::now();
 
-    // Read request header
-    let mut header_buf = [0u8; 8];
-    stream_recv(endpoint, &mut header_buf).await?;
-    let path_len = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
-    let data_len = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+    // Parse header: [path_len(4)] [data_len(4)] [path(variable)]
+    let header = msg.header();
+    if header.len() < 8 {
+        return Err(format!("Write header too short: {} bytes", header.len()));
+    }
+
+    let path_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let data_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+    if header.len() < 8 + path_len {
+        return Err(format!("Write header truncated: expected {}, got {}", 8 + path_len, header.len()));
+    }
+
+    let path_bytes = &header[8..8 + path_len];
+    let path = String::from_utf8_lossy(path_bytes).to_string();  // Copy to owned String to drop header borrow
 
     let after_header = start.elapsed();
-    eprintln!("[Server] Write request: path_len={}, data_len={}, header_time={:?}",
-              path_len, data_len, after_header);
+    eprintln!("[Server AM] Write request: path={}, data_len={}, header_time={:?}",
+              path, data_len, after_header);
 
-    // Read path
-    let mut path_buf = vec![0u8; path_len as usize];
-    if path_len > 0 {
-        stream_recv(endpoint, &mut path_buf).await?;
-    }
-    let path = String::from_utf8_lossy(&path_buf);
-
-    let after_path = start.elapsed();
-
-    // Read data (skip if data_len is 0 to avoid UCX assertion)
-    let data_buf = if data_len > 0 {
-        let mut buf = vec![0u8; data_len as usize];
-        stream_recv(endpoint, &mut buf).await?;
-        buf
+    // Get data: either from immediate data or recv_data()
+    // Note: We need to drop the header borrow before calling recv_data() (which takes &mut self)
+    let data_buf = if let Some(immediate_data) = msg.get_data() {
+        eprintln!("[Server AM] Using immediate data: {} bytes", immediate_data.len());
+        immediate_data.to_vec()
     } else {
-        Vec::new()
+        eprintln!("[Server AM] Receiving large data...");
+        msg.recv_data().await.map_err(|e| format!("recv_data failed: {:?}", e))?
     };
 
     let after_data_recv = start.elapsed();
-    eprintln!("[Server] Data recv time: {:?} (total: {:?})",
-              after_data_recv - after_path, after_data_recv);
+    eprintln!("[Server AM] Data recv time: {:?} (total: {:?})",
+              after_data_recv - after_header, after_data_recv);
 
     // Write to storage
     storage.write(&path, &data_buf).await?;
 
     let after_storage_write = start.elapsed();
-    eprintln!("[Server] Storage write time: {:?} (total: {:?})",
+    eprintln!("[Server AM] Storage write time: {:?} (total: {:?})",
               after_storage_write - after_data_recv, after_storage_write);
 
-    eprintln!("[Server] Wrote {} bytes to {}", data_len, path);
+    eprintln!("[Server AM] Wrote {} bytes to {}", data_buf.len(), path);
 
-    // Send response
-    let response = WriteResponse {
-        status: BENCHFS_MINI_SUCCESS,
-    };
-    stream_send(endpoint, &response.status.to_le_bytes()).await?;
+    // Send reply: [status(4)]
+    let status = BENCHFS_MINI_SUCCESS.to_le_bytes();
+    unsafe {
+        msg.reply(0, &status, &[], false, None).await
+            .map_err(|e| format!("reply failed: {:?}", e))?;
+    }
 
     let total_time = start.elapsed();
-    eprintln!("[Server] Response send time: {:?}, TOTAL: {:?}",
+    eprintln!("[Server AM] Response send time: {:?}, TOTAL: {:?}",
               total_time - after_storage_write, total_time);
 
     Ok(())
 }
 
-async fn handle_read(endpoint: &Endpoint, storage: &FileStorage) -> Result<(), String> {
-    // Read request header
-    let mut header_buf = [0u8; 8];
-    stream_recv(endpoint, &mut header_buf).await?;
-    let path_len = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
-    let buffer_len = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+/// Handle Read Active Messages (AM ID = RPC_READ = 2)
+async fn handle_read_am(msg: AmMsg, storage: Rc<FileStorage>) -> Result<(), String> {
+    // Parse header: [path_len(4)] [buffer_len(4)] [path(variable)]
+    let header = msg.header();
+    if header.len() < 8 {
+        return Err(format!("Read header too short: {} bytes", header.len()));
+    }
 
-    eprintln!("[Server] Read request: path_len={}, buffer_len={}", path_len, buffer_len);
+    let path_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let buffer_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
-    // Read path
-    let mut path_buf = vec![0u8; path_len as usize];
-    stream_recv(endpoint, &mut path_buf).await?;
-    let path = String::from_utf8_lossy(&path_buf);
+    if header.len() < 8 + path_len {
+        return Err(format!("Read header truncated: expected {}, got {}", 8 + path_len, header.len()));
+    }
+
+    let path_bytes = &header[8..8 + path_len];
+    let path = String::from_utf8_lossy(path_bytes).to_string();  // Copy to owned String
+
+    eprintln!("[Server AM] Read request: path={}, buffer_len={}", path, buffer_len);
 
     // Read from storage
-    let mut data_buf = vec![0u8; buffer_len as usize];
+    let mut data_buf = vec![0u8; buffer_len];
     let data_len = match storage.read(&path, &mut data_buf).await {
         Ok(len) => len,
         Err(_) => 0,
     };
 
-    eprintln!("[Server] Read {} bytes from {}", data_len, path);
+    eprintln!("[Server AM] Read {} bytes from {}", data_len, path);
 
-    // Send response
-    let response = ReadResponse {
-        status: BENCHFS_MINI_SUCCESS,
-        data_len: data_len as u32,
+    // Send reply: Header=[status(4)] [data_len(4)], Data=[file_data]
+    let mut reply_header = Vec::with_capacity(8);
+    reply_header.extend_from_slice(&BENCHFS_MINI_SUCCESS.to_le_bytes());
+    reply_header.extend_from_slice(&(data_len as u32).to_le_bytes());
+
+    let reply_data = if data_len > 0 {
+        &data_buf[..data_len]
+    } else {
+        &[]
     };
-    stream_send(endpoint, &response.status.to_le_bytes()).await?;
-    stream_send(endpoint, &response.data_len.to_le_bytes()).await?;
 
-    // Send data
-    if data_len > 0 {
-        stream_send(endpoint, &data_buf[..data_len]).await?;
+    unsafe {
+        msg.reply(0, &reply_header, reply_data, false, None).await
+            .map_err(|e| format!("reply failed: {:?}", e))?;
     }
 
     Ok(())
 }
 
-async fn run_server(worker: Rc<Worker>, mut listener: pluvio_ucx::listener::Listener, storage: Rc<FileStorage>) {
-    eprintln!("[Server] Waiting for connections...");
+/// Server main loop: process Active Messages from both AM streams
+async fn run_server_am(worker: Rc<Worker>, storage: Rc<FileStorage>) {
+    eprintln!("[Server AM] Creating AM streams for RPC_WRITE and RPC_READ...");
 
+    // Create AM streams for Write and Read
+    let am_write_stream = worker.am_stream(RPC_WRITE).expect("Failed to create AM stream for WRITE");
+    let am_read_stream = worker.am_stream(RPC_READ).expect("Failed to create AM stream for READ");
+
+    eprintln!("[Server AM] Waiting for Active Messages...");
+
+    // Process messages from both streams
     loop {
-        // Get next connection from listener
-        let connection = listener.next().await;
-
-        // Accept the connection using the worker
-        match worker.accept(connection).await {
-            Ok(endpoint) => {
-                eprintln!("[Server] Accepted connection");
-                let storage_clone = storage.clone();
-                pluvio_runtime::spawn(async move {
-                    handle_client(endpoint, storage_clone).await;
-                });
+        // Use select! to wait for messages from either stream
+        futures::select! {
+            msg_opt = am_write_stream.wait_msg().fuse() => {
+                if let Some(msg) = msg_opt {
+                    eprintln!("[Server AM] Received Write AM");
+                    let storage_clone = storage.clone();
+                    pluvio_runtime::spawn(async move {
+                        if let Err(e) = handle_write_am(msg, storage_clone).await {
+                            eprintln!("[Server AM] Write handler error: {}", e);
+                        }
+                    });
+                } else {
+                    eprintln!("[Server AM] Write stream closed");
+                    break;
+                }
             }
-            Err(e) => {
-                eprintln!("[Server] Accept error: {:?}", e);
-                break;
+            msg_opt = am_read_stream.wait_msg().fuse() => {
+                if let Some(msg) = msg_opt {
+                    eprintln!("[Server AM] Received Read AM");
+                    let storage_clone = storage.clone();
+                    pluvio_runtime::spawn(async move {
+                        if let Err(e) = handle_read_am(msg, storage_clone).await {
+                            eprintln!("[Server AM] Read handler error: {}", e);
+                        }
+                    });
+                } else {
+                    eprintln!("[Server AM] Read stream closed");
+                    break;
+                }
             }
         }
     }
+
+    eprintln!("[Server AM] Server loop ended");
 }
 
 // ============================================================================
-// Client Implementation
+// Client Implementation - Active Message Based
 // ============================================================================
 
-async fn rpc_write(endpoint: &Endpoint, path: &str, data: &[u8]) -> Result<(), String> {
-    eprintln!("[Client] rpc_write: path={}, data_len={}", path, data.len());
+/// Rust client Write using Active Message
+async fn rpc_write_am(endpoint: &Endpoint, worker: &Rc<Worker>, path: &str, data: &[u8]) -> Result<(), String> {
+    eprintln!("[Client AM] rpc_write: path={}, data_len={}", path, data.len());
 
-    // Send RPC ID
-    let rpc_id = RPC_WRITE.to_le_bytes();
-    stream_send(endpoint, &rpc_id).await?;
-
-    // Send request
     let path_bytes = path.as_bytes();
-    let header = WriteRequest {
-        path_len: path_bytes.len() as u32,
-        data_len: data.len() as u32,
-    };
+    let path_len = path_bytes.len();
 
-    eprintln!("[Client] Sending header: path_len={}, data_len={}", header.path_len, header.data_len);
-    stream_send(endpoint, &header.path_len.to_le_bytes()).await?;
-    stream_send(endpoint, &header.data_len.to_le_bytes()).await?;
-    stream_send(endpoint, path_bytes).await?;
-    stream_send(endpoint, data).await?;
+    // Build header: [path_len(4)] [data_len(4)] [path(variable)]
+    let mut header = Vec::with_capacity(8 + path_len);
+    header.extend_from_slice(&(path_len as u32).to_le_bytes());
+    header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    header.extend_from_slice(path_bytes);
 
-    eprintln!("[Client] Waiting for response...");
-    // Receive response
-    let mut status_buf = [0u8; 4];
-    stream_recv(endpoint, &mut status_buf).await?;
-    let status = i32::from_le_bytes(status_buf);
+    eprintln!("[Client AM] Sending Write AM: header_len={}, data_len={}", header.len(), data.len());
 
-    if status != BENCHFS_MINI_SUCCESS {
-        return Err(format!("Write failed with status: {}", status));
+    // Send Active Message with reply expected
+    endpoint.am_send(RPC_WRITE as u32, &header, data, true, None).await
+        .map_err(|e| format!("am_send failed: {:?}", e))?;
+
+    eprintln!("[Client AM] Write AM sent, waiting for reply...");
+
+    // Create AM stream to receive reply (AM ID 0 is used for replies by default)
+    // We need to receive the reply, which will come as an Active Message
+    // For simplicity, we create a temporary AM stream for reply reception
+    let reply_stream = worker.am_stream(0)
+        .map_err(|e| format!("Failed to create reply stream: {:?}", e))?;
+
+    // Wait for reply
+    if let Some(reply_msg) = reply_stream.wait_msg().await {
+        let reply_header = reply_msg.header();
+        if reply_header.len() < 4 {
+            return Err(format!("Reply too short: {} bytes", reply_header.len()));
+        }
+
+        let status = i32::from_le_bytes([reply_header[0], reply_header[1], reply_header[2], reply_header[3]]);
+        if status != BENCHFS_MINI_SUCCESS {
+            return Err(format!("Write failed with status: {}", status));
+        }
+
+        eprintln!("[Client AM] Write completed successfully");
+        Ok(())
+    } else {
+        Err("No reply received".to_string())
     }
-
-    eprintln!("[Client] Write completed successfully");
-    Ok(())
 }
 
-async fn rpc_read(endpoint: &Endpoint, path: &str, buffer: &mut [u8]) -> Result<usize, String> {
-    // Send RPC ID
-    let rpc_id = RPC_READ.to_le_bytes();
-    stream_send(endpoint, &rpc_id).await?;
-
-    // Send request
+/// Rust client Read using Active Message
+async fn rpc_read_am(endpoint: &Endpoint, worker: &Rc<Worker>, path: &str, buffer: &mut [u8]) -> Result<usize, String> {
     let path_bytes = path.as_bytes();
-    let header = ReadRequest {
-        path_len: path_bytes.len() as u32,
-        buffer_len: buffer.len() as u32,
-    };
-    stream_send(endpoint, &header.path_len.to_le_bytes()).await?;
-    stream_send(endpoint, &header.buffer_len.to_le_bytes()).await?;
-    stream_send(endpoint, path_bytes).await?;
+    let path_len = path_bytes.len();
 
-    // Receive response
-    let mut status_buf = [0u8; 4];
-    stream_recv(endpoint, &mut status_buf).await?;
-    let status = i32::from_le_bytes(status_buf);
+    // Build header: [path_len(4)] [buffer_len(4)] [path(variable)]
+    let mut header = Vec::with_capacity(8 + path_len);
+    header.extend_from_slice(&(path_len as u32).to_le_bytes());
+    header.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+    header.extend_from_slice(path_bytes);
 
-    let mut data_len_buf = [0u8; 4];
-    stream_recv(endpoint, &mut data_len_buf).await?;
-    let data_len = u32::from_le_bytes(data_len_buf) as usize;
+    eprintln!("[Client AM] Sending Read AM: header_len={}", header.len());
 
-    if status != BENCHFS_MINI_SUCCESS {
-        return Err(format!("Read failed with status: {}", status));
+    // Send Active Message with reply expected
+    endpoint.am_send(RPC_READ as u32, &header, &[], true, None).await
+        .map_err(|e| format!("am_send failed: {:?}", e))?;
+
+    eprintln!("[Client AM] Read AM sent, waiting for reply...");
+
+    // Create AM stream to receive reply
+    let reply_stream = worker.am_stream(0)
+        .map_err(|e| format!("Failed to create reply stream: {:?}", e))?;
+
+    // Wait for reply
+    if let Some(mut reply_msg) = reply_stream.wait_msg().await {
+        let reply_header = reply_msg.header();
+        if reply_header.len() < 8 {
+            return Err(format!("Reply header too short: {} bytes", reply_header.len()));
+        }
+
+        let status = i32::from_le_bytes([reply_header[0], reply_header[1], reply_header[2], reply_header[3]]);
+        let data_len = u32::from_le_bytes([reply_header[4], reply_header[5], reply_header[6], reply_header[7]]) as usize;
+
+        if status != BENCHFS_MINI_SUCCESS {
+            return Err(format!("Read failed with status: {}", status));
+        }
+
+        // Get reply data
+        if data_len > 0 {
+            let reply_data = if let Some(immediate_data) = reply_msg.get_data() {
+                immediate_data.to_vec()
+            } else {
+                reply_msg.recv_data().await.map_err(|e| format!("recv_data failed: {:?}", e))?
+            };
+
+            let copy_len = reply_data.len().min(buffer.len());
+            buffer[..copy_len].copy_from_slice(&reply_data[..copy_len]);
+            eprintln!("[Client AM] Read completed: {} bytes", copy_len);
+            Ok(copy_len)
+        } else {
+            eprintln!("[Client AM] Read completed: 0 bytes");
+            Ok(0)
+        }
+    } else {
+        Err("No reply received".to_string())
     }
-
-    // Receive data
-    if data_len > 0 {
-        stream_recv(endpoint, &mut buffer[..data_len]).await?;
-    }
-
-    Ok(data_len)
 }
 
 // ============================================================================
@@ -583,6 +579,27 @@ fn register_server(registry_dir: &str, rank: i32, hostname: &str, port: u16) -> 
     let content = format!("{}:{}", hostname, port);
     std::fs::write(&path, content)
         .map_err(|e| format!("Failed to register server: {:?}", e))
+}
+
+fn register_server_worker_addr(registry_dir: &str, rank: i32, worker_addr: &[u8]) -> Result<(), String> {
+    let path = format!("{}/server_{}_worker.bin", registry_dir, rank);
+    std::fs::write(&path, worker_addr)
+        .map_err(|e| format!("Failed to register worker address: {:?}", e))
+}
+
+fn lookup_server_worker_addr(registry_dir: &str, rank: i32) -> Result<Vec<u8>, String> {
+    let path = format!("{}/server_{}_worker.bin", registry_dir, rank);
+
+    // Wait for file to appear
+    for _ in 0..30 {
+        if std::path::Path::new(&path).exists() {
+            return std::fs::read(&path)
+                .map_err(|e| format!("Failed to read worker address: {:?}", e));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    Err(format!("Server {} worker address not found in registry", rank))
 }
 
 fn lookup_server(registry_dir: &str, rank: i32) -> Result<SocketAddr, String> {
@@ -692,21 +709,30 @@ pub extern "C" fn benchfs_mini_init(
         // Register worker with reactor
         ucx_reactor.register_worker(worker.clone());
 
+        // For AM-based implementation, clients connect to servers to create endpoints
+        // Then use Active Messages through those endpoints
+        // Servers must keep the listener alive for clients to connect
         let listener = if is_server {
-            // Create listener
+            // Register server address for clients to discover
+            // We need to bind a port and keep listener alive for clients to connect
             let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
             let listener = worker.create_listener(listen_addr).unwrap();
             let bound_addr = listener.socket_addr().unwrap();
 
             eprintln!("[Rank {}] Server listening on {}", rank, bound_addr);
 
-            // Register server
+            // Register server (socket address for backward compatibility)
             let hostname = std::env::var("HOSTNAME")
                 .unwrap_or_else(|_| gethostname::gethostname().to_string_lossy().to_string());
             register_server(&registry_dir_str, rank, &hostname, bound_addr.port()).unwrap();
 
-            eprintln!("[Rank {}] Registered as {}:{}", rank, hostname, bound_addr.port());
+            // Also register WorkerAddress for Active Message
+            let worker_addr = worker.address().unwrap();
+            register_server_worker_addr(&registry_dir_str, rank, worker_addr.as_ref()).unwrap();
 
+            eprintln!("[Rank {}] Registered as {}:{} (socket) and WorkerAddress (AM)", rank, hostname, bound_addr.port());
+
+            // Keep listener alive - clients need it to connect
             Some(listener)
         } else {
             None
@@ -722,13 +748,13 @@ pub extern "C" fn benchfs_mini_init(
             uring_reactor,
             worker,
             context,
-            listener,
             server_started: false,
             rank,
             size,
             registry_dir: registry_dir_str,
             storage_dir,
-            server_endpoints: Arc::new(AsyncMutex::new(Vec::new())),
+            server_endpoints: Arc::new(AsyncMutex::new(HashMap::new())),
+            listener,
         }));
 
         eprintln!("[Rank {}] BenchFS Mini initialized", rank);
@@ -748,31 +774,32 @@ pub extern "C" fn benchfs_mini_start_server() -> i32 {
                 return BENCHFS_MINI_SUCCESS;
             }
 
-            if let Some(listener) = state.listener.take() {
-                let worker = state.worker.clone();
-                let storage_dir = state.storage_dir.clone();
-                let storage = Rc::new(FileStorage::new(storage_dir));
-                let rank = state.rank;
-                let runtime = state.runtime.clone();
+            let worker = state.worker.clone();
+            let storage_dir = state.storage_dir.clone();
+            let storage = Rc::new(FileStorage::new(storage_dir));
+            let rank = state.rank;
+            let runtime = state.runtime.clone();
 
-                eprintln!("[Rank {}] Starting server loop", rank);
+            eprintln!("[Rank {}] Starting AM server loop", rank);
 
-                // Spawn server task in the background
-                pluvio_runtime::spawn(async move {
-                    run_server(worker, listener, storage).await;
-                });
+            // Wait for clients to connect
+            eprintln!("[Rank {}] Calling worker.wait_connect()...", rank);
+            worker.wait_connect();
+            eprintln!("[Rank {}] worker.wait_connect() returned", rank);
 
-                state.server_started = true;
-                eprintln!("[Rank {}] Server task spawned, entering runtime loop", rank);
+            // Spawn AM server task in the background
+            pluvio_runtime::spawn(async move {
+                run_server_am(worker, storage).await;
+            });
 
-                // Server processes must continuously drive the runtime
-                // This infinite loop processes spawned tasks and handles connections
-                // To stop the server, use pkill or similar
-                loop {
-                    runtime.progress();
-                }
-            } else {
-                eprintln!("[Rank {}] No listener available (not a server rank?)", state.rank);
+            state.server_started = true;
+            eprintln!("[Rank {}] AM server task spawned, entering runtime loop", rank);
+
+            // Server processes must continuously drive the runtime
+            // This infinite loop processes spawned tasks and handles Active Messages
+            // To stop the server, use pkill or similar
+            loop {
+                runtime.progress();
             }
         }
 
@@ -794,21 +821,24 @@ pub extern "C" fn benchfs_mini_connect(server_rank: i32) -> i32 {
 
         // Use block_on_with_runtime to drive the Pluvio runtime
         let result = block_on_with_runtime(&runtime, async move {
-            // Lookup server address
-            let server_addr = lookup_server(&registry_dir, server_rank)?;
-            eprintln!("[Client] Connecting to {}", server_addr);
+            // Lookup server WorkerAddress
+            let worker_addr_bytes = lookup_server_worker_addr(&registry_dir, server_rank)?;
+            eprintln!("[Client] Found WorkerAddress for server {} ({} bytes)", server_rank, worker_addr_bytes.len());
 
-            // Connect
+            // Convert to WorkerAddressInner
+            let worker_addr = pluvio_ucx::WorkerAddressInner::from(worker_addr_bytes.as_slice());
+            eprintln!("[Client] Connecting to server {} using WorkerAddress", server_rank);
+
+            // Connect using WorkerAddress
             let endpoint = worker
-                .connect_socket(server_addr)
-                .await
+                .connect_addr(&worker_addr)
                 .map_err(|e| format!("Failed to connect: {:?}", e))?;
 
             eprintln!("[Client] Connected to server");
             endpoint.print_to_stderr();
 
-            // Store endpoint
-            endpoints.lock().await.push(endpoint);
+            // Store endpoint with server_rank as key
+            endpoints.lock().await.insert(server_rank, endpoint);
 
             Ok::<_, String>(())
         });
@@ -838,22 +868,23 @@ pub extern "C" fn benchfs_mini_write(
         eprintln!("[FFI] benchfs_mini_write: path={}, data_len={}, server_rank={}", path_str, data_len, server_rank);
 
         let endpoints = state.server_endpoints.clone();
+        let worker = state.worker.clone();
         let runtime = state.runtime.clone();
 
-        eprintln!("[FFI] Entering block_on_with_runtime");
+        eprintln!("[FFI AM] Entering block_on_with_runtime for write");
         let result = block_on_with_runtime(&runtime, async move {
-            eprintln!("[FFI async] Inside async block, acquiring endpoints lock");
+            eprintln!("[FFI AM async] Inside async block, acquiring endpoints lock");
             let endpoints_guard = endpoints.lock().await;
-            eprintln!("[FFI async] Lock acquired, checking endpoint {}", server_rank);
-            if let Some(endpoint) = endpoints_guard.get(server_rank as usize) {
-                eprintln!("[FFI async] Endpoint found, calling rpc_write");
-                rpc_write(endpoint, &path_str, data_slice).await
+            eprintln!("[FFI AM async] Lock acquired, checking endpoint for server {}", server_rank);
+            if let Some(endpoint) = endpoints_guard.get(&server_rank) {
+                eprintln!("[FFI AM async] Endpoint found, calling rpc_write_am");
+                rpc_write_am(endpoint, &worker, &path_str, data_slice).await
             } else {
-                eprintln!("[FFI async] Endpoint not found!");
+                eprintln!("[FFI AM async] Endpoint not found!");
                 Err(format!("No connection to server rank {}", server_rank))
             }
         });
-        eprintln!("[FFI] block_on_with_runtime returned");
+        eprintln!("[FFI AM] block_on_with_runtime returned");
 
         match result {
             Ok(_) => BENCHFS_MINI_SUCCESS,
@@ -878,12 +909,13 @@ pub extern "C" fn benchfs_mini_read(
         let buffer_slice = std::slice::from_raw_parts_mut(buffer, buffer_len);
 
         let endpoints = state.server_endpoints.clone();
+        let worker = state.worker.clone();
         let runtime = state.runtime.clone();
 
         let result = block_on_with_runtime(&runtime, async move {
             let endpoints_guard = endpoints.lock().await;
-            if let Some(endpoint) = endpoints_guard.get(server_rank as usize) {
-                rpc_read(endpoint, &path_str, buffer_slice).await
+            if let Some(endpoint) = endpoints_guard.get(&server_rank) {
+                rpc_read_am(endpoint, &worker, &path_str, buffer_slice).await
             } else {
                 Err(format!("No connection to server rank {}", server_rank))
             }

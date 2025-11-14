@@ -10,7 +10,7 @@ BUILD_CONTEXT := ../..
 PLUVIO_PATH := $(BUILD_CONTEXT)/lib/pluvio
 BENCHFS_PATH := $(BUILD_CONTEXT)
 
-.PHONY: help build-mini up down logs test-ior clean clean-all status
+.PHONY: help build-mini up down logs test-ior test-ior-c clean clean-all status
 
 help:
 	@echo "BenchFS Mini Docker Test Targets:"
@@ -78,6 +78,16 @@ test-ior:
 	fi
 	@# Run test script
 	docker exec benchfs_mini_controller /scripts/run_ior_mini.sh
+
+test-ior-c:
+	@echo "=== Running IOR test with BENCHFSMINI backend (C version) ==="
+	@# Ensure cluster is running
+	@if [ -z "$$(docker ps -q -f name=benchfs_mini_controller)" ]; then \
+		echo "ERROR: Cluster is not running. Run 'make up' first."; \
+		exit 1; \
+	fi
+	@# Run test script
+	docker exec benchfs_mini_controller /scripts/run_ior_mini_c.sh
 
 # Clean containers and volumes
 clean:

@@ -84,7 +84,9 @@
       "Bash(cargo fix:*)",
       "Bash(timeout 600 make:*)",
       "Bash(timeout 30 make:*)",
-      "Read(//usr/include/**)"
+      "Read(//usr/include/**)",
+      "Bash(wait)",
+      "WebFetch(domain:openucx.github.io)"
     ],
     "deny": [],
     "ask": []
