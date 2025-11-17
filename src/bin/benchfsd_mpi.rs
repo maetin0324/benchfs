@@ -17,7 +17,6 @@ use benchfs::rpc::RpcError;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
-use benchfs::rpc::stream_server::StreamRpcServer;
 use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
@@ -61,10 +60,6 @@ impl ServerState {
 
     fn is_primary(&self) -> bool {
         self.mpi_rank == 0
-    }
-
-    fn stop(&self) {
-        self.running.store(false, Ordering::Relaxed);
     }
 }
 
@@ -276,15 +271,8 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         allocator,
     ));
 
-    // Create RPC server (Active Message based - legacy support)
+    // Create RPC server (Active Message based)
     let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));
-
-    // Create Stream RPC server (Stream + RMA based)
-    let stream_rpc_server = Rc::new(StreamRpcServer::new(
-        worker.clone(),
-        handler_context.clone(),
-        ucx_context.clone(),
-    ));
 
     // Create connection pool for inter-node communication
     // Note: bind_and_register() will be called later to create the socket listener
@@ -325,9 +313,6 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let registry_dir_clone = PathBuf::from(registry_dir);
     let mpi_rank_clone = state.mpi_rank;
     let mpi_size_clone = state.mpi_size;
-    let stream_rpc_server_clone = stream_rpc_server.clone();
-    let state_clone_for_registration = state.clone();
-    let worker_clone_for_registration = worker.clone();
 
     // Registration will be done synchronously before starting the main loop
     let registration_future = async move {
@@ -429,63 +414,6 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
             node_id_clone,
             bound_addr
         );
-
-        // Start Stream RPC acceptor loop now that listener is bound
-        // Take the listener from the connection pool
-        if let Some(stream_listener) = pool_clone.take_listener() {
-            tracing::info!("Starting Stream RPC acceptor on {}", bound_addr);
-
-            let stream_server_clone_inner = stream_rpc_server_clone.clone();
-            let state_clone_inner = state_clone_for_registration.clone();
-            let worker_clone_inner = worker_clone_for_registration.clone();
-            let mut stream_listener_mut = stream_listener;
-
-            pluvio_runtime::spawn_with_name(
-                async move {
-                    tracing::info!("Stream RPC server accepting connections on {}", bound_addr);
-
-                    loop {
-                        if !state_clone_inner.is_running() {
-                            break;
-                        }
-
-                        // Accept incoming connection
-                        let connection = stream_listener_mut.next().await;
-
-                        match worker_clone_inner.accept(connection).await {
-                            Ok(endpoint) => {
-                                tracing::info!("Stream RPC: accepted new client connection");
-
-                                // Spawn a task to serve this connection
-                                let server_clone = stream_server_clone_inner.clone();
-
-                                pluvio_runtime::spawn_with_name(
-                                    async move {
-                                        if let Err(e) = server_clone.serve(endpoint).await {
-                                            tracing::error!("Stream RPC connection error: {:?}", e);
-                                        }
-                                        Ok::<(), std::io::Error>(())
-                                    },
-                                    format!("stream_rpc_connection"),
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!("Stream RPC accept error: {:?}", e);
-                                // Brief delay before retrying
-                                futures_timer::Delay::new(std::time::Duration::from_millis(100))
-                                    .await;
-                            }
-                        }
-                    }
-
-                    tracing::info!("Stream RPC server stopped accepting connections");
-                    Ok::<(), std::io::Error>(())
-                },
-                "stream_rpc_acceptor".to_string(),
-            );
-        } else {
-            tracing::warn!("No listener available for Stream RPC acceptor");
-        }
 
         // Wait for all nodes to register
         let max_wait_secs = 120; // Increased timeout for large-scale deployments
