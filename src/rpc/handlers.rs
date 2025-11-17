@@ -341,6 +341,9 @@ pub async fn handle_metadata_lookup(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
 ) -> Result<(MetadataLookupResponseHeader, AmMsg), (RpcError, AmMsg)> {
+    eprintln!("[AM RPC REQUEST] Received MetadataLookup request");
+    tracing::info!("[AM RPC REQUEST] Received MetadataLookup request");
+
     // Parse request header
     let header: MetadataLookupRequestHeader = match am_msg
         .header()
@@ -348,7 +351,10 @@ pub async fn handle_metadata_lookup(
         .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
     {
         Some(h) => h,
-        None => return Err((RpcError::InvalidHeader, am_msg)),
+        None => {
+            tracing::error!("[AM RPC REQUEST] Failed to parse MetadataLookup header");
+            return Err((RpcError::InvalidHeader, am_msg));
+        }
     };
 
     // Receive path from request data if available

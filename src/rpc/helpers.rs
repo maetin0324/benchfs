@@ -264,6 +264,14 @@ where
         None
     };
 
+    tracing::info!(
+        "[AM RPC REPLY] Sending reply on stream {} (header={} bytes, data={} bytes, proto={:?})",
+        reply_stream_id,
+        header_bytes.len(),
+        data.len(),
+        proto
+    );
+
     let result = unsafe {
         am_msg
             .reply(
@@ -277,12 +285,14 @@ where
     };
 
     if let Err(e) = result {
-        tracing::error!("Failed to send reply: {:?}", e);
+        tracing::error!("[AM RPC REPLY] Failed to send reply on stream {}: {:?}", reply_stream_id, e);
         return Err((
             RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
             am_msg,
         ));
     }
+
+    tracing::info!("[AM RPC REPLY] Successfully sent reply on stream {}", reply_stream_id);
 
     Ok((
         crate::rpc::ServerResponse::new(response_header.clone()),

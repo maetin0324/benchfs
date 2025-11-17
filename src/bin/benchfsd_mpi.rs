@@ -199,6 +199,9 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let worker = ucx_context.create_worker()?;
     ucx_reactor.register_worker(worker.clone());
 
+    // Note: UCXReactor will automatically call worker.progress() when registered
+    // No need to manually spawn polling task
+
     // Create metadata manager
     let cache_policy = if config.cache.cache_ttl_secs > 0 {
         CachePolicy::lru_with_ttl(
@@ -482,11 +485,13 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         Ok::<(), std::io::Error>(())
     };
 
-    // Start socket listener acceptance loop (socket-based AM RPC server)
+    // Start socket listener acceptance loop with worker address exchange protocol
     let listener_handle = {
         let pool_clone = connection_pool.clone();
         let state_clone = state.clone();
         let worker_clone = worker.clone();
+        let rpc_server_clone = rpc_server.clone();
+        let ucx_context_clone = ucx_context.clone();
 
         pluvio_runtime::spawn_with_name(
             async move {
@@ -502,7 +507,17 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                     }
                 };
 
-                tracing::info!("Socket listener started, accepting connections...");
+                // Get server's worker address for exchange
+                let server_worker_addr = worker_clone.address()
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to get worker address: {:?}", e)
+                    ))?;
+                // Convert to bytes for transmission
+                let server_addr_bytes: Vec<u8> = server_worker_addr.as_ref().to_vec();
+                eprintln!("[WORKER ADDR EXCHANGE] Server worker address length: {}", server_addr_bytes.len());
+
+                tracing::info!("Socket listener started, accepting connections with worker address exchange...");
 
                 loop {
                     if !state_clone.is_running() {
@@ -510,44 +525,131 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                         break;
                     }
 
-                    // Accept next connection
-                    // listener.next().await returns ConnectionRequest directly
+                    // Accept next connection (socket-based for discovery only)
                     let conn_request = listener.next().await;
+                    eprintln!("[WORKER ADDR EXCHANGE] Received connection request from client");
 
-                    tracing::info!("Received connection request from client");
-
-                    // Accept the connection using worker.accept()
-                    match worker_clone.accept(conn_request).await {
-                        Ok(endpoint) => {
-                            tracing::info!(
-                                "Accepted client connection, endpoint established. \
-                                 UCX AM RPC handlers will now process requests from this client."
-                            );
-
-                            // The endpoint is now established. The client can send AM requests
-                            // which will be handled by the registered AM handlers in RpcServer.
-                            // We don't need to do anything else - just keep the endpoint alive
-                            // by holding it in memory. When dropped, the connection closes.
-
-                            // Spawn a task to keep the endpoint alive
-                            pluvio_runtime::spawn_with_name(
-                                async move {
-                                    // Just hold the endpoint until it closes
-                                    loop {
-                                        if endpoint.is_closed() {
-                                            tracing::info!("Client endpoint closed");
-                                            break;
-                                        }
-                                        futures_timer::Delay::new(std::time::Duration::from_secs(1)).await;
-                                    }
-                                },
-                                "client_endpoint_keeper".to_string(),
-                            );
-                        }
+                    // Accept the socket connection
+                    let socket_endpoint = match worker_clone.accept(conn_request).await {
+                        Ok(ep) => ep,
                         Err(e) => {
-                            tracing::error!("Failed to accept connection: {:?}", e);
+                            eprintln!("[WORKER ADDR EXCHANGE] Failed to accept socket connection: {:?}", e);
+                            continue;
                         }
-                    }
+                    };
+
+                    eprintln!("[WORKER ADDR EXCHANGE] Socket endpoint established, starting worker address exchange");
+
+                    // Spawn task to handle worker address exchange for this client
+                    let worker_clone2 = worker_clone.clone();
+                    let server_addr_clone = server_addr_bytes.clone();
+                    let rpc_server_clone2 = rpc_server_clone.clone();
+                    let ucx_context_clone2 = ucx_context_clone.clone();
+
+                    pluvio_runtime::spawn_with_name(
+                        async move {
+                            // Step 1: Receive client's worker address length (4 bytes)
+                            let mut len_buf = [std::mem::MaybeUninit::new(0u8); 4];
+                            match socket_endpoint.stream_recv(&mut len_buf).await {
+                                Ok(4) => {
+                                    let len_bytes: [u8; 4] = unsafe {
+                                        std::mem::transmute(len_buf)
+                                    };
+                                    let client_addr_len = u32::from_be_bytes(len_bytes) as usize;
+                                    eprintln!("[WORKER ADDR EXCHANGE] Received client worker address length: {}", client_addr_len);
+
+                                    if client_addr_len == 0 || client_addr_len > 1024 {
+                                        eprintln!("[WORKER ADDR EXCHANGE] Invalid client worker address length: {}", client_addr_len);
+                                        return;
+                                    }
+
+                                    // Step 2: Receive client's worker address
+                                    let mut client_addr_buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::new(0); client_addr_len];
+                                    match socket_endpoint.stream_recv(&mut client_addr_buf).await {
+                                        Ok(n) if n == client_addr_len => {
+                                            eprintln!("[WORKER ADDR EXCHANGE] Received client worker address ({} bytes)", n);
+
+                                            // Convert MaybeUninit to initialized bytes
+                                            let client_worker_addr: Vec<u8> = client_addr_buf.into_iter()
+                                                .map(|b| unsafe { b.assume_init() })
+                                                .collect();
+
+                                            // Step 3: Send server's worker address length
+                                            let server_len = server_addr_clone.len() as u32;
+                                            let server_len_bytes = server_len.to_be_bytes();
+                                            match socket_endpoint.stream_send(&server_len_bytes).await {
+                                                Ok(4) => {
+                                                    eprintln!("[WORKER ADDR EXCHANGE] Sent server worker address length: {}", server_len);
+
+                                                    // Step 4: Send server's worker address
+                                                    match socket_endpoint.stream_send(&server_addr_clone).await {
+                                                        Ok(n) if n == server_addr_clone.len() => {
+                                                            eprintln!("[WORKER ADDR EXCHANGE] Sent server worker address ({} bytes)", n);
+
+                                                            // Step 5: Close socket endpoint (no longer needed)
+                                                            let _ = socket_endpoint.close(false).await;
+                                                            eprintln!("[WORKER ADDR EXCHANGE] Socket endpoint closed");
+
+                                                            // Step 6: Create AM endpoint using client's worker address
+                                                            use pluvio_ucx::WorkerAddressInner;
+                                                            let client_addr_inner = WorkerAddressInner::from(client_worker_addr.as_slice());
+                                                            match worker_clone2.connect_addr(&client_addr_inner) {
+                                                                Ok(am_endpoint) => {
+                                                                    eprintln!("[WORKER ADDR EXCHANGE] Created AM endpoint for client");
+
+                                                                    // Register this endpoint with RPC server so it can receive AM requests
+                                                                    // The RPC server already has AM handlers registered, so the endpoint
+                                                                    // can immediately start receiving requests
+                                                                    tracing::info!("Worker address exchange complete, AM endpoint ready for client requests");
+
+                                                                    // Keep endpoint alive
+                                                                    loop {
+                                                                        if am_endpoint.is_closed() {
+                                                                            eprintln!("[WORKER ADDR EXCHANGE] Client AM endpoint closed");
+                                                                            break;
+                                                                        }
+                                                                        futures_timer::Delay::new(std::time::Duration::from_secs(1)).await;
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("[WORKER ADDR EXCHANGE] Failed to create AM endpoint: {:?}", e);
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(n) => {
+                                                            eprintln!("[WORKER ADDR EXCHANGE] Partial send of server worker address: {}/{}", n, server_addr_clone.len());
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!("[WORKER ADDR EXCHANGE] Failed to send server worker address: {:?}", e);
+                                                        }
+                                                    }
+                                                }
+                                                Ok(n) => {
+                                                    eprintln!("[WORKER ADDR EXCHANGE] Partial send of server address length: {}/4", n);
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[WORKER ADDR EXCHANGE] Failed to send server address length: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                        Ok(n) => {
+                                            eprintln!("[WORKER ADDR EXCHANGE] Partial receive of client worker address: {}/{}", n, client_addr_len);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[WORKER ADDR EXCHANGE] Failed to receive client worker address: {:?}", e);
+                                        }
+                                    }
+                                }
+                                Ok(n) => {
+                                    eprintln!("[WORKER ADDR EXCHANGE] Partial receive of client address length: {}/4", n);
+                                }
+                                Err(e) => {
+                                    eprintln!("[WORKER ADDR EXCHANGE] Failed to receive client address length: {:?}", e);
+                                }
+                            }
+                        },
+                        "worker_addr_exchange".to_string(),
+                    );
                 }
 
                 tracing::info!("Socket listener stopped");
@@ -589,7 +691,7 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // Run the runtime with proper initialization sequence
-    // First complete registration, then start the server
+    // First complete registration, then keep server running until shutdown
     pluvio_runtime::run_with_name("benchfsd_mpi_server_main", async move {
         // Execute registration synchronously before starting the server
         tracing::info!("Starting node registration...");
@@ -599,7 +701,19 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         }
         tracing::info!("Node registration completed successfully");
 
-        // Wait for both listener and server to complete
+        // Listener and server tasks are now running in the background
+        // Keep the runtime alive by waiting for shutdown signal
+        loop {
+            if !state.is_running() {
+                tracing::info!("Shutdown signal received");
+                break;
+            }
+            // Small delay to avoid busy-waiting
+            futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Wait for both listener and server to complete gracefully
+        tracing::info!("Waiting for listener and server tasks to complete...");
         let (listener_result, server_result) = futures::future::join(listener_handle, server_handle).await;
 
         // Check listener result

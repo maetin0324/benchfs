@@ -67,7 +67,7 @@ benchfs_client_t *benchfs_client_create(void) {
     ucp_params.field_mask = UCP_PARAM_FIELD_FEATURES |
                             UCP_PARAM_FIELD_REQUEST_SIZE |
                             UCP_PARAM_FIELD_REQUEST_INIT;
-    ucp_params.features = UCP_FEATURE_AM;  /* Active Message support */
+    ucp_params.features = UCP_FEATURE_AM | UCP_FEATURE_STREAM;  /* Active Message + Stream support */
     ucp_params.request_size = 0;
     ucp_params.request_init = NULL;
 
@@ -115,6 +115,8 @@ int benchfs_client_connect(benchfs_client_t *client, const char *server_addr) {
         return BENCHFS_INVALID_ARG;
     }
 
+    printf("[WORKER ADDR EXCHANGE] Starting connection to %s\n", server_addr);
+
     /* Parse server address (IP:port) */
     char *addr_copy = strdup(server_addr);
     char *colon = strchr(addr_copy, ':');
@@ -146,7 +148,9 @@ int benchfs_client_connect(benchfs_client_t *client, const char *server_addr) {
         memcpy(&server_sockaddr.sin_addr, he->h_addr_list[0], he->h_length);
     }
 
-    /* Create endpoint to server */
+    printf("[WORKER ADDR EXCHANGE] Resolved %s to socket address\n", server_addr);
+
+    /* Create socket endpoint for worker address exchange */
     ucp_ep_params_t ep_params;
     memset(&ep_params, 0, sizeof(ep_params));
     ep_params.field_mask = UCP_EP_PARAM_FIELD_FLAGS |
@@ -155,43 +159,164 @@ int benchfs_client_connect(benchfs_client_t *client, const char *server_addr) {
     ep_params.sockaddr.addr = (const struct sockaddr *)&server_sockaddr;
     ep_params.sockaddr.addrlen = sizeof(server_sockaddr);
 
-    ucs_status_t status = ucp_ep_create(client->ucp_worker, &ep_params, &client->ucp_ep);
+    ucp_ep_h socket_ep = NULL;
+    ucs_status_t status = ucp_ep_create(client->ucp_worker, &ep_params, &socket_ep);
     free(addr_copy);
 
     if (status != UCS_OK) {
-        fprintf(stderr, "Failed to create endpoint: %s\n", ucs_status_string(status));
+        fprintf(stderr, "[ERROR] Failed to create socket endpoint: %s\n", ucs_status_string(status));
         return BENCHFS_ERROR;
     }
 
-    /* Register AM handlers for reply streams BEFORE sending any requests */
-    if (!client->am_handlers_registered) {
-        printf("[DEBUG] Registering AM handlers for reply streams\n");
+    printf("[WORKER ADDR EXCHANGE] Socket endpoint created successfully\n");
 
-        /* Register handler for reply stream ID 120 (used by metadata operations) */
-        ucp_am_handler_param_t am_param;
-        memset(&am_param, 0, sizeof(am_param));
-        am_param.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID |
-                              UCP_AM_HANDLER_PARAM_FIELD_CB |
-                              UCP_AM_HANDLER_PARAM_FIELD_ARG;
-        am_param.id = 120;  /* Reply stream ID for metadata ops */
-        am_param.cb = am_reply_handler;
-        am_param.arg = NULL;
+    /* WORKER ADDRESS EXCHANGE PROTOCOL */
 
-        status = ucp_worker_set_am_recv_handler(client->ucp_worker, &am_param);
+    /* Step 1: Send client worker address length (4 bytes big-endian) */
+    uint32_t client_addr_len = (uint32_t)client->worker_addr_len;
+    uint32_t client_addr_len_be = htonl(client_addr_len);
+    printf("[WORKER ADDR EXCHANGE] Sending client worker address length: %u bytes\n", client_addr_len);
+
+    /* We need to use UCP stream send for the socket endpoint */
+    /* UCX stream API requires a different approach - we'll use ucp_stream_send_nbx */
+    ucp_request_param_t send_param;
+    memset(&send_param, 0, sizeof(send_param));
+    send_param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE;
+    send_param.datatype = ucp_dt_make_contig(1);  /* Byte datatype */
+
+    /* Send length */
+    ucs_status_ptr_t req = ucp_stream_send_nbx(socket_ep, &client_addr_len_be,
+                                                sizeof(client_addr_len_be), &send_param);
+    if (UCS_PTR_IS_PTR(req)) {
+        /* Wait for completion */
+        do {
+            ucp_worker_progress(client->ucp_worker);
+            status = ucp_request_check_status(req);
+        } while (status == UCS_INPROGRESS);
+        ucp_request_free(req);
+
         if (status != UCS_OK) {
-            fprintf(stderr, "[ERROR] Failed to set AM handler for stream 120: %s\n", ucs_status_string(status));
-            ucp_ep_destroy(client->ucp_ep);
-            client->ucp_ep = NULL;
-            client->connected = 0;
+            fprintf(stderr, "[ERROR] Failed to send client address length: %s\n", ucs_status_string(status));
+            ucp_ep_destroy(socket_ep);
             return BENCHFS_ERROR;
         }
-
-        printf("[DEBUG] Successfully registered AM handler for stream 120\n");
-        client->am_handlers_registered = 1;
+    } else if (UCS_PTR_STATUS(req) != UCS_OK) {
+        fprintf(stderr, "[ERROR] Stream send failed: %s\n", ucs_status_string(UCS_PTR_STATUS(req)));
+        ucp_ep_destroy(socket_ep);
+        return BENCHFS_ERROR;
     }
 
-    client->connected = 1;
-    printf("Connected to BenchFS server at %s\n", server_addr);
+    printf("[WORKER ADDR EXCHANGE] Sent client worker address length\n");
+
+    /* Step 2: Send client worker address */
+    req = ucp_stream_send_nbx(socket_ep, client->worker_addr,
+                              client->worker_addr_len, &send_param);
+    if (UCS_PTR_IS_PTR(req)) {
+        do {
+            ucp_worker_progress(client->ucp_worker);
+            status = ucp_request_check_status(req);
+        } while (status == UCS_INPROGRESS);
+        ucp_request_free(req);
+
+        if (status != UCS_OK) {
+            fprintf(stderr, "[ERROR] Failed to send client worker address: %s\n", ucs_status_string(status));
+            ucp_ep_destroy(socket_ep);
+            return BENCHFS_ERROR;
+        }
+    } else if (UCS_PTR_STATUS(req) != UCS_OK) {
+        fprintf(stderr, "[ERROR] Stream send failed: %s\n", ucs_status_string(UCS_PTR_STATUS(req)));
+        ucp_ep_destroy(socket_ep);
+        return BENCHFS_ERROR;
+    }
+
+    printf("[WORKER ADDR EXCHANGE] Sent client worker address (%zu bytes)\n", client->worker_addr_len);
+
+    /* Step 3: Receive server worker address length */
+    uint32_t server_addr_len_be = 0;
+    size_t recv_len;
+    ucp_request_param_t recv_param;
+    memset(&recv_param, 0, sizeof(recv_param));
+    recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_FLAGS;
+    recv_param.datatype = ucp_dt_make_contig(1);
+    recv_param.flags = UCP_STREAM_RECV_FLAG_WAITALL;  /* Wait for all data */
+
+    req = ucp_stream_recv_nbx(socket_ep, &server_addr_len_be, sizeof(server_addr_len_be),
+                              &recv_len, &recv_param);
+    if (UCS_PTR_IS_PTR(req)) {
+        do {
+            ucp_worker_progress(client->ucp_worker);
+            status = ucp_request_check_status(req);
+        } while (status == UCS_INPROGRESS);
+        ucp_request_free(req);
+
+        if (status != UCS_OK) {
+            fprintf(stderr, "[ERROR] Failed to receive server address length: %s\n", ucs_status_string(status));
+            ucp_ep_destroy(socket_ep);
+            return BENCHFS_ERROR;
+        }
+    } else if (UCS_PTR_STATUS(req) != UCS_OK) {
+        fprintf(stderr, "[ERROR] Stream recv failed: %s\n", ucs_status_string(UCS_PTR_STATUS(req)));
+        ucp_ep_destroy(socket_ep);
+        return BENCHFS_ERROR;
+    }
+
+    uint32_t server_addr_len = ntohl(server_addr_len_be);
+    printf("[WORKER ADDR EXCHANGE] Received server worker address length: %u bytes\n", server_addr_len);
+
+    if (server_addr_len == 0 || server_addr_len > 1024) {
+        fprintf(stderr, "[ERROR] Invalid server worker address length: %u\n", server_addr_len);
+        ucp_ep_destroy(socket_ep);
+        return BENCHFS_ERROR;
+    }
+
+    /* Step 4: Receive server worker address */
+    unsigned char *server_worker_addr = malloc(server_addr_len);
+    if (!server_worker_addr) {
+        fprintf(stderr, "[ERROR] Failed to allocate memory for server worker address\n");
+        ucp_ep_destroy(socket_ep);
+        return BENCHFS_ERROR;
+    }
+
+    req = ucp_stream_recv_nbx(socket_ep, server_worker_addr, server_addr_len,
+                              &recv_len, &recv_param);
+    if (UCS_PTR_IS_PTR(req)) {
+        do {
+            ucp_worker_progress(client->ucp_worker);
+            status = ucp_request_check_status(req);
+        } while (status == UCS_INPROGRESS);
+        ucp_request_free(req);
+
+        if (status != UCS_OK) {
+            fprintf(stderr, "[ERROR] Failed to receive server worker address: %s\n", ucs_status_string(status));
+            free(server_worker_addr);
+            ucp_ep_destroy(socket_ep);
+            return BENCHFS_ERROR;
+        }
+    } else if (UCS_PTR_STATUS(req) != UCS_OK) {
+        fprintf(stderr, "[ERROR] Stream recv failed: %s\n", ucs_status_string(UCS_PTR_STATUS(req)));
+        free(server_worker_addr);
+        ucp_ep_destroy(socket_ep);
+        return BENCHFS_ERROR;
+    }
+
+    printf("[WORKER ADDR EXCHANGE] Received server worker address (%u bytes)\n", server_addr_len);
+
+    /* Step 5: Close socket endpoint (no longer needed) */
+    ucp_ep_destroy(socket_ep);
+    printf("[WORKER ADDR EXCHANGE] Socket endpoint closed\n");
+
+    /* Step 6: Create AM endpoint using server's worker address */
+    printf("[WORKER ADDR EXCHANGE] Creating AM endpoint with server worker address...\n");
+    int result = benchfs_client_connect_worker_addr(client, server_worker_addr, server_addr_len);
+    free(server_worker_addr);
+
+    if (result != BENCHFS_SUCCESS) {
+        fprintf(stderr, "[ERROR] Failed to create AM endpoint from worker address\n");
+        return result;
+    }
+
+    printf("[WORKER ADDR EXCHANGE] Worker address exchange completed successfully\n");
+    printf("Connected to BenchFS server at %s using worker address exchange\n", server_addr);
 
     return BENCHFS_SUCCESS;
 }
@@ -393,10 +518,11 @@ int send_am_request(benchfs_client_t *client, uint32_t rpc_id, uint32_t reply_st
     /* Prepare send parameters for UCX 1.18+ */
     ucp_request_param_t send_param;
     memset(&send_param, 0, sizeof(send_param));
-    send_param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE;  /* No callback - using synchronous polling */
+    send_param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_FLAGS;
     send_param.datatype = ucp_dt_make_contig(1);  /* Byte datatype */
+    send_param.flags = UCP_AM_SEND_FLAG_REPLY;  /* Request reply capability */
 
-    printf("[DEBUG] send_am_request: Calling ucp_am_send_nbx...\n");
+    printf("[DEBUG] send_am_request: Calling ucp_am_send_nbx with REPLY flag...\n");
 
     /* Send AM request with header and data
      * UCX 1.18+ separates header and payload */

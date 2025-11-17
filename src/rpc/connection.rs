@@ -96,8 +96,11 @@ impl ConnectionPool {
         let worker_addr_bytes = worker_addr.as_ref();
         self.registry.register(node_id, worker_addr_bytes)?;
 
-        // Register hostname and port separately for AM RPC connections
-        self.registry.register_am_hostname(node_id, &hostname)?;
+        // Register combined hostname:port for AM RPC connections (for C client socket connection)
+        let socket_addr_string = format!("{}:{}", hostname, bound_addr.port());
+        self.registry.register_am_hostname(node_id, &socket_addr_string)?;
+
+        // Also register port separately for Rust client compatibility
         self.registry
             .register_am_port(node_id, bound_addr.port())?;
 
@@ -154,14 +157,28 @@ impl ConnectionPool {
         // Remove closed connection if it exists
         self.connections.borrow_mut().remove(node_id);
 
-        // Lookup hostname and port from registry
+        // Lookup socket address from registry (hostname:port format)
         tracing::info!(
             "Creating new connection to node {} using socket address",
             node_id
         );
 
-        let hostname = self.registry.lookup_am_hostname(node_id)?;
-        let port = self.registry.lookup_am_port(node_id)?;
+        let socket_addr_str = self.registry.lookup_am_hostname(node_id)?;
+
+        // Parse hostname:port format
+        let (hostname, port) = socket_addr_str.split_once(':').ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "Invalid socket address format for {}: expected hostname:port, got {}",
+                node_id, socket_addr_str
+            ))
+        })?;
+
+        let port = port.parse::<u16>().map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "Invalid port number for {}: {}",
+                node_id, e
+            ))
+        })?;
 
         tracing::info!("Connecting to {}:{}", hostname, port);
 
