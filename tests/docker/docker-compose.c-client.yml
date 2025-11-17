@@ -1,0 +1,258 @@
+version: '3.8'
+
+# Docker Compose configuration for BenchFS with C Client + IOR
+# This setup uses:
+#   - BenchFS servers running with AM RPC only (benchfsd_mpi)
+#   - IOR client using pure C client library (libbenchfs_c_api.so)
+#
+# Usage:
+#   docker-compose -f docker-compose.c-client.yml up -d
+#   docker exec -it benchfs_ior_client /scripts/run_ior_test.sh
+
+services:
+  # Server node 1 - isolated data directory
+  server1:
+    image: benchfs:latest
+    container_name: benchfs_server1
+    hostname: server1
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.11
+    volumes:
+      - shared_registry:/shared/registry:rw
+      - server1_data:/shared/data:rw
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          memory: 4G
+    command: /usr/sbin/sshd -D
+
+  # Server node 2 - isolated data directory
+  server2:
+    image: benchfs:latest
+    container_name: benchfs_server2
+    hostname: server2
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.12
+    volumes:
+      - shared_registry:/shared/registry:rw
+      - server2_data:/shared/data:rw
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          memory: 4G
+    command: /usr/sbin/sshd -D
+
+  # Server node 3 - isolated data directory
+  server3:
+    image: benchfs:latest
+    container_name: benchfs_server3
+    hostname: server3
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.13
+    volumes:
+      - shared_registry:/shared/registry:rw
+      - server3_data:/shared/data:rw
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          memory: 4G
+    command: /usr/sbin/sshd -D
+
+  # Server node 4 - isolated data directory
+  server4:
+    image: benchfs:latest
+    container_name: benchfs_server4
+    hostname: server4
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.14
+    volumes:
+      - shared_registry:/shared/registry:rw
+      - server4_data:/shared/data:rw
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          memory: 4G
+    command: /usr/sbin/sshd -D
+
+  # MPI controller node (starts BenchFS servers)
+  controller:
+    image: benchfs:latest
+    container_name: benchfs_controller
+    hostname: controller
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.10
+    volumes:
+      - shared_registry:/shared/registry:rw
+      - controller_results:/shared/results:rw
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    depends_on:
+      - server1
+      - server2
+      - server3
+      - server4
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+    command: /usr/sbin/sshd -D
+
+  # IOR client with C client library
+  ior_client:
+    image: benchfs-c-client:latest
+    container_name: benchfs_ior_client
+    hostname: ior-client
+    networks:
+      benchfs_net:
+        ipv4_address: 172.20.0.20
+    volumes:
+      - shared_registry:/shared/registry:ro  # Read-only access to registry
+      - ior_results:/shared/results:rw       # IOR results output
+      - ./scripts:/scripts:ro                # Test scripts
+    environment:
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - LD_LIBRARY_PATH=/usr/local/lib
+    depends_on:
+      - controller
+      - server1
+      - server2
+      - server3
+      - server4
+    cap_add:
+      - IPC_LOCK
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+    command: /usr/sbin/sshd -D
+
+volumes:
+  # Shared registry for service discovery
+  shared_registry:
+    driver: local
+
+  # Isolated data volumes per server
+  server1_data:
+    driver: local
+  server2_data:
+    driver: local
+  server3_data:
+    driver: local
+  server4_data:
+    driver: local
+
+  # Results directories
+  controller_results:
+    driver: local
+  ior_results:
+    driver: local
+
+networks:
+  benchfs_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

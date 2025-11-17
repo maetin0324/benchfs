@@ -1,0 +1,107 @@
+# BenchFS C Client Docker Image with IOR
+# This image uses the BenchFS C client library (libbenchfs_c_api.so)
+# instead of the Rust FFI library (libbenchfs.so)
+#
+# Build:
+#   cd ../.. && docker build -f tests/docker/Dockerfile.c-client -t benchfs-c-client:latest .
+
+# ============================================================================
+# Stage 1: Build C Client and IOR
+# ============================================================================
+FROM benchfs/ucx-mpi-base:1.0 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    make \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and build BenchFS C client
+WORKDIR /build/c_client
+COPY benchfs/c_client/*.h benchfs/c_client/*.c benchfs/c_client/Makefile ./
+
+# Build C client libraries (including libbenchfs_c_api.so)
+RUN make clean && make && ls -la lib*
+
+# Install C client library as libbenchfs.so (replacing Rust FFI version)
+RUN mkdir -p /usr/local/lib /usr/local/include && \
+    cp libbenchfs_c_api.so /usr/local/lib/libbenchfs.so && \
+    cp benchfs_c_api.h /usr/local/include/ && \
+    ldconfig
+
+# Setup pkg-config for IOR build
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# Create pkg-config file
+RUN printf 'prefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: BenchFS\nDescription: BenchFS C Client\nVersion: 0.1.0\nLibs: -L${libdir} -lbenchfs\nCflags: -I${includedir}\n' > /usr/local/lib/pkgconfig/benchfs.pc
+
+# Copy IOR integration source
+WORKDIR /build/ior_integration
+COPY benchfs/ior_integration ./
+
+# Build IOR with BenchFS support (uses existing BENCHFS AIORI adapter)
+WORKDIR /build/ior_integration/ior
+
+# Remove BENCHFSMINI adapter from source and build system
+# BENCHFSMINI is already commented out in configure.ac, just remove from Makefile.am
+RUN rm -f src/aiori-BENCHFSMINI.c && \
+    sed -i '/^if USE_BENCHFSMINI_AIORI$/,/^endif$/d' src/Makefile.am && \
+    sed -i '/#ifdef USE_BENCHFSMINI_AIORI/,/#endif/d' src/aiori.c
+
+RUN ./bootstrap && \
+    ./configure \
+        CFLAGS="-O2 -g" \
+        PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+        --prefix=/usr/local \
+        --with-benchfs && \
+    make -j$(nproc) && \
+    make install
+
+# Verify IOR built with BenchFS
+RUN ior -h 2>&1 | grep -i benchfs || echo "BenchFS backend check"
+
+# ============================================================================
+# Stage 2: Runtime Image
+# ============================================================================
+FROM benchfs/ucx-mpi-base:1.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Copy BenchFS C client library (as libbenchfs.so)
+COPY --from=builder /usr/local/lib/libbenchfs.so /usr/local/lib/
+COPY --from=builder /usr/local/lib/pkgconfig/benchfs.pc /usr/local/lib/pkgconfig/
+COPY --from=builder /usr/local/include/benchfs_c_api.h /usr/local/include/
+
+# Copy IOR binaries
+COPY --from=builder /usr/local/bin/ior /usr/local/bin/
+COPY --from=builder /usr/local/bin/mdtest /usr/local/bin/
+
+# Update library cache
+RUN ldconfig
+
+# Install runtime utilities
+RUN apt-get update && apt-get install -y \
+    gdb \
+    strace \
+    procps \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set environment variables
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+
+WORKDIR /workspace
+
+# Inherit SSH, UCX, MPI setup from base image
+CMD ["/usr/sbin/sshd", "-D"]

@@ -59,6 +59,9 @@ WORKDIR /build/ior_integration
 RUN set -x && \
     ./sync-benchfs.sh && \
     cd ior && \
+    rm -f src/aiori-BENCHFSMINI.c && \
+    sed -i '/^if USE_BENCHFSMINI_AIORI$/,/^endif$/d' src/Makefile.am && \
+    sed -i '/#ifdef USE_BENCHFSMINI_AIORI/,/#endif/d' src/aiori.c && \
     ./bootstrap && \
     ./configure CFLAGS="-O0 -g3 -ggdb3 -fno-omit-frame-pointer -UNDEBUG" LD_FLAGS="-Wl,-rdynamic" --prefix=/usr/local && \
     make -j$(nproc) && \

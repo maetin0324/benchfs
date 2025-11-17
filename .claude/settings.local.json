@@ -81,7 +81,10 @@
       "Bash(echo:*)",
       "Bash(docker build:*)",
       "Bash(timeout 300 make:*)",
-      "Bash(cargo fix:*)"
+      "Bash(cargo fix:*)",
+      "Bash(docker rmi:*)",
+      "Bash(docker run:*)",
+      "Bash(UCX_DEBUG=1 make test-c-client:*)"
     ],
     "deny": [],
     "ask": []

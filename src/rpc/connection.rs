@@ -85,7 +85,7 @@ impl ConnectionPool {
 
         tracing::info!("AM RPC listener bound to {}", bound_addr);
 
-        // Determine hostname/IP for stream registration. Prefer explicit overrides,
+        // Determine hostname/IP for AM registration. Prefer explicit overrides,
         // then interface-based detection, and finally fall back to the system hostname.
         let hostname = Self::determine_stream_hostname();
 
@@ -96,10 +96,10 @@ impl ConnectionPool {
         let worker_addr_bytes = worker_addr.as_ref();
         self.registry.register(node_id, worker_addr_bytes)?;
 
-        // Register hostname and port separately for socket-based connections
-        self.registry.register_stream_hostname(node_id, &hostname)?;
+        // Register hostname and port separately for AM RPC connections
+        self.registry.register_am_hostname(node_id, &hostname)?;
         self.registry
-            .register_stream_port(node_id, bound_addr.port())?;
+            .register_am_port(node_id, bound_addr.port())?;
 
         // Store listener
         *self.am_listener.borrow_mut() = Some(listener);
@@ -160,8 +160,8 @@ impl ConnectionPool {
             node_id
         );
 
-        let hostname = self.registry.lookup_stream_hostname(node_id)?;
-        let port = self.registry.lookup_stream_port(node_id)?;
+        let hostname = self.registry.lookup_am_hostname(node_id)?;
+        let port = self.registry.lookup_am_port(node_id)?;
 
         tracing::info!("Connecting to {}:{}", hostname, port);
 
@@ -260,11 +260,11 @@ impl ConnectionPool {
         // Wait for hostname and port to be available
         let _hostname = self
             .registry
-            .wait_for_stream_hostname(node_id, timeout_secs)
+            .wait_for_am_hostname(node_id, timeout_secs)
             .await?;
         let _port = self
             .registry
-            .wait_for_stream_port(node_id, timeout_secs)
+            .wait_for_am_port(node_id, timeout_secs)
             .await?;
 
         // Use get_or_connect() which will lookup and connect
