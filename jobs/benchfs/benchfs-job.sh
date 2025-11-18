@@ -141,7 +141,7 @@ should_override_ucx_net_devices() {
 
 if [[ -z "${UCX_TLS:-}" ]]; then
   if detect_active_ib; then
-    export UCX_TLS="rc_mlx5,rc_verbs,tcp,self"
+    export UCX_TLS="rc_x,tcp,self"
   else
     export UCX_TLS="tcp,self"
   fi
@@ -195,7 +195,7 @@ export UCX_PROTOS="^ud,dc"
 # ==============================================================================
 # UCXのデフォルト値では不十分な場合があるため、増加
 
-export UCX_RC_TIMEOUT=2.0s               # タイムアウト時間（デフォルト: 1.0s）
+# export UCX_RC_TIMEOUT=2.0s               # タイムアウト時間（デフォルト: 1.0s）
 export UCX_RC_RETRY_COUNT=16             # リトライ回数（デフォルト: 7）
 export UCX_RC_TIMEOUT_MULTIPLIER=4.0     # タイムアウト乗数（デフォルト: 2.0）
 
@@ -207,11 +207,11 @@ export UCX_RC_TIMEOUT_MULTIPLIER=4.0     # タイムアウト乗数（デフォ�
 export UCX_AM_MAX_SHORT=128              # Short AMの最大サイズ (デフォルト: 128B)
 export UCX_AM_MAX_EAGER=8192             # Eager AMの最大サイズ (8KB)
 # export UCX_RNDV_THRESH=16384             # Rendezvous閾値 (16KB)
-export UCX_RNDV_THRESH=inf              # Rendezvousプロトコル無効化（全てEagerに）
+# export UCX_RNDV_THRESH=inf              # Rendezvousプロトコル無効化（全てEagerに）
 
 # AMストリームのキューサイズ
-export UCX_AM_SEND_QUEUE_SIZE=1024       # 送信キューサイズ
-export UCX_AM_RECV_QUEUE_SIZE=1024       # 受信キューサイズ
+export UCX_AM_SEND_QUEUE_SIZE=4096       # 送信キューサイズ
+export UCX_AM_RECV_QUEUE_SIZE=4096       # 受信キューサイズ
 
 # ==============================================================================
 # 4. RDMA設定
@@ -354,7 +354,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=Error
+export RUST_LOG=Debug
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
