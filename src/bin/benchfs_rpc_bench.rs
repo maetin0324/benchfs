@@ -25,7 +25,6 @@ use mpi::traits::*;
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -208,7 +207,7 @@ fn main() {
     pluvio_runtime::set_runtime(runtime.clone());
 
     // Create UCX context and reactor
-    let ucx_context = Arc::new(UcxContext::new().expect("Failed to create UCX context"));
+    let ucx_context = Rc::new(UcxContext::new().expect("Failed to create UCX context"));
     let ucx_reactor = UCXReactor::current();
     runtime.register_reactor("ucx", ucx_reactor.clone());
 
@@ -229,7 +228,7 @@ fn main() {
 
     // Create connection pool
     let connection_pool = Rc::new(
-        ConnectionPool::new(worker.clone(), ucx_context.clone(), &registry_dir)
+        ConnectionPool::new(worker.clone(), &registry_dir)
             .expect("Failed to create connection pool"),
     );
 
@@ -309,13 +308,9 @@ fn run_client(
         // Note: Client does not need to register handlers as it only sends requests,
         // not receives them. This avoids having idle handler tasks that need cleanup.
 
-        // Bind to socket and register this client's address
-        let base_port = 50051u16;
-        let listen_port = base_port + mpi_rank as u16;
-        let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
-
-        if let Err(e) = connection_pool.bind_and_register(&node_id, listen_addr) {
-            tracing::error!("Failed to bind and register client: {:?}", e);
+        // Register self in connection pool
+        if let Err(e) = connection_pool.register_self(&node_id) {
+            tracing::error!("Failed to register self: {:?}", e);
             return;
         }
 
@@ -522,13 +517,9 @@ fn run_server(
             return;
         }
 
-        // Bind to socket and register this server's address
-        let base_port = 50051u16;
-        let listen_port = base_port + mpi_rank as u16;
-        let listen_addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
-
-        if let Err(e) = connection_pool.bind_and_register(&node_id, listen_addr) {
-            tracing::error!("Failed to bind and register server: {:?}", e);
+        // Register self in connection pool
+        if let Err(e) = connection_pool.register_self(&node_id) {
+            tracing::error!("Failed to register self: {:?}", e);
             return;
         }
 

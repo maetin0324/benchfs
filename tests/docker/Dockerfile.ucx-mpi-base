@@ -9,7 +9,7 @@
 #   docker tag benchfs/ucx-mpi-base:1.0 your-registry/benchfs/ucx-mpi-base:1.0
 #   docker push your-registry/benchfs/ucx-mpi-base:1.0
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

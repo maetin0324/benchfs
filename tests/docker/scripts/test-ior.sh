@@ -80,7 +80,7 @@ echo "Server PID: $SERVER_PID"
 # Wait for registration
 echo "Waiting for server registration..."
 for i in {1..60}; do
-    REGISTERED=$(find ${REGISTRY_DIR} -name "node_*.stream_hostname" 2>/dev/null | wc -l)
+    REGISTERED=$(find ${REGISTRY_DIR} -name "node_*.addr" 2>/dev/null | wc -l)
 
     if [ "$REGISTERED" -eq "$NNODES" ]; then
         echo "All servers registered: $REGISTERED/$NNODES"
