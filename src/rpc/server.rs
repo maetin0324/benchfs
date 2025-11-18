@@ -12,7 +12,7 @@ impl<T, const N: usize> SizeCheck<T, N> {
     const OK: () = assert!(size_of::<T>() <= N);
 }
 
-pub const MAX_HEADER_SIZE: usize = 256;
+pub const MAX_HEADER_SIZE: usize = 512;
 
 /// RPC server that receives and dispatches ActiveMessages
 pub struct RpcServer {

@@ -16,7 +16,10 @@ pub const RPC_WRITE_CHUNK: RpcId = 11;
 // ReadChunk RPC
 // ============================================================================
 
-/// ReadChunk request header
+/// Maximum path length for RPC operations
+pub const MAX_RPC_PATH_LENGTH: usize = 256;
+
+/// ReadChunk request header with embedded path
 #[repr(C)]
 #[derive(
     Debug,
@@ -37,18 +40,33 @@ pub struct ReadChunkRequestHeader {
     /// Length to read
     pub length: u64,
 
-    /// Path length (path is sent in data section)
+    /// Actual path length (valid bytes in path_buffer)
     pub path_len: u64,
+
+    /// Fixed-size path buffer (256 bytes)
+    pub path_buffer: [u8; MAX_RPC_PATH_LENGTH],
 }
 
 impl ReadChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path: &str) -> Self {
+        let mut path_buffer = [0u8; MAX_RPC_PATH_LENGTH];
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len().min(MAX_RPC_PATH_LENGTH);
+        path_buffer[..path_len].copy_from_slice(&path_bytes[..path_len]);
+
         Self {
             chunk_index,
             offset,
             length,
-            path_len,
+            path_len: path_len as u64,
+            path_buffer,
         }
+    }
+
+    /// Get the path as a string slice
+    pub fn path(&self) -> Result<&str, std::str::Utf8Error> {
+        let path_len = self.path_len as usize;
+        std::str::from_utf8(&self.path_buffer[..path_len])
     }
 }
 
@@ -98,18 +116,11 @@ impl ReadChunkResponseHeader {
 
 /// ReadChunk RPC request
 ///
-/// IMPORTANT: This struct must be kept alive for the entire duration of the RPC call.
-/// The IoSlices reference the internal data directly, so dropping this struct
-/// while the RPC is in flight will cause use-after-free errors.
+/// Path is now embedded in the header, so no separate data payload is needed for the request.
 pub struct ReadChunkRequest {
     header: ReadChunkRequestHeader,
-    #[allow(dead_code)]
-    path: String,
-    /// Data buffers - these must be stored directly in the struct
-    path_bytes: Vec<u8>,
     response_buffer: Vec<u8>,
-    /// Cached IoSlices - lazily initialized on first call
-    cached_request_ioslices: UnsafeCell<Option<[IoSlice<'static>; 1]>>,
+    /// Cached IoSliceMut for response - lazily initialized on first call
     cached_response_ioslice: UnsafeCell<Option<IoSliceMut<'static>>>,
 }
 
@@ -118,16 +129,11 @@ unsafe impl Send for ReadChunkRequest {}
 
 impl ReadChunkRequest {
     pub fn new(chunk_index: u64, offset: u64, length: u64, path: String) -> Self {
-        let path_bytes = path.as_bytes().to_vec();
-        let path_len = path_bytes.len() as u64;
         let response_buffer = vec![0u8; length as usize];
 
         Self {
-            header: ReadChunkRequestHeader::new(chunk_index, offset, length, path_len),
-            path,
-            path_bytes,
+            header: ReadChunkRequestHeader::new(chunk_index, offset, length, &path),
             response_buffer,
-            cached_request_ioslices: UnsafeCell::new(None),
             cached_response_ioslice: UnsafeCell::new(None),
         }
     }
@@ -161,19 +167,8 @@ impl AmRpc for ReadChunkRequest {
     }
 
     fn request_data(&self) -> &[std::io::IoSlice<'_>] {
-        // Lazily initialize the cached IoSlices on first call
-        unsafe {
-            let cache = &mut *self.cached_request_ioslices.get();
-
-            if cache.is_none() {
-                let ioslices = [IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(
-                    &self.path_bytes,
-                ))];
-                *cache = Some(ioslices);
-            }
-
-            std::mem::transmute::<&[IoSlice<'static>], &[IoSlice<'_>]>(cache.as_ref().unwrap())
-        }
+        // No request data - path is embedded in header
+        &[]
     }
 
     fn response_buffer(&self) -> &[IoSliceMut<'_>] {
@@ -237,31 +232,8 @@ impl AmRpc for ReadChunkRequest {
         )
         .entered();
 
-        // Receive Path from request data using reusable buffer
-        let path_len = header.path_len as usize;
-        if path_len == 0 || path_len > crate::constants::MAX_PATH_LENGTH {
-            return Err((
-                RpcError::TransportError(format!(
-                    "Invalid path length {} (max {})",
-                    path_len,
-                    crate::constants::MAX_PATH_LENGTH
-                )),
-                am_msg,
-            ));
-        }
-
-        let mut path_buffer = ctx.acquire_path_buffer();
-        if let Err(e) = am_msg
-            .recv_data_vectored(&[std::io::IoSliceMut::new(path_buffer.as_mut_slice(path_len))])
-            .await
-        {
-            return Err((
-                RpcError::TransportError(format!("Failed to receive data: {:?}", e)),
-                am_msg,
-            ));
-        }
-
-        let path = match path_buffer.as_str(path_len) {
+        // Extract path from header
+        let path = match header.path() {
             Ok(p) => p.to_owned(),
             Err(e) => {
                 return Err((
@@ -370,7 +342,7 @@ impl AmRpc for ReadChunkRequest {
 // WriteChunk RPC
 // ============================================================================
 
-/// WriteChunk request header
+/// WriteChunk request header with embedded path
 #[repr(C)]
 #[derive(
     Debug,
@@ -391,18 +363,33 @@ pub struct WriteChunkRequestHeader {
     /// Length to write
     pub length: u64,
 
-    /// Path length (path is sent in data section)
+    /// Actual path length (valid bytes in path_buffer)
     pub path_len: u64,
+
+    /// Fixed-size path buffer (256 bytes)
+    pub path_buffer: [u8; MAX_RPC_PATH_LENGTH],
 }
 
 impl WriteChunkRequestHeader {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path_len: u64) -> Self {
+    pub fn new(chunk_index: u64, offset: u64, length: u64, path: &str) -> Self {
+        let mut path_buffer = [0u8; MAX_RPC_PATH_LENGTH];
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len().min(MAX_RPC_PATH_LENGTH);
+        path_buffer[..path_len].copy_from_slice(&path_bytes[..path_len]);
+
         Self {
             chunk_index,
             offset,
             length,
-            path_len,
+            path_len: path_len as u64,
+            path_buffer,
         }
+    }
+
+    /// Get the path as a string slice
+    pub fn path(&self) -> Result<&str, std::str::Utf8Error> {
+        let path_len = self.path_len as usize;
+        std::str::from_utf8(&self.path_buffer[..path_len])
     }
 }
 
@@ -452,19 +439,12 @@ impl WriteChunkResponseHeader {
 
 /// WriteChunk RPC request
 ///
-/// IMPORTANT: This struct must be kept alive for the entire duration of the RPC call.
-/// The IoSlices reference the internal data directly, so dropping this struct
-/// while the RPC is in flight will cause use-after-free errors.
+/// Path is now embedded in the header, so only data payload is sent.
 pub struct WriteChunkRequest<'a> {
     header: WriteChunkRequestHeader,
-    /// File path (for reference)
-    #[allow(dead_code)]
-    path: String,
-    /// Data buffers - these must be stored directly in the struct
-    path_bytes: Vec<u8>,
     data: &'a [u8],
-    /// Cached IoSlices - lazily initialized on first call to request_data()
-    cached_ioslices: UnsafeCell<Option<[IoSlice<'static>; 2]>>,
+    /// Cached IoSlice for data - lazily initialized on first call to request_data()
+    cached_ioslice: UnsafeCell<Option<IoSlice<'static>>>,
 }
 
 // SAFETY: WriteChunkRequest is Send because all its fields are Send
@@ -473,15 +453,11 @@ unsafe impl Send for WriteChunkRequest<'_> {}
 impl<'a> WriteChunkRequest<'a> {
     pub fn new(chunk_index: u64, offset: u64, data: &'a [u8], path: String) -> Self {
         let length = data.len() as u64;
-        let path_len = path.len() as u64;
-        let path_bytes = path.as_bytes().to_vec();
 
         Self {
-            header: WriteChunkRequestHeader::new(chunk_index, offset, length, path_len),
-            path,
-            path_bytes,
+            header: WriteChunkRequestHeader::new(chunk_index, offset, length, &path),
             data,
-            cached_ioslices: UnsafeCell::new(None),
+            cached_ioslice: UnsafeCell::new(None),
         }
     }
 
@@ -509,28 +485,21 @@ impl AmRpc for WriteChunkRequest<'_> {
     }
 
     fn request_data(&self) -> &[IoSlice<'_>] {
-        // Lazily initialize the cached IoSlices on first call
+        // Lazily initialize the cached IoSlice for data
         unsafe {
-            let cache = &mut *self.cached_ioslices.get();
+            let cache = &mut *self.cached_ioslice.get();
 
             if cache.is_none() {
-                // Create IoSlices from our internal buffers
-                // We transmute to 'static lifetime, which is safe because:
-                // 1. The data is owned by self and won't move
-                // 2. The IoSlices are cached in self, so they live as long as self
-                // 3. self must outlive any use of these IoSlices (ensured by API contract)
-                let ioslices = [
-                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(
-                        &self.path_bytes,
-                    )),
-                    IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(&self.data)),
-                ];
-                *cache = Some(ioslices);
+                // Create IoSlice from data buffer only (path is in header)
+                *cache = Some(IoSlice::new(std::mem::transmute::<&[u8], &'static [u8]>(
+                    &self.data,
+                )));
             }
 
-            // Return the cached IoSlices
-            // The lifetime is tied to &self, which is correct
-            std::mem::transmute::<&[IoSlice<'static>], &[IoSlice<'_>]>(cache.as_ref().unwrap())
+            // Return as a slice
+            std::slice::from_ref(std::mem::transmute::<&IoSlice<'static>, &IoSlice<'_>>(
+                cache.as_ref().unwrap(),
+            ))
         }
     }
 
@@ -597,6 +566,19 @@ impl AmRpc for WriteChunkRequest<'_> {
             chunk_store_any.downcast_ref::<IOUringChunkStore>()
         {
             tracing::debug!("Using zero-copy path for WriteChunk");
+
+            // Extract path from header
+            let path = match header.path() {
+                Ok(p) => p.to_owned(),
+                Err(e) => {
+                    tracing::error!("Failed to decode path: {:?}", e);
+                    return Ok((
+                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                        am_msg,
+                    ));
+                }
+            };
+
             // Zero-copy path: Use registered buffer
             let mut fixed_buffer = ctx.allocator.acquire().await;
 
@@ -609,56 +591,26 @@ impl AmRpc for WriteChunkRequest<'_> {
                 );
                 WriteChunkResponseHeader::error(-22)
             } else {
-                // Receive Path and Data in one vectored call (zero-copy RDMA)
-                let path_len = header.path_len as usize;
-                if path_len > crate::constants::MAX_PATH_LENGTH {
-                    tracing::error!(
-                        "Path length {} exceeds MAX_PATH_LENGTH {}",
-                        path_len,
-                        crate::constants::MAX_PATH_LENGTH
-                    );
-                    return Ok((
-                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
-                        am_msg,
-                    ));
-                }
-                let mut path_buffer = ctx.acquire_path_buffer();
                 let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
                 tracing::debug!(
-                    "WriteChunk: receiving data - path_len={}, data_len={}",
-                    header.path_len,
+                    "WriteChunk: receiving data - data_len={}",
                     data_len
                 );
-                tracing::trace!("WriteChunk: calling recv_data_vectored (zero-copy)...");
+                tracing::trace!("WriteChunk: calling recv_data_single (zero-copy)...");
 
+                // Receive data into FixedBuffer
                 if let Err(e) = am_msg
-                    .recv_data_vectored(&[
-                        std::io::IoSliceMut::new(path_buffer.as_mut_slice(path_len)),
-                        std::io::IoSliceMut::new(buffer_slice),
-                    ])
+                    .recv_data_single(buffer_slice)
                     .await
                 {
                     tracing::error!(
-                        "WriteChunk: failed to receive request data (zero-copy): {:?}",
+                        "WriteChunk: failed to receive data (zero-copy): {:?}",
                         e
                     );
                     WriteChunkResponseHeader::error(-5)
                 } else {
-                    tracing::trace!("WriteChunk: recv_data_vectored completed (zero-copy)");
-
-                    let path = match path_buffer.as_str(path_len) {
-                        Ok(p) => p.to_owned(),
-                        Err(e) => {
-                            tracing::error!("Failed to decode path: {:?}", e);
-                            return Ok((
-                                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(
-                                    -22,
-                                )),
-                                am_msg,
-                            ));
-                        }
-                    };
+                    tracing::trace!("WriteChunk: recv_data_single completed (zero-copy)");
 
                     tracing::debug!(
                         "WriteChunk request (zero-copy): path={}, chunk={}, offset={}, length={}",
@@ -700,42 +652,29 @@ impl AmRpc for WriteChunkRequest<'_> {
             tracing::debug!(
                 "Using fallback path for WriteChunk (chunk_store is not IOUringChunkStore)"
             );
-            let path_len = header.path_len as usize;
-            if path_len > crate::constants::MAX_PATH_LENGTH {
-                tracing::error!(
-                    "Path length {} exceeds MAX_PATH_LENGTH {}",
-                    path_len,
-                    crate::constants::MAX_PATH_LENGTH
-                );
-                return Ok((
-                    crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
-                    am_msg,
-                ));
-            }
-            let mut path_buffer = ctx.acquire_path_buffer();
+
+            // Extract path from header
+            let path = match header.path() {
+                Ok(p) => p.to_owned(),
+                Err(e) => {
+                    tracing::error!("Failed to decode path: {:?}", e);
+                    return Ok((
+                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                        am_msg,
+                    ));
+                }
+            };
+
             let mut data = vec![0u8; data_len];
 
+            // Receive data
             if let Err(e) = am_msg
-                .recv_data_vectored(&[
-                    std::io::IoSliceMut::new(path_buffer.as_mut_slice(path_len)),
-                    std::io::IoSliceMut::new(&mut data),
-                ])
+                .recv_data_single(&mut data)
                 .await
             {
-                tracing::error!("Failed to receive request data: {:?}", e);
+                tracing::error!("Failed to receive data: {:?}", e);
                 WriteChunkResponseHeader::error(-5)
             } else {
-                let path = match path_buffer.as_str(path_len) {
-                    Ok(p) => p.to_owned(),
-                    Err(e) => {
-                        tracing::error!("Failed to decode path: {:?}", e);
-                        return Ok((
-                            crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
-                            am_msg,
-                        ));
-                    }
-                };
-
                 tracing::debug!(
                     "WriteChunk request: path={}, chunk={}, offset={}, length={}",
                     path,
@@ -829,11 +768,12 @@ mod tests {
 
     #[test]
     fn test_read_chunk_request_header() {
-        let header = ReadChunkRequestHeader::new(5, 1024, 4096, 42);
+        let header = ReadChunkRequestHeader::new(5, 1024, 4096, "/test/file.txt");
         assert_eq!(header.chunk_index, 5);
         assert_eq!(header.offset, 1024);
         assert_eq!(header.length, 4096);
-        assert_eq!(header.path_len, 42);
+        assert_eq!(header.path_len, 14); // "/test/file.txt".len()
+        assert_eq!(header.path().unwrap(), "/test/file.txt");
 
         // Verify it can be serialized
         let bytes = zerocopy::IntoBytes::as_bytes(&header);
@@ -843,6 +783,7 @@ mod tests {
         let deserialized: ReadChunkRequestHeader =
             zerocopy::FromBytes::read_from_bytes(bytes).unwrap();
         assert_eq!(deserialized.chunk_index, 5);
+        assert_eq!(deserialized.path().unwrap(), "/test/file.txt");
     }
 
     #[test]
@@ -862,6 +803,7 @@ mod tests {
         assert_eq!(request.header.chunk_index, 0);
         assert_eq!(request.header.length, 1024);
         assert_eq!(request.header.path_len, 14); // "/test/file.txt".len()
+        assert_eq!(request.header.path().unwrap(), "/test/file.txt");
 
         // Buffer should be allocated
         assert_eq!(request.data().len(), 1024);
@@ -869,11 +811,12 @@ mod tests {
 
     #[test]
     fn test_write_chunk_request_header() {
-        let header = WriteChunkRequestHeader::new(3, 512, 2048, 99);
+        let header = WriteChunkRequestHeader::new(3, 512, 2048, "/my/test/path.dat");
         assert_eq!(header.chunk_index, 3);
         assert_eq!(header.offset, 512);
         assert_eq!(header.length, 2048);
-        assert_eq!(header.path_len, 99);
+        assert_eq!(header.path_len, 17); // "/my/test/path.dat".len()
+        assert_eq!(header.path().unwrap(), "/my/test/path.dat");
     }
 
     #[test]
