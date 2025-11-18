@@ -415,7 +415,7 @@ mod tests {
 
         runtime
             .clone()
-            .run_with_name("local_fs_test_create_directory", async move {
+            .run_with_name_and_runtime("local_fs_test_create_directory", async move {
                 let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
                 let dir_path = Path::new("/testdir");
@@ -437,7 +437,7 @@ mod tests {
 
         runtime
             .clone()
-            .run_with_name("local_fs_test_list_directory", async move {
+            .run_with_name_and_runtime("local_fs_test_list_directory", async move {
                 let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
 
                 // ディレクトリを作成
