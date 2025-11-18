@@ -141,7 +141,7 @@ should_override_ucx_net_devices() {
 
 if [[ -z "${UCX_TLS:-}" ]]; then
   if detect_active_ib; then
-    export UCX_TLS="rc_x,tcp,self"
+    export UCX_TLS="all"
   else
     export UCX_TLS="tcp,self"
   fi
