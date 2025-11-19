@@ -354,7 +354,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=Debug
+export RUST_LOG=Trace
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
