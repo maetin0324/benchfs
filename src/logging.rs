@@ -59,10 +59,21 @@ where
         // Write level (no ANSI codes)
         write!(writer, "{:5} ", meta.level())?;
 
-        // Write span context with tabs
+        // Write span context with newlines and tab indentation showing hierarchy
         if let Some(scope) = ctx.event_scope() {
-            for span in scope.from_root() {
-                write!(writer, "\t{}", span.name())?;
+            // Collect all spans first
+            let spans: Vec<_> = scope.from_root().collect();
+
+            // Write each span on a new line with increasing indentation
+            for (depth, span) in spans.iter().enumerate() {
+                writeln!(writer)?; // New line for each span
+
+                // Write indentation based on depth
+                for _ in 0..=depth {
+                    write!(writer, "\t")?;
+                }
+
+                write!(writer, "{}", span.name())?;
 
                 // Format span fields
                 let ext = span.extensions();
@@ -72,10 +83,18 @@ where
                     }
                 }
             }
+
+            // New line before the message
+            writeln!(writer)?;
+
+            // Indent the message line to match the deepest span level
+            for _ in 0..=spans.len() {
+                write!(writer, "\t")?;
+            }
         }
 
         // Write target (module path)
-        write!(writer, "\t{}", meta.target())?;
+        write!(writer, "{}", meta.target())?;
 
         // Write file and line
         if let Some(file) = meta.file() {

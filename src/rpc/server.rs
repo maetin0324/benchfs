@@ -49,6 +49,7 @@ impl RpcServer {
     ///
     /// server.listen::<ReadChunkRequest, _, _>(runtime.clone()).await?;
     /// ```
+    #[async_backtrace::framed]
     pub async fn listen<Rpc, ReqH, ResH>(&self) -> Result<(), RpcError>
     where
         ResH: Serializable + 'static,
@@ -138,6 +139,7 @@ impl RpcServer {
     ///
     /// server.register_all_handlers().await?;
     /// ```
+    #[async_backtrace::framed]
     pub async fn register_all_handlers(&self) -> Result<(), RpcError> {
         use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
         use crate::rpc::metadata_ops::{
@@ -257,6 +259,7 @@ impl RpcServer {
     }
 
     /// Register only benchmark RPC handlers (Ping-Pong, Throughput, etc.)
+    #[async_backtrace::framed]
     pub async fn register_bench_handlers(&self) -> Result<(), RpcError> {
         use crate::rpc::bench_ops::{BenchPingRequest, BenchShutdownRequest};
 

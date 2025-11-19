@@ -69,6 +69,7 @@ impl ConnectionPool {
     ///
     /// # Returns
     /// RPC client for the specified node
+    #[async_backtrace::framed]
     pub async fn get_or_connect(&self, node_id: &str) -> Result<Rc<RpcClient>, RpcError> {
         // Check if connection already exists AND is still valid
         {
@@ -139,6 +140,7 @@ impl ConnectionPool {
     /// # Arguments
     /// * `node_id` - Node identifier to wait for
     /// * `timeout_secs` - Maximum time to wait in seconds (0 = no timeout)
+    #[async_backtrace::framed]
     pub async fn wait_and_connect(
         &self,
         node_id: &str,

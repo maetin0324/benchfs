@@ -75,6 +75,7 @@ impl IOUringBackend {
     /// * `offset` - Offset within the file
     /// * `fixed_buffer` - Pre-populated registered buffer
     /// * `data_len` - Actual data length in the buffer
+    #[async_backtrace::framed]
     pub async fn write_fixed_direct(
         &self,
         handle: FileHandle,

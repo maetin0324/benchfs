@@ -32,6 +32,7 @@ chrono = "0.4"
 # Logging
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-backtrace = "0.2"
 
 # Error handling
 thiserror = "2.0"

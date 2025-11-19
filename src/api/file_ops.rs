@@ -228,6 +228,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// File handle
+    #[async_backtrace::framed]
     pub async fn benchfs_open(&self, path: &str, flags: OpenFlags) -> ApiResult<FileHandle> {
         let _span = tracing::debug_span!("api_open", path, ?flags).entered();
 
@@ -519,6 +520,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// Number of bytes read
+    #[async_backtrace::framed]
     pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
         let _span = tracing::trace_span!("api_read", path = %handle.path, len = buf.len(), pos = handle.position()).entered();
 
@@ -707,6 +709,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// Number of bytes written
+    #[async_backtrace::framed]
     pub async fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
         let _span = tracing::trace_span!("api_write", path = %handle.path, len = data.len(), pos = handle.position()).entered();
 
@@ -869,6 +872,7 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `handle` - File handle
+    #[async_backtrace::framed]
     pub async fn benchfs_close(&self, handle: &FileHandle) -> ApiResult<()> {
         let _span = tracing::debug_span!("api_close", path = %handle.path).entered();
 
@@ -965,6 +969,7 @@ impl BenchFS {
     ///
     /// # Arguments
     /// * `path` - File path
+    #[async_backtrace::framed]
     pub async fn benchfs_unlink(&self, path: &str) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);
@@ -1029,6 +1034,7 @@ impl BenchFS {
     ///
     /// In the new KV design, directories are not needed as we use full paths as keys.
     /// This always succeeds to maintain API compatibility.
+    #[async_backtrace::framed]
     pub async fn benchfs_mkdir(&self, _path: &str, _mode: u32) -> ApiResult<()> {
         // Dummy implementation: always succeed
         // Directories are meaningless in full-path KV design
@@ -1109,6 +1115,7 @@ impl BenchFS {
     /// For InMemoryChunkStore, this is a no-op since data is already in memory.
     /// For persistent backends (IOUringChunkStore), this ensures all writes are
     /// flushed to disk before returning.
+    #[async_backtrace::framed]
     pub async fn benchfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(&handle.path);
@@ -1143,6 +1150,7 @@ impl BenchFS {
     ///
     /// # Returns
     /// File status information (FileStat)
+    #[async_backtrace::framed]
     pub async fn benchfs_stat(&self, path: &str) -> ApiResult<crate::api::types::FileStat> {
         use crate::api::types::FileStat;
         use std::path::Path;
@@ -1289,6 +1297,7 @@ impl BenchFS {
     /// # Note
     /// When truncating to a smaller size, chunks beyond the new size are deleted.
     /// When truncating to a larger size, the file is extended with zeros (sparse file).
+    #[async_backtrace::framed]
     pub async fn benchfs_truncate(&self, path: &str, size: u64) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);

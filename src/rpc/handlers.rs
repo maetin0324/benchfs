@@ -93,6 +93,7 @@ pub struct ReadChunkHandlerResponse {
 /// Handle ReadChunk RPC request
 ///
 /// Reads chunk data from local storage and returns it to the client via RDMA.
+#[async_backtrace::framed]
 pub async fn handle_read_chunk(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
@@ -196,6 +197,7 @@ pub async fn handle_read_chunk(
 ///
 /// Receives chunk data from the client via RDMA and writes it to local storage.
 /// Uses registered buffers for zero-copy DMA writes.
+#[async_backtrace::framed]
 pub async fn handle_write_chunk(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
@@ -337,6 +339,7 @@ pub async fn handle_write_chunk(
 /// Handle MetadataLookup RPC request
 ///
 /// Looks up file or directory metadata and returns it to the client.
+#[async_backtrace::framed]
 pub async fn handle_metadata_lookup(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
@@ -401,6 +404,7 @@ pub async fn handle_metadata_lookup(
 /// Handle MetadataCreateFile RPC request
 ///
 /// Creates a new file metadata entry.
+#[async_backtrace::framed]
 pub async fn handle_metadata_create_file(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
@@ -465,6 +469,7 @@ pub async fn handle_metadata_create_file(
 /// Handle MetadataCreateDir RPC request
 ///
 /// Creates a new directory metadata entry.
+#[async_backtrace::framed]
 pub async fn handle_metadata_create_dir(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
@@ -526,6 +531,7 @@ pub async fn handle_metadata_create_dir(
 /// Handle MetadataDelete RPC request
 ///
 /// Deletes a file or directory metadata entry.
+#[async_backtrace::framed]
 pub async fn handle_metadata_delete(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,
@@ -599,6 +605,7 @@ pub async fn handle_metadata_delete(
 /// Handle MetadataUpdate RPC request
 ///
 /// Updates file metadata (size, mode/permissions).
+#[async_backtrace::framed]
 pub async fn handle_metadata_update(
     ctx: Rc<RpcHandlerContext>,
     mut am_msg: AmMsg,

@@ -119,6 +119,7 @@ impl LocalFileSystem {
     }
 
     /// ファイルを開く (メタデータも管理)
+    #[async_backtrace::framed]
     pub async fn open_file(&self, path: &Path, flags: OpenFlags) -> StorageResult<FileHandle> {
         let physical_path = self.virtual_to_physical(path);
 
@@ -160,6 +161,7 @@ impl LocalFileSystem {
     }
 
     /// ファイルを作成
+    #[async_backtrace::framed]
     pub async fn create_file(&self, path: &Path, mode: u32) -> StorageResult<FileHandle> {
         let physical_path = self.virtual_to_physical(path);
 
@@ -212,6 +214,7 @@ impl LocalFileSystem {
     }
 
     /// ファイルを削除
+    #[async_backtrace::framed]
     pub async fn unlink_file(&self, path: &Path) -> StorageResult<()> {
         let physical_path = self.virtual_to_physical(path);
 
@@ -252,6 +255,7 @@ impl LocalFileSystem {
     }
 
     /// ディレクトリを作成
+    #[async_backtrace::framed]
     pub async fn create_directory(&self, path: &Path, mode: u32) -> StorageResult<()> {
         let physical_path = self.virtual_to_physical(path);
 
@@ -305,6 +309,7 @@ impl LocalFileSystem {
     }
 
     /// ディレクトリを削除
+    #[async_backtrace::framed]
     pub async fn remove_directory(&self, path: &Path) -> StorageResult<()> {
         let physical_path = self.virtual_to_physical(path);
 
@@ -354,6 +359,7 @@ impl LocalFileSystem {
     }
 
     /// ディレクトリの内容を一覧
+    #[async_backtrace::framed]
     pub async fn list_directory(&self, path: &Path) -> StorageResult<Vec<(String, InodeType)>> {
         let inode = self
             .get_inode(path)

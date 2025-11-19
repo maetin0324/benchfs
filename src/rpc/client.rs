@@ -73,6 +73,7 @@ impl RpcClient {
     /// let request = ReadRequest { offset: 0, len: 4096 };
     /// let response: ReadResponse = client.execute(&request).await?;
     /// ```
+    #[async_backtrace::framed]
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         let rpc_id = T::rpc_id();
         let _span = tracing::trace_span!("rpc_call", rpc_id).entered();
@@ -179,6 +180,7 @@ impl RpcClient {
 
     /// Execute an RPC without expecting a reply
     /// Useful for fire-and-forget operations
+    #[async_backtrace::framed]
     pub async fn execute_no_reply<T: AmRpc>(&self, request: &T) -> Result<(), RpcError> {
         let rpc_id = T::rpc_id();
         let header = request.request_header();

@@ -135,6 +135,7 @@ impl WorkerAddressRegistry {
     /// # Arguments
     /// * `node_id` - Node identifier to wait for
     /// * `timeout_secs` - Maximum time to wait in seconds (0 = no timeout)
+    #[async_backtrace::framed]
     pub async fn wait_for(&self, node_id: &str, timeout_secs: u64) -> Result<Vec<u8>, RpcError> {
         use std::time::{Duration, Instant};
 
@@ -288,6 +289,7 @@ impl WorkerAddressRegistry {
     /// # Arguments
     /// * `node_id` - Node identifier to wait for
     /// * `timeout_secs` - Maximum time to wait in seconds (0 = no timeout)
+    #[async_backtrace::framed]
     pub async fn wait_for_stream_port(
         &self,
         node_id: &str,
@@ -404,6 +406,7 @@ impl WorkerAddressRegistry {
     /// # Arguments
     /// * `node_id` - Node identifier to wait for
     /// * `timeout_secs` - Maximum time to wait in seconds (0 = no timeout)
+    #[async_backtrace::framed]
     pub async fn wait_for_stream_hostname(
         &self,
         node_id: &str,

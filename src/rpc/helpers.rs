@@ -136,6 +136,7 @@ pub fn rpc_error_to_errno(error: &RpcError) -> i32 {
 ///
 /// - `Ok(path)` on success
 /// - `Err(RpcError)` if data reception fails or path is invalid UTF-8
+#[async_backtrace::framed]
 pub async fn receive_path(
     ctx: &RpcHandlerContext,
     am_msg: &mut AmMsg,
@@ -229,6 +230,7 @@ pub async fn receive_path(
 /// Uses unsafe AmMsg::reply() method, but is safe because:
 /// - reply_ep is managed by UCX and valid for AmMsg lifetime
 /// - We check need_reply() before attempting to reply
+#[async_backtrace::framed]
 pub async fn send_rpc_response_via_reply<H>(
     reply_stream_id: u16,
     response_header: &H,
