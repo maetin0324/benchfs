@@ -66,6 +66,7 @@ pub mod config;
 pub mod constants;
 pub mod data;
 pub mod ffi;
+pub mod logging;
 pub mod metadata;
 pub mod rpc;
 pub mod server;

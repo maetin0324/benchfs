@@ -240,34 +240,7 @@ pub extern "C" fn benchfs_init(
     data_dir: *const c_char,
     is_server: i32,
 ) -> *mut benchfs_context_t {
-    use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::fmt::format::FmtSpan;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    // Get hostname for log prefix
-    let hostname = gethostname::gethostname()
-        .to_str()
-        .unwrap_or("unknown")
-        .to_string();
-
-    fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)  // Disable ANSI color codes for file output
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_file(true)
-        .with_line_number(true)
-        .with_span_events(FmtSpan::ACTIVE)  // Log span enter/exit
-        .with_timer(tracing_subscriber::fmt::time::SystemTime)
-        .with_writer(move || {
-            // Add hostname prefix to each log line
-            std::io::LineWriter::new(std::io::stderr())
-        })
-        .init();
-
-    tracing::info!("Logging initialized on host: {}", hostname);
+    crate::logging::init_with_hostname("info");
 
     // Validate pointers
     if node_id.is_null() || registry_dir.is_null() {
