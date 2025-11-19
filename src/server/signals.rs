@@ -6,10 +6,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Set up signal handlers for graceful shutdown
+/// Set up signal handlers for graceful shutdown and debugging
 ///
-/// This function registers handlers for SIGINT and SIGTERM signals
-/// that will set the provided `running` flag to false when received.
+/// This function registers handlers for:
+/// - SIGINT and SIGTERM: graceful shutdown
+/// - SIGUSR1: async task backtrace dump
 ///
 /// # Arguments
 /// * `running` - An atomic boolean flag that will be set to false on shutdown signal
@@ -28,23 +29,33 @@ pub fn setup_signal_handlers(running: Arc<AtomicBool>) {
     static RUNNING_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
     *RUNNING_FLAG.lock().unwrap() = Some(running);
 
-    // Setup SIGINT (Ctrl+C) and SIGTERM handlers
+    // Setup SIGINT (Ctrl+C), SIGTERM, and SIGUSR1 handlers
     #[cfg(unix)]
     {
-        use libc::{SIGINT, SIGTERM};
+        use libc::{SIGINT, SIGTERM, SIGUSR1};
         unsafe {
-            libc::signal(SIGINT, signal_handler as libc::sighandler_t);
-            libc::signal(SIGTERM, signal_handler as libc::sighandler_t);
+            libc::signal(SIGINT, shutdown_signal_handler as libc::sighandler_t);
+            libc::signal(SIGTERM, shutdown_signal_handler as libc::sighandler_t);
+            libc::signal(SIGUSR1, taskdump_signal_handler as libc::sighandler_t);
         }
+        eprintln!("Signal handlers registered:");
+        eprintln!("  - SIGINT/SIGTERM: graceful shutdown");
+        eprintln!("  - SIGUSR1: async task backtrace dump");
     }
 
     #[cfg(unix)]
-    extern "C" fn signal_handler(_: libc::c_int) {
+    extern "C" fn shutdown_signal_handler(_: libc::c_int) {
         static RUNNING_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
         if let Some(flag) = RUNNING_FLAG.lock().unwrap().as_ref() {
             eprintln!("\nReceived shutdown signal, stopping server...");
             flag.store(false, Ordering::Relaxed);
         }
+    }
+
+    #[cfg(unix)]
+    extern "C" fn taskdump_signal_handler(_: libc::c_int) {
+        eprintln!("\nReceived SIGUSR1, dumping async task backtraces...");
+        crate::logging::dump_async_tasks();
     }
 }

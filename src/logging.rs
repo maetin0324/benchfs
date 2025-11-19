@@ -133,3 +133,10 @@ pub fn init_with_hostname(level: &str) {
     let hostname = hostname_os.to_str().unwrap_or("unknown");
     tracing::info!("Logging initialized on host: {}", hostname);
 }
+
+/// Dump the current async task backtrace tree to stderr
+pub fn dump_async_tasks() {
+    eprintln!("\n========== Async Task Backtrace Dump ==========");
+    eprintln!("{}", async_backtrace::taskdump_tree(true));
+    eprintln!("===============================================\n");
+}
