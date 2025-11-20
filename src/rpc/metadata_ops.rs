@@ -179,16 +179,19 @@ impl AmRpc for MetadataLookupRequest {
         self.io_helper.get()
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "MetadataLookup requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -349,16 +352,19 @@ impl AmRpc for MetadataCreateFileRequest {
         self.io_helper.get()
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "MetadataCreateFile requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -480,16 +486,19 @@ impl AmRpc for MetadataCreateDirRequest {
         self.io_helper.get()
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "MetadataCreateDir requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -678,16 +687,19 @@ impl AmRpc for MetadataDeleteRequest {
         self.io_helper.get()
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "MetadataDelete requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -893,16 +905,19 @@ impl AmRpc for MetadataUpdateRequest {
         self.io_helper.get()
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "MetadataUpdate requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -1181,16 +1196,19 @@ impl AmRpc for ShutdownRequest {
         &[] // No data payload - reply via reply_ep
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "Shutdown requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,

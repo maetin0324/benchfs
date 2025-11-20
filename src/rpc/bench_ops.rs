@@ -104,16 +104,19 @@ impl AmRpc for BenchPingRequest {
         &[] // No data payload - reply via reply_ep
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "BenchPing requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         _ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
@@ -228,16 +231,19 @@ impl AmRpc for BenchShutdownRequest {
         &[] // No data payload - reply via reply_ep
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "BenchShutdown requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,

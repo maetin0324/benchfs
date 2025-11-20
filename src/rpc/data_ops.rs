@@ -204,16 +204,19 @@ impl AmRpc for ReadChunkRequest {
         None
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, _client: &RpcClient) -> Result<(), RpcError> {
         Err(RpcError::HandlerError(
             "ReadChunk requires a reply".to_string(),
         ))
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -513,14 +516,17 @@ impl AmRpc for WriteChunkRequest<'_> {
         }
     }
 
+    #[async_backtrace::framed]
     async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
         client.execute(self).await
     }
 
+    #[async_backtrace::framed]
     async fn call_no_reply(&self, client: &RpcClient) -> Result<(), RpcError> {
         client.execute_no_reply(self).await
     }
 
+    #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,

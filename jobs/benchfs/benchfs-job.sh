@@ -219,7 +219,7 @@ export UCX_AM_RECV_QUEUE_SIZE=4096       # 受信キューサイズ
 # ゼロコピーとRendezvousプロトコルの最適化
 
 export UCX_ZCOPY_THRESH=0                # ゼロコピー常時有効（0 = 常時）
-export UCX_RNDV_SCHEME=get_zcopy         # Rendezvous方式: GET with zero-copy
+export UCX_RNDV_SCHEME=auto              # Rendezvous方式: GET with zero-copy
 
 # InfiniBand固有設定
 export UCX_IB_NUM_PATHS=2                # IBパス数
@@ -230,7 +230,8 @@ export UCX_RC_MLX5_RX_QUEUE_LEN=4096     # 受信キューの長さ（デフォ�
 # 5. メモリ登録キャッシュ
 # ==============================================================================
 # memtype cache は GPU 誤検出を避けるためセクション1で n に設定済み
-export UCX_RCACHE_ENABLE=y               # 登録キャッシュ有効
+export UCX_RCACHE_ENABLE=n               # 登録キャッシュ有効
+export UCX_IB_REG_METHODS=rcache,direct
 
 # ==============================================================================
 # 6. フロー制御
