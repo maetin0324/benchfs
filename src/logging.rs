@@ -122,7 +122,7 @@ pub fn init_with_hostname(level: &str) {
 
     let fmt_layer = fmt::layer()
         .event_format(HostnameFormatter::new())
-        .with_writer(std::io::stderr);
+        .with_writer(std::io::stdout);
 
     tracing_subscriber::registry()
         .with(filter)
