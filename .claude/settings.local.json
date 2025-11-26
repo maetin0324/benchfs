@@ -83,7 +83,14 @@
       "Bash(timeout 300 make:*)",
       "Bash(cargo fix:*)",
       "Bash(sort:*)",
-      "Bash(sed:*)"
+      "Bash(sed:*)",
+      "Bash(./perf-debug.sh:*)",
+      "Bash(qstat:*)",
+      "Bash(./benchfs.sh:*)",
+      "Bash(while qstat 379190.nqsv)",
+      "Bash(do sleep 30)",
+      "Bash(break)",
+      "Bash(./jobs/benchfs/benchfs.sh:*)"
     ],
     "deny": [],
     "ask": []

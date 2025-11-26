@@ -39,156 +39,158 @@ IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
 # ==============================================================================
+# NOTE: UCX_* 環境変数を全てコメントアウト
+# remote_io_benchプロジェクトでも同様の現象が発生し、UCX_*をコメントアウトしたところ動いた
 # UD/DC を許可すると DCI QP で Input/output error が発生し、返信が
 # 捨てられて RPC がハングする。GPU (cuda_copy) も無効化し CPU 専用にする。
 
-detect_active_ib() {
-  if command -v ibstat >/dev/null 2>&1; then
-    if ibstat 2>/dev/null | grep -q "State:.*Active"; then
-      return 0
-    fi
-  fi
-
-  if command -v ibv_devinfo >/dev/null 2>&1; then
-    if ibv_devinfo 2>/dev/null | grep -q "state:.*PORT_ACTIVE"; then
-      return 0
-    fi
-  fi
-
-  if compgen -G "/sys/class/infiniband/*/ports/*/state" >/dev/null; then
-    while IFS= read -r state_file; do
-      if grep -q "ACTIVE" "$state_file" 2>/dev/null; then
-        return 0
-      fi
-    done < <(find /sys/class/infiniband -maxdepth 3 -name state -print)
-  fi
-
-  return 1
-}
-
-detect_ib_device() {
-  if command -v ibdev2netdev >/dev/null 2>&1; then
-    local selection
-    selection=$(
-      ibdev2netdev 2>/dev/null | awk '
-        /==>/ {
-          last_dev=$1;
-          last_port=$3;
-          if ($0 ~ /\(Up\)/) {
-            printf "%s:%s\n", $1, $3;
-            exit;
-          }
-        }
-        END {
-          if (NR > 0 && last_dev != "" && last_port != "") {
-            printf "%s:%s\n", last_dev, last_port;
-          }
-        }'
-    )
-    if [[ -n "${selection}" ]]; then
-      echo "${selection}"
-      return
-    fi
-  fi
-
-  local first_device
-  first_device=$(ls /sys/class/infiniband 2>/dev/null | head -n 1)
-  if [[ -n "${first_device}" ]]; then
-    if [[ -d "/sys/class/infiniband/${first_device}/ports/1" ]]; then
-      echo "${first_device}:1"
-    else
-      echo "${first_device}"
-    fi
-  fi
-}
-
-detect_primary_netdev() {
-  if command -v ip >/dev/null 2>&1; then
-    local dev
-    dev=$(
-      ip route get 1.1.1.1 2>/dev/null \
-        | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
-    )
-    if [[ -n "${dev}" ]]; then
-      echo "${dev}"
-      return
-    fi
-  fi
-
-  if [[ -r /proc/net/route ]]; then
-    awk '
-      $2 == "00000000" && $3 != "00000000" {
-        print $1
-        exit
-      }
-    ' /proc/net/route
-  fi
-}
-
-should_override_ucx_net_devices() {
-  local current="${UCX_NET_DEVICES:-}"
-  if [[ -z "${current}" ]]; then
-    return 0
-  fi
-
-  local lower=${current,,}
-  if [[ "${lower}" == "all" || "${lower}" == "auto" ]]; then
-    return 0
-  fi
-
-  return 1
-}
-
-if [[ -z "${UCX_TLS:-}" ]]; then
-  if detect_active_ib; then
-    export UCX_TLS="all"
-  else
-    export UCX_TLS="tcp,self"
-  fi
-fi
-
-# UCX が GPU メモリタイプを誤検出しないように memtype cache を無効化
-export UCX_MEMTYPE_CACHE="n"
-
-# UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
-# if should_override_ucx_net_devices; then
-#   if [[ "${UCX_TLS}" == *rc* ]]; then
-#     ib_device=$(detect_ib_device)
-#     primary_netdev=$(detect_primary_netdev)
-
-#     if [[ -n "${ib_device}" && -n "${primary_netdev}" ]]; then
-#       export UCX_NET_DEVICES="${ib_device},${primary_netdev}"
-#       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
-#     elif [[ -n "${ib_device}" ]]; then
-#       export UCX_NET_DEVICES="${ib_device}"
-#       unset BENCHFS_STREAM_INTERFACE
-#     elif [[ -n "${primary_netdev}" ]]; then
-#       export UCX_NET_DEVICES="${primary_netdev}"
-#       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
-#     else
-#       export UCX_NET_DEVICES="all"
-#       unset BENCHFS_STREAM_INTERFACE
-#     fi
-#   else
-#     primary_netdev=$(detect_primary_netdev)
-#     if [[ -n "${primary_netdev}" ]]; then
-#       export UCX_NET_DEVICES="${primary_netdev}"
-#       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
-#     else
-#       export UCX_NET_DEVICES="all"
-#       unset BENCHFS_STREAM_INTERFACE
+# detect_active_ib() {
+#   if command -v ibstat >/dev/null 2>&1; then
+#     if ibstat 2>/dev/null | grep -q "State:.*Active"; then
+#       return 0
 #     fi
 #   fi
-
-#   echo "Auto-selected UCX_NET_DEVICES=${UCX_NET_DEVICES}"
-# else
-#   echo "UCX_NET_DEVICES preset to ${UCX_NET_DEVICES}, leaving unchanged"
+#
+#   if command -v ibv_devinfo >/dev/null 2>&1; then
+#     if ibv_devinfo 2>/dev/null | grep -q "state:.*PORT_ACTIVE"; then
+#       return 0
+#     fi
+#   fi
+#
+#   if compgen -G "/sys/class/infiniband/*/ports/*/state" >/dev/null; then
+#     while IFS= read -r state_file; do
+#       if grep -q "ACTIVE" "$state_file" 2>/dev/null; then
+#         return 0
+#       fi
+#     done < <(find /sys/class/infiniband -maxdepth 3 -name state -print)
+#   fi
+#
+#   return 1
+# }
+#
+# detect_ib_device() {
+#   if command -v ibdev2netdev >/dev/null 2>&1; then
+#     local selection
+#     selection=$(
+#       ibdev2netdev 2>/dev/null | awk '
+#         /==>/ {
+#           last_dev=$1;
+#           last_port=$3;
+#           if ($0 ~ /\(Up\)/) {
+#             printf "%s:%s\n", $1, $3;
+#             exit;
+#           }
+#         }
+#         END {
+#           if (NR > 0 && last_dev != "" && last_port != "") {
+#             printf "%s:%s\n", last_dev, last_port;
+#           }
+#         }'
+#     )
+#     if [[ -n "${selection}" ]]; then
+#       echo "${selection}"
+#       return
+#     fi
+#   fi
+#
+#   local first_device
+#   first_device=$(ls /sys/class/infiniband 2>/dev/null | head -n 1)
+#   if [[ -n "${first_device}" ]]; then
+#     if [[ -d "/sys/class/infiniband/${first_device}/ports/1" ]]; then
+#       echo "${first_device}:1"
+#     else
+#       echo "${first_device}"
+#     fi
+#   fi
+# }
+#
+# detect_primary_netdev() {
+#   if command -v ip >/dev/null 2>&1; then
+#     local dev
+#     dev=$(
+#       ip route get 1.1.1.1 2>/dev/null \
+#         | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+#     )
+#     if [[ -n "${dev}" ]]; then
+#       echo "${dev}"
+#       return
+#     fi
+#   fi
+#
+#   if [[ -r /proc/net/route ]]; then
+#     awk '
+#       $2 == "00000000" && $3 != "00000000" {
+#         print $1
+#         exit
+#       }
+#     ' /proc/net/route
+#   fi
+# }
+#
+# should_override_ucx_net_devices() {
+#   local current="${UCX_NET_DEVICES:-}"
+#   if [[ -z "${current}" ]]; then
+#     return 0
+#   fi
+#
+#   local lower=${current,,}
+#   if [[ "${lower}" == "all" || "${lower}" == "auto" ]]; then
+#     return 0
+#   fi
+#
+#   return 1
+# }
+#
+# if [[ -z "${UCX_TLS:-}" ]]; then
+#   if detect_active_ib; then
+#     export UCX_TLS="all"
+#   else
+#     export UCX_TLS="tcp,self"
+#   fi
 # fi
-
-export UCX_NET_DEVICES="all"
-
-# 明示的に UD/DC を使わせない
-export UCX_PROTOS="^ud,dc"
+#
+# # UCX が GPU メモリタイプを誤検出しないように memtype cache を無効化
+# export UCX_MEMTYPE_CACHE="n"
+#
+# # UCX が勝手に net device を切り替えないよう、RC 使用時はデバイスも固定
+# # if should_override_ucx_net_devices; then
+# #   if [[ "${UCX_TLS}" == *rc* ]]; then
+# #     ib_device=$(detect_ib_device)
+# #     primary_netdev=$(detect_primary_netdev)
+#
+# #     if [[ -n "${ib_device}" && -n "${primary_netdev}" ]]; then
+# #       export UCX_NET_DEVICES="${ib_device},${primary_netdev}"
+# #       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
+# #     elif [[ -n "${ib_device}" ]]; then
+# #       export UCX_NET_DEVICES="${ib_device}"
+# #       unset BENCHFS_STREAM_INTERFACE
+# #     elif [[ -n "${primary_netdev}" ]]; then
+# #       export UCX_NET_DEVICES="${primary_netdev}"
+# #       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
+# #     else
+# #       export UCX_NET_DEVICES="all"
+# #       unset BENCHFS_STREAM_INTERFACE
+# #     fi
+# #   else
+# #     primary_netdev=$(detect_primary_netdev)
+# #     if [[ -n "${primary_netdev}" ]]; then
+# #       export UCX_NET_DEVICES="${primary_netdev}"
+# #       export BENCHFS_STREAM_INTERFACE="${primary_netdev}"
+# #     else
+# #       export UCX_NET_DEVICES="all"
+# #       unset BENCHFS_STREAM_INTERFACE
+# #     fi
+# #   fi
+#
+# #   echo "Auto-selected UCX_NET_DEVICES=${UCX_NET_DEVICES}"
+# # else
+# #   echo "UCX_NET_DEVICES preset to ${UCX_NET_DEVICES}, leaving unchanged"
+# # fi
+#
+# export UCX_NET_DEVICES="all"
+#
+# # 明示的に UD/DC を使わせない
+# export UCX_PROTOS="^ud,dc"
 
 # ==============================================================================
 # 2. タイムアウトとリトライ設定
@@ -196,54 +198,56 @@ export UCX_PROTOS="^ud,dc"
 # UCXのデフォルト値では不十分な場合があるため、増加
 
 # export UCX_RC_TIMEOUT=2.0s               # タイムアウト時間（デフォルト: 1.0s）
-export UCX_RC_RETRY_COUNT=16             # リトライ回数（デフォルト: 7）
-export UCX_RC_TIMEOUT_MULTIPLIER=4.0     # タイムアウト乗数（デフォルト: 2.0）
+# export UCX_RC_RETRY_COUNT=16             # リトライ回数（デフォルト: 7）
+# export UCX_RC_TIMEOUT_MULTIPLIER=4.0     # タイムアウト乗数（デフォルト: 2.0）
 
 # ==============================================================================
 # 3. Active Message設定
 # ==============================================================================
 # Active Messageのバッファサイズとプロトコル閾値を最適化
 
-export UCX_AM_MAX_SHORT=128              # Short AMの最大サイズ (デフォルト: 128B)
-export UCX_AM_MAX_EAGER=8192             # Eager AMの最大サイズ (8KB)
+# export UCX_AM_MAX_SHORT=128              # Short AMの最大サイズ (デフォルト: 128B)
+# export UCX_AM_MAX_EAGER=8192             # Eager AMの最大サイズ (8KB)
 # export UCX_RNDV_THRESH=16384             # Rendezvous閾値 (16KB)
 # export UCX_RNDV_THRESH=inf              # Rendezvousプロトコル無効化（全てEagerに）
 
 # AMストリームのキューサイズ
-export UCX_AM_SEND_QUEUE_SIZE=4096       # 送信キューサイズ
-export UCX_AM_RECV_QUEUE_SIZE=4096       # 受信キューサイズ
+# export UCX_AM_SEND_QUEUE_SIZE=4096       # 送信キューサイズ
+# export UCX_AM_RECV_QUEUE_SIZE=4096       # 受信キューサイズ
 
 # ==============================================================================
 # 4. RDMA設定
 # ==============================================================================
 # ゼロコピーとRendezvousプロトコルの最適化
 
-export UCX_ZCOPY_THRESH=0                # ゼロコピー常時有効（0 = 常時）
-export UCX_RNDV_SCHEME=auto              # Rendezvous方式: GET with zero-copy
+# export UCX_ZCOPY_THRESH=0                # ゼロコピー常時有効（0 = 常時）
+# export UCX_RNDV_SCHEME=auto              # Rendezvous方式: GET with zero-copy
 
 # InfiniBand固有設定
-export UCX_IB_NUM_PATHS=2                # IBパス数
-export UCX_RC_MLX5_TM_ENABLE=y           # タグマッチングハードウェア加速
-export UCX_RC_MLX5_RX_QUEUE_LEN=4096     # 受信キューの長さ（デフォルト: 1024）
+# export UCX_IB_NUM_PATHS=2                # IBパス数
+# export UCX_RC_MLX5_TM_ENABLE=y           # タグマッチングハードウェア加速
+# export UCX_RC_MLX5_RX_QUEUE_LEN=4096     # 受信キューの長さ（デフォルト: 1024）
 
 # ==============================================================================
 # 5. メモリ登録キャッシュ
 # ==============================================================================
 # memtype cache は GPU 誤検出を避けるためセクション1で n に設定済み
-export UCX_RCACHE_ENABLE=n               # 登録キャッシュ有効
-export UCX_IB_REG_METHODS=rcache,direct
+# export UCX_RCACHE_ENABLE=n               # 登録キャッシュ有効
+# export UCX_IB_REG_METHODS=rcache,direct
+# export UCX_MLX5_DEVX_OBJECTS=''
+# export UCX_MLX5_DEVX=n
 
 # ==============================================================================
 # 6. フロー制御
 # ==============================================================================
-export UCX_RC_FC_ENABLE=y                # フロー制御有効化
-export UCX_RC_MAX_NUM_EPS=-1             # エンドポイント数無制限
+# export UCX_RC_FC_ENABLE=y                # フロー制御有効化
+# export UCX_RC_MAX_NUM_EPS=-1             # エンドポイント数無制限
 
 # ==============================================================================
 # 7. ネットワーク層設定
 # ==============================================================================
-export UCX_IB_SEG_SIZE=8192              # IBセグメントサイズ (8KB)
-export UCX_RC_PATH_MTU=4096              # Path MTU (4KB推奨)
+# export UCX_IB_SEG_SIZE=8192              # IBセグメントサイズ (8KB)
+# export UCX_RC_PATH_MTU=4096              # Path MTU (4KB推奨)
 
 # RoCE使用時（必要に応じて有効化）
 # export UCX_IB_GID_INDEX=0              # GIDインデックス
@@ -251,21 +255,21 @@ export UCX_RC_PATH_MTU=4096              # Path MTU (4KB推奨)
 # ==============================================================================
 # 8. プログレス設定
 # ==============================================================================
-export UCX_ADAPTIVE_PROGRESS=y           # アダプティブプログレス
-export UCX_ASYNC_MAX_EVENTS=256          # 非同期イベント最大数
+# export UCX_ADAPTIVE_PROGRESS=y           # アダプティブプログレス
+# export UCX_ASYNC_MAX_EVENTS=256          # 非同期イベント最大数
 
 # シングルスレッドの場合（MPIプロセス内でスレッド不使用）
-export UCX_USE_MT_MUTEX=n                # マルチスレッドmutex無効
+# export UCX_USE_MT_MUTEX=n                # マルチスレッドmutex無効
 
 # UCX Configuration for avoiding Rendezvous protocol issues
 # - UCX_TLS: Use only TCP, shared memory, and self transports (avoid InfiniBand)
 # - UCX_RNDV_THRESH: Set to inf to disable Rendezvous protocol completely
 #   This forces all messages to use Eager protocol, which is compatible
 #   with current implementation
-UCX_LOG_LEVEL="TRACE"
+# UCX_LOG_LEVEL="TRACE"
 
-export UCX_LOG_LEVEL
-export UCX_RNDV_THRESH
+# export UCX_LOG_LEVEL
+# export UCX_RNDV_THRESH
 
 # Calculate project root from SCRIPT_DIR and set LD_LIBRARY_PATH dynamically
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -355,7 +359,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=Trace
+export RUST_LOG=info
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
@@ -375,6 +379,8 @@ else
   echo "WARNING: UCX PML not available – falling back to ob1/tcp configuration"
 fi
 
+# NOTE: UCX_* 環境変数をコメントアウトしたため、-x UCX_* オプションも削除
+# remote_io_benchプロジェクトでも同様の現象が発生し、UCX_*をコメントアウトしたところ動いた
 if [[ "${USE_UCX_PML}" -eq 1 ]]; then
   cmd_mpirun_common=(
     mpirun
@@ -382,18 +388,18 @@ if [[ "${USE_UCX_PML}" -eq 1 ]]; then
     --mca pml ucx
     --mca btl self
     --mca osc ucx
-    -x UCX_TLS
-    -x UCX_NET_DEVICES
-    -x UCX_MEMTYPE_CACHE
-    -x UCX_PROTOS
+    # -x UCX_TLS
+    # -x UCX_NET_DEVICES
+    # -x UCX_MEMTYPE_CACHE
+    # -x UCX_PROTOS
     # -x UCX_LOG_LEVEL
-    -x UCX_RNDV_THRESH
-    -x UCX_RNDV_SCHEME
-    -x UCX_RC_TIMEOUT
-    -x UCX_RC_RETRY_COUNT
-    -x UCX_RC_TIMEOUT_MULTIPLIER
-    -x UCX_AM_MAX_SHORT
-    -x UCX_AM_MAX_EAGER
+    # -x UCX_RNDV_THRESH
+    # -x UCX_RNDV_SCHEME
+    # -x UCX_RC_TIMEOUT
+    # -x UCX_RC_RETRY_COUNT
+    # -x UCX_RC_TIMEOUT_MULTIPLIER
+    # -x UCX_AM_MAX_SHORT
+    # -x UCX_AM_MAX_EAGER
     -x PATH
     -x LD_LIBRARY_PATH
   )
