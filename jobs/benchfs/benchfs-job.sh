@@ -9,7 +9,12 @@ set -euo pipefail
 
 # Increase file descriptor limit for large-scale MPI jobs
 # This prevents FD exhaustion when running with high ppn values
-ulimit -n 65536
+# For large block sizes (16g+) with many clients (256+), we need more FDs:
+#   16GiB / 32MiB chunk = 512 chunks per file
+#   256 clients * 512 chunks = 131,072 potential open files
+# Setting to 1M to be safe for future scaling
+ulimit -n 1048576 2>/dev/null || ulimit -n 524288 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536
+echo "File descriptor limit: $(ulimit -n)"
 
 module purge
 module load "openmpi/$NQSV_MPI_VER"

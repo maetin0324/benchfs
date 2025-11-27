@@ -987,6 +987,60 @@ impl IOUringChunkStore {
     pub fn allocator(&self) -> &std::rc::Rc<pluvio_uring::allocator::FixedBufferAllocator> {
         self.backend.allocator()
     }
+
+    /// Read a chunk using a registered buffer (zero-copy DMA)
+    ///
+    /// This method reads data directly from disk into a FixedBuffer without
+    /// an intermediate copy, maximizing read performance.
+    ///
+    /// # Arguments
+    /// * `file_path` - File path
+    /// * `chunk_index` - Chunk index
+    /// * `offset` - Offset within the chunk
+    /// * `fixed_buffer` - Pre-allocated registered buffer to read into
+    ///
+    /// # Returns
+    /// A tuple of (bytes_read, buffer) where buffer is the FixedBuffer with data
+    #[async_backtrace::framed]
+    pub async fn read_chunk_fixed(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        fixed_buffer: pluvio_uring::allocator::FixedBuffer,
+    ) -> ChunkStoreResult<(usize, pluvio_uring::allocator::FixedBuffer)> {
+        if offset >= self.chunk_size as u64 {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+
+        if !chunk_file_path.exists() {
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
+        }
+
+        // Open the chunk file
+        let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
+
+        // Read data directly into registered buffer using DMA (zero-copy)
+        let (bytes_read, fixed_buffer) = self
+            .backend
+            .read_fixed_direct(handle, offset, fixed_buffer)
+            .await?;
+
+        tracing::debug!(
+            "Read {} bytes (zero-copy) from chunk (path={}, chunk_index={}, offset={})",
+            bytes_read,
+            file_path,
+            chunk_index,
+            offset
+        );
+
+        Ok((bytes_read, fixed_buffer))
+    }
 }
 
 #[async_trait::async_trait(?Send)]

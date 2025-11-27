@@ -120,6 +120,58 @@ impl IOUringBackend {
     pub fn allocator(&self) -> &Rc<FixedBufferAllocator> {
         &self.allocator
     }
+
+    /// Read data directly into a registered buffer (zero-copy DMA)
+    ///
+    /// This method reads data from disk directly into the provided FixedBuffer,
+    /// avoiding the intermediate copy that `read()` performs.
+    ///
+    /// # Arguments
+    /// * `handle` - File handle
+    /// * `offset` - Offset within the file
+    /// * `fixed_buffer` - Pre-allocated registered buffer to read into
+    ///
+    /// # Returns
+    /// A tuple of (bytes_read, buffer) where buffer is the same FixedBuffer passed in
+    #[async_backtrace::framed]
+    pub async fn read_fixed_direct(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        fixed_buffer: pluvio_uring::allocator::FixedBuffer,
+    ) -> StorageResult<(usize, pluvio_uring::allocator::FixedBuffer)> {
+        // Clone the DmaFile to avoid holding the borrow across await
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
+
+        // Read data using read_fixed with registered buffer (zero-copy DMA)
+        let (bytes_read_raw, fixed_buffer) = dma_file
+            .read_fixed(fixed_buffer, offset)
+            .await
+            .map_err(StorageError::IoError)?;
+
+        if bytes_read_raw < 0 {
+            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                -bytes_read_raw,
+            )));
+        }
+
+        let bytes_read = bytes_read_raw as usize;
+
+        tracing::trace!(
+            "Read {} bytes (zero-copy) from fd={} at offset={}",
+            bytes_read,
+            handle.0,
+            offset
+        );
+
+        Ok((bytes_read, fixed_buffer))
+    }
 }
 
 // Default implementation removed - allocator must be provided

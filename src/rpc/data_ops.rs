@@ -248,20 +248,67 @@ impl AmRpc for ReadChunkRequest {
 
         tracing::trace!("Reading from path: {}", path);
 
-        // Read chunk data from storage
-        let (response_header, response_data) = match ctx
-            .chunk_store
-            .read_chunk(&path, header.chunk_index, header.offset, header.length)
-            .await
+        // Check if chunk_store is IOUringChunkStore to use zero-copy path
+        use crate::storage::chunk_store::IOUringChunkStore;
+        use std::any::Any;
+
+        let chunk_store_any = &*ctx.chunk_store as &dyn Any;
+
+        // Try zero-copy path first for IOUringChunkStore
+        let (response_header, response_data, fixed_buffer_opt) = if let Some(io_uring_store) =
+            chunk_store_any.downcast_ref::<IOUringChunkStore>()
         {
-            Ok(data) => {
-                let bytes_read = data.len() as u64;
-                tracing::trace!("Read {} bytes from storage", bytes_read);
-                (ReadChunkResponseHeader::success(bytes_read), Some(data))
+            tracing::debug!("Using zero-copy path for ReadChunk");
+
+            // Acquire a registered buffer from the allocator
+            let fixed_buffer = ctx.allocator.acquire().await;
+
+            // Ensure the requested length fits in the buffer
+            let read_len = (header.length as usize).min(fixed_buffer.len());
+
+            match io_uring_store
+                .read_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer)
+                .await
+            {
+                Ok((bytes_read, fixed_buffer)) => {
+                    let actual_bytes = bytes_read.min(read_len);
+                    tracing::debug!(
+                        "Read {} bytes (zero-copy) from storage (path={}, chunk={})",
+                        actual_bytes,
+                        path,
+                        header.chunk_index
+                    );
+                    (
+                        ReadChunkResponseHeader::success(actual_bytes as u64),
+                        None,
+                        Some((fixed_buffer, actual_bytes)),
+                    )
+                }
+                Err(e) => {
+                    tracing::error!("Failed to read chunk (zero-copy): {:?}", e);
+                    (ReadChunkResponseHeader::error(-2), None, None)
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to read chunk: {:?}", e);
-                (ReadChunkResponseHeader::error(-2), None)
+        } else {
+            // Fallback path: Use Vec<u8> for non-IOUring backends
+            tracing::debug!(
+                "Using fallback path for ReadChunk (chunk_store is not IOUringChunkStore)"
+            );
+
+            match ctx
+                .chunk_store
+                .read_chunk(&path, header.chunk_index, header.offset, header.length)
+                .await
+            {
+                Ok(data) => {
+                    let bytes_read = data.len() as u64;
+                    tracing::trace!("Read {} bytes from storage", bytes_read);
+                    (ReadChunkResponseHeader::success(bytes_read), Some(data), None)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to read chunk: {:?}", e);
+                    (ReadChunkResponseHeader::error(-2), None, None)
+                }
             }
         };
 
@@ -278,20 +325,41 @@ impl AmRpc for ReadChunkRequest {
         let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
         let header_bytes: &[u8] = &header_vec;
 
-        // Determine protocol based on data size
-        let proto = if let Some(ref data) = response_data {
-            if crate::rpc::should_use_rdma(data.len() as u64) {
+        // Use reply_vectorized with IoSlice
+        let result = if let Some((mut fixed_buffer, bytes_read)) = fixed_buffer_opt {
+            // Zero-copy path: send directly from registered buffer
+            let data_slice = &fixed_buffer.as_mut_slice()[..bytes_read];
+            let data_slices = [std::io::IoSlice::new(data_slice)];
+
+            // Determine protocol based on data size
+            let proto = if crate::rpc::should_use_rdma(bytes_read as u64) {
                 Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
-        // Use reply_vectorized with IoSlice
-        let result = if let Some(ref data) = response_data {
+            unsafe {
+                am_msg
+                    .reply_vectorized(
+                        Self::reply_stream_id() as u32,
+                        header_bytes,
+                        &data_slices,
+                        false, // need_reply
+                        proto,
+                    )
+                    .await
+            }
+        } else if let Some(ref data) = response_data {
+            // Fallback path: send from Vec<u8>
             let data_slices = [std::io::IoSlice::new(data)];
+
+            // Determine protocol based on data size
+            let proto = if crate::rpc::should_use_rdma(data.len() as u64) {
+                Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+            } else {
+                None
+            };
+
             unsafe {
                 am_msg
                     .reply_vectorized(
@@ -304,7 +372,7 @@ impl AmRpc for ReadChunkRequest {
                     .await
             }
         } else {
-            // No data, just send header
+            // No data, just send header (error case)
             unsafe {
                 am_msg
                     .reply_vectorized(
