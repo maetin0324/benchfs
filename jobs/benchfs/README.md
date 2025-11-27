@@ -146,8 +146,8 @@ benchfs_chunk_size_list=(
 │   │       ├── benchfsd_stdout.log
 │   │       └── benchfsd_stderr.log
 │   └── ior_results/                # IORベンチマーク結果
-│       ├── ior_result_0.txt
-│       └── ior_stderr_0.txt
+│       ├── ior_result_0.json       # IOR結果（JSON形式）
+│       └── ior_stderr_0.log
 ```
 
 ### 結果の解析
@@ -155,11 +155,20 @@ benchfs_chunk_size_list=(
 #### IORベンチマーク結果
 
 ```bash
-# 特定のrunの結果を確認
-cat results/benchfs/TIMESTAMP-LABEL/TIMESTAMP-JOBID-NNODES/ior_results/ior_result_0.txt
+# 結果解析スクリプトを使用（推奨）
+./jobs/benchfs/scripts/analyze_results.py results/benchfs/TIMESTAMP-LABEL/
 
-# スループット情報を抽出
-grep "Max Write\|Max Read" results/benchfs/*/*/ior_results/ior_result_*.txt
+# CSV形式で出力
+./jobs/benchfs/scripts/analyze_results.py results/benchfs/TIMESTAMP-LABEL/ -f csv > results.csv
+
+# JSON形式で出力
+./jobs/benchfs/scripts/analyze_results.py results/benchfs/TIMESTAMP-LABEL/ -f json
+
+# IOR JSON出力を修正（IORのJSONにはバグがあるため）
+./jobs/benchfs/scripts/fix_ior_json.py ior_result_0.json > fixed.json
+
+# 直接JSONを確認する場合（fix_ior_json.pyでパイプ）
+./jobs/benchfs/scripts/fix_ior_json.py results/benchfs/*/*/ior_results/ior_result_0.json | jq '.summary[]'
 ```
 
 #### ジョブパラメータの確認

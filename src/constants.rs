@@ -64,23 +64,23 @@ fn rdma_allowed() -> bool {
             return false;
         }
 
-        if let Ok(tls) = env::var("UCX_TLS") {
-            let has_rdma = tls
-                .split(',')
-                .map(|v| v.trim().to_ascii_lowercase())
-                .any(|t| t.starts_with("rc") || t.starts_with("dc"));
+        // if let Ok(tls) = env::var("UCX_TLS") {
+        //     let has_rdma = tls
+        //         .split(',')
+        //         .map(|v| v.trim().to_ascii_lowercase())
+        //         .any(|t| t.starts_with("rc") || t.starts_with("dc"));
 
-            if has_rdma {
-                tracing::debug!("RDMA enabled (UCX_TLS={})", tls);
-                return true;
-            } else {
-                tracing::warn!(
-                    "UCX_TLS ({}) has no RC/DC transports; forcing eager protocol",
-                    tls
-                );
-                return false;
-            }
-        }
+        //     if has_rdma {
+        //         tracing::debug!("RDMA enabled (UCX_TLS={})", tls);
+        //         return true;
+        //     } else {
+        //         tracing::warn!(
+        //             "UCX_TLS ({}) has no RC/DC transports; forcing eager protocol",
+        //             tls
+        //         );
+        //         return false;
+        //     }
+        // }
 
         tracing::info!(
             "UCX_TLS not set; assuming RC-capable transports. Set BENCHFS_DISABLE_RDMA=1 to force eager."

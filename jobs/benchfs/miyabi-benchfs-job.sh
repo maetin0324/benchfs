@@ -431,11 +431,12 @@ else
     echo "Using built-in default parameters"
     # Fallback default values
     # NOTE: block_size must be a multiple of transfer_size
-    transfer_size_list=(4m 16m)
-    block_size_list=(64m 128m 256m)
+    # WARNING: transfer_size > 4m can cause UCX Active Message deadlock
+    transfer_size_list=(4m)
+    block_size_list=(64m 256m 512m 1g)
     ppn_list=(1 2 4)
-    ior_flags_list=("-w -r -F" "-w -r")
-    benchfs_chunk_size_list=(4194304)
+    ior_flags_list=("-w -r -F")
+    benchfs_chunk_size_list=(4194304 16777216)
 fi
 
 # Save parameter configuration for reproducibility
@@ -616,7 +617,7 @@ EOF
 
           # Run IOR benchmark
           echo "Running IOR benchmark..."
-          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.txt"
+          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
           ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
 
           cmd_ior=(
@@ -637,7 +638,7 @@ EOF
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"
             -o "${BENCHFS_DATA_DIR}/testfile"
-            # -O summaryFormat=JSON
+            -O summaryFormat=JSON
             -O summaryFile="${ior_json_file}"
           )
 

@@ -15,6 +15,9 @@ BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
 BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
+# Resolve PARAM_FILE to absolute path BEFORE cd (relative paths won't work after cd)
+PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}")"
+
 # Debug: Print paths
 echo "=========================================="
 echo "BenchFS Job Submission"
@@ -22,6 +25,7 @@ echo "=========================================="
 echo "PROJECT_ROOT: $PROJECT_ROOT"
 echo "BENCHFS_PREFIX: $BENCHFS_PREFIX"
 echo "IOR_PREFIX: $IOR_PREFIX"
+echo "PARAM_FILE: $PARAM_FILE_RESOLVED"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -36,8 +40,8 @@ mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
   # 1 2 4 8
-  4
-  # 2 4 8 16
+  # 4
+  2 4 8 16
   # 32
   # 64
 )
@@ -70,7 +74,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -v LABEL="$LABEL"
         -v BENCHFS_PREFIX="$BENCHFS_PREFIX"
         -v IOR_PREFIX="$IOR_PREFIX"
-        -v PARAM_FILE="${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}"
+        -v PARAM_FILE="$PARAM_FILE_RESOLVED"
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

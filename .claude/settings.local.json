@@ -90,7 +90,8 @@
       "Bash(while qstat 379190.nqsv)",
       "Bash(do sleep 30)",
       "Bash(break)",
-      "Bash(./jobs/benchfs/benchfs.sh:*)"
+      "Bash(./jobs/benchfs/benchfs.sh:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []

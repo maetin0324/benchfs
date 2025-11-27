@@ -357,7 +357,7 @@ sleep 5
 
 # Run IOR benchmark while perf is recording
 echo "Running IOR benchmark (perf is recording in background)..."
-ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.txt"
+ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
 ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
 
 # Also profile IOR client on rank 0
@@ -421,6 +421,7 @@ cmd_ior=(
   --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
   --benchfs.datadir="${BENCHFS_DATA_DIR}"
   -o "${BENCHFS_DATA_DIR}/testfile"
+  -O summaryFormat=JSON
   -O summaryFile="${ior_json_file}"
 )
 
