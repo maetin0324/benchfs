@@ -460,10 +460,12 @@ pub extern "C" fn benchfs_read(
         match result {
             Ok(Ok(n)) => n as i64,
             Ok(Err(e)) => {
+                tracing::error!("benchfs_read failed: {}", e);
                 set_error_message(&e.to_string());
                 BENCHFS_EIO as i64
             }
             Err(e) => {
+                tracing::error!("benchfs_read context error: {}", e);
                 set_error_message(&e);
                 BENCHFS_ERROR as i64
             }

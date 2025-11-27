@@ -551,45 +551,81 @@ impl BenchFS {
             .calculate_read_chunks(offset, actual_length, file_meta.size)
             .map_err(|e| ApiError::Internal(format!("Failed to calculate chunks: {:?}", e)))?;
 
-        // Read all chunks concurrently
-        tracing::trace!("Reading {} chunks concurrently", chunks.len());
+        // Read all chunks concurrently with zero-copy directly into user buffer
+        tracing::trace!("Reading {} chunks concurrently (zero-copy)", chunks.len());
         use futures::future::join_all;
 
-        // Collect futures for reading all chunks
         let file_path = file_meta.path.clone();
-        // Note: In path-based KV design, chunk_locations are not tracked
         let fs_ptr = self as *const BenchFS;
-        let chunk_futures: Vec<_> = chunks
+
+        // Get raw pointer to buffer for zero-copy writes from multiple tasks
+        // SAFETY: Each task writes to a non-overlapping region of the buffer
+        let buf_ptr = buf.as_mut_ptr();
+        let buf_len = buf.len();
+
+        // Calculate buffer offsets for each chunk
+        let mut buf_offset = 0usize;
+        let chunk_infos: Vec<_> = chunks
             .iter()
-            .map(|(chunk_index, _chunk_offset, _read_size)| {
-                let chunk_id = ChunkId::from_path(&file_path, *chunk_index);
-                let chunk_index = *chunk_index;
+            .map(|(chunk_index, chunk_offset, read_size)| {
+                let info = (*chunk_index, *chunk_offset, *read_size, buf_offset);
+                buf_offset += *read_size as usize;
+                info
+            })
+            .collect();
+
+        let chunk_futures: Vec<_> = chunk_infos
+            .into_iter()
+            .map(|(chunk_index, chunk_offset, read_size, buf_offset)| {
+                let chunk_id = ChunkId::from_path(&file_path, chunk_index);
                 let file_path = file_path.clone();
 
                 spawn_with_name(
                     async move {
                         let fs = unsafe { &*fs_ptr };
 
-                        if let Some(cached_chunk) = fs.chunk_cache.get(&chunk_id) {
-                            tracing::trace!("Cache hit for chunk {}", chunk_index);
-                            return (chunk_index, Some(cached_chunk));
+                        // SAFETY: Each task writes to its own non-overlapping region
+                        let chunk_buf = unsafe {
+                            let end = (buf_offset + read_size as usize).min(buf_len);
+                            std::slice::from_raw_parts_mut(buf_ptr.add(buf_offset), end - buf_offset)
+                        };
+
+                        // Cache is only useful for full chunk reads at offset 0
+                        // For partial reads, skip cache lookup
+                        if chunk_offset == 0 && read_size == fs.chunk_manager.chunk_size() as u64 {
+                            if let Some(cached_chunk) = fs.chunk_cache.get(&chunk_id) {
+                                tracing::trace!("Cache hit for chunk {}", chunk_index);
+                                let copy_len = cached_chunk.len().min(chunk_buf.len());
+                                chunk_buf[..copy_len].copy_from_slice(&cached_chunk[..copy_len]);
+                                return (chunk_index, Ok::<usize, ()>(copy_len));
+                            }
                         }
 
-                        tracing::trace!("Cache miss for chunk {}", chunk_index);
+                        tracing::trace!(
+                            "Reading chunk {} (offset={}, size={}, buf_offset={})",
+                            chunk_index,
+                            chunk_offset,
+                            read_size,
+                            buf_offset
+                        );
 
+                        // Try local storage first with actual offset and size
                         match fs
                             .chunk_store
-                            .read_chunk(
-                                &file_path,
-                                chunk_index,
-                                0,
-                                fs.chunk_manager.chunk_size() as u64,
-                            )
+                            .read_chunk(&file_path, chunk_index, chunk_offset, read_size)
                             .await
                         {
-                            Ok(full_chunk) => {
-                                fs.chunk_cache.put(chunk_id, full_chunk.clone());
-                                (chunk_index, Some(full_chunk))
+                            Ok(chunk_data) => {
+                                // Only cache full chunk reads
+                                if chunk_offset == 0
+                                    && read_size == fs.chunk_manager.chunk_size() as u64
+                                {
+                                    fs.chunk_cache.put(chunk_id, chunk_data.clone());
+                                }
+                                // Copy to user buffer
+                                let copy_len = chunk_data.len().min(chunk_buf.len());
+                                chunk_buf[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
+                                (chunk_index, Ok(copy_len))
                             }
                             Err(_) => {
                                 if let Some(pool) = &fs.connection_pool {
@@ -597,40 +633,48 @@ impl BenchFS {
                                     let node_id = fs.get_chunk_node(&chunk_key);
 
                                     tracing::debug!(
-                                        "Fetching chunk {} from remote node {}",
+                                        "Fetching chunk {} from remote node {} (offset={}, size={})",
                                         chunk_index,
-                                        node_id
+                                        node_id,
+                                        chunk_offset,
+                                        read_size
                                     );
 
                                     match pool.get_or_connect(&node_id).await {
                                         Ok(client) => {
+                                            // Zero-copy: Read directly into user buffer
                                             let request = ReadChunkRequest::new(
                                                 chunk_index,
-                                                0,
-                                                fs.chunk_manager.chunk_size() as u64,
+                                                chunk_offset,
+                                                read_size,
                                                 file_path.clone(),
+                                                chunk_buf,
                                             );
 
                                             match request.call(&*client).await {
                                                 Ok(response) if response.is_success() => {
-                                                    let full_chunk = request.take_data();
+                                                    let bytes_read = response.bytes_read as usize;
                                                     tracing::debug!(
-                                                        "Successfully fetched {} bytes from remote node",
-                                                        full_chunk.len()
+                                                        "Successfully fetched {} bytes from remote node (zero-copy)",
+                                                        bytes_read
                                                     );
-                                                    fs.chunk_cache.put(chunk_id, full_chunk.clone());
-                                                    (chunk_index, Some(full_chunk))
+                                                    // Note: For zero-copy reads, we don't cache
+                                                    // because the data is already in the user buffer
+                                                    (chunk_index, Ok(bytes_read))
                                                 }
                                                 Ok(response) => {
                                                     tracing::warn!(
                                                         "Remote read failed with status {}",
                                                         response.status
                                                     );
-                                                    (chunk_index, None)
+                                                    // Fill with zeros on error
+                                                    chunk_buf.fill(0);
+                                                    (chunk_index, Ok(chunk_buf.len()))
                                                 }
                                                 Err(e) => {
                                                     tracing::error!("RPC error: {:?}", e);
-                                                    (chunk_index, None)
+                                                    chunk_buf.fill(0);
+                                                    (chunk_index, Ok(chunk_buf.len()))
                                                 }
                                             }
                                         }
@@ -640,11 +684,14 @@ impl BenchFS {
                                                 node_id,
                                                 e
                                             );
-                                            (chunk_index, None)
+                                            chunk_buf.fill(0);
+                                            (chunk_index, Ok(chunk_buf.len()))
                                         }
                                     }
                                 } else {
-                                    (chunk_index, None)
+                                    // No connection pool, fill with zeros (sparse file)
+                                    chunk_buf.fill(0);
+                                    (chunk_index, Ok(chunk_buf.len()))
                                 }
                             }
                         }
@@ -656,42 +703,17 @@ impl BenchFS {
 
         // Execute all reads concurrently
         let chunk_results_handles = join_all(chunk_futures).await;
-        let mut chunk_results = Vec::with_capacity(chunk_results_handles.len());
-        for result in chunk_results_handles {
-            chunk_results.push(
-                result.map_err(|e| ApiError::Internal(format!("Chunk read task failed: {}", e)))?,
-            );
-        }
 
-        // Copy data to buffer in correct order
-        tracing::trace!("Completed {} chunk reads", chunk_results.len());
+        // Sum up bytes read from all chunks
         let mut bytes_read = 0;
-        for ((_chunk_index, chunk_offset, read_size), (_result_idx, chunk_data)) in
-            chunks.iter().zip(chunk_results.iter())
-        {
-            // Extract and copy the requested portion
-            if let Some(chunk) = chunk_data {
-                let buf_offset = bytes_read;
-                let chunk_start = *chunk_offset as usize;
-                let chunk_end = (chunk_start + *read_size as usize).min(chunk.len());
-                let copy_len = (chunk_end - chunk_start).min(buf.len() - buf_offset);
-
-                if chunk_start < chunk.len() {
-                    buf[buf_offset..buf_offset + copy_len]
-                        .copy_from_slice(&chunk[chunk_start..chunk_start + copy_len]);
-                    bytes_read += copy_len;
-                } else {
-                    // Request is beyond chunk data, fill with zeros
-                    let zero_len = *read_size as usize;
-                    buf[buf_offset..buf_offset + zero_len].fill(0);
-                    bytes_read += zero_len;
+        for result in chunk_results_handles {
+            let (chunk_index, read_result) = result
+                .map_err(|e| ApiError::Internal(format!("Chunk read task failed: {}", e)))?;
+            match read_result {
+                Ok(len) => bytes_read += len,
+                Err(e) => {
+                    tracing::error!("Chunk {} read failed: {:?}", chunk_index, e);
                 }
-            } else {
-                // Chunk doesn't exist locally, return zeros (sparse file)
-                let buf_offset = bytes_read;
-                let zero_len = *read_size as usize;
-                buf[buf_offset..buf_offset + zero_len].fill(0);
-                bytes_read += zero_len;
             }
         }
 

@@ -41,7 +41,8 @@ mkdir -p "${BACKEND_DIR}"
 nnodes_list=(
   # 1 2 4 8
   # 4
-  2 4 8 16
+  # 2 4 8 16
+  16
   # 32
   # 64
 )

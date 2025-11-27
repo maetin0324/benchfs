@@ -92,7 +92,9 @@
       "Bash(break)",
       "Bash(./jobs/benchfs/benchfs.sh:*)",
       "Bash(python3:*)",
-      "Bash(source:*)"
+      "Bash(source:*)",
+      "Bash(git stash:*)",
+      "Bash(./benchfs-perf.sh:*)"
     ],
     "deny": [],
     "ask": []

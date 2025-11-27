@@ -18,6 +18,7 @@ PARAM_FILE=./jobs/benchfs/params/throughput.conf LABEL=throughput-test ./jobs/be
 |------|---------|-------------------|
 | `minimal.conf` | Quick sanity check | ~1 min |
 | `debug.conf` | Troubleshooting | ~30 sec |
+| `debug_large.conf` | Large-scale debugging | ~5 min |
 | `standard.conf` | Comprehensive benchmark | ~10-15 min |
 | `scalability.conf` | Scalability testing | ~20-30 min |
 | `throughput.conf` | Maximum throughput | ~5-10 min |

@@ -114,42 +114,59 @@ impl ReadChunkResponseHeader {
     }
 }
 
-/// ReadChunk RPC request
+/// ReadChunk RPC request with external buffer
 ///
-/// Path is now embedded in the header, so no separate data payload is needed for the request.
-pub struct ReadChunkRequest {
+/// This version takes an external buffer reference to receive data directly,
+/// avoiding an extra copy from internal Vec to user buffer.
+pub struct ReadChunkRequest<'a> {
     header: ReadChunkRequestHeader,
-    response_buffer: Vec<u8>,
+    /// External buffer to receive response data directly
+    response_buffer: &'a mut [u8],
     /// Cached IoSliceMut for response - lazily initialized on first call
     cached_response_ioslice: UnsafeCell<Option<IoSliceMut<'static>>>,
 }
 
 // SAFETY: ReadChunkRequest is Send because all its fields are Send
-unsafe impl Send for ReadChunkRequest {}
+unsafe impl<'a> Send for ReadChunkRequest<'a> {}
 
-impl ReadChunkRequest {
-    pub fn new(chunk_index: u64, offset: u64, length: u64, path: String) -> Self {
-        let response_buffer = vec![0u8; length as usize];
+impl<'a> ReadChunkRequest<'a> {
+    /// Create a new ReadChunkRequest with an external buffer
+    ///
+    /// The buffer must be at least `length` bytes long.
+    /// Data will be written directly to this buffer during the RPC call.
+    pub fn new(
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+        path: String,
+        buffer: &'a mut [u8],
+    ) -> Self {
+        debug_assert!(
+            buffer.len() >= length as usize,
+            "Buffer too small: {} < {}",
+            buffer.len(),
+            length
+        );
 
         Self {
             header: ReadChunkRequestHeader::new(chunk_index, offset, length, &path),
-            response_buffer,
+            response_buffer: buffer,
             cached_response_ioslice: UnsafeCell::new(None),
         }
     }
 
-    /// Get the data buffer after the RPC completes
-    pub fn take_data(mut self) -> Vec<u8> {
-        std::mem::take(&mut self.response_buffer)
-    }
-
     /// Get a reference to the data buffer
     pub fn data(&self) -> &[u8] {
-        &self.response_buffer
+        self.response_buffer
+    }
+
+    /// Get the length of data requested
+    pub fn requested_length(&self) -> usize {
+        self.header.length as usize
     }
 }
 
-impl AmRpc for ReadChunkRequest {
+impl<'a> AmRpc for ReadChunkRequest<'a> {
     type RequestHeader = ReadChunkRequestHeader;
     type ResponseHeader = ReadChunkResponseHeader;
 
@@ -873,14 +890,16 @@ mod tests {
 
     #[test]
     fn test_read_chunk_request() {
-        let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string());
+        let mut buffer = vec![0u8; 1024];
+        let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string(), &mut buffer);
         assert_eq!(request.header.chunk_index, 0);
         assert_eq!(request.header.length, 1024);
         assert_eq!(request.header.path_len, 14); // "/test/file.txt".len()
         assert_eq!(request.header.path().unwrap(), "/test/file.txt");
 
-        // Buffer should be allocated
+        // Buffer should be the external buffer
         assert_eq!(request.data().len(), 1024);
+        assert_eq!(request.requested_length(), 1024);
     }
 
     #[test]

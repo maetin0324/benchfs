@@ -78,7 +78,7 @@ impl RpcServer {
                 break;
             }
 
-            tracing::debug!("RpcServer: Waiting for message on RPC ID {}", Rpc::rpc_id());
+            tracing::trace!("RpcServer: Waiting for message on RPC ID {}", Rpc::rpc_id());
             let msg = stream.wait_msg().await;
             if msg.is_none() {
                 tracing::info!("RpcServer: Stream closed for RPC ID {}", Rpc::rpc_id());
@@ -88,22 +88,18 @@ impl RpcServer {
             let am_msg = msg
                 .ok_or_else(|| RpcError::TransportError("Failed to receive message".to_string()))?;
 
-            tracing::debug!(
-                "RpcServer: Received message on RPC ID {}, calling server_handler",
+            tracing::trace!(
+                "RpcServer: Received message on RPC ID {}, processing",
                 Rpc::rpc_id()
             );
 
-            let ctx_clone = ctx.clone();
-
-            // Call the unified server_handler with span for tracking
             let _handler_span =
                 tracing::debug_span!("rpc_server_handler", rpc_id = Rpc::rpc_id()).entered();
 
-            match Rpc::server_handler(ctx_clone, am_msg).await {
+            match Rpc::server_handler(ctx.clone(), am_msg).await {
                 Ok((_response, _am_msg)) => {
                     // Response was already sent within server_handler via reply_ep
-                    // reply_ep使用を回避するため、ここでは何もしない
-                    tracing::debug!(
+                    tracing::trace!(
                         "RPC handler completed successfully for RPC ID {} (response sent directly)",
                         Rpc::rpc_id()
                     );
@@ -113,8 +109,6 @@ impl RpcServer {
                     tracing::error!("Handler failed for RPC ID {}: {:?}", Rpc::rpc_id(), e);
                 }
             }
-
-            drop(_handler_span);
         }
 
         Ok(())
