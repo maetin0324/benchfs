@@ -326,13 +326,23 @@ echo "prepare ior output dir: ${IOR_OUTPUT_DIR}"
 mkdir -p "${IOR_OUTPUT_DIR}"
 
 save_job_metadata() {
+  local file_per_proc=0
+  [[ "$ior_flags" == *"-F"* ]] && file_per_proc=1
   cat <<EOS >"${JOB_OUTPUT_DIR}"/job_metadata_${runid}.json
 {
   "jobid": "$JOBID",
   "runid": ${runid},
+  "nnodes": ${NNODES},
+  "server_ppn": ${server_ppn},
+  "server_np": ${server_np},
+  "client_ppn": ${ppn},
+  "client_np": ${np},
+  "transfer_size": "${transfer_size}",
+  "block_size": "${block_size}",
   "benchfs_chunk_size": ${benchfs_chunk_size},
-  "job_start_time": "${JOB_START}",
-  "nnodes": ${NNODES}
+  "file_per_proc": ${file_per_proc},
+  "ior_flags": "${ior_flags}",
+  "job_start_time": "${JOB_START}"
 }
 EOS
 }
@@ -435,31 +445,56 @@ else
     transfer_size_list=(4m)
     block_size_list=(64m 256m 512m 1g)
     ppn_list=(1 2 4)
+    server_ppn_list=(1)
     ior_flags_list=("-w -r -F")
     benchfs_chunk_size_list=(4194304 16777216)
 fi
+
+# Default server_ppn_list if not defined in param file
+if [ -z "${server_ppn_list+x}" ]; then
+    server_ppn_list=(1)
+fi
+
+# Convert size string (e.g., 4m, 16m, 1g) to bytes
+parse_size_to_bytes() {
+    local size_str="${1,,}"  # Convert to lowercase
+    local number="${size_str%[kmgt]}"
+    local suffix="${size_str: -1}"
+
+    case "$suffix" in
+        k) echo $((number * 1024)) ;;
+        m) echo $((number * 1024 * 1024)) ;;
+        g) echo $((number * 1024 * 1024 * 1024)) ;;
+        t) echo $((number * 1024 * 1024 * 1024 * 1024)) ;;
+        [0-9]) echo "$size_str" ;;  # Already a number
+        *) echo "$size_str" ;;  # Return as-is if unknown
+    esac
+}
 
 # Save parameter configuration for reproducibility
 cat > "${JOB_OUTPUT_DIR}/parameters.json" <<EOF
 {
   "parameter_file": "$PARAM_FILE",
+  "nnodes": ${NNODES},
   "transfer_sizes": [$(printf '"%s",' "${transfer_size_list[@]}" | sed 's/,$//; s/,$//')],
   "block_sizes": [$(printf '"%s",' "${block_size_list[@]}" | sed 's/,$//; s/,$//')],
-  "ppn_values": [$(printf '%s,' "${ppn_list[@]}" | sed 's/,$//; s/,$//')],
+  "client_ppn_values": [$(printf '%s,' "${ppn_list[@]}" | sed 's/,$//; s/,$//')],
+  "server_ppn_values": [$(printf '%s,' "${server_ppn_list[@]}" | sed 's/,$//; s/,$//')],
   "ior_flags": [$(printf '"%s",' "${ior_flags_list[@]}" | sed 's/,$//; s/,$//')],
   "chunk_sizes": [$(printf '%s,' "${benchfs_chunk_size_list[@]}" | sed 's/,$//; s/,$//')]
 }
 EOF
 
 check_server_ready() {
+  local expected_count=$1
   local max_attempts=60
   local attempt=0
 
   while [ $attempt -lt $max_attempts ]; do
     local ready_count=$(find "${BENCHFS_REGISTRY_DIR}" -name "node_*.addr" -type f 2>/dev/null | wc -l)
 
-    if [ "$ready_count" -eq "$NNODES" ]; then
-      echo "BenchFS servers registered: $ready_count/$NNODES nodes"
+    if [ "$ready_count" -eq "$expected_count" ]; then
+      echo "BenchFS servers registered: $ready_count/$expected_count processes"
 
       # Additional wait for RPC handler initialization
       # All nodes have registered, but their RPC handlers may still be initializing
@@ -472,7 +507,7 @@ check_server_ready() {
       return 0
     fi
 
-    echo "Waiting for BenchFS servers: $ready_count/$NNODES nodes (attempt $((attempt+1))/$max_attempts)"
+    echo "Waiting for BenchFS servers: $ready_count/$expected_count processes (attempt $((attempt+1))/$max_attempts)"
     sleep 1
     attempt=$((attempt + 1))
   done
@@ -482,20 +517,28 @@ check_server_ready() {
 }
 
 runid=0
-for benchfs_chunk_size in "${benchfs_chunk_size_list[@]}"; do
-  for ppn in "${ppn_list[@]}"; do
-    np=$((NNODES * ppn))
+for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
+  # Convert chunk size string to bytes
+  benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
 
-    for transfer_size in "${transfer_size_list[@]}"; do
-      for block_size in "${block_size_list[@]}"; do
-        for ior_flags in "${ior_flags_list[@]}"; do
-          echo "=========================================="
-          echo "Run ID: $runid"
-          echo "Nodes: $NNODES, PPN: $ppn, NP: $np"
-          echo "Transfer size: $transfer_size, Block size: $block_size"
-          echo "IOR flags: $ior_flags"
-          echo "BenchFS chunk size: $benchfs_chunk_size bytes"
-          echo "=========================================="
+  for server_ppn in "${server_ppn_list[@]}"; do
+    server_np=$((NNODES * server_ppn))
+
+    for ppn in "${ppn_list[@]}"; do
+      np=$((NNODES * ppn))
+
+      for transfer_size in "${transfer_size_list[@]}"; do
+        for block_size in "${block_size_list[@]}"; do
+          for ior_flags in "${ior_flags_list[@]}"; do
+            echo "=========================================="
+            echo "Run ID: $runid"
+            echo "Nodes: $NNODES"
+            echo "Server: PPN=$server_ppn, NP=$server_np"
+            echo "Client: PPN=$ppn, NP=$np"
+            echo "Transfer size: $transfer_size, Block size: $block_size"
+            echo "IOR flags: $ior_flags"
+            echo "BenchFS chunk size: $benchfs_chunk_size_str ($benchfs_chunk_size bytes)"
+            echo "=========================================="
 
           # Clean up previous run
           rm -rf "${BENCHFS_REGISTRY_DIR}"/*
@@ -562,25 +605,25 @@ EOF
           ls -la "${config_file}" || echo "WARNING: Config file not found"
           ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "WARNING: Binary not found"
 
-          cmd_benchfsd=(
-            "${cmd_mpirun_common[@]}"
-            -np "$NNODES"
-            --bind-to none
-            -map-by ppr:1:node
-            -x RUST_LOG
-            -x RUST_BACKTRACE
-            # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
-            "${BENCHFS_PREFIX}/benchfsd_mpi"
-            "${BENCHFS_REGISTRY_DIR}"
-            "${config_file}"
-          )
+            cmd_benchfsd=(
+              "${cmd_mpirun_common[@]}"
+              -np "$server_np"
+              --bind-to none
+              -map-by "ppr:${server_ppn}:node"
+              -x RUST_LOG
+              -x RUST_BACKTRACE
+              # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
+              "${BENCHFS_PREFIX}/benchfsd_mpi"
+              "${BENCHFS_REGISTRY_DIR}"
+              "${config_file}"
+            )
 
-          echo "${cmd_benchfsd[@]}"
-          "${cmd_benchfsd[@]}" > "${run_log_dir}/benchfsd_stdout.log" 2> "${run_log_dir}/benchfsd_stderr.log" &
-          BENCHFSD_PID=$!
+            echo "${cmd_benchfsd[@]}"
+            "${cmd_benchfsd[@]}" > "${run_log_dir}/benchfsd_stdout.log" 2> "${run_log_dir}/benchfsd_stderr.log" &
+            BENCHFSD_PID=$!
 
-          # Wait for servers to be ready
-          if ! check_server_ready; then
+            # Wait for servers to be ready
+            if ! check_server_ready "$server_np"; then
             echo "ERROR: BenchFS servers failed to start"
             echo "=========================================="
             echo "BenchFS Server STDOUT:"
@@ -679,7 +722,8 @@ EOF
           # Wait for cleanup and FD release
           sleep 3
 
-          runid=$((runid + 1))
+            runid=$((runid + 1))
+          done
         done
       done
     done

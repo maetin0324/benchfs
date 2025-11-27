@@ -460,6 +460,22 @@ if [ -z "${server_ppn_list+x}" ]; then
     server_ppn_list=(1)
 fi
 
+# Convert size string (e.g., 4m, 16m, 1g) to bytes
+parse_size_to_bytes() {
+    local size_str="${1,,}"  # Convert to lowercase
+    local number="${size_str%[kmgt]}"
+    local suffix="${size_str: -1}"
+
+    case "$suffix" in
+        k) echo $((number * 1024)) ;;
+        m) echo $((number * 1024 * 1024)) ;;
+        g) echo $((number * 1024 * 1024 * 1024)) ;;
+        t) echo $((number * 1024 * 1024 * 1024 * 1024)) ;;
+        [0-9]) echo "$size_str" ;;  # Already a number
+        *) echo "$size_str" ;;  # Return as-is if unknown
+    esac
+}
+
 # Save parameter configuration for reproducibility
 cat > "${JOB_OUTPUT_DIR}/parameters.json" <<EOF
 {
@@ -506,7 +522,10 @@ check_server_ready() {
 }
 
 runid=0
-for benchfs_chunk_size in "${benchfs_chunk_size_list[@]}"; do
+for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
+  # Convert chunk size string to bytes
+  benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
+
   for server_ppn in "${server_ppn_list[@]}"; do
     server_np=$((NNODES * server_ppn))
 
@@ -523,7 +542,7 @@ for benchfs_chunk_size in "${benchfs_chunk_size_list[@]}"; do
             echo "Client: PPN=$ppn, NP=$np"
             echo "Transfer size: $transfer_size, Block size: $block_size"
           echo "IOR flags: $ior_flags"
-          echo "BenchFS chunk size: $benchfs_chunk_size bytes"
+          echo "BenchFS chunk size: $benchfs_chunk_size_str ($benchfs_chunk_size bytes)"
           echo "=========================================="
 
           # Clean up previous run
