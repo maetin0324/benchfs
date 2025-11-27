@@ -8,6 +8,9 @@ Cargo.lock
 *.so
 *.dylib
 
+# virtual environments
+.venv/
+
 # Backend/data directories
 backend/
 data/

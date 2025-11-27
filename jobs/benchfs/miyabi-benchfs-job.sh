@@ -650,19 +650,34 @@ EOF
             > "${ior_stdout_file}" \
             2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || true
 
-          # Stop BenchFS servers
+          # Stop BenchFS servers gracefully
+          # Using SIGTERM first allows graceful shutdown, then SIGKILL as fallback
+          # This prevents MPI from reporting killed processes as errors
           echo "Stopping BenchFS servers..."
+
+          # First, try graceful shutdown with SIGTERM via mpirun
+          # This ensures all nodes receive the signal properly
+          "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
+            pkill -TERM benchfsd_mpi 2>/dev/null || true
+
+          # Wait for graceful shutdown (benchfsd handles SIGTERM)
+          sleep 3
+
+          # Kill the mpirun process that launched benchfsd
           kill $BENCHFSD_PID 2>/dev/null || true
           wait $BENCHFSD_PID 2>/dev/null || true
 
-          # Force cleanup of any orphaned processes
-          # This is critical when running with high ppn values to prevent
-          # resource exhaustion across multiple benchmark runs
+          # Force cleanup of any orphaned processes with SIGKILL
+          # Only use this as a last resort after graceful shutdown attempt
           echo "Force cleanup of orphaned processes..."
-          pkill -9 benchfsd_mpi || true
+          "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
+            pkill -9 benchfsd_mpi 2>/dev/null || true
+
+          # Also clean up local processes (for any edge cases)
+          pkill -9 benchfsd_mpi 2>/dev/null || true
 
           # Wait for cleanup and FD release
-          sleep 5
+          sleep 3
 
           runid=$((runid + 1))
         done

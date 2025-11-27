@@ -5,3 +5,4 @@ plot.egg-info/SOURCES.txt
 plot.egg-info/dependency_links.txt
 plot.egg-info/requires.txt
 plot.egg-info/top_level.txt
+plot/bin/activate_this.py
