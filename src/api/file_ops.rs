@@ -577,7 +577,6 @@ impl BenchFS {
         let chunk_futures: Vec<_> = chunk_infos
             .into_iter()
             .map(|(chunk_index, chunk_offset, read_size, buf_offset)| {
-                let chunk_id = ChunkId::from_path(&file_path, chunk_index);
                 let file_path = file_path.clone();
 
                 spawn_with_name(
@@ -590,16 +589,8 @@ impl BenchFS {
                             std::slice::from_raw_parts_mut(buf_ptr.add(buf_offset), end - buf_offset)
                         };
 
-                        // Cache is only useful for full chunk reads at offset 0
-                        // For partial reads, skip cache lookup
-                        if chunk_offset == 0 && read_size == fs.chunk_manager.chunk_size() as u64 {
-                            if let Some(cached_chunk) = fs.chunk_cache.get(&chunk_id) {
-                                tracing::trace!("Cache hit for chunk {}", chunk_index);
-                                let copy_len = cached_chunk.len().min(chunk_buf.len());
-                                chunk_buf[..copy_len].copy_from_slice(&cached_chunk[..copy_len]);
-                                return (chunk_index, Ok::<usize, ()>(copy_len));
-                            }
-                        }
+                        // NOTE: Chunk cache disabled for read operations to ensure consistency
+                        // in distributed environments where other nodes may modify the same data.
 
                         tracing::trace!(
                             "Reading chunk {} (offset={}, size={}, buf_offset={})",
@@ -616,16 +607,10 @@ impl BenchFS {
                             .await
                         {
                             Ok(chunk_data) => {
-                                // Only cache full chunk reads
-                                if chunk_offset == 0
-                                    && read_size == fs.chunk_manager.chunk_size() as u64
-                                {
-                                    fs.chunk_cache.put(chunk_id, chunk_data.clone());
-                                }
-                                // Copy to user buffer
+                                // Copy to user buffer (no caching for consistency)
                                 let copy_len = chunk_data.len().min(chunk_buf.len());
                                 chunk_buf[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
-                                (chunk_index, Ok(copy_len))
+                                (chunk_index, Ok::<usize, ()>(copy_len))
                             }
                             Err(_) => {
                                 if let Some(pool) = &fs.connection_pool {

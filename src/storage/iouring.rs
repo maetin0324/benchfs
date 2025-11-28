@@ -56,11 +56,15 @@ impl IOUringBackend {
             .truncate(flags.truncate)
             .append(flags.append);
 
-        // O_DIRECTはアライメント要件が厳しいため、テストでは無効化
-        // 本番環境では有効化を検討
-        // if flags.direct {
-        //     opts.custom_flags(libc::O_DIRECT);
-        // }
+        // O_DIRECTを有効化してOSページキャッシュをバイパス
+        // アライメント要件: バッファ、オフセット、サイズが512バイト境界
+        if flags.direct {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_DIRECT);
+            }
+        }
 
         opts
     }

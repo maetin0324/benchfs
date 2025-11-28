@@ -670,7 +670,7 @@ impl IOUringChunkStore {
         self.ensure_path_dir(file_path)?;
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
-        // Open or create the file
+        // Open or create the file with O_DIRECT to bypass OS page cache
         let flags = if write {
             OpenFlags {
                 read: true,
@@ -678,10 +678,10 @@ impl IOUringChunkStore {
                 create: true,
                 truncate: false,
                 append: false,
-                direct: false,
+                direct: true,
             }
         } else {
-            OpenFlags::read_only()
+            OpenFlags::read_only().with_direct()
         };
 
         let handle = self.backend.open(&chunk_file_path, flags).await?;
