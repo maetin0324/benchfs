@@ -1,45 +1,60 @@
-use super::{VIRTUAL_NODES_PER_NODE, XXHASH_SEED};
 use crate::metadata::types::NodeId;
-use std::collections::BTreeMap;
-use xxhash_rust::xxh64::xxh64;
 
-/// ハッシュリング上の位置
-type RingPosition = u64;
-
-/// Consistent Hashingリング
+/// koyama_hash: ファイル名ベースの単純ハッシュ関数
 ///
-/// 仮想ノードを使用してノード間でデータを均等に分散する。
-/// xxHash64を使用してファイルパスをハッシュ化し、対応するノードを決定する。
+/// 文字列を走査し、数字の連続は数値として解釈して加算、
+/// それ以外の文字はASCII値として加算する。
+///
+/// # Arguments
+/// * `data` - ハッシュ対象のバイト列
+///
+/// # Returns
+/// 32ビットのハッシュ値
+pub fn koyama_hash(data: &[u8]) -> u32 {
+    let mut digest: u32 = 0;
+    let mut i = 0;
+
+    while i < data.len() {
+        let b = data[i];
+        if b.is_ascii_digit() {
+            // 数字の連続を数値として解釈
+            let mut num: u32 = 0;
+            while i < data.len() && data[i].is_ascii_digit() {
+                num = num.wrapping_mul(10).wrapping_add((data[i] - b'0') as u32);
+                i += 1;
+            }
+            digest = digest.wrapping_add(num);
+        } else {
+            // 数字以外はASCII値を加算
+            digest = digest.wrapping_add(b as u32);
+            i += 1;
+        }
+    }
+
+    digest
+}
+
+/// ファイル配置用ハッシュリング
+///
+/// koyama_hashを使用してファイル名をハッシュ化し、
+/// モジュロ演算で対応するノードを決定する。
 pub struct ConsistentHashRing {
-    /// リング上の位置 -> ノードID のマッピング
-    /// BTreeMapを使用して、範囲検索を効率的に行う
-    ring: BTreeMap<RingPosition, NodeId>,
-
-    /// 物理ノードIDのリスト (追加順)
+    /// 物理ノードIDのリスト (追加順 = ノード番号順)
     nodes: Vec<NodeId>,
-
-    /// ノードあたりの仮想ノード数
-    virtual_nodes_per_node: usize,
 }
 
 impl ConsistentHashRing {
     /// 新しい空のハッシュリングを作成
     pub fn new() -> Self {
-        Self::with_virtual_nodes(VIRTUAL_NODES_PER_NODE)
+        Self { nodes: Vec::new() }
     }
 
-    /// 仮想ノード数を指定してハッシュリングを作成
-    pub fn with_virtual_nodes(virtual_nodes_per_node: usize) -> Self {
-        Self {
-            ring: BTreeMap::new(),
-            nodes: Vec::new(),
-            virtual_nodes_per_node,
-        }
+    /// 仮想ノード数を指定してハッシュリングを作成 (互換性のため残す)
+    pub fn with_virtual_nodes(_virtual_nodes_per_node: usize) -> Self {
+        Self::new()
     }
 
     /// ノードをリングに追加
-    ///
-    /// 指定されたノードIDに対して、仮想ノードを作成しリングに配置する。
     ///
     /// # Arguments
     /// * `node_id` - 追加するノードID
@@ -52,17 +67,10 @@ impl ConsistentHashRing {
 
         self.nodes.push(node_id.clone());
 
-        // 仮想ノードを作成してリングに配置
-        for i in 0..self.virtual_nodes_per_node {
-            let virtual_node_key = format!("{}:{}", node_id, i);
-            let position = xxh64(virtual_node_key.as_bytes(), XXHASH_SEED);
-            self.ring.insert(position, node_id.clone());
-        }
-
         tracing::debug!(
-            "Added node {} with {} virtual nodes",
+            "Added node {} (total nodes: {})",
             node_id,
-            self.virtual_nodes_per_node
+            self.nodes.len()
         );
     }
 
@@ -74,17 +82,8 @@ impl ConsistentHashRing {
     /// # Returns
     /// ノードが存在して削除された場合は `true`、存在しなかった場合は `false`
     pub fn remove_node(&mut self, node_id: &NodeId) -> bool {
-        // ノードリストから削除
         if let Some(pos) = self.nodes.iter().position(|id| id == node_id) {
             self.nodes.remove(pos);
-
-            // 仮想ノードをリングから削除
-            for i in 0..self.virtual_nodes_per_node {
-                let virtual_node_key = format!("{}:{}", node_id, i);
-                let position = xxh64(virtual_node_key.as_bytes(), XXHASH_SEED);
-                self.ring.remove(&position);
-            }
-
             tracing::debug!("Removed node {} from the ring", node_id);
             true
         } else {
@@ -95,7 +94,7 @@ impl ConsistentHashRing {
 
     /// 指定されたキーに対応するノードを取得
     ///
-    /// キーをハッシュ化し、リング上で時計回りに最も近い仮想ノードを見つける。
+    /// ファイル名をkoyama_hashでハッシュ化し、モジュロ演算でノードを選択する。
     ///
     /// # Arguments
     /// * `key` - 検索するキー (通常はファイルパス)
@@ -103,22 +102,14 @@ impl ConsistentHashRing {
     /// # Returns
     /// 対応するノードID。リングが空の場合は `None`
     pub fn get_node(&self, key: &str) -> Option<NodeId> {
-        if self.ring.is_empty() {
+        if self.nodes.is_empty() {
             return None;
         }
 
-        let hash = xxh64(key.as_bytes(), XXHASH_SEED);
+        let hash = koyama_hash(key.as_bytes());
+        let index = (hash as usize) % self.nodes.len();
 
-        // hash以上の最小のキーを探す
-        if let Some((&_position, node_id)) = self.ring.range(hash..).next() {
-            return Some(node_id.clone());
-        }
-
-        // 見つからない場合は、リングの先頭 (最小値) に戻る
-        self.ring
-            .iter()
-            .next()
-            .map(|(_pos, node_id)| node_id.clone())
+        Some(self.nodes[index].clone())
     }
 
     /// 指定されたキーに対応する複数のノードを取得 (レプリケーション用)
@@ -130,34 +121,18 @@ impl ConsistentHashRing {
     /// # Returns
     /// 対応するノードIDのベクター (重複なし)
     pub fn get_nodes(&self, key: &str, count: usize) -> Vec<NodeId> {
-        if self.ring.is_empty() || count == 0 {
+        if self.nodes.is_empty() || count == 0 {
             return Vec::new();
         }
 
-        let hash = xxh64(key.as_bytes(), XXHASH_SEED);
-        let mut result = Vec::with_capacity(count);
-        let mut seen = std::collections::HashSet::new();
+        let hash = koyama_hash(key.as_bytes());
+        let start_index = (hash as usize) % self.nodes.len();
+        let actual_count = count.min(self.nodes.len());
 
-        // hash以降のノードを収集
-        for (_position, node_id) in self.ring.range(hash..) {
-            if !seen.contains(node_id) {
-                seen.insert(node_id.clone());
-                result.push(node_id.clone());
-                if result.len() >= count {
-                    return result;
-                }
-            }
-        }
-
-        // 足りない場合は、リングの先頭から追加
-        for (_position, node_id) in self.ring.iter() {
-            if !seen.contains(node_id) {
-                seen.insert(node_id.clone());
-                result.push(node_id.clone());
-                if result.len() >= count {
-                    return result;
-                }
-            }
+        let mut result = Vec::with_capacity(actual_count);
+        for i in 0..actual_count {
+            let index = (start_index + i) % self.nodes.len();
+            result.push(self.nodes[index].clone());
         }
 
         result
@@ -173,9 +148,9 @@ impl ConsistentHashRing {
         &self.nodes
     }
 
-    /// 仮想ノード数を取得
+    /// 仮想ノード数を取得 (互換性のため残す、実際はノード数と同じ)
     pub fn virtual_node_count(&self) -> usize {
-        self.ring.len()
+        self.nodes.len()
     }
 }
 
@@ -190,20 +165,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_koyama_hash() {
+        // Cコードのテストケースと同じ結果を確認
+        // test("a", 1) => 'a' = 97
+        assert_eq!(koyama_hash(b"a"), 97);
+
+        // test("abc", 3) => 'a' + 'b' + 'c' = 97 + 98 + 99 = 294
+        assert_eq!(koyama_hash(b"abc"), 294);
+
+        // test("abc123", 6) => 97 + 98 + 99 + 123 = 417
+        assert_eq!(koyama_hash(b"abc123"), 417);
+
+        // test("abc12300", 8) => 97 + 98 + 99 + 12300 = 12594
+        assert_eq!(koyama_hash(b"abc12300"), 12594);
+
+        // test("abc12300a10", 11) => 97 + 98 + 99 + 12300 + 97 + 10 = 12701
+        assert_eq!(koyama_hash(b"abc12300a10"), 12701);
+    }
+
+    #[test]
     fn test_add_remove_node() {
         let mut ring = ConsistentHashRing::new();
 
         ring.add_node("node1".to_string());
         assert_eq!(ring.node_count(), 1);
-        assert_eq!(ring.virtual_node_count(), VIRTUAL_NODES_PER_NODE);
 
         ring.add_node("node2".to_string());
         assert_eq!(ring.node_count(), 2);
-        assert_eq!(ring.virtual_node_count(), VIRTUAL_NODES_PER_NODE * 2);
 
         assert!(ring.remove_node(&"node1".to_string()));
         assert_eq!(ring.node_count(), 1);
-        assert_eq!(ring.virtual_node_count(), VIRTUAL_NODES_PER_NODE);
 
         assert!(!ring.remove_node(&"node999".to_string())); // 存在しないノード
     }
@@ -254,6 +245,33 @@ mod tests {
     }
 
     #[test]
+    fn test_modulo_distribution() {
+        let mut ring = ConsistentHashRing::new();
+
+        ring.add_node("node_0".to_string());
+        ring.add_node("node_1".to_string());
+        ring.add_node("node_2".to_string());
+
+        // koyama_hashはファイル名の数字を数値として解釈するため、
+        // /file/0, /file/1, /file/2 は異なるノードに配置される
+        let node0 = ring.get_node("/file/0").unwrap();
+        let node1 = ring.get_node("/file/1").unwrap();
+        let node2 = ring.get_node("/file/2").unwrap();
+
+        // hash("/file/0") = '/' + 'f' + 'i' + 'l' + 'e' + '/' + 0 = 47+102+105+108+101+47+0 = 510
+        // 510 % 3 = 0 => node_0
+        assert_eq!(node0, "node_0");
+
+        // hash("/file/1") = 510 + 1 = 511
+        // 511 % 3 = 1 => node_1
+        assert_eq!(node1, "node_1");
+
+        // hash("/file/2") = 510 + 2 = 512
+        // 512 % 3 = 2 => node_2
+        assert_eq!(node2, "node_2");
+    }
+
+    #[test]
     fn test_node_distribution() {
         let mut ring = ConsistentHashRing::new();
 
@@ -270,19 +288,17 @@ mod tests {
             }
         }
 
-        // 各ノードが少なくとも100個以上のキーを担当していることを確認
-        // (完全に均等ではないが、合理的な分散)
+        // koyama_hashのモジュロ分散では、連続する数字が連続するノードに配置される
+        // そのため、ほぼ均等に分散される
         for node_id in ring.nodes() {
             let count = distribution.get(node_id).unwrap_or(&0);
             assert!(
-                *count > 100,
-                "Node {} has only {} keys (expected > 100)",
+                *count > 200,
+                "Node {} has only {} keys (expected > 200)",
                 node_id,
                 count
             );
         }
-
-        tracing::info!("Distribution: {:?}", distribution);
     }
 
     #[test]

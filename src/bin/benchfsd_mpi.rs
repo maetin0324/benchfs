@@ -225,11 +225,12 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         // Buffer size must be at least as large as the maximum transfer size used by IOR
         // IOR typically uses 2MB-4MB transfer sizes, so we use 4MB to be safe
         // Optimized parameters for high-throughput workloads:
-        // - queue_size: 2048 (moderate to avoid excessive memory usage)
+        // - queue_size: 256 (reduced from 2048 to support high ppn configurations)
+        //   With 16 processes per node: 256 * 4MiB * 16 = 16 GiB (manageable)
         // - submit_depth: 128 (up from 64) for better batching and throughput
         // - Aggressive timeouts (1μs) to minimize latency in polling mode
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(2048)
+            .queue_size(256)
             .buffer_size(4 << 20) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
             .submit_depth(128)
             .wait_submit_timeout(std::time::Duration::from_micros(1))

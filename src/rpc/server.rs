@@ -98,8 +98,9 @@ impl RpcServer {
             // the current request is being processed (storage I/O + network send)
             let ctx_clone = ctx.clone();
             pluvio_runtime::spawn(async move {
+                // Use trace_span to avoid excessive logging at debug level
                 let _handler_span =
-                    tracing::debug_span!("rpc_server_handler", rpc_id = Rpc::rpc_id()).entered();
+                    tracing::trace_span!("rpc_server_handler", rpc_id = Rpc::rpc_id()).entered();
 
                 match Rpc::server_handler(ctx_clone, am_msg).await {
                     Ok((_response, _am_msg)) => {

@@ -275,7 +275,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
         let (response_header, response_data, fixed_buffer_opt) = if let Some(io_uring_store) =
             chunk_store_any.downcast_ref::<IOUringChunkStore>()
         {
-            tracing::debug!("Using zero-copy path for ReadChunk");
+            tracing::trace!("Using zero-copy path for ReadChunk");
 
             // Acquire a registered buffer from the allocator
             let fixed_buffer = ctx.allocator.acquire().await;
@@ -289,7 +289,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
             {
                 Ok((bytes_read, fixed_buffer)) => {
                     let actual_bytes = bytes_read.min(read_len);
-                    tracing::debug!(
+                    tracing::trace!(
                         "Read {} bytes (zero-copy) from storage (path={}, chunk={})",
                         actual_bytes,
                         path,
@@ -308,7 +308,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
             }
         } else {
             // Fallback path: Use Vec<u8> for non-IOUring backends
-            tracing::debug!(
+            tracing::trace!(
                 "Using fallback path for ReadChunk (chunk_store is not IOUringChunkStore)"
             );
 
@@ -656,7 +656,7 @@ impl AmRpc for WriteChunkRequest<'_> {
         let response_header = if let Some(io_uring_store) =
             chunk_store_any.downcast_ref::<IOUringChunkStore>()
         {
-            tracing::debug!("Using zero-copy path for WriteChunk");
+            tracing::trace!("Using zero-copy path for WriteChunk");
 
             // Extract path from header
             let path = match header.path() {
@@ -684,7 +684,7 @@ impl AmRpc for WriteChunkRequest<'_> {
             } else {
                 let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
-                tracing::debug!(
+                tracing::trace!(
                     "WriteChunk: receiving data - data_len={}",
                     data_len
                 );
@@ -703,7 +703,7 @@ impl AmRpc for WriteChunkRequest<'_> {
                 } else {
                     tracing::trace!("WriteChunk: recv_data_single completed (zero-copy)");
 
-                    tracing::debug!(
+                    tracing::trace!(
                         "WriteChunk request (zero-copy): path={}, chunk={}, offset={}, length={}",
                         path,
                         header.chunk_index,
@@ -723,7 +723,7 @@ impl AmRpc for WriteChunkRequest<'_> {
                         .await
                     {
                         Ok(bytes_written) => {
-                            tracing::debug!(
+                            tracing::trace!(
                                 "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
                                 bytes_written,
                                 path,
@@ -740,7 +740,7 @@ impl AmRpc for WriteChunkRequest<'_> {
             }
         } else {
             // Fallback path: Use Vec<u8> for non-IOUring backends
-            tracing::debug!(
+            tracing::trace!(
                 "Using fallback path for WriteChunk (chunk_store is not IOUringChunkStore)"
             );
 
@@ -766,7 +766,7 @@ impl AmRpc for WriteChunkRequest<'_> {
                 tracing::error!("Failed to receive data: {:?}", e);
                 WriteChunkResponseHeader::error(-5)
             } else {
-                tracing::debug!(
+                tracing::trace!(
                     "WriteChunk request: path={}, chunk={}, offset={}, length={}",
                     path,
                     header.chunk_index,
@@ -780,7 +780,7 @@ impl AmRpc for WriteChunkRequest<'_> {
                     .await
                 {
                     Ok(_bytes_written) => {
-                        tracing::debug!(
+                        tracing::trace!(
                             "Wrote {} bytes to storage (path={}, chunk={})",
                             data.len(),
                             path,

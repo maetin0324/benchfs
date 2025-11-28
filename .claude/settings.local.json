@@ -94,7 +94,8 @@
       "Bash(python3:*)",
       "Bash(source:*)",
       "Bash(git stash:*)",
-      "Bash(./benchfs-perf.sh:*)"
+      "Bash(./benchfs-perf.sh:*)",
+      "Bash(git submodule:*)"
     ],
     "deny": [],
     "ask": []
