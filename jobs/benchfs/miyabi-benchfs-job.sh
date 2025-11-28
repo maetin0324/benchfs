@@ -10,15 +10,19 @@ cleanup_exported_bash_functions() {
   # PBS -V exports bash functions (module/ml) as environment variables.
   # Open MPI spawns /bin/sh on remote nodes, which fails to import them and
   # causes launches like the one in miyabi-benchfs-job.sh.e1074667 to abort.
-  local entry var_name func_name
-  while IFS= read -r -d '' entry; do
-    var_name=${entry%%=*}
-    [[ "${var_name}" == BASH_FUNC_*%% ]] || continue
-    func_name=${var_name#BASH_FUNC_}
-    func_name=${func_name%%%}
-    unset -f "${func_name}" 2>/dev/null || true
-    unset "${var_name}" 2>/dev/null || true
-  done < <(env -0)
+
+  # Explicitly unset known problematic functions
+  unset -f module ml 2>/dev/null || true
+
+  # Remove BASH_FUNC_* environment variables
+  while IFS= read -r var_name; do
+    [[ -n "$var_name" ]] && unset "$var_name" 2>/dev/null || true
+  done < <(env | grep -oE '^BASH_FUNC_[^=]+' || true)
+
+  # Also try the %% suffix format used by some bash versions
+  while IFS= read -r var_name; do
+    [[ -n "$var_name" ]] && unset "$var_name" 2>/dev/null || true
+  done < <(compgen -e | grep '^BASH_FUNC_' || true)
 }
 
 # Increase file descriptor limit for large-scale MPI jobs
@@ -426,6 +430,17 @@ fi
 
 # NOTE: UCX_* 環境変数をコメントアウトしたため、-x UCX_* オプションも削除
 # remote_io_benchプロジェクトでも同様の現象が発生し、UCX_*をコメントアウトしたところ動いた
+
+# Re-run cleanup to ensure bash functions are not passed to mpirun
+cleanup_exported_bash_functions
+# Prevent bash from reading startup files on remote nodes
+# Unset both the function and the environment variable (various naming formats)
+unset -f module ml 2>/dev/null || true
+unset BASH_ENV 2>/dev/null || true
+unset 'BASH_FUNC_module%%' 'BASH_FUNC_ml%%' 2>/dev/null || true
+unset 'BASH_FUNC_module' 'BASH_FUNC_ml' 2>/dev/null || true
+export BASH_ENV=
+
 if [[ "${USE_UCX_PML}" -eq 1 ]]; then
   cmd_mpirun_common=(
     mpirun
