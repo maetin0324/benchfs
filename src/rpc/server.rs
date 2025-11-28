@@ -93,22 +93,28 @@ impl RpcServer {
                 Rpc::rpc_id()
             );
 
-            let _handler_span =
-                tracing::debug_span!("rpc_server_handler", rpc_id = Rpc::rpc_id()).entered();
+            // Spawn handler as separate task to enable parallel request processing
+            // This allows the server to immediately accept the next request while
+            // the current request is being processed (storage I/O + network send)
+            let ctx_clone = ctx.clone();
+            pluvio_runtime::spawn(async move {
+                let _handler_span =
+                    tracing::debug_span!("rpc_server_handler", rpc_id = Rpc::rpc_id()).entered();
 
-            match Rpc::server_handler(ctx.clone(), am_msg).await {
-                Ok((_response, _am_msg)) => {
-                    // Response was already sent within server_handler via reply_ep
-                    tracing::trace!(
-                        "RPC handler completed successfully for RPC ID {} (response sent directly)",
-                        Rpc::rpc_id()
-                    );
+                match Rpc::server_handler(ctx_clone, am_msg).await {
+                    Ok((_response, _am_msg)) => {
+                        // Response was already sent within server_handler via reply_ep
+                        tracing::trace!(
+                            "RPC handler completed successfully for RPC ID {} (response sent directly)",
+                            Rpc::rpc_id()
+                        );
+                    }
+                    Err((e, _am_msg)) => {
+                        // エラーレスポンスもserver_handler内で送信済み（またはハンドラーがエラーを返した）
+                        tracing::error!("Handler failed for RPC ID {}: {:?}", Rpc::rpc_id(), e);
+                    }
                 }
-                Err((e, _am_msg)) => {
-                    // エラーレスポンスもserver_handler内で送信済み（またはハンドラーがエラーを返した）
-                    tracing::error!("Handler failed for RPC ID {}: {:?}", Rpc::rpc_id(), e);
-                }
-            }
+            });
         }
 
         Ok(())
