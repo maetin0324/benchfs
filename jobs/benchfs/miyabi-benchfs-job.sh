@@ -41,7 +41,9 @@ unset OMPI_MCA_mca_base_env_list
 SCRIPT_DIR="/work/xg24i002/x10043/workspace/rust/benchfs/jobs/benchfs"
 JOB_FILE="/work/xg24i002/x10043/workspace/rust/benchfs/jobs/benchfs/miyabi-benchfs-job.sh"
 PROJECT_ROOT="/work/xg24i002/x10043/workspace/rust/benchfs"
-OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${PBS_JOBID}"
+# OUTPUT_DIR is exported from miyabi-benchfs.sh via -V
+# Use the exported value to keep stdout files and results in the same directory
+: ${OUTPUT_DIR:="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${PBS_JOBID}"}
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
 BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
@@ -59,12 +61,13 @@ source "$SCRIPT_DIR/common.sh"
 # exec 2> >(addtimestamp >&2)
 
 JOB_START=$(timestamp)
-NNODES=$(wc --lines "${PBS_NODEFILE}" | awk '{print $1}')
-JOBID=$(echo "$PBS_JOBID" | cut -d : -f 2)
-JOB_OUTPUT_DIR="${OUTPUT_DIR}/${JOB_START}-${PBS_JOBID}-${MPI_PROC}"
+NNODES=$(cat "${PBS_NODEFILE}" | sort -u | wc -l)
+JOBID=$(echo "$PBS_JOBID" | cut -d . -f 1)
+JOB_OUTPUT_DIR="${OUTPUT_DIR}/${JOB_START}-${JOBID}"
 JOB_BACKEND_DIR="${BACKEND_DIR}/$(basename -- "${JOB_OUTPUT_DIR}")"
 BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
-BENCHFS_DATA_DIR="/local"
+# Use job-specific subdirectory under /local to avoid permission errors
+BENCHFS_DATA_DIR="/local/benchfs_${JOBID}"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 
@@ -346,8 +349,8 @@ echo ""
 
 echo "prepare backend dir: ${JOB_BACKEND_DIR}"
 mkdir -p "${JOB_BACKEND_DIR}"
-trap 'rm -rf "${JOB_BACKEND_DIR}" ; exit 1' 1 2 3 15
-trap 'rm -rf "${JOB_BACKEND_DIR}" ; exit 0' EXIT
+trap 'rm -rf "${JOB_BACKEND_DIR}" "${BENCHFS_DATA_DIR}" ; exit 1' 1 2 3 15
+trap 'rm -rf "${JOB_BACKEND_DIR}" "${BENCHFS_DATA_DIR}" ; exit 0' EXIT
 
 echo "prepare benchfs registry dir: ${BENCHFS_REGISTRY_DIR}"
 mkdir -p "${BENCHFS_REGISTRY_DIR}"
