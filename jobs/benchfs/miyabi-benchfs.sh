@@ -15,6 +15,9 @@ BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
 BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
+# Resolve PARAM_FILE to absolute path BEFORE cd (relative paths won't work after cd)
+PARAM_FILE="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}")"
+
 export JOB_FILE
 export PROJECT_ROOT
 export OUTPUT_DIR
@@ -22,6 +25,7 @@ export BACKEND_DIR
 export BENCHFS_PREFIX
 export IOR_PREFIX
 export TIMESTAMP
+export PARAM_FILE
 
 # Debug: Print paths
 echo "=========================================="
@@ -30,6 +34,7 @@ echo "=========================================="
 echo "PROJECT_ROOT: $PROJECT_ROOT"
 echo "BENCHFS_PREFIX: $BENCHFS_PREFIX"
 echo "IOR_PREFIX: $IOR_PREFIX"
+echo "PARAM_FILE: $PARAM_FILE"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
