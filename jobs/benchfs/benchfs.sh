@@ -40,11 +40,11 @@ mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
   # 1 2 4 8
-  4
+  # 4
   # 2 4 8 16
   # 16
   # 32
-  # 64
+  64
   # 100
 )
 niter=1
@@ -55,6 +55,38 @@ param_set_list=(
   "
 )
 
+# Calculate total nodes and select appropriate queue
+# gen_S: total <= 31 nodes
+# gen_M: total <= 63 nodes
+# gen_L: total > 63 nodes
+select_queue_for_nodes() {
+  local total_nodes=0
+  for n in "${nnodes_list[@]}"; do
+    total_nodes=$((total_nodes + n))
+  done
+
+  local queue
+  if [ "$total_nodes" -le 31 ]; then
+    queue="gen_S"
+  elif [ "$total_nodes" -le 63 ]; then
+    queue="gen_M"
+  else
+    queue="gen_L"
+  fi
+
+  echo "Total nodes in nnodes_list: $total_nodes -> Queue: $queue"
+  echo "$queue"
+}
+
+# Get the appropriate queue based on total nodes
+SELECTED_QUEUE=$(select_queue_for_nodes | tail -1)
+echo "=========================================="
+echo "Queue Selection"
+echo "=========================================="
+select_queue_for_nodes | head -1
+echo "Selected queue: $SELECTED_QUEUE"
+echo "=========================================="
+
 for nnodes in "${nnodes_list[@]}"; do
   for ((iter=0; iter<niter; iter++)); do
     for param_set in "${param_set_list[@]}"; do
@@ -63,9 +95,7 @@ for nnodes in "${nnodes_list[@]}"; do
       cmd_qsub=(
         qsub
         -A NBBG
-        -q gen_S
-        # -q gen_M
-        # -q gen_L
+        -q "$SELECTED_QUEUE"
         -l elapstim_req="${ELAPSTIM_REQ}"
         -T openmpi
         -v NQSV_MPI_VER="${NQSV_MPI_VER}"
