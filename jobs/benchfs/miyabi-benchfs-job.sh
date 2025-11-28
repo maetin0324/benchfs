@@ -27,8 +27,8 @@ cleanup_exported_bash_functions() {
 #   16GiB / 32MiB chunk = 512 chunks per file
 #   256 clients * 512 chunks = 131,072 potential open files
 # Setting to 1M to be safe for future scaling
-ulimit -n 1048576 2>/dev/null || ulimit -n 524288 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536
-echo "File descriptor limit: $(ulimit -n)"
+# ulimit -n 1048576 2>/dev/null || ulimit -n 524288 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536
+# echo "File descriptor limit: $(ulimit -n)"
 
 # set gcc and OpenMPI modules
 module purge

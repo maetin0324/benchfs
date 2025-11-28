@@ -65,7 +65,7 @@ for nnodes in "${nnodes_list[@]}"; do
       cmd_qsub=(
         qsub
         -W group_list="xg24i002"
-        -q debug-g
+        -q short-g
         -l select="$nnodes"
         -l walltime="${ELAPSTIM_REQ}"
         -V
