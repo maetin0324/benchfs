@@ -4,25 +4,44 @@
 #PBS -q debug-g
 #PBS -V
 #------- Program execution -----------
-set -euo pipefail
+# NOTE: DO NOT use "set -e" here!
+# IOR benchmark may fail for various reasons (timeout, resource exhaustion, etc.)
+# and we want to continue running other parameter combinations.
+# The -u (nounset) and -o pipefail options are still useful for catching errors.
+set -uo pipefail
 
 cleanup_exported_bash_functions() {
   # PBS -V exports bash functions (module/ml) as environment variables.
   # Open MPI spawns /bin/sh on remote nodes, which fails to import them and
   # causes launches like the one in miyabi-benchfs-job.sh.e1074667 to abort.
+  #
+  # Bash exports functions as environment variables with special naming:
+  # - BASH_FUNC_name%% (bash 4.4+)
+  # - BASH_FUNC_name() (older bash)
+  # These cause "/bin/sh: ml: line 1: syntax error" on remote nodes.
 
   # Explicitly unset known problematic functions
-  unset -f module ml 2>/dev/null || true
+  unset -f module ml _module_raw 2>/dev/null || true
 
-  # Remove BASH_FUNC_* environment variables
-  while IFS= read -r var_name; do
-    [[ -n "$var_name" ]] && unset "$var_name" 2>/dev/null || true
-  done < <(env | grep -oE '^BASH_FUNC_[^=]+' || true)
+  # Remove all BASH_FUNC_* environment variables using env -u
+  # This is the most reliable way to remove exported bash functions
+  local vars_to_unset=()
+  while IFS= read -r line; do
+    local var_name="${line%%=*}"
+    if [[ "$var_name" == BASH_FUNC_* ]]; then
+      vars_to_unset+=("$var_name")
+    fi
+  done < <(env)
 
-  # Also try the %% suffix format used by some bash versions
-  while IFS= read -r var_name; do
-    [[ -n "$var_name" ]] && unset "$var_name" 2>/dev/null || true
-  done < <(compgen -e | grep '^BASH_FUNC_' || true)
+  for var in "${vars_to_unset[@]}"; do
+    unset "$var" 2>/dev/null || true
+  done
+
+  # Also try the %% suffix format used by bash 4.4+
+  for func_name in module ml _module_raw; do
+    unset "BASH_FUNC_${func_name}%%" 2>/dev/null || true
+    unset "BASH_FUNC_${func_name}()" 2>/dev/null || true
+  done
 }
 
 # Increase file descriptor limit for large-scale MPI jobs
@@ -578,40 +597,53 @@ check_server_ready() {
   return 1
 }
 
-runid=0
-for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
-  # Convert chunk size string to bytes
-  benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
+# ==============================================================================
+# Benchmark Loop
+# ==============================================================================
+# Optimized loop structure: benchfsd is only restarted when its parameters change
+# (benchfs_chunk_size, server_ppn). IOR parameters (ppn, transfer_size, block_size,
+# ior_flags) don't require benchfsd restart.
 
-  for server_ppn in "${server_ppn_list[@]}"; do
-    server_np=$((NNODES * server_ppn))
+stop_benchfsd() {
+  if [ -n "${BENCHFSD_PID:-}" ]; then
+    echo "Stopping BenchFS servers..."
 
-    for ppn in "${ppn_list[@]}"; do
-      np=$((NNODES * ppn))
+    # First, try graceful shutdown with SIGTERM via mpirun
+    "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
+      pkill -TERM benchfsd_mpi 2>/dev/null || true
 
-      for transfer_size in "${transfer_size_list[@]}"; do
-        for block_size in "${block_size_list[@]}"; do
-          for ior_flags in "${ior_flags_list[@]}"; do
-            echo "=========================================="
-            echo "Run ID: $runid"
-            echo "Nodes: $NNODES"
-            echo "Server: PPN=$server_ppn, NP=$server_np"
-            echo "Client: PPN=$ppn, NP=$np"
-            echo "Transfer size: $transfer_size, Block size: $block_size"
-            echo "IOR flags: $ior_flags"
-            echo "BenchFS chunk size: $benchfs_chunk_size_str ($benchfs_chunk_size bytes)"
-            echo "=========================================="
+    # Wait for graceful shutdown
+    sleep 3
 
-          # Clean up previous run
-          rm -rf "${BENCHFS_REGISTRY_DIR}"/*
-          rm -rf "${BENCHFS_DATA_DIR}"/*
+    # Kill the mpirun process that launched benchfsd
+    kill $BENCHFSD_PID 2>/dev/null || true
+    wait $BENCHFSD_PID 2>/dev/null || true
 
-          run_log_dir="${BENCHFSD_LOG_BASE_DIR}/run_${runid}"
-          mkdir -p "${run_log_dir}"
+    # Force cleanup of any orphaned processes
+    "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
+      pkill -9 benchfsd_mpi 2>/dev/null || true
+    pkill -9 benchfsd_mpi 2>/dev/null || true
 
-          # Create BenchFS config file for this run
-          config_file="${JOB_OUTPUT_DIR}/benchfs_${runid}.toml"
-          cat > "${config_file}" <<EOF
+    # Wait for cleanup and FD release
+    sleep 3
+
+    unset BENCHFSD_PID
+  fi
+}
+
+start_benchfsd() {
+  local config_id=$1
+
+  # Clean up registry and data directories
+  rm -rf "${BENCHFS_REGISTRY_DIR}"/*
+  rm -rf "${BENCHFS_DATA_DIR}"/*
+
+  server_log_dir="${BENCHFSD_LOG_BASE_DIR}/server_${config_id}"
+  mkdir -p "${server_log_dir}"
+
+  # Create BenchFS config file
+  config_file="${JOB_OUTPUT_DIR}/benchfs_${config_id}.toml"
+  cat > "${config_file}" <<EOF
 [node]
 node_id = "node0"
 data_dir = "${BENCHFS_DATA_DIR}"
@@ -634,162 +666,164 @@ chunk_cache_mb = 1024
 cache_ttl_secs = 0
 EOF
 
-          # Launch BenchFS servers
-          echo "Launching BenchFS servers..."
-          echo "Registry dir: ${BENCHFS_REGISTRY_DIR}"
-          echo "Config file: ${config_file}"
-          echo "Binary: ${BENCHFS_PREFIX}/benchfsd_mpi"
+  echo "=========================================="
+  echo "Starting BenchFS servers"
+  echo "  Config ID: ${config_id}"
+  echo "  Server PPN: ${server_ppn}, NP: ${server_np}"
+  echo "  Chunk size: ${benchfs_chunk_size_str} (${benchfs_chunk_size} bytes)"
+  echo "  Config file: ${config_file}"
+  echo "=========================================="
 
-          # UCX/Network Debug Information (only on first run for efficiency)
-          if [ "$runid" -eq 0 ]; then
-            echo ""
-            echo "=========================================="
-            echo "Network Configuration Debug Information"
-            echo "=========================================="
-            echo "UCX Configuration:"
-            echo "  UCX_TLS=${UCX_TLS:-not set}"
-            echo "  UCX_NET_DEVICES=${UCX_NET_DEVICES:-not set}"
-            echo ""
-            echo "Available network interfaces:"
-            ip -o -4 addr show | awk '{print "  " $2 " : " $4}' || echo "  Unable to list interfaces"
-            echo ""
-            echo "InfiniBand status:"
-            which ibstat >/dev/null 2>&1 && ibstat 2>/dev/null | grep -E "State:|Physical state:" | head -4 || echo "  InfiniBand not available or ibstat not found"
-            echo ""
-            echo "UCX info (if available):"
-            which ucx_info >/dev/null 2>&1 && ucx_info -v 2>/dev/null | head -3 || echo "  ucx_info not available"
-            echo "=========================================="
-            echo ""
-          fi
+  # UCX/Network Debug Information (only on first start)
+  if [ "$config_id" == "0" ]; then
+    echo ""
+    echo "=========================================="
+    echo "Network Configuration Debug Information"
+    echo "=========================================="
+    echo "UCX Configuration:"
+    echo "  UCX_TLS=${UCX_TLS:-not set}"
+    echo "  UCX_NET_DEVICES=${UCX_NET_DEVICES:-not set}"
+    echo ""
+    echo "Available network interfaces:"
+    ip -o -4 addr show | awk '{print "  " $2 " : " $4}' || echo "  Unable to list interfaces"
+    echo ""
+    echo "InfiniBand status:"
+    which ibstat >/dev/null 2>&1 && ibstat 2>/dev/null | grep -E "State:|Physical state:" | head -4 || echo "  InfiniBand not available or ibstat not found"
+    echo ""
+    echo "UCX info (if available):"
+    which ucx_info >/dev/null 2>&1 && ucx_info -v 2>/dev/null | head -3 || echo "  ucx_info not available"
+    echo "=========================================="
+    echo ""
+  fi
 
-          # Verify files exist
-          ls -la "${BENCHFS_REGISTRY_DIR}" || echo "WARNING: Registry dir not accessible"
-          ls -la "${config_file}" || echo "WARNING: Config file not found"
-          ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "WARNING: Binary not found"
+  cmd_benchfsd=(
+    "${cmd_mpirun_common[@]}"
+    -np "$server_np"
+    --bind-to none
+    -map-by "ppr:${server_ppn}:node"
+    -x RUST_LOG
+    -x RUST_BACKTRACE
+    "${BENCHFS_PREFIX}/benchfsd_mpi"
+    "${BENCHFS_REGISTRY_DIR}"
+    "${config_file}"
+  )
 
-            cmd_benchfsd=(
+  echo "${cmd_benchfsd[@]}"
+  "${cmd_benchfsd[@]}" > "${server_log_dir}/benchfsd_stdout.log" 2> "${server_log_dir}/benchfsd_stderr.log" &
+  BENCHFSD_PID=$!
+
+  # Wait for servers to be ready
+  if ! check_server_ready "$server_np"; then
+    echo "ERROR: BenchFS servers failed to start"
+    echo "=========================================="
+    echo "BenchFS Server STDOUT:"
+    cat "${server_log_dir}/benchfsd_stdout.log" || echo "No stdout log"
+    echo ""
+    echo "BenchFS Server STDERR:"
+    cat "${server_log_dir}/benchfsd_stderr.log" || echo "No stderr log"
+    echo ""
+    echo "Registry Directory Contents:"
+    ls -la "${BENCHFS_REGISTRY_DIR}/" || echo "Cannot access registry"
+    echo "=========================================="
+    stop_benchfsd
+    exit 1
+  fi
+
+  # Give servers time to fully initialize
+  sleep 5
+  echo "BenchFS servers started successfully"
+}
+
+runid=0
+server_config_id=0
+
+for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
+  # Convert chunk size string to bytes
+  benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
+
+  for server_ppn in "${server_ppn_list[@]}"; do
+    server_np=$((NNODES * server_ppn))
+
+    # Start benchfsd with current server configuration
+    stop_benchfsd
+    start_benchfsd "$server_config_id"
+
+    # Run all IOR parameter combinations with this server configuration
+    for ppn in "${ppn_list[@]}"; do
+      np=$((NNODES * ppn))
+
+      for transfer_size in "${transfer_size_list[@]}"; do
+        for block_size in "${block_size_list[@]}"; do
+          for ior_flags in "${ior_flags_list[@]}"; do
+            echo "=========================================="
+            echo "Run ID: $runid"
+            echo "Nodes: $NNODES"
+            echo "Server: PPN=$server_ppn, NP=$server_np (config_id=$server_config_id)"
+            echo "Client: PPN=$ppn, NP=$np"
+            echo "Transfer size: $transfer_size, Block size: $block_size"
+            echo "IOR flags: $ior_flags"
+            echo "BenchFS chunk size: $benchfs_chunk_size_str ($benchfs_chunk_size bytes)"
+            echo "=========================================="
+
+            # Clean data directory between IOR runs (but keep registry)
+            rm -rf "${BENCHFS_DATA_DIR}"/*
+
+            # MPI Debug: Testing MPI communication before IOR
+            echo "MPI Debug: Testing MPI communication before IOR"
+            "${cmd_mpirun_common[@]}" -np "$np" --map-by "ppr:${ppn}:node" hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
+            echo "MPI Debug: Communication test completed"
+
+            # Run IOR benchmark
+            echo "Running IOR benchmark..."
+            ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
+            ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
+
+            cmd_ior=(
+              time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
               "${cmd_mpirun_common[@]}"
-              -np "$server_np"
+              -np "$np"
               --bind-to none
-              -map-by "ppr:${server_ppn}:node"
-              -x RUST_LOG
+              --map-by "ppr:${ppn}:node"
+              -x RUST_LOG=warn
               -x RUST_BACKTRACE
-              # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
-              "${BENCHFS_PREFIX}/benchfsd_mpi"
-              "${BENCHFS_REGISTRY_DIR}"
-              "${config_file}"
+              "${IOR_PREFIX}/src/ior"
+              -vvv
+              -a BENCHFS
+              -t "$transfer_size"
+              -b "$block_size"
+              $ior_flags
+              --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
+              --benchfs.datadir="${BENCHFS_DATA_DIR}"
+              -o "${BENCHFS_DATA_DIR}/testfile"
+              -O summaryFormat=JSON
+              -O summaryFile="${ior_json_file}"
             )
 
-            echo "${cmd_benchfsd[@]}"
-            "${cmd_benchfsd[@]}" > "${run_log_dir}/benchfsd_stdout.log" 2> "${run_log_dir}/benchfsd_stderr.log" &
-            BENCHFSD_PID=$!
+            save_job_metadata
 
-            # Wait for servers to be ready
-            if ! check_server_ready "$server_np"; then
-            echo "ERROR: BenchFS servers failed to start"
-            echo "=========================================="
-            echo "BenchFS Server STDOUT:"
-            echo "=========================================="
-            cat "${run_log_dir}/benchfsd_stdout.log" || echo "No stdout log"
-            echo ""
-            echo "=========================================="
-            echo "BenchFS Server STDERR:"
-            echo "=========================================="
-            cat "${run_log_dir}/benchfsd_stderr.log" || echo "No stderr log"
-            echo ""
-            echo "=========================================="
-            echo "Registry Directory Contents:"
-            echo "=========================================="
-            ls -la "${BENCHFS_REGISTRY_DIR}/" || echo "Cannot access registry"
-            echo ""
-            echo "=========================================="
-            echo "Data Directory Contents:"
-            echo "=========================================="
-            ls -la "${BENCHFS_DATA_DIR}/" || echo "Cannot access data dir"
-            echo ""
-            kill $BENCHFSD_PID 2>/dev/null || true
-            wait $BENCHFSD_PID 2>/dev/null || true
-            exit 1
-          fi
+            echo "${cmd_ior[@]}"
+            ior_exit_code=0
+            "${cmd_ior[@]}" \
+              > "${ior_stdout_file}" \
+              2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || ior_exit_code=$?
 
-          # Give servers a bit more time to fully initialize
-          sleep 5
-
-          # MPI Debug: Testing MPI communication before IOR
-          echo "MPI Debug: Testing MPI communication before IOR"
-          "${cmd_mpirun_common[@]}" -np "$np" --map-by "ppr:${ppn}:node" hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
-          echo "MPI Debug: Communication test completed"
-
-          # Run IOR benchmark
-          echo "Running IOR benchmark..."
-          ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
-          ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
-
-          cmd_ior=(
-            time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
-            "${cmd_mpirun_common[@]}"
-            -np "$np"
-            --bind-to none
-            --map-by "ppr:${ppn}:node"
-            -x RUST_LOG=warn
-            -x RUST_BACKTRACE
-            # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
-            "${IOR_PREFIX}/src/ior"
-            -vvv
-            -a BENCHFS
-            -t "$transfer_size"
-            -b "$block_size"
-            $ior_flags
-            --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
-            --benchfs.datadir="${BENCHFS_DATA_DIR}"
-            -o "${BENCHFS_DATA_DIR}/testfile"
-            -O summaryFormat=JSON
-            -O summaryFile="${ior_json_file}"
-          )
-
-          save_job_metadata
-
-          echo "${cmd_ior[@]}"
-          # NOTE: Use simple redirection instead of process substitution to avoid FD leak
-          "${cmd_ior[@]}" \
-            > "${ior_stdout_file}" \
-            2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || true
-
-          # Stop BenchFS servers gracefully
-          # Using SIGTERM first allows graceful shutdown, then SIGKILL as fallback
-          # This prevents MPI from reporting killed processes as errors
-          echo "Stopping BenchFS servers..."
-
-          # First, try graceful shutdown with SIGTERM via mpirun
-          # This ensures all nodes receive the signal properly
-          "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
-            pkill -TERM benchfsd_mpi 2>/dev/null || true
-
-          # Wait for graceful shutdown (benchfsd handles SIGTERM)
-          sleep 3
-
-          # Kill the mpirun process that launched benchfsd
-          kill $BENCHFSD_PID 2>/dev/null || true
-          wait $BENCHFSD_PID 2>/dev/null || true
-
-          # Force cleanup of any orphaned processes with SIGKILL
-          # Only use this as a last resort after graceful shutdown attempt
-          echo "Force cleanup of orphaned processes..."
-          "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
-            pkill -9 benchfsd_mpi 2>/dev/null || true
-
-          # Also clean up local processes (for any edge cases)
-          pkill -9 benchfsd_mpi 2>/dev/null || true
-
-          # Wait for cleanup and FD release
-          sleep 3
+            if [ "$ior_exit_code" -ne 0 ]; then
+              echo "WARNING: IOR run $runid failed with exit code $ior_exit_code"
+              echo "  Stderr log: ${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log"
+              echo "  Continuing with next parameter combination..."
+            fi
 
             runid=$((runid + 1))
           done
         done
       done
     done
+
+    server_config_id=$((server_config_id + 1))
   done
 done
+
+# Final cleanup
+stop_benchfsd
 
 echo "All benchmarks completed"
