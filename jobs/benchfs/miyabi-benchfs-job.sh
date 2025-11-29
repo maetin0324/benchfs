@@ -446,6 +446,9 @@ if [[ "${USE_UCX_PML}" -eq 1 ]]; then
     mpirun
     # "${nqsii_mpiopts_array[@]}"
     --mca mca_base_env_list ""
+    # Routing fix for large-scale runs: use direct routing instead of tree-based
+    --mca routed direct
+    --mca plm_rsh_no_tree_spawn 1
     --mca pml ucx
     --mca btl self
     --mca osc ucx
@@ -468,6 +471,9 @@ else
   cmd_mpirun_common=(
     mpirun
     # "${nqsii_mpiopts_array[@]}"
+    # Routing fix for large-scale runs: use direct routing instead of tree-based
+    --mca routed direct
+    --mca plm_rsh_no_tree_spawn 1
     --mca pml ob1
     --mca btl tcp,vader,self
     --mca btl_openib_allow_ib 0
