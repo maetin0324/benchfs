@@ -5,7 +5,6 @@
 set -e
 
 BENCHFS_MOUNT="/benchfs"
-BENCHFS_CLIENT="/usr/local/bin/benchfs_client"
 
 # Ensure mount directory exists
 mkdir -p "$BENCHFS_MOUNT"
@@ -27,7 +26,8 @@ case "$op" in
     write)
         path="$1"
         offset="$2"
-        data_b64="$3"
+        # Read base64 data from stdin
+        data_b64=$(cat)
         # Decode base64 data and write at offset
         dir=$(dirname "$path")
         mkdir -p "$dir" 2>/dev/null || true

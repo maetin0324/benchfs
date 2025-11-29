@@ -18,10 +18,10 @@ use std::time::Duration;
 const MAX_FILE_SIZE: usize = 1024 * 1024;
 /// Maximum number of files to create
 const MAX_FILES: usize = 10;
-/// Maximum path depth
-const MAX_PATH_DEPTH: usize = 3;
 /// Chunk size (must match BenchFS default)
 const CHUNK_SIZE: usize = 64 * 1024;
+/// Maximum path length (BenchFS constraint)
+const MAX_PATH_LEN: usize = 255;
 
 /// File operation transitions for the state machine
 #[derive(Clone, Debug)]
@@ -88,20 +88,15 @@ impl ReferenceStateMachine for FilesystemRefState {
         let mut strategies: Vec<BoxedStrategy<Transition>> = Vec::new();
 
         // CreateFile - only if we haven't reached max files
+        // Use short paths to stay within BenchFS 256-byte limit
         if can_create {
             strategies.push(
-                (0..MAX_PATH_DEPTH, "[a-z]{1,8}")
-                    .prop_map(move |(depth, name)| {
-                        let path = format!(
-                            "/benchfs{}/{}_{}.txt",
-                            if depth > 0 {
-                                format!("/dir{}", depth)
-                            } else {
-                                String::new()
-                            },
-                            name,
-                            file_counter
-                        );
+                "[a-z]{1,4}"
+                    .prop_map(move |name| {
+                        // Simple short path: /benchfs/f{counter}_{name}.txt
+                        // Max length: /benchfs/ (9) + f (1) + counter (max 3) + _ (1) + name (4) + .txt (4) = ~22 bytes
+                        let path = format!("/benchfs/f{}_{}.txt", file_counter, name);
+                        assert!(path.len() < MAX_PATH_LEN, "Path too long: {}", path);
                         Transition::CreateFile { path }
                     })
                     .boxed(),
@@ -171,10 +166,10 @@ impl ReferenceStateMachine for FilesystemRefState {
             if can_create {
                 let rename_paths = paths.clone();
                 strategies.push(
-                    (prop::sample::select(rename_paths), "[a-z]{1,8}")
+                    (prop::sample::select(rename_paths), "[a-z]{1,4}")
                         .prop_map(move |(old_path, new_name)| {
-                            let new_path =
-                                format!("/benchfs/renamed_{}_{}.txt", new_name, file_counter);
+                            // Short rename path: /benchfs/r{counter}_{name}.txt
+                            let new_path = format!("/benchfs/r{}_{}.txt", file_counter, new_name);
                             Transition::RenameFile { old_path, new_path }
                         })
                         .boxed(),
@@ -184,18 +179,9 @@ impl ReferenceStateMachine for FilesystemRefState {
 
         // If no strategies available (empty state and can't create), return CreateFile
         if strategies.is_empty() {
-            return (0..MAX_PATH_DEPTH, "[a-z]{1,8}")
-                .prop_map(move |(depth, name)| {
-                    let path = format!(
-                        "/benchfs{}/{}_{}.txt",
-                        if depth > 0 {
-                            format!("/dir{}", depth)
-                        } else {
-                            String::new()
-                        },
-                        name,
-                        file_counter
-                    );
+            return "[a-z]{1,4}"
+                .prop_map(move |name| {
+                    let path = format!("/benchfs/f{}_{}.txt", file_counter, name);
                     Transition::CreateFile { path }
                 })
                 .boxed();
@@ -359,6 +345,7 @@ impl BenchFSCluster {
             .args([
                 "exec",
                 "benchfs_pbt_controller",
+                "bash",
                 "/scripts/pbt-op.sh",
                 "create",
                 path,
@@ -376,21 +363,37 @@ impl BenchFSCluster {
     }
 
     fn write_file(&self, path: &str, offset: u64, data: &[u8]) -> Result<TransitionResult, String> {
-        // Encode data as base64 for safe transfer
+        // Encode data as base64 for safe transfer via stdin
         let data_b64 = base64_encode(data);
 
-        let output = Command::new("docker")
+        use std::io::Write;
+        let mut child = Command::new("docker")
             .args([
                 "exec",
+                "-i",
                 "benchfs_pbt_controller",
+                "bash",
                 "/scripts/pbt-op.sh",
                 "write",
                 path,
                 &offset.to_string(),
-                &data_b64,
             ])
-            .output()
-            .map_err(|e| format!("Failed to execute write: {}", e))?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn write: {}", e))?;
+
+        // Write base64 data to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(data_b64.as_bytes())
+                .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("Failed to wait for write: {}", e))?;
 
         if output.status.success() {
             Ok(TransitionResult::Success)
@@ -411,6 +414,7 @@ impl BenchFSCluster {
             .args([
                 "exec",
                 "benchfs_pbt_controller",
+                "bash",
                 "/scripts/pbt-op.sh",
                 "read",
                 path,
@@ -435,6 +439,7 @@ impl BenchFSCluster {
             .args([
                 "exec",
                 "benchfs_pbt_controller",
+                "bash",
                 "/scripts/pbt-op.sh",
                 "delete",
                 path,
@@ -456,6 +461,7 @@ impl BenchFSCluster {
             .args([
                 "exec",
                 "benchfs_pbt_controller",
+                "bash",
                 "/scripts/pbt-op.sh",
                 "truncate",
                 path,
@@ -478,6 +484,7 @@ impl BenchFSCluster {
             .args([
                 "exec",
                 "benchfs_pbt_controller",
+                "bash",
                 "/scripts/pbt-op.sh",
                 "rename",
                 old_path,
@@ -500,6 +507,7 @@ impl BenchFSCluster {
             .args([
                 "exec",
                 "benchfs_pbt_controller",
+                "bash",
                 "/scripts/pbt-op.sh",
                 "stat",
                 path,
