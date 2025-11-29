@@ -4,11 +4,12 @@
 #PBS -q debug-g
 #PBS -V
 #------- Program execution -----------
-# NOTE: DO NOT use "set -e" here!
+# NOTE: DO NOT use "set -e" or "set -u" or "set -o pipefail" here!
 # IOR benchmark may fail for various reasons (timeout, resource exhaustion, etc.)
 # and we want to continue running other parameter combinations.
-# The -u (nounset) and -o pipefail options are still useful for catching errors.
-set -uo pipefail
+# Any strict bash options will cause the script to exit prematurely when mpirun
+# returns non-zero exit codes (which happens frequently with large-scale MPI jobs).
+set +e
 
 cleanup_exported_bash_functions() {
   # PBS -V exports bash functions (module/ml) as environment variables.
@@ -372,8 +373,29 @@ echo ""
 
 echo "prepare backend dir: ${JOB_BACKEND_DIR}"
 mkdir -p "${JOB_BACKEND_DIR}"
-trap 'rm -rf "${JOB_BACKEND_DIR}" "${BENCHFS_DATA_DIR}" ; exit 1' 1 2 3 15
-trap 'rm -rf "${JOB_BACKEND_DIR}" "${BENCHFS_DATA_DIR}" ; exit 0' EXIT
+
+# Cleanup function for graceful shutdown
+cleanup_and_exit() {
+  local exit_code=${1:-1}
+  local signal_name=${2:-"unknown"}
+  echo ""
+  echo "=========================================="
+  echo "Job interrupted by signal: $signal_name"
+  echo "Current Run ID: ${runid:-N/A}"
+  echo "Cleaning up backend and data directories..."
+  echo "=========================================="
+  stop_benchfsd 2>/dev/null || true
+  rm -rf "${JOB_BACKEND_DIR}" "${BENCHFS_DATA_DIR}" 2>/dev/null || true
+  exit "$exit_code"
+}
+
+# Trap signals for cleanup
+# SIGHUP(1), SIGINT(2), SIGQUIT(3), SIGTERM(15) - from PBS walltime or user
+trap 'cleanup_and_exit 1 "SIGHUP (walltime or session end)"' 1
+trap 'cleanup_and_exit 1 "SIGINT (user interrupt)"' 2
+trap 'cleanup_and_exit 1 "SIGQUIT"' 3
+trap 'cleanup_and_exit 1 "SIGTERM (PBS walltime reached)"' 15
+trap 'rm -rf "${JOB_BACKEND_DIR}" "${BENCHFS_DATA_DIR}" 2>/dev/null || true; exit 0' EXIT
 
 echo "prepare benchfs registry dir: ${BENCHFS_REGISTRY_DIR}"
 mkdir -p "${BENCHFS_REGISTRY_DIR}"

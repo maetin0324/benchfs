@@ -238,10 +238,13 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
             .build();
 
         let allocator = uring_reactor.allocator.clone();
+        let reactor_for_backend = uring_reactor.clone();
         runtime.register_reactor("io_uring", uring_reactor);
 
         // Create IOUringBackend and chunk store
-        let io_backend = Rc::new(IOUringBackend::new(allocator.clone()));
+        // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
+        // that has the registered buffers (fixes SEGFAULT with 4+ nodes)
+        let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), reactor_for_backend));
         let chunk_store = Rc::new(IOUringChunkStore::new(
             &chunk_store_dir,
             io_backend.clone(),

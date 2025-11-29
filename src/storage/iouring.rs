@@ -4,6 +4,7 @@ use super::{
 };
 use pluvio_uring::allocator::FixedBufferAllocator;
 use pluvio_uring::file::DmaFile;
+use pluvio_uring::reactor::IoUringReactor;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -23,6 +24,10 @@ pub struct IOUringBackend {
 
     /// Registered buffer allocator
     allocator: Rc<FixedBufferAllocator>,
+
+    /// io_uring reactor reference
+    /// This ensures DmaFile uses the same reactor that registered the fixed buffers
+    reactor: Rc<IoUringReactor>,
 }
 
 impl IOUringBackend {
@@ -30,11 +35,13 @@ impl IOUringBackend {
     ///
     /// # Arguments
     /// * `allocator` - Registered buffer allocator
-    pub fn new(allocator: Rc<FixedBufferAllocator>) -> Self {
+    /// * `reactor` - The io_uring reactor that owns the allocator's registered buffers
+    pub fn new(allocator: Rc<FixedBufferAllocator>, reactor: Rc<IoUringReactor>) -> Self {
         Self {
             files: RefCell::new(HashMap::new()),
             next_fd: RefCell::new(100), // 100から開始 (標準入出力を避ける)
             allocator,
+            reactor,
         }
     }
 
@@ -196,7 +203,7 @@ impl StorageBackend for IOUringBackend {
             _ => StorageError::IoError(e),
         })?;
 
-        let dma_file = Rc::new(DmaFile::new(file));
+        let dma_file = Rc::new(DmaFile::with_reactor(file, self.reactor.clone()));
         let fd = self.allocate_fd();
 
         let mut files = self.files.borrow_mut();
@@ -339,7 +346,7 @@ impl StorageBackend for IOUringBackend {
             _ => StorageError::IoError(e),
         })?;
 
-        let dma_file = Rc::new(DmaFile::new(file));
+        let dma_file = Rc::new(DmaFile::with_reactor(file, self.reactor.clone()));
         let fd = self.allocate_fd();
 
         let mut files = self.files.borrow_mut();
@@ -482,7 +489,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn setup_runtime() -> (Rc<Runtime>, Rc<FixedBufferAllocator>) {
+    fn setup_runtime() -> (Rc<Runtime>, Rc<FixedBufferAllocator>, Rc<IoUringReactor>) {
         let runtime = Runtime::new(1024);
 
         // IoUringReactorを初期化して登録
@@ -496,16 +503,17 @@ mod tests {
 
         // Get buffer allocator from reactor (it's a public field, not a method)
         let allocator = Rc::clone(&reactor.allocator);
+        let reactor_clone = reactor.clone();
 
         // Runtime::newは既にRc<Runtime>を返す
         runtime.register_reactor("io_uring_reactor", reactor);
 
-        (runtime, allocator)
+        (runtime, allocator, reactor_clone)
     }
 
     #[test]
     fn test_stat() {
-        let (runtime, allocator) = setup_runtime();
+        let (runtime, allocator, reactor) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("stat_test.txt");
 
@@ -516,7 +524,7 @@ mod tests {
         runtime
             .clone()
             .run_with_name_and_runtime("iouring_backend_test_stat", async move {
-                let backend = IOUringBackend::new(allocator);
+                let backend = IOUringBackend::new(allocator, reactor);
                 let stat = backend.stat(&test_file).await.unwrap();
                 assert_eq!(stat.size, 5);
             });
@@ -524,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_open_read_write() {
-        let (runtime, allocator) = setup_runtime();
+        let (runtime, allocator, reactor) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.txt");
 
@@ -536,7 +544,7 @@ mod tests {
         runtime.clone().run_with_name_and_runtime(
             "iouring_backend_test_open_read_write",
             async move {
-                let backend = IOUringBackend::new(allocator);
+                let backend = IOUringBackend::new(allocator, reactor);
 
                 // ファイルを開く
                 let handle = backend
@@ -559,14 +567,14 @@ mod tests {
 
     #[test]
     fn test_create_write() {
-        let (runtime, allocator) = setup_runtime();
+        let (runtime, allocator, reactor) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("new_file.txt");
 
         runtime
             .clone()
             .run_with_name_and_runtime("iouring_backend_test_create_write", async move {
-                let backend = IOUringBackend::new(allocator);
+                let backend = IOUringBackend::new(allocator, reactor);
 
                 // ファイルを作成
                 let handle = backend.create(&test_file, 0o644).await.unwrap();

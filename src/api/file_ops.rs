@@ -1579,10 +1579,11 @@ mod tests {
             .build();
 
         let allocator = uring_reactor.allocator.clone();
+        let reactor_for_backend = uring_reactor.clone();
         runtime.register_reactor("io_uring", uring_reactor);
 
         // Create IOUringBackend and chunk store with unique directory per test
-        let io_backend = Rc::new(IOUringBackend::new(allocator));
+        let io_backend = Rc::new(IOUringBackend::new(allocator, reactor_for_backend));
         let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir = format!("/tmp/benchfs_test_{}_{}", std::process::id(), test_id);
         let chunk_store_dir = format!("{}/chunks", temp_dir);

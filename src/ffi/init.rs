@@ -336,6 +336,7 @@ pub extern "C" fn benchfs_init(
         );
 
         let allocator = uring_reactor.allocator.clone();
+        let reactor_for_backend = uring_reactor.clone();
         runtime.register_reactor("io_uring", uring_reactor);
 
         // Create UCX context and reactor
@@ -365,7 +366,8 @@ pub extern "C" fn benchfs_init(
         let metadata_manager = Rc::new(MetadataManager::new(node_id_str.to_string()));
 
         // Create IOUringBackend and ChunkStore
-        let io_backend = Rc::new(IOUringBackend::new(allocator.clone()));
+        // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
+        let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), reactor_for_backend));
         let chunk_store_dir = format!("{}/chunks", data_dir);
         if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
             set_error_message(&format!("Failed to create chunk store directory: {}", e));
@@ -566,10 +568,12 @@ pub extern "C" fn benchfs_init(
         );
 
         let allocator = uring_reactor.allocator.clone();
+        let reactor_for_backend = uring_reactor.clone();
         runtime.register_reactor("io_uring", uring_reactor);
 
         // Create IOUringBackend and ChunkStore for client
-        let io_backend = Rc::new(IOUringBackend::new(allocator));
+        // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
+        let io_backend = Rc::new(IOUringBackend::new(allocator, reactor_for_backend));
         let chunk_store_dir = format!("{}/chunks", client_data_dir);
         if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
             set_error_message(&format!(

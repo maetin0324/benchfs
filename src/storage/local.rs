@@ -8,6 +8,7 @@ use crate::metadata::{
     types::{InodeId, InodeType},
 };
 use pluvio_uring::allocator::FixedBufferAllocator;
+use pluvio_uring::reactor::IoUringReactor;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,7 +46,12 @@ impl LocalFileSystem {
     /// # Arguments
     /// * `root` - ルートディレクトリのパス
     /// * `allocator` - Registered buffer allocator
-    pub fn new(root: PathBuf, allocator: Rc<FixedBufferAllocator>) -> StorageResult<Self> {
+    /// * `reactor` - The io_uring reactor that owns the allocator's registered buffers
+    pub fn new(
+        root: PathBuf,
+        allocator: Rc<FixedBufferAllocator>,
+        reactor: Rc<IoUringReactor>,
+    ) -> StorageResult<Self> {
         // ルートディレクトリが存在することを確認
         if !root.exists() {
             return Err(StorageError::NotFound(root.display().to_string()));
@@ -58,7 +64,7 @@ impl LocalFileSystem {
             )));
         }
 
-        let backend = Rc::new(IOUringBackend::new(allocator));
+        let backend = Rc::new(IOUringBackend::new(allocator, reactor));
 
         let mut path_to_inode = HashMap::new();
         let mut dir_metadata = HashMap::new();
@@ -393,7 +399,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn setup_runtime() -> (Rc<Runtime>, Rc<FixedBufferAllocator>) {
+    fn setup_runtime() -> (Rc<Runtime>, Rc<FixedBufferAllocator>, Rc<IoUringReactor>) {
         let runtime = Runtime::new(1024);
 
         // IoUringReactorを初期化して登録
@@ -407,22 +413,23 @@ mod tests {
 
         // Get buffer allocator from reactor (it's a public field, not a method)
         let allocator = Rc::clone(&reactor.allocator);
+        let reactor_clone = reactor.clone();
 
         // Runtime::newは既にRc<Runtime>を返す
         runtime.register_reactor("io_uring_reactor", reactor);
 
-        (runtime, allocator)
+        (runtime, allocator, reactor_clone)
     }
 
     #[test]
     fn test_create_directory() {
-        let (runtime, allocator) = setup_runtime();
+        let (runtime, allocator, reactor) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
         runtime
             .clone()
             .run_with_name_and_runtime("local_fs_test_create_directory", async move {
-                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor).unwrap();
 
                 let dir_path = Path::new("/testdir");
 
@@ -438,13 +445,13 @@ mod tests {
 
     #[test]
     fn test_list_directory() {
-        let (runtime, allocator) = setup_runtime();
+        let (runtime, allocator, reactor) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
         runtime
             .clone()
             .run_with_name_and_runtime("local_fs_test_list_directory", async move {
-                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor).unwrap();
 
                 // ディレクトリを作成
                 fs.create_directory(Path::new("/dir1"), 0o755)
@@ -461,13 +468,13 @@ mod tests {
 
     #[test]
     fn test_create_and_open_file() {
-        let (runtime, allocator) = setup_runtime();
+        let (runtime, allocator, reactor) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
         runtime
             .clone()
             .run_with_name_and_runtime("local_fs_test_create_and_open_file", async move {
-                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor).unwrap();
 
                 let file_path = Path::new("/test.txt");
 
@@ -508,9 +515,10 @@ mod tests {
             .wait_complete_timeout(Duration::from_millis(150))
             .build();
         let allocator = Rc::clone(&reactor.allocator);
+        let reactor_for_fs = reactor.clone();
         runtime.register_reactor("io_uring_reactor", reactor);
 
-        let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator).unwrap();
+        let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor_for_fs).unwrap();
 
         // ルートディレクトリのinodeを確認
         let root_inode = fs.get_inode(Path::new("/"));

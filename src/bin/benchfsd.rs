@@ -139,7 +139,8 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     ));
 
     // Create IOUringBackend for chunk storage
-    let io_backend = Rc::new(IOUringBackend::new(allocator.clone()));
+    // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
+    let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), uring_reactor.clone()));
 
     // Create chunk store with io_uring backend
     let chunk_store_dir = config.node.data_dir.join("chunks");
