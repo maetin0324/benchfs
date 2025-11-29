@@ -1,0 +1,136 @@
+version: '3.8'
+
+# Docker compose configuration for Property-Based Testing (PBT)
+# Uses a minimal 2-node setup for faster test iteration
+
+services:
+  server1:
+    image: benchfs:latest
+    container_name: benchfs_pbt_server1
+    hostname: server1
+    networks:
+      benchfs_pbt_net:
+        ipv4_address: 172.21.0.11
+    volumes:
+      - pbt_shared_registry:/shared/registry:rw
+      - pbt_server1_data:/shared/data:rw
+      - ../../target/release/benchfsd_mpi:/usr/local/bin/benchfsd_mpi:ro
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+    command: /usr/sbin/sshd -D
+
+  server2:
+    image: benchfs:latest
+    container_name: benchfs_pbt_server2
+    hostname: server2
+    networks:
+      benchfs_pbt_net:
+        ipv4_address: 172.21.0.12
+    volumes:
+      - pbt_shared_registry:/shared/registry:rw
+      - pbt_server2_data:/shared/data:rw
+      - ../../target/release/benchfsd_mpi:/usr/local/bin/benchfsd_mpi:ro
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+    command: /usr/sbin/sshd -D
+
+  controller:
+    image: benchfs:latest
+    container_name: benchfs_pbt_controller
+    hostname: controller
+    networks:
+      benchfs_pbt_net:
+        ipv4_address: 172.21.0.10
+    volumes:
+      - pbt_shared_registry:/shared/registry:rw
+      - pbt_results:/shared/results:rw
+      - pbt_benchfs_mount:/benchfs:rw
+      - ../../target/release/benchfsd_mpi:/usr/local/bin/benchfsd_mpi:ro
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - UCX_TLS=tcp,self
+      - UCX_LOG_LEVEL=warn
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - BENCHFS_OPERATION_TIMEOUT=30
+    depends_on:
+      - server1
+      - server2
+    cap_add:
+      - SYS_PTRACE
+      - IPC_LOCK
+      - SYS_RESOURCE
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    command: /usr/sbin/sshd -D
+
+volumes:
+  pbt_shared_registry:
+    driver: local
+  pbt_server1_data:
+    driver: local
+  pbt_server2_data:
+    driver: local
+  pbt_results:
+    driver: local
+  pbt_benchfs_mount:
+    driver: local
+
+networks:
+  benchfs_pbt_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16

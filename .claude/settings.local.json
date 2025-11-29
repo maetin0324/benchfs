@@ -97,7 +97,8 @@
       "Bash(./benchfs-perf.sh:*)",
       "Bash(git submodule:*)",
       "Bash(uv --version:*)",
-      "Bash(uv sync:*)"
+      "Bash(uv sync:*)",
+      "Bash(cargo search:*)"
     ],
     "deny": [],
     "ask": []

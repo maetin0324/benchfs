@@ -55,6 +55,8 @@ mpi = { version = "0.8", features = ["derive"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.0"
+proptest = "1.4"
+proptest-state-machine = "0.3"
 
 [features]
 default = []

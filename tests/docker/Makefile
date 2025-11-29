@@ -31,6 +31,14 @@ help:
 	@echo "  make test-ior-small - Run IOR benchmark on 2-node cluster"
 	@echo "  make test-ior-8gib-ssf - Run 8GiB SSF benchmark on 4-node cluster"
 	@echo ""
+	@echo "Property-Based Testing (PBT) Commands:"
+	@echo "  make pbt-test       - Run PBT state machine tests (2-node cluster)"
+	@echo "  make pbt-test-verbose - Run PBT tests with verbose logging"
+	@echo "  make pbt-up         - Start PBT test cluster"
+	@echo "  make pbt-down       - Stop PBT test cluster"
+	@echo "  make pbt-shell      - Open shell in PBT controller"
+	@echo "  make pbt-clean      - Clean PBT containers and volumes"
+	@echo ""
 	@echo "Utility Commands:"
 	@echo "  make logs           - View container logs"
 	@echo "  make shell          - Open shell in controller"
@@ -222,3 +230,66 @@ quick-test: build-simple up-small test-small down
 # Full test workflow
 full-test: build-simple up test down
 	@echo "Full test completed"
+
+# ============================================================
+# Property-Based Testing (PBT) targets
+# ============================================================
+
+.PHONY: pbt-up pbt-down pbt-test pbt-clean
+
+PBT_COMPOSE_FILE := docker-compose.pbt.yml
+PBT_PROJECT_NAME := benchfs_pbt
+
+pbt-up:
+	@echo "Building BenchFS MPI binary first..."
+	cd ../.. && cargo build --release --features mpi-support --bin benchfsd_mpi
+	@echo "Starting PBT cluster (2 nodes)..."
+	docker-compose -p $(PBT_PROJECT_NAME) -f $(PBT_COMPOSE_FILE) up -d --remove-orphans
+	@echo "Waiting for services to be ready..."
+	sleep 5
+	docker-compose -p $(PBT_PROJECT_NAME) -f $(PBT_COMPOSE_FILE) ps
+
+pbt-down:
+	docker-compose -p $(PBT_PROJECT_NAME) -f $(PBT_COMPOSE_FILE) down --remove-orphans
+
+pbt-start-servers:
+	@echo "Starting BenchFS MPI servers..."
+	@CONTAINER_NAME=$$(docker ps --format '{{.Names}}' | grep pbt_controller | head -1); \
+	if [ -z "$$CONTAINER_NAME" ]; then \
+		echo "ERROR: PBT Controller container not found"; \
+		docker ps -a; \
+		exit 1; \
+	fi; \
+	echo "Using container: $$CONTAINER_NAME"; \
+	docker exec -d $$CONTAINER_NAME mpirun -np 2 --host server1,server2 \
+		--mca btl tcp,self --mca btl_tcp_if_include eth0 \
+		/usr/local/bin/benchfsd_mpi
+
+pbt-test: pbt-up pbt-start-servers
+	@echo "Running Property-Based Tests..."
+	@sleep 5
+	cd ../.. && cargo test --test pbt_filesystem -- --nocapture
+	$(MAKE) pbt-down
+
+pbt-test-verbose: pbt-up pbt-start-servers
+	@echo "Running Property-Based Tests (verbose)..."
+	@sleep 5
+	cd ../.. && RUST_LOG=debug cargo test --test pbt_filesystem -- --nocapture
+	$(MAKE) pbt-down
+
+pbt-shell:
+	@CONTAINER_NAME=$$(docker ps --format '{{.Names}}' | grep pbt_controller | head -1); \
+	docker exec -it $$CONTAINER_NAME /bin/bash
+
+pbt-logs:
+	docker-compose -p $(PBT_PROJECT_NAME) -f $(PBT_COMPOSE_FILE) logs -f
+
+pbt-clean: pbt-down
+	@echo "Removing PBT containers and volumes..."
+	docker rm -f benchfs_pbt_controller benchfs_pbt_server1 benchfs_pbt_server2 2>/dev/null || true
+	docker volume rm benchfs_pbt_pbt_shared_registry 2>/dev/null || true
+	docker volume rm benchfs_pbt_pbt_server1_data 2>/dev/null || true
+	docker volume rm benchfs_pbt_pbt_server2_data 2>/dev/null || true
+	docker volume rm benchfs_pbt_pbt_results 2>/dev/null || true
+	docker volume rm benchfs_pbt_pbt_benchfs_mount 2>/dev/null || true
+	@echo "PBT resources cleaned up"
