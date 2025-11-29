@@ -49,10 +49,10 @@ mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
   # 1 2 4 8
-  4
+  # 4
   # 2 4 8 16
   # 32
-  # 64
+  64
 )
 niter=1
 
@@ -70,7 +70,7 @@ for nnodes in "${nnodes_list[@]}"; do
       cmd_qsub=(
         qsub
         -W group_list="xg24i002"
-        -q short-g
+        -q regular-g
         -l select="$nnodes"
         -l walltime="${ELAPSTIM_REQ}"
         -V
