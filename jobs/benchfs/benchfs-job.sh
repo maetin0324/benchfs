@@ -679,7 +679,7 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
-            -x RUST_LOG
+            -x RUST_LOG=warn
             -x RUST_BACKTRACE
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"

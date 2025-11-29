@@ -257,7 +257,7 @@ cmd_ior_perf=(
   -np "$np"
   --bind-to none
   --map-by "ppr:${ppn}:node"
-  -x RUST_LOG
+  -x RUST_LOG=warn
   -x RUST_BACKTRACE
   "${CLIENT_PERF_WRAPPER}"
   "${PERF_OUTPUT_DIR}"

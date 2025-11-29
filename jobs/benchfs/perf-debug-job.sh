@@ -407,7 +407,7 @@ cmd_ior=(
   -np "$np"
   --bind-to none
   --map-by "ppr:${ppn}:node"
-  -x RUST_LOG
+  -x RUST_LOG=warn
   -x RUST_BACKTRACE
   -x OMPI_COMM_WORLD_RANK
   "${IOR_PERF_WRAPPER}"
