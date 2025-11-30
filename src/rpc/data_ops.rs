@@ -355,7 +355,12 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                 None
             };
 
-            unsafe {
+            tracing::debug!(
+                "ReadChunk: sending response (zero-copy), bytes={}, proto={:?}",
+                bytes_read, proto
+            );
+
+            let send_result = unsafe {
                 am_msg
                     .reply_vectorized(
                         Self::reply_stream_id() as u32,
@@ -365,7 +370,10 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                         proto,
                     )
                     .await
-            }
+            };
+
+            tracing::debug!("ReadChunk: response sent (zero-copy), success={}", send_result.is_ok());
+            send_result
         } else if let Some(ref data) = response_data {
             // Fallback path: send from Vec<u8>
             let data_slices = [std::io::IoSlice::new(data)];
@@ -377,7 +385,12 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                 None
             };
 
-            unsafe {
+            tracing::debug!(
+                "ReadChunk: sending response (fallback), bytes={}, proto={:?}",
+                data.len(), proto
+            );
+
+            let send_result = unsafe {
                 am_msg
                     .reply_vectorized(
                         Self::reply_stream_id() as u32,
@@ -387,10 +400,15 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                         proto,
                     )
                     .await
-            }
+            };
+
+            tracing::debug!("ReadChunk: response sent (fallback), success={}", send_result.is_ok());
+            send_result
         } else {
             // No data, just send header (error case)
-            unsafe {
+            tracing::debug!("ReadChunk: sending error response (no data)");
+
+            let send_result = unsafe {
                 am_msg
                     .reply_vectorized(
                         Self::reply_stream_id() as u32,
@@ -400,7 +418,10 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                         None,
                     )
                     .await
-            }
+            };
+
+            tracing::debug!("ReadChunk: error response sent, success={}", send_result.is_ok());
+            send_result
         };
 
         if let Err(e) = result {
@@ -808,6 +829,11 @@ impl AmRpc for WriteChunkRequest<'_> {
         let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
         let header_bytes: &[u8] = &header_vec;
 
+        tracing::debug!(
+            "WriteChunk: sending response, status={}, bytes_written={}",
+            response_header.status, response_header.bytes_written
+        );
+
         // Send header only (no data payload for write response)
         let result = unsafe {
             am_msg
@@ -820,6 +846,8 @@ impl AmRpc for WriteChunkRequest<'_> {
                 )
                 .await
         };
+
+        tracing::debug!("WriteChunk: response sent, success={}", result.is_ok());
 
         if let Err(e) = result {
             tracing::error!("Failed to send reply: {:?}", e);

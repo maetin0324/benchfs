@@ -449,7 +449,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=debug
+export RUST_LOG=trace
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
@@ -806,7 +806,7 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
               -np "$np"
               --bind-to none
               --map-by "ppr:${ppn}:node"
-              -x RUST_LOG=warn
+              -x RUST_LOG=trace
               -x RUST_BACKTRACE
               "${IOR_PREFIX}/src/ior"
               -vvv
