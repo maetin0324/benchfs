@@ -98,7 +98,8 @@
       "Bash(git submodule:*)",
       "Bash(uv --version:*)",
       "Bash(uv sync:*)",
-      "Bash(cargo search:*)"
+      "Bash(cargo search:*)",
+      "Bash(git revert:*)"
     ],
     "deny": [],
     "ask": []
