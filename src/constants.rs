@@ -49,7 +49,6 @@ pub fn should_use_rdma(data_size: u64) -> bool {
 }
 
 fn rdma_allowed() -> bool {
-    use std::env;
     use std::sync::OnceLock;
 
     static CACHE: OnceLock<bool> = OnceLock::new();

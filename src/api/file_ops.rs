@@ -293,7 +293,9 @@ impl BenchFS {
 
         let inode = if let Some(meta) = file_meta {
             // File exists
-            if flags.create && !flags.truncate {
+            // O_CREAT | O_EXCL: fail if file exists (POSIX semantics)
+            // O_CREAT alone: just open the file (no error)
+            if flags.create && flags.exclusive {
                 return Err(ApiError::AlreadyExists(path.to_string()));
             }
 

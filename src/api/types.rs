@@ -37,6 +37,9 @@ pub struct OpenFlags {
 
     /// Append mode
     pub append: bool,
+
+    /// Exclusive mode (O_EXCL): fail if file exists when creating
+    pub exclusive: bool,
 }
 
 impl OpenFlags {
@@ -47,6 +50,7 @@ impl OpenFlags {
             create: false,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 
@@ -57,6 +61,7 @@ impl OpenFlags {
             create: false,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 
@@ -67,6 +72,7 @@ impl OpenFlags {
             create: false,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 
@@ -77,6 +83,7 @@ impl OpenFlags {
             create: true,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 }

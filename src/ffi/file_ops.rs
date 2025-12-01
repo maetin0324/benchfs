@@ -164,6 +164,7 @@ fn c_flags_to_open_flags(flags: i32) -> OpenFlags {
         create: false,
         truncate: false,
         append: false,
+        exclusive: false,
     };
 
     // Access mode
@@ -194,7 +195,10 @@ fn c_flags_to_open_flags(flags: i32) -> OpenFlags {
     if flags & BENCHFS_O_APPEND != 0 {
         open_flags.append = true;
     }
-    // Note: EXCL flag is handled implicitly by the create flag in BenchFS
+    // O_EXCL: fail if file exists (only meaningful with O_CREAT)
+    if flags & BENCHFS_O_EXCL != 0 {
+        open_flags.exclusive = true;
+    }
 
     open_flags
 }
