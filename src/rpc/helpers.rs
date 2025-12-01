@@ -8,12 +8,15 @@
 
 use std::cell::UnsafeCell;
 use std::io::IoSlice;
+use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
+use pluvio_ucx::Worker;
 use zerocopy::FromBytes;
 
 use super::RpcError;
 use crate::rpc::handlers::RpcHandlerContext;
+use crate::rpc::RpcRequestPrefix;
 
 /// Helper for creating IoSlices with extended lifetimes for RPC requests
 ///
@@ -106,6 +109,123 @@ where
     H: FromBytes + Clone,
 {
     parse_header(am_msg).map_err(|e| (e, am_msg))
+}
+
+/// Parse RPC request with prefix containing client's worker address
+///
+/// All RPC requests now include an `RpcRequestPrefix` at the beginning of the header
+/// containing the client's worker address for the server to reply to.
+///
+/// # Returns
+///
+/// - `Ok((RpcRequestPrefix, H))` if both prefix and header were successfully parsed
+/// - `Err(RpcError)` if parsing fails
+pub fn parse_request_with_prefix<H>(am_msg: &AmMsg) -> Result<(RpcRequestPrefix, H), RpcError>
+where
+    H: FromBytes + Clone + zerocopy::KnownLayout,
+{
+    let header_bytes = am_msg.header();
+    let prefix_size = std::mem::size_of::<RpcRequestPrefix>();
+    let header_size = std::mem::size_of::<H>();
+
+    if header_bytes.len() < prefix_size {
+        tracing::error!(
+            "Header too short for prefix: got {} bytes, need {} bytes",
+            header_bytes.len(),
+            prefix_size
+        );
+        return Err(RpcError::InvalidHeader);
+    }
+
+    let prefix: RpcRequestPrefix = zerocopy::FromBytes::read_from_bytes(&header_bytes[..prefix_size])
+        .map_err(|_| {
+            tracing::error!("Failed to parse RpcRequestPrefix");
+            RpcError::InvalidHeader
+        })?;
+
+    if header_bytes.len() < prefix_size + header_size {
+        tracing::error!(
+            "Header too short for request header: got {} bytes, need {} + {} = {} bytes",
+            header_bytes.len(),
+            prefix_size,
+            header_size,
+            prefix_size + header_size
+        );
+        return Err(RpcError::InvalidHeader);
+    }
+
+    let header: H = zerocopy::FromBytes::read_from_prefix(&header_bytes[prefix_size..])
+        .map(|(h, _rest): (H, &[u8])| h.clone())
+        .map_err(|_| {
+            tracing::error!("Failed to parse request header");
+            RpcError::InvalidHeader
+        })?;
+
+    Ok((prefix, header))
+}
+
+/// Send RPC response using client's worker address
+///
+/// This is the new response mechanism that replaces the unstable `reply_ep`.
+/// The server creates a new endpoint to the client using the worker address
+/// from the request prefix, sends the response, and then closes the endpoint.
+///
+/// # Arguments
+///
+/// * `worker` - The server's worker for creating endpoint
+/// * `reply_stream_id` - The reply stream ID for this RPC type
+/// * `client_worker_address` - The client's worker address bytes
+/// * `response_header` - The response header to send
+/// * `response_data` - Optional response data payload
+///
+/// # Returns
+///
+/// - `Ok(())` on success
+/// - `Err(RpcError)` if endpoint creation or sending fails
+#[async_backtrace::framed]
+pub async fn send_rpc_response<H>(
+    worker: &Rc<Worker>,
+    reply_stream_id: u16,
+    client_worker_address: &[u8],
+    response_header: &H,
+    response_data: Option<&[u8]>,
+) -> Result<(), RpcError>
+where
+    H: zerocopy::IntoBytes + zerocopy::KnownLayout + zerocopy::Immutable,
+{
+    // Create endpoint to client using worker address
+    let addr = pluvio_ucx::WorkerAddressInner::from(client_worker_address);
+    let endpoint = worker.connect_addr(&addr).map_err(|e| {
+        tracing::error!("Failed to connect to client worker address: {:?}", e);
+        RpcError::TransportError(format!("Failed to connect to client: {:?}", e))
+    })?;
+
+    // Send response
+    let header_bytes = zerocopy::IntoBytes::as_bytes(response_header);
+    let data = response_data.unwrap_or(&[]);
+
+    // Determine protocol based on data size
+    let proto = if data.is_empty() {
+        None
+    } else if crate::rpc::should_use_rdma(data.len() as u64) {
+        Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+    } else {
+        None
+    };
+
+    endpoint
+        .am_send(reply_stream_id as u32, header_bytes, data, false, proto)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to send RPC response: {:?}", e);
+            RpcError::TransportError(format!("Failed to send response: {:?}", e))
+        })?;
+
+    // Close endpoint after sending
+    // Use force=true to avoid waiting for graceful close
+    let _ = endpoint.close(true).await;
+
+    Ok(())
 }
 
 /// Standard error code mapping for RPC errors
@@ -208,31 +328,29 @@ pub async fn receive_path(
         .map_err(|e| RpcError::TransportError(format!("Invalid UTF-8 in path: {:?}", e)))
 }
 
-/// Send RPC response using AmMsg reply_ep mechanism
+/// Send RPC response using worker address (wrapper for server handlers)
 ///
-/// This helper uses UCX's native reply endpoint to send responses,
-/// eliminating the need to send worker addresses in requests.
+/// This is a convenience wrapper around `send_rpc_response` that returns
+/// the AmMsg alongside the result, which is the pattern used in server handlers.
 ///
 /// # Arguments
 ///
+/// * `worker` - The server's worker for creating endpoint
 /// * `reply_stream_id` - The reply stream ID for this RPC type
+/// * `client_worker_address` - The client's WorkerAddress bytes from RpcRequestPrefix
 /// * `response_header` - The response header to send
 /// * `response_data` - Optional response data payload
-/// * `am_msg` - The active message containing reply_ep
+/// * `am_msg` - The active message (returned for ownership)
 ///
 /// # Returns
 ///
 /// - `Ok((ServerResponse, AmMsg))` on success
 /// - `Err((RpcError, AmMsg))` if sending fails
-///
-/// # Safety
-///
-/// Uses unsafe AmMsg::reply() method, but is safe because:
-/// - reply_ep is managed by UCX and valid for AmMsg lifetime
-/// - We check need_reply() before attempting to reply
 #[async_backtrace::framed]
-pub async fn send_rpc_response_via_reply<H>(
+pub async fn send_rpc_response_with_msg<H>(
+    worker: &Rc<Worker>,
     reply_stream_id: u16,
+    client_worker_address: &[u8],
     response_header: &H,
     response_data: Option<&[u8]>,
     am_msg: pluvio_ucx::async_ucx::ucp::AmMsg,
@@ -246,50 +364,24 @@ pub async fn send_rpc_response_via_reply<H>(
 where
     H: zerocopy::IntoBytes + zerocopy::KnownLayout + zerocopy::Immutable + Clone,
 {
-    if !am_msg.need_reply() {
-        tracing::error!("Message does not support reply");
-        return Err((
-            RpcError::HandlerError("Message does not support reply".to_string()),
+    match send_rpc_response(
+        worker,
+        reply_stream_id,
+        client_worker_address,
+        response_header,
+        response_data,
+    )
+    .await
+    {
+        Ok(()) => Ok((
+            crate::rpc::ServerResponse::new(response_header.clone()),
             am_msg,
-        ));
+        )),
+        Err(e) => {
+            tracing::error!("Failed to send response: {:?}", e);
+            Err((e, am_msg))
+        }
     }
-
-    let header_bytes = zerocopy::IntoBytes::as_bytes(response_header);
-    let data = response_data.unwrap_or(&[]);
-
-    // Determine protocol based on data size
-    let proto = if data.is_empty() {
-        None
-    } else if crate::rpc::should_use_rdma(data.len() as u64) {
-        Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
-    } else {
-        None
-    };
-
-    let result = unsafe {
-        am_msg
-            .reply(
-                reply_stream_id as u32,
-                header_bytes,
-                data,
-                false, // need_reply
-                proto,
-            )
-            .await
-    };
-
-    if let Err(e) = result {
-        tracing::error!("Failed to send reply: {:?}", e);
-        return Err((
-            RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
-            am_msg,
-        ));
-    }
-
-    Ok((
-        crate::rpc::ServerResponse::new(response_header.clone()),
-        am_msg,
-    ))
 }
 
 #[cfg(test)]

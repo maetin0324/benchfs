@@ -221,7 +221,7 @@ fn main() {
         .expect("Failed to create worker");
 
     // Create RPC handler context (minimal for benchmark)
-    let handler_context = Rc::new(RpcHandlerContext::new_bench());
+    let handler_context = Rc::new(RpcHandlerContext::new_bench(worker.clone()));
 
     // Create RPC server
     let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));

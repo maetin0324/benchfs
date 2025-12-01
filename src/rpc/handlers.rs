@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use pluvio_ucx::Worker;
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
@@ -10,12 +11,14 @@ use crate::storage::ChunkStore;
 
 /// RPC Handler context
 ///
-/// Contains references to the metadata manager and chunk store
+/// Contains references to the metadata manager, chunk store, and worker
 /// that handlers need to access.
 pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+    /// Worker for creating endpoints to send RPC responses
+    pub worker: Rc<Worker>,
     path_buffer_pool: Rc<PathBufferPool>,
     /// Shutdown flag for graceful termination
     shutdown_flag: RefCell<bool>,
@@ -26,18 +29,20 @@ impl RpcHandlerContext {
         metadata_manager: Rc<MetadataManager>,
         chunk_store: Rc<dyn ChunkStore>,
         allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+        worker: Rc<Worker>,
     ) -> Self {
         Self {
             metadata_manager,
             chunk_store,
             allocator,
+            worker,
             path_buffer_pool: Rc::new(PathBufferPool::new(64)),
             shutdown_flag: RefCell::new(false),
         }
     }
 
     /// Create a minimal context for benchmark (no storage/metadata)
-    pub fn new_bench() -> Self {
+    pub fn new_bench(worker: Rc<Worker>) -> Self {
         use crate::metadata::MetadataManager;
         use crate::storage::InMemoryChunkStore;
 
@@ -59,6 +64,7 @@ impl RpcHandlerContext {
             metadata_manager,
             chunk_store,
             allocator,
+            worker,
             path_buffer_pool: Rc::new(PathBufferPool::new(16)),
             shutdown_flag: RefCell::new(false),
         }

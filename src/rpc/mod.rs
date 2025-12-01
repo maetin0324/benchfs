@@ -25,6 +25,54 @@ pub use crate::constants::{
     RDMA_THRESHOLD, SHUTDOWN_MAGIC, WORKER_ADDRESS_BUFFER_SIZE, should_use_rdma,
 };
 
+/// RPC request prefix containing client's worker address for reply
+///
+/// All RPC requests now include this prefix at the beginning of the header.
+/// The server uses the client's worker address to create an endpoint and send the response,
+/// instead of using the unstable `reply_ep` mechanism.
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct RpcRequestPrefix {
+    /// Length of the worker address (0 if not provided)
+    pub worker_address_len: u32,
+    /// Reserved for alignment
+    pub _reserved: u32,
+    /// Worker address bytes (variable length, max 512 bytes)
+    pub worker_address: [u8; WORKER_ADDRESS_BUFFER_SIZE],
+}
+
+impl RpcRequestPrefix {
+    /// Create a new RpcRequestPrefix with the given worker address
+    pub fn new(worker_address: &[u8]) -> Self {
+        let mut prefix = Self {
+            worker_address_len: worker_address.len() as u32,
+            _reserved: 0,
+            worker_address: [0u8; WORKER_ADDRESS_BUFFER_SIZE],
+        };
+        let copy_len = worker_address.len().min(WORKER_ADDRESS_BUFFER_SIZE);
+        prefix.worker_address[..copy_len].copy_from_slice(&worker_address[..copy_len]);
+        prefix
+    }
+
+    /// Get the worker address bytes if present
+    pub fn get_worker_address(&self) -> Option<&[u8]> {
+        let len = self.worker_address_len as usize;
+        if len > 0 && len <= WORKER_ADDRESS_BUFFER_SIZE {
+            Some(&self.worker_address[..len])
+        } else {
+            None
+        }
+    }
+}
+
 /// Unified server response structure
 /// Contains response header and optional data payload
 pub struct ServerResponse<H> {

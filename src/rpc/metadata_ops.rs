@@ -6,9 +6,10 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::{DirectoryMetadata, FileMetadata};
 use crate::rpc::helpers::{
-    RpcIoSliceHelper, parse_header, receive_path, rpc_error_to_errno, send_rpc_response_via_reply,
+    RpcIoSliceHelper, parse_request_with_prefix, receive_path, rpc_error_to_errno,
+    send_rpc_response_with_msg,
 };
-use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, SHUTDOWN_MAGIC};
+use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, RpcRequestPrefix, SHUTDOWN_MAGIC};
 
 /// RPC IDs for metadata operations
 pub const RPC_METADATA_LOOKUP: RpcId = 20;
@@ -196,10 +197,16 @@ impl AmRpc for MetadataLookupRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: MetadataLookupRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, MetadataLookupRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr.to_vec(),
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Receive path data
@@ -219,8 +226,16 @@ impl AmRpc for MetadataLookupRequest {
             MetadataLookupResponseHeader::not_found()
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            &client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -369,10 +384,16 @@ impl AmRpc for MetadataCreateFileRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: MetadataCreateFileRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, MetadataCreateFileRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr.to_vec(),
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Receive path data
@@ -397,8 +418,16 @@ impl AmRpc for MetadataCreateFileRequest {
             }
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            &client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -503,10 +532,16 @@ impl AmRpc for MetadataCreateDirRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: MetadataCreateDirRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, MetadataCreateDirRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr.to_vec(),
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Receive path data
@@ -532,8 +567,16 @@ impl AmRpc for MetadataCreateDirRequest {
             }
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            &client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -704,10 +747,16 @@ impl AmRpc for MetadataDeleteRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: MetadataDeleteRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, MetadataDeleteRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr.to_vec(),
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Receive path data
@@ -735,8 +784,16 @@ impl AmRpc for MetadataDeleteRequest {
             MetadataDeleteResponseHeader::error(-22) // EINVAL
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            &client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -922,10 +979,16 @@ impl AmRpc for MetadataUpdateRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: MetadataUpdateRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, MetadataUpdateRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr.to_vec(),
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Receive path data
@@ -940,8 +1003,11 @@ impl AmRpc for MetadataUpdateRequest {
             Ok(meta) => meta,
             Err(_) => {
                 let error_header = MetadataUpdateResponseHeader::error(-2); // ENOENT
-                return send_rpc_response_via_reply(
+                // Send error response using worker address
+                return send_rpc_response_with_msg(
+                    &ctx.worker,
                     Self::reply_stream_id(),
+                    &client_addr,
                     &error_header,
                     None,
                     am_msg,
@@ -964,8 +1030,16 @@ impl AmRpc for MetadataUpdateRequest {
             Err(_e) => MetadataUpdateResponseHeader::error(-5), // EIO
         };
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            &client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -1213,10 +1287,16 @@ impl AmRpc for ShutdownRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: ShutdownRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, ShutdownRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr.to_vec(),
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Verify magic number
@@ -1232,8 +1312,16 @@ impl AmRpc for ShutdownRequest {
 
         let response_header = ShutdownResponseHeader::new(true);
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            &client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

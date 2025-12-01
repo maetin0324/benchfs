@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use crate::rpc::{AmRpc, Connection, RpcError};
+use crate::rpc::{AmRpc, Connection, RpcError, RpcRequestPrefix};
 
 /// RPC client for making RPC calls
 ///
@@ -10,41 +10,14 @@ pub struct RpcClient {
     // Store reply stream opaquely since pluvio_ucx may not export AmStream
     #[allow(dead_code)]
     reply_stream_id: RefCell<Option<u16>>,
-    /// Client's own WorkerAddress for direct response
-    worker_address: Vec<u8>,
 }
 
 impl RpcClient {
     pub fn new(conn: Connection) -> Self {
-        // Get worker address from the connection
-        let worker_address = conn
-            .worker()
-            .address()
-            .map(|addr| {
-                let addr_vec = addr.as_ref().to_vec();
-                tracing::debug!(
-                    "RpcClient: Got worker address, length={}, first_32_bytes={:?}",
-                    addr_vec.len(),
-                    &addr_vec.get(0..32.min(addr_vec.len())).unwrap_or(&[])
-                );
-                addr_vec
-            })
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to get worker address: {:?}", e);
-                tracing::error!("RpcClient: Returning empty worker address due to error");
-                vec![]
-            });
-
         Self {
             conn,
             reply_stream_id: RefCell::new(None),
-            worker_address,
         }
-    }
-
-    /// Get the client's WorkerAddress
-    pub fn worker_address(&self) -> &[u8] {
-        &self.worker_address
     }
 
     /// Get the underlying connection
@@ -68,6 +41,9 @@ impl RpcClient {
     /// This is the main entry point for executing RPCs. Pass any struct that implements
     /// RpcCall and it will be sent to the server, with the response being returned.
     ///
+    /// The client sends its WorkerAddress in a prefix so the server can send
+    /// the response using its endpoint cache (avoiding reply_ep SEGFAULTs).
+    ///
     /// # Example
     /// ```ignore
     /// let request = ReadRequest { offset: 0, len: 4096 };
@@ -82,7 +58,7 @@ impl RpcClient {
         let header = request.request_header();
         let data = request.request_data();
         let need_reply = request.need_reply();
-        let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
+        let proto = request.proto();
 
         tracing::debug!(
             "RPC call: rpc_id={}, reply_stream_id={}, has_data={}, data_len={}",
@@ -108,22 +84,35 @@ impl RpcClient {
             ));
         }
 
-        // Send the RPC request (proto is set to None for now)
+        // Create RpcRequestPrefix with our worker address for server to reply
+        let worker_addr = self.conn.worker.address().map_err(|e| {
+            RpcError::TransportError(format!("Failed to get worker address: {:?}", e))
+        })?;
+        let prefix = RpcRequestPrefix::new(worker_addr.as_ref());
+
+        // Combine prefix + header into a single header buffer
+        let prefix_bytes = zerocopy::IntoBytes::as_bytes(&prefix);
+        let header_bytes = zerocopy::IntoBytes::as_bytes(header);
+        let mut combined_header = Vec::with_capacity(prefix_bytes.len() + header_bytes.len());
+        combined_header.extend_from_slice(prefix_bytes);
+        combined_header.extend_from_slice(header_bytes);
+
         tracing::debug!(
-            "Sending AM request: rpc_id={}, header_size={}, need_reply={}, proto={:?}",
+            "Sending AM request: rpc_id={}, prefix_size={}, header_size={}, proto={:?}",
             rpc_id,
-            std::mem::size_of_val(zerocopy::IntoBytes::as_bytes(header)),
-            need_reply,
+            prefix_bytes.len(),
+            header_bytes.len(),
             proto
         );
 
+        // Send with need_reply=false (server uses endpoint cache, not reply_ep)
         self.conn
             .endpoint()
             .am_send_vectorized(
                 rpc_id as u32,
-                zerocopy::IntoBytes::as_bytes(header),
-                &data,
-                need_reply,
+                &combined_header,
+                data,
+                false, // need_reply = false (server uses endpoint cache)
                 proto,
             )
             .await
@@ -180,21 +169,37 @@ impl RpcClient {
 
     /// Execute an RPC without expecting a reply
     /// Useful for fire-and-forget operations
+    ///
+    /// Note: Even for no-reply RPCs, we include the WorkerAddress prefix
+    /// in case the server needs to identify the client.
     #[async_backtrace::framed]
     pub async fn execute_no_reply<T: AmRpc>(&self, request: &T) -> Result<(), RpcError> {
         let rpc_id = T::rpc_id();
         let header = request.request_header();
         let data = request.request_data();
-        let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
+        let proto = request.proto();
+
+        // Create RpcRequestPrefix with our worker address
+        let worker_addr = self.conn.worker.address().map_err(|e| {
+            RpcError::TransportError(format!("Failed to get worker address: {:?}", e))
+        })?;
+        let prefix = RpcRequestPrefix::new(worker_addr.as_ref());
+
+        // Combine prefix + header into a single header buffer
+        let prefix_bytes = zerocopy::IntoBytes::as_bytes(&prefix);
+        let header_bytes = zerocopy::IntoBytes::as_bytes(header);
+        let mut combined_header = Vec::with_capacity(prefix_bytes.len() + header_bytes.len());
+        combined_header.extend_from_slice(prefix_bytes);
+        combined_header.extend_from_slice(header_bytes);
 
         self.conn
             .endpoint()
             .am_send_vectorized(
                 rpc_id as u32,
-                zerocopy::IntoBytes::as_bytes(header),
-                &data,
+                &combined_header,
+                data,
                 false, // need_reply = false
-                proto, // proto - TODO: pass actual proto when available
+                proto,
             )
             .await
             .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;

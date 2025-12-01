@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
-use crate::rpc::helpers::{parse_header, send_rpc_response_via_reply};
+use crate::rpc::helpers::{parse_request_with_prefix, send_rpc_response_with_msg};
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, SHUTDOWN_MAGIC};
 
 /// RPC IDs for benchmark operations
@@ -118,13 +118,19 @@ impl AmRpc for BenchPingRequest {
 
     #[async_backtrace::framed]
     async fn server_handler(
-        _ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: BenchPingRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (_, BenchPingRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Get server timestamp
@@ -136,8 +142,16 @@ impl AmRpc for BenchPingRequest {
         let response_header =
             BenchPingResponseHeader::new(header.sequence_number, server_timestamp_ns);
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -248,10 +262,16 @@ impl AmRpc for BenchShutdownRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: BenchShutdownRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (_, BenchShutdownRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         // Verify magic number
@@ -267,8 +287,16 @@ impl AmRpc for BenchShutdownRequest {
 
         let response_header = BenchShutdownResponseHeader::new(true);
 
-        // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        // Send response using worker address
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

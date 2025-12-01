@@ -5,8 +5,8 @@ use std::rc::Rc;
 use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::NodeId;
-use crate::rpc::helpers::parse_header;
-use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId};
+use crate::rpc::helpers::{parse_request_with_prefix, send_rpc_response_with_msg};
+use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId, RpcRequestPrefix};
 
 /// RPC IDs for data operations
 pub const RPC_READ_CHUNK: RpcId = 10;
@@ -236,12 +236,18 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
     #[async_backtrace::framed]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
-        mut am_msg: AmMsg,
+        am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: ReadChunkRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, ReadChunkRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr.to_vec(),
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         let _span = tracing::trace_span!(
@@ -272,7 +278,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
         let chunk_store_any = &*ctx.chunk_store as &dyn Any;
 
         // Try zero-copy path first for IOUringChunkStore
-        let (response_header, response_data, fixed_buffer_opt) = if let Some(io_uring_store) =
+        let (response_header, response_data) = if let Some(io_uring_store) =
             chunk_store_any.downcast_ref::<IOUringChunkStore>()
         {
             tracing::trace!("Using zero-copy path for ReadChunk");
@@ -287,7 +293,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                 .read_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer)
                 .await
             {
-                Ok((bytes_read, fixed_buffer)) => {
+                Ok((bytes_read, mut fixed_buffer)) => {
                     let actual_bytes = bytes_read.min(read_len);
                     tracing::trace!(
                         "Read {} bytes (zero-copy) from storage (path={}, chunk={})",
@@ -295,15 +301,16 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                         path,
                         header.chunk_index
                     );
+                    // Copy data from fixed buffer (send_rpc_response_with_msg needs owned data)
+                    let data = fixed_buffer.as_mut_slice()[..actual_bytes].to_vec();
                     (
                         ReadChunkResponseHeader::success(actual_bytes as u64),
-                        None,
-                        Some((fixed_buffer, actual_bytes)),
+                        Some(data),
                     )
                 }
                 Err(e) => {
                     tracing::error!("Failed to read chunk (zero-copy): {:?}", e);
-                    (ReadChunkResponseHeader::error(-2), None, None)
+                    (ReadChunkResponseHeader::error(-2), None)
                 }
             }
         } else {
@@ -320,119 +327,31 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
                 Ok(data) => {
                     let bytes_read = data.len() as u64;
                     tracing::trace!("Read {} bytes from storage", bytes_read);
-                    (ReadChunkResponseHeader::success(bytes_read), Some(data), None)
+                    (ReadChunkResponseHeader::success(bytes_read), Some(data))
                 }
                 Err(e) => {
                     tracing::error!("Failed to read chunk: {:?}", e);
-                    (ReadChunkResponseHeader::error(-2), None, None)
+                    (ReadChunkResponseHeader::error(-2), None)
                 }
             }
         };
 
-        // Send response using reply_vectorized
-        if !am_msg.need_reply() {
-            tracing::error!("Message does not support reply");
-            return Err((
-                RpcError::HandlerError("Message does not support reply".to_string()),
-                am_msg,
-            ));
-        }
+        // Send response using worker address
+        tracing::debug!(
+            "ReadChunk: sending response, bytes={}, status={}",
+            response_data.as_ref().map(|d| d.len()).unwrap_or(0),
+            response_header.status
+        );
 
-        // Copy header bytes into an owned buffer so they live for the entire async send.
-        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
-        let header_bytes: &[u8] = &header_vec;
-
-        // Use reply_vectorized with IoSlice
-        let result = if let Some((mut fixed_buffer, bytes_read)) = fixed_buffer_opt {
-            // Zero-copy path: send directly from registered buffer
-            let data_slice = &fixed_buffer.as_mut_slice()[..bytes_read];
-            let data_slices = [std::io::IoSlice::new(data_slice)];
-
-            // Determine protocol based on data size
-            let proto = if crate::rpc::should_use_rdma(bytes_read as u64) {
-                Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
-            } else {
-                None
-            };
-
-            tracing::debug!(
-                "ReadChunk: sending response (zero-copy), bytes={}, proto={:?}",
-                bytes_read, proto
-            );
-
-            let send_result = unsafe {
-                am_msg
-                    .reply_vectorized(
-                        Self::reply_stream_id() as u32,
-                        header_bytes,
-                        &data_slices,
-                        false, // need_reply
-                        proto,
-                    )
-                    .await
-            };
-
-            tracing::debug!("ReadChunk: response sent (zero-copy), success={}", send_result.is_ok());
-            send_result
-        } else if let Some(ref data) = response_data {
-            // Fallback path: send from Vec<u8>
-            let data_slices = [std::io::IoSlice::new(data)];
-
-            // Determine protocol based on data size
-            let proto = if crate::rpc::should_use_rdma(data.len() as u64) {
-                Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
-            } else {
-                None
-            };
-
-            tracing::debug!(
-                "ReadChunk: sending response (fallback), bytes={}, proto={:?}",
-                data.len(), proto
-            );
-
-            let send_result = unsafe {
-                am_msg
-                    .reply_vectorized(
-                        Self::reply_stream_id() as u32,
-                        header_bytes,
-                        &data_slices,
-                        false, // need_reply
-                        proto,
-                    )
-                    .await
-            };
-
-            tracing::debug!("ReadChunk: response sent (fallback), success={}", send_result.is_ok());
-            send_result
-        } else {
-            // No data, just send header (error case)
-            tracing::debug!("ReadChunk: sending error response (no data)");
-
-            let send_result = unsafe {
-                am_msg
-                    .reply_vectorized(
-                        Self::reply_stream_id() as u32,
-                        header_bytes,
-                        &[],
-                        false, // need_reply
-                        None,
-                    )
-                    .await
-            };
-
-            tracing::debug!("ReadChunk: error response sent, success={}", send_result.is_ok());
-            send_result
-        };
-
-        if let Err(e) = result {
-            tracing::error!("Failed to send reply: {:?}", e);
-            return Err((
-                RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
-                am_msg,
-            ));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            &client_addr,
+            &response_header,
+            response_data.as_deref(),
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -637,10 +556,16 @@ impl AmRpc for WriteChunkRequest<'_> {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: WriteChunkRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
-            Err(e) => return Err((e, am_msg)),
+        // Parse request with prefix to get client's worker address
+        let (prefix, header): (RpcRequestPrefix, WriteChunkRequestHeader) =
+            match parse_request_with_prefix(&am_msg) {
+                Ok(v) => v,
+                Err(e) => return Err((e, am_msg)),
+            };
+
+        let client_addr = match prefix.get_worker_address() {
+            Some(addr) => addr,
+            None => return Err((RpcError::InvalidHeader, am_msg)),
         };
 
         let _span = tracing::trace_span!(
@@ -654,10 +579,17 @@ impl AmRpc for WriteChunkRequest<'_> {
         // Receive path and data from client
         if !am_msg.contains_data() {
             tracing::error!("WriteChunk request contains no data");
-            return Ok((
-                crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+            let response_header = WriteChunkResponseHeader::error(-22);
+            // Send error response using worker address
+            return send_rpc_response_with_msg(
+                &ctx.worker,
+                Self::reply_stream_id(),
+                client_addr,
+                &response_header,
+                None,
                 am_msg,
-            ));
+            )
+            .await;
         }
 
         // Check if chunk_store is IOUringChunkStore to use zero-copy path
@@ -681,80 +613,88 @@ impl AmRpc for WriteChunkRequest<'_> {
 
             // Extract path from header
             let path = match header.path() {
-                Ok(p) => p.to_owned(),
-                Err(e) => {
-                    tracing::error!("Failed to decode path: {:?}", e);
-                    return Ok((
-                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                Ok(p) if !p.is_empty() => p.to_owned(),
+                Ok(_) | Err(_) => {
+                    tracing::error!("Failed to decode path or path is empty");
+                    let response_header = WriteChunkResponseHeader::error(-22);
+                    return send_rpc_response_with_msg(
+                        &ctx.worker,
+                        Self::reply_stream_id(),
+                        client_addr,
+                        &response_header,
+                        None,
                         am_msg,
-                    ));
+                    )
+                    .await;
                 }
             };
 
-            // Zero-copy path: Use registered buffer
-            let mut fixed_buffer = ctx.allocator.acquire().await;
+            {
+                // Zero-copy path: Use registered buffer
+                let mut fixed_buffer = ctx.allocator.acquire().await;
 
-            // Ensure the data fits in the registered buffer
-            if data_len > fixed_buffer.len() {
-                tracing::error!(
-                    "Data size {} exceeds registered buffer size {}",
-                    data_len,
-                    fixed_buffer.len()
-                );
-                WriteChunkResponseHeader::error(-22)
-            } else {
-                let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
-
-                tracing::trace!(
-                    "WriteChunk: receiving data - data_len={}",
-                    data_len
-                );
-                tracing::trace!("WriteChunk: calling recv_data_single (zero-copy)...");
-
-                // Receive data into FixedBuffer
-                if let Err(e) = am_msg
-                    .recv_data_single(buffer_slice)
-                    .await
-                {
+                // Ensure the data fits in the registered buffer
+                if data_len > fixed_buffer.len() {
                     tracing::error!(
-                        "WriteChunk: failed to receive data (zero-copy): {:?}",
-                        e
+                        "Data size {} exceeds registered buffer size {}",
+                        data_len,
+                        fixed_buffer.len()
                     );
-                    WriteChunkResponseHeader::error(-5)
+                    WriteChunkResponseHeader::error(-22)
                 } else {
-                    tracing::trace!("WriteChunk: recv_data_single completed (zero-copy)");
+                    let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
                     tracing::trace!(
-                        "WriteChunk request (zero-copy): path={}, chunk={}, offset={}, length={}",
-                        path,
-                        header.chunk_index,
-                        header.offset,
-                        header.length
+                        "WriteChunk: receiving data - data_len={}",
+                        data_len
                     );
+                    tracing::trace!("WriteChunk: calling recv_data_single (zero-copy)...");
 
-                    // Use zero-copy write with registered buffer
-                    match io_uring_store
-                        .write_chunk_fixed(
-                            &path,
-                            header.chunk_index,
-                            header.offset,
-                            fixed_buffer,
-                            data_len,
-                        )
+                    // Receive data into FixedBuffer
+                    if let Err(e) = am_msg
+                        .recv_data_single(buffer_slice)
                         .await
                     {
-                        Ok(bytes_written) => {
-                            tracing::trace!(
-                                "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
-                                bytes_written,
-                                path,
-                                header.chunk_index
-                            );
-                            WriteChunkResponseHeader::success(header.length)
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
-                            WriteChunkResponseHeader::error(-5)
+                        tracing::error!(
+                            "WriteChunk: failed to receive data (zero-copy): {:?}",
+                            e
+                        );
+                        WriteChunkResponseHeader::error(-5)
+                    } else {
+                        tracing::trace!("WriteChunk: recv_data_single completed (zero-copy)");
+
+                        tracing::trace!(
+                            "WriteChunk request (zero-copy): path={}, chunk={}, offset={}, length={}",
+                            path,
+                            header.chunk_index,
+                            header.offset,
+                            header.length
+                        );
+
+                        // Use zero-copy write with registered buffer
+                        match io_uring_store
+                            .write_chunk_fixed(
+                                &path,
+                                header.chunk_index,
+                                header.offset,
+                                fixed_buffer,
+                                data_len,
+                            )
+                            .await
+                        {
+                            Ok(bytes_written) => {
+                                tracing::trace!(
+                                    "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
+                                    bytes_written,
+                                    path,
+                                    header.chunk_index
+                                );
+                                WriteChunkResponseHeader::success(header.length)
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
+                                WriteChunkResponseHeader::error(-5)
+                            }
                         }
                     }
                 }
@@ -767,97 +707,79 @@ impl AmRpc for WriteChunkRequest<'_> {
 
             // Extract path from header
             let path = match header.path() {
-                Ok(p) => p.to_owned(),
-                Err(e) => {
-                    tracing::error!("Failed to decode path: {:?}", e);
-                    return Ok((
-                        crate::rpc::ServerResponse::new(WriteChunkResponseHeader::error(-22)),
+                Ok(p) if !p.is_empty() => p.to_owned(),
+                Ok(_) | Err(_) => {
+                    tracing::error!("Failed to decode path or path is empty");
+                    let response_header = WriteChunkResponseHeader::error(-22);
+                    return send_rpc_response_with_msg(
+                        &ctx.worker,
+                        Self::reply_stream_id(),
+                        client_addr,
+                        &response_header,
+                        None,
                         am_msg,
-                    ));
+                    )
+                    .await;
                 }
             };
 
-            let mut data = vec![0u8; data_len];
-
-            // Receive data
-            if let Err(e) = am_msg
-                .recv_data_single(&mut data)
-                .await
             {
-                tracing::error!("Failed to receive data: {:?}", e);
-                WriteChunkResponseHeader::error(-5)
-            } else {
-                tracing::trace!(
-                    "WriteChunk request: path={}, chunk={}, offset={}, length={}",
-                    path,
-                    header.chunk_index,
-                    header.offset,
-                    header.length
-                );
+                let mut data = vec![0u8; data_len];
 
-                match ctx
-                    .chunk_store
-                    .write_chunk(&path, header.chunk_index, header.offset, &data)
+                // Receive data
+                if let Err(e) = am_msg
+                    .recv_data_single(&mut data)
                     .await
                 {
-                    Ok(_bytes_written) => {
-                        tracing::trace!(
-                            "Wrote {} bytes to storage (path={}, chunk={})",
-                            data.len(),
-                            path,
-                            header.chunk_index
-                        );
-                        WriteChunkResponseHeader::success(header.length)
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to write chunk: {:?}", e);
-                        WriteChunkResponseHeader::error(-5)
+                    tracing::error!("Failed to receive data: {:?}", e);
+                    WriteChunkResponseHeader::error(-5)
+                } else {
+                    tracing::trace!(
+                        "WriteChunk request: path={}, chunk={}, offset={}, length={}",
+                        path,
+                        header.chunk_index,
+                        header.offset,
+                        header.length
+                    );
+
+                    match ctx
+                        .chunk_store
+                        .write_chunk(&path, header.chunk_index, header.offset, &data)
+                        .await
+                    {
+                        Ok(_bytes_written) => {
+                            tracing::trace!(
+                                "Wrote {} bytes to storage (path={}, chunk={})",
+                                data.len(),
+                                path,
+                                header.chunk_index
+                            );
+                            WriteChunkResponseHeader::success(header.length)
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to write chunk: {:?}", e);
+                            WriteChunkResponseHeader::error(-5)
+                        }
                     }
                 }
             }
         };
 
-        // Send response using reply_vectorized
-        if !am_msg.need_reply() {
-            tracing::error!("Message does not support reply");
-            return Err((
-                RpcError::HandlerError("Message does not support reply".to_string()),
-                am_msg,
-            ));
-        }
-
-        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
-        let header_bytes: &[u8] = &header_vec;
-
+        // Send response using worker address
         tracing::debug!(
             "WriteChunk: sending response, status={}, bytes_written={}",
             response_header.status, response_header.bytes_written
         );
 
-        // Send header only (no data payload for write response)
-        let result = unsafe {
-            am_msg
-                .reply_vectorized(
-                    Self::reply_stream_id() as u32,
-                    header_bytes,
-                    &[],
-                    false, // need_reply
-                    None,  // No data, so no protocol needed
-                )
-                .await
-        };
-
-        tracing::debug!("WriteChunk: response sent, success={}", result.is_ok());
-
-        if let Err(e) = result {
-            tracing::error!("Failed to send reply: {:?}", e);
-            return Err((
-                RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
-                am_msg,
-            ));
-        }
-
-        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+        send_rpc_response_with_msg(
+            &ctx.worker,
+            Self::reply_stream_id(),
+            client_addr,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
