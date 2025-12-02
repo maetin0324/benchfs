@@ -288,12 +288,28 @@ echo "=========================================="
 echo "Phase 3: Stopping Server and Collecting Perf Data"
 echo "=========================================="
 
-echo "Stopping server (perf data will be written)..."
+echo "Sending SIGTERM to benchfsd_mpi for graceful shutdown..."
 "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node pkill -TERM benchfsd_mpi || true
-sleep 5
-kill $BENCHFSD_PID 2>/dev/null || true
+
+echo "Waiting for server to shutdown gracefully (max 60 seconds)..."
+SHUTDOWN_TIMEOUT=60
+ELAPSED=0
+while kill -0 $BENCHFSD_PID 2>/dev/null && [ $ELAPSED -lt $SHUTDOWN_TIMEOUT ]; do
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+    if [ $((ELAPSED % 10)) -eq 0 ]; then
+        echo "  Still waiting... ${ELAPSED}s elapsed"
+    fi
+done
+
+if kill -0 $BENCHFSD_PID 2>/dev/null; then
+    echo "WARNING: Server did not shutdown within ${SHUTDOWN_TIMEOUT}s, sending SIGKILL"
+    "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node pkill -9 benchfsd_mpi || true
+    kill -9 $BENCHFSD_PID 2>/dev/null || true
+else
+    echo "Server shutdown completed gracefully after ${ELAPSED}s"
+fi
 wait $BENCHFSD_PID 2>/dev/null || true
-"${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node pkill -9 benchfsd_mpi || true
 
 # ============================================================
 # Phase 4: Generate perf reports

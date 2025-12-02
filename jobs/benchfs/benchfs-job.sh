@@ -703,34 +703,56 @@ EOF
             > "${ior_stdout_file}" \
             2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || true
 
-          # Stop BenchFS servers gracefully
-          # Using SIGTERM first allows graceful shutdown, then SIGKILL as fallback
-          # This prevents MPI from reporting killed processes as errors
-          echo "Stopping BenchFS servers..."
+          # Stop BenchFS servers gracefully (for perf compatibility)
+          # Using SIGTERM allows graceful shutdown so perf can flush its data
+          echo "Stopping BenchFS servers (graceful shutdown for perf compatibility)..."
+
+          # Graceful shutdown timeout in seconds
+          graceful_timeout=${BENCHFS_SHUTDOWN_TIMEOUT:-30}
 
           # First, try graceful shutdown with SIGTERM via mpirun
-          # This ensures all nodes receive the signal properly
+          echo "Sending SIGTERM to benchfsd_mpi processes..."
           "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
             pkill -TERM benchfsd_mpi 2>/dev/null || true
 
-          # Wait for graceful shutdown (benchfsd handles SIGTERM)
-          sleep 3
+          # Wait for graceful shutdown - poll until process exits or timeout
+          echo "Waiting up to ${graceful_timeout}s for graceful shutdown..."
+          elapsed=0
+          graceful_success=0
+          while [ $elapsed -lt $graceful_timeout ]; do
+            # Check if mpirun process has exited
+            if ! kill -0 $BENCHFSD_PID 2>/dev/null; then
+              echo "BenchFS servers stopped gracefully after ${elapsed}s"
+              wait $BENCHFSD_PID 2>/dev/null || true
+              graceful_success=1
+              break
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
 
-          # Kill the mpirun process that launched benchfsd
-          kill $BENCHFSD_PID 2>/dev/null || true
-          wait $BENCHFSD_PID 2>/dev/null || true
+            # Show progress every 5 seconds
+            if [ $((elapsed % 5)) -eq 0 ]; then
+              echo "  Still waiting for graceful shutdown... (${elapsed}s/${graceful_timeout}s)"
+            fi
+          done
 
-          # Force cleanup of any orphaned processes with SIGKILL
-          # Only use this as a last resort after graceful shutdown attempt
-          echo "Force cleanup of orphaned processes..."
-          "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
+          # If graceful shutdown failed, use SIGKILL as last resort
+          if [ $graceful_success -eq 0 ]; then
+            echo "WARNING: Graceful shutdown timed out after ${graceful_timeout}s"
+            echo "WARNING: perf results may be incomplete due to forced termination"
+
+            # Kill the mpirun process that launched benchfsd
+            kill $BENCHFSD_PID 2>/dev/null || true
+            wait $BENCHFSD_PID 2>/dev/null || true
+
+            # Force cleanup of any orphaned processes with SIGKILL
+            "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
+              pkill -9 benchfsd_mpi 2>/dev/null || true
             pkill -9 benchfsd_mpi 2>/dev/null || true
 
-          # Also clean up local processes (for any edge cases)
-          pkill -9 benchfsd_mpi 2>/dev/null || true
-
-          # Wait for cleanup and FD release
-          sleep 3
+            # Wait for cleanup and FD release
+            sleep 3
+          fi
 
             runid=$((runid + 1))
           done

@@ -19,6 +19,7 @@ use benchfs::rpc::server::RpcServer;
 use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::Runtime;
+use pluvio_timer::TimerReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
 
@@ -50,7 +51,7 @@ impl ServerState {
     }
 
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.running.load(Ordering::Acquire)
     }
 
     fn node_id(&self) -> String {
@@ -189,6 +190,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     let ucx_context = Rc::new(UcxContext::new()?);
     let ucx_reactor = UCXReactor::current();
     runtime.register_reactor("ucx", ucx_reactor.clone());
+
+    // Register timer reactor for async sleep support
+    let timer_reactor = TimerReactor::current();
+    runtime.register_reactor("timer", timer_reactor);
 
     // Create UCX worker
     let worker = ucx_context.create_worker()?;
@@ -421,6 +426,8 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     // Start server main loop
     let server_handle = {
         let state_clone = state.clone();
+        let rpc_server_clone = rpc_server.clone();
+        let runtime_clone = runtime.clone();
 
         pluvio_runtime::spawn_with_name(
             async move {
@@ -433,6 +440,34 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
                     }
                     // Yield to allow other tasks to run
                     futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                }
+
+                // ========== Graceful Shutdown Sequence ==========
+                tracing::info!("Initiating graceful shutdown...");
+
+                // Step 1: Set shutdown flag on handler context
+                rpc_server_clone.handler_context().set_shutdown_flag();
+
+                // Step 2: Close all AM streams to wake up blocked listeners
+                rpc_server_clone.shutdown_all_streams();
+
+                // Step 3: Wait briefly for listener tasks to exit gracefully
+                let shutdown_timeout = std::time::Duration::from_millis(500);
+                tracing::info!(
+                    "Waiting {:?} for listener tasks to exit...",
+                    shutdown_timeout
+                );
+                pluvio_timer::sleep(shutdown_timeout).await;
+
+                // Step 4: Check if tasks are still running and force shutdown if needed
+                let remaining_tasks = runtime_clone.task_pool.borrow().len();
+                if remaining_tasks > 1 {
+                    // >1 because this task itself is still running
+                    tracing::warn!(
+                        "{} tasks still running after shutdown wait, requesting runtime shutdown",
+                        remaining_tasks - 1
+                    );
+                    runtime_clone.request_shutdown();
                 }
 
                 tracing::info!("RPC server stopped");

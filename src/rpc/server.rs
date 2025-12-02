@@ -1,7 +1,8 @@
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress};
+use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress, am::AmStream};
 
 use crate::rpc::handlers::RpcHandlerContext;
 use crate::rpc::{AmRpc, RpcError, Serializable};
@@ -18,6 +19,8 @@ pub const MAX_HEADER_SIZE: usize = 512;
 pub struct RpcServer {
     worker: Rc<Worker>,
     handler_context: Rc<RpcHandlerContext>,
+    /// Streams registered for RPC handlers, used for graceful shutdown
+    streams: Rc<RefCell<Vec<AmStream>>>,
 }
 
 impl RpcServer {
@@ -25,6 +28,7 @@ impl RpcServer {
         Self {
             worker,
             handler_context,
+            streams: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -63,6 +67,9 @@ impl RpcServer {
         let stream = self.worker.am_stream(Rpc::rpc_id()).map_err(|e| {
             RpcError::TransportError(format!("Failed to create AM stream: {:?}", e))
         })?;
+
+        // Store the stream for later shutdown
+        self.streams.borrow_mut().push(stream.clone());
 
         tracing::info!("RpcServer: Listening on AM stream ID {}", Rpc::rpc_id());
 
@@ -297,11 +304,28 @@ impl RpcServer {
     }
 
     /// Clone the server for use in handler tasks
-    /// This creates a shallow clone that shares the worker and handler context
+    /// This creates a shallow clone that shares the worker, handler context, and streams
     fn clone_for_handler(&self) -> Self {
         Self {
             worker: self.worker.clone(),
             handler_context: self.handler_context.clone(),
+            streams: self.streams.clone(),
         }
+    }
+
+    /// Close all registered streams to initiate graceful shutdown of handlers.
+    ///
+    /// This will cause all `wait_msg()` calls to return `None`, allowing the
+    /// listener tasks to exit gracefully.
+    pub fn shutdown_all_streams(&self) {
+        let streams = self.streams.borrow();
+        let count = streams.len();
+        tracing::info!("Closing {} RPC streams for graceful shutdown", count);
+
+        for stream in streams.iter() {
+            stream.close();
+        }
+
+        tracing::info!("All {} RPC streams closed", count);
     }
 }
