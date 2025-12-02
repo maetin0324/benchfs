@@ -2,7 +2,6 @@
 #------- qsub option -----------
 #PBS -A NBB
 #PBS -l elapstim_req=12:00:00
-#PBS -l USE_BEEOND=1
 #PBS -T openmpi
 #PBS -v NQSV_MPI_VER=4.1.8/gcc11.4.0-cuda12.8.1
 #PBS -v USE_BEEOND=1
@@ -222,6 +221,7 @@ for ppn in "${ppn_list[@]}"; do
           "${IOR_PREFIX}/src/ior"
           -vvv
           -a POSIX
+          --posix.odirect
           -t "$transfer_size"
           -b "$block_size"
           $ior_flags

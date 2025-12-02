@@ -33,6 +33,7 @@ cd "${OUTPUT_DIR}"
 
 nnodes_list=(
   2 4 8 16
+  # 4
 )
 niter=1
 
