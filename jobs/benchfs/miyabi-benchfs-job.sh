@@ -628,20 +628,47 @@ check_server_ready() {
 
 stop_benchfsd() {
   if [ -n "${BENCHFSD_PID:-}" ]; then
-    echo "Stopping BenchFS servers..."
+    echo "Stopping BenchFS servers (graceful shutdown for perf compatibility)..."
+
+    # Graceful shutdown timeout in seconds
+    # This must be long enough for perf to flush its data
+    local graceful_timeout=${BENCHFS_SHUTDOWN_TIMEOUT:-30}
 
     # First, try graceful shutdown with SIGTERM via mpirun
+    # This sends SIGTERM to benchfsd_mpi processes on all nodes
+    echo "Sending SIGTERM to benchfsd_mpi processes..."
     "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
       pkill -TERM benchfsd_mpi 2>/dev/null || true
 
-    # Wait for graceful shutdown
-    sleep 3
+    # Wait for graceful shutdown - poll until process exits or timeout
+    echo "Waiting up to ${graceful_timeout}s for graceful shutdown..."
+    local elapsed=0
+    while [ $elapsed -lt $graceful_timeout ]; do
+      # Check if mpirun process has exited
+      if ! kill -0 $BENCHFSD_PID 2>/dev/null; then
+        echo "BenchFS servers stopped gracefully after ${elapsed}s"
+        wait $BENCHFSD_PID 2>/dev/null || true
+        unset BENCHFSD_PID
+        return 0
+      fi
+      sleep 1
+      elapsed=$((elapsed + 1))
+
+      # Show progress every 5 seconds
+      if [ $((elapsed % 5)) -eq 0 ]; then
+        echo "  Still waiting for graceful shutdown... (${elapsed}s/${graceful_timeout}s)"
+      fi
+    done
+
+    # Graceful shutdown timed out - now use SIGKILL as last resort
+    echo "WARNING: Graceful shutdown timed out after ${graceful_timeout}s"
+    echo "WARNING: perf results may be incomplete due to forced termination"
 
     # Kill the mpirun process that launched benchfsd
     kill $BENCHFSD_PID 2>/dev/null || true
     wait $BENCHFSD_PID 2>/dev/null || true
 
-    # Force cleanup of any orphaned processes
+    # Force cleanup of any orphaned processes with SIGKILL
     "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
       pkill -9 benchfsd_mpi 2>/dev/null || true
     pkill -9 benchfsd_mpi 2>/dev/null || true
