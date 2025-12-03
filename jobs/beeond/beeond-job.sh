@@ -156,7 +156,7 @@ else
 fi
 
 # Load benchmark parameters from configuration file
-PARAM_FILE="${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}"
+PARAM_FILE="${PARAM_FILE:-${SCRIPT_DIR}/../params/standard.conf}"
 if [ -f "$PARAM_FILE" ]; then
     echo "Loading parameters from: $PARAM_FILE"
     source "$PARAM_FILE"

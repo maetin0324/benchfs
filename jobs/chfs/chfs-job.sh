@@ -91,7 +91,7 @@ cmd_mpirun_common=(
 # Parameter Loading
 # ============================================================
 
-PARAM_FILE="${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}"
+PARAM_FILE="${PARAM_FILE:-${SCRIPT_DIR}/../params/standard.conf}"
 if [ -f "$PARAM_FILE" ]; then
     echo "Loading parameters from: $PARAM_FILE"
     source "$PARAM_FILE"
@@ -139,6 +139,27 @@ start_chfs_servers() {
 
   # Create hostfile
   cp "${PBS_NODEFILE}" "${JOB_OUTPUT_DIR}/hostfile"
+
+  # Create wrapper script to limit chfsd to 2 cores using taskset
+  # This ensures CHFS server doesn't consume all CPU cores
+  local WRAPPER_DIR="${JOB_OUTPUT_DIR}/bin"
+  mkdir -p "${WRAPPER_DIR}"
+
+  cat > "${WRAPPER_DIR}/chfsd" <<'WRAPPER_EOF'
+#!/bin/bash
+# Wrapper script to limit chfsd to 2 CPU cores (cores 0 and 1)
+REAL_CHFSD="__CHFS_PREFIX__/sbin/chfsd"
+exec taskset -c 0,1 "${REAL_CHFSD}" "$@"
+WRAPPER_EOF
+
+  # Replace placeholder with actual CHFS_PREFIX
+  sed -i "s|__CHFS_PREFIX__|${CHFS_PREFIX}|g" "${WRAPPER_DIR}/chfsd"
+  chmod +x "${WRAPPER_DIR}/chfsd"
+
+  echo "Created chfsd wrapper with taskset -c 0,1 at ${WRAPPER_DIR}/chfsd"
+
+  # Prepend wrapper directory to PATH so chfsctl uses our wrapper
+  export PATH="${WRAPPER_DIR}:${PATH}"
 
   # Start CHFS servers (no FUSE mount, using native API)
   echo "Running chfsctl start..."

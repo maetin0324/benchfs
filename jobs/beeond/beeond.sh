@@ -14,7 +14,7 @@ OUTPUT_DIR="$PROJECT_ROOT/results/beeond/${TIMESTAMP}-${LABEL}"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 # Resolve PARAM_FILE to absolute path BEFORE cd (relative paths won't work after cd)
-PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}")"
+PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/../params/standard.conf}")"
 
 # Debug: Print paths
 echo "=========================================="

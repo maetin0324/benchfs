@@ -21,7 +21,7 @@ CHFS_PREFIX="/work/NBB/rmaeda/.local"  # CHFS installation directory
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"  # IOR with CHFS support
 
 # Resolve PARAM_FILE to absolute path BEFORE cd
-PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}")"
+PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/../params/standard.conf}")"
 
 echo "=========================================="
 echo "CHFS Job Submission"
