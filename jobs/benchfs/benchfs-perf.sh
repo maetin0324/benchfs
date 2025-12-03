@@ -11,7 +11,7 @@ JOB_FILE="${SCRIPT_DIR}/benchfs-perf-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
 OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
-BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
+BENCHFS_PREFIX="${PROJECT_ROOT}/target/debug"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 echo "=========================================="

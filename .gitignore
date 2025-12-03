@@ -8,6 +8,9 @@ Cargo.lock
 *.so
 *.dylib
 
+# External
+/external
+
 # virtual environments
 .venv/
 

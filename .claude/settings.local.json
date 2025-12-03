@@ -99,7 +99,8 @@
       "Bash(uv --version:*)",
       "Bash(uv sync:*)",
       "Bash(cargo search:*)",
-      "Bash(git revert:*)"
+      "Bash(git revert:*)",
+      "Bash(spack load:*)"
     ],
     "deny": [],
     "ask": []
