@@ -100,7 +100,9 @@
       "Bash(uv sync:*)",
       "Bash(cargo search:*)",
       "Bash(git revert:*)",
-      "Bash(spack load:*)"
+      "Bash(spack load:*)",
+      "Bash(tree:*)",
+      "WebFetch(domain:docs.rs)"
     ],
     "deny": [],
     "ask": []

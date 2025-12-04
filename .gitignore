@@ -21,6 +21,7 @@ data/
 # Test results
 results/
 raw/
+traces/
 
 # Editor
 .vscode/

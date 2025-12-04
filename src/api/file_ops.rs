@@ -10,6 +10,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures_timer::Delay;
 use pluvio_runtime::spawn_with_name;
+use tracing::instrument;
 
 use crate::api::types::{ApiError, ApiResult, FileHandle, OpenFlags};
 use crate::cache::{ChunkCache, ChunkId};
@@ -521,9 +522,8 @@ impl BenchFS {
     /// # Returns
     /// Number of bytes read
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "api_read", skip(self, buf), fields(path = %handle.path, len = buf.len(), pos = handle.position()))]
     pub async fn benchfs_read(&self, handle: &FileHandle, buf: &mut [u8]) -> ApiResult<usize> {
-        let _span = tracing::trace_span!("api_read", path = %handle.path, len = buf.len(), pos = handle.position()).entered();
-
         if !handle.flags.read {
             return Err(ApiError::PermissionDenied(
                 "File not opened for reading".to_string(),
@@ -717,9 +717,8 @@ impl BenchFS {
     /// # Returns
     /// Number of bytes written
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "api_write", skip(self, data), fields(path = %handle.path, len = data.len(), pos = handle.position()))]
     pub async fn benchfs_write(&self, handle: &FileHandle, data: &[u8]) -> ApiResult<usize> {
-        let _span = tracing::trace_span!("api_write", path = %handle.path, len = data.len(), pos = handle.position()).entered();
-
         if !handle.flags.write {
             return Err(ApiError::PermissionDenied(
                 "File not opened for writing".to_string(),

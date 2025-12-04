@@ -134,6 +134,76 @@ pub fn init_with_hostname(level: &str) {
     tracing::info!("Logging initialized on host: {}", hostname);
 }
 
+/// Chrome tracing guard that holds the FlushGuard
+///
+/// This guard must be kept alive for the duration of tracing.
+/// The trace file will be flushed when this guard is dropped.
+///
+/// Note: We use tracing-chrome instead of tracing-perfetto because
+/// tracing-perfetto has issues with duration tracking (all durations show as 0ms).
+/// tracing-chrome produces Chrome Trace Format JSON which Perfetto UI can read
+/// with accurate duration information.
+pub struct PerfettoGuard {
+    /// tracing-chrome FlushGuard
+    _guard: tracing_chrome::FlushGuard,
+}
+
+/// Initialize tracing with Chrome trace format output for performance analysis
+///
+/// This function sets up both console logging (with hostname prefix) and
+/// Chrome trace file output (compatible with Perfetto UI). The returned guard
+/// must be kept alive for the duration of tracing; dropping it will flush
+/// and close the trace file.
+///
+/// # Arguments
+/// * `level` - Log level filter (e.g., "info", "debug", "trace")
+/// * `trace_path` - Path to the output trace file (.json extension recommended)
+///
+/// # Returns
+/// A `PerfettoGuard` that must be kept alive for tracing to work
+///
+/// # Note
+/// We use tracing-chrome instead of tracing-perfetto because tracing-perfetto
+/// has issues with duration tracking in async contexts (all durations show as 0ms).
+/// tracing-chrome produces Chrome Trace Format JSON which Perfetto UI can read
+/// with accurate duration information.
+pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> PerfettoGuard {
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    // Console output layer with hostname formatter
+    let fmt_layer = fmt::layer()
+        .event_format(HostnameFormatter::new())
+        .with_writer(std::io::stdout);
+
+    // Chrome trace file layer (compatible with Perfetto UI)
+    // This properly tracks span enter/exit for accurate duration measurement
+    let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+        .file(trace_path)
+        .include_args(true)
+        .build();
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(chrome_layer)
+        .init();
+
+    let hostname_os = gethostname::gethostname();
+    let hostname = hostname_os.to_str().unwrap_or("unknown");
+    tracing::info!(
+        "Logging initialized on host: {} with Chrome trace output: {}",
+        hostname,
+        trace_path.display()
+    );
+
+    PerfettoGuard { _guard: guard }
+}
+
 /// Dump the current async task backtrace tree to stderr
 pub fn dump_async_tasks() {
     eprintln!("\n========== Async Task Backtrace Dump ==========");

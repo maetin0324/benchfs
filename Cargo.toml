@@ -52,6 +52,12 @@ once_cell = "1.19"
 
 # MPI support
 mpi = { version = "0.8", features = ["derive"], optional = true }
+tracing-perfetto = "0.1.5"
+tracing-chrome = "0.7"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
 
 [dev-dependencies]
 tempfile = "3.0"
@@ -78,6 +84,10 @@ required-features = ["mpi-support"]
 name = "benchfs_rpc_bench"
 path = "src/bin/benchfs_rpc_bench.rs"
 required-features = ["mpi-support"]
+
+[[bin]]
+name = "benchfs_perf"
+path = "src/bin/benchfs_perf.rs"
 
 # Benchmark configuration - currently disabled as benches/small.rs does not exist
 # [[bench]]

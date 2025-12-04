@@ -104,22 +104,19 @@ impl RpcServer {
             // This allows the server to immediately accept the next request while
             // the current request is being processed (storage I/O + network send)
             let ctx_clone = ctx.clone();
+            let rpc_id = Rpc::rpc_id();
             pluvio_runtime::spawn(async move {
-                // Use trace_span to avoid excessive logging at debug level
-                let _handler_span =
-                    tracing::trace_span!("rpc_server_handler", rpc_id = Rpc::rpc_id()).entered();
-
                 match Rpc::server_handler(ctx_clone, am_msg).await {
                     Ok((_response, _am_msg)) => {
                         // Response was already sent within server_handler via reply_ep
                         tracing::trace!(
                             "RPC handler completed successfully for RPC ID {} (response sent directly)",
-                            Rpc::rpc_id()
+                            rpc_id
                         );
                     }
                     Err((e, _am_msg)) => {
                         // エラーレスポンスもserver_handler内で送信済み（またはハンドラーがエラーを返した）
-                        tracing::error!("Handler failed for RPC ID {}: {:?}", Rpc::rpc_id(), e);
+                        tracing::error!("Handler failed for RPC ID {}: {:?}", rpc_id, e);
                     }
                 }
             });

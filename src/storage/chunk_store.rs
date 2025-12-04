@@ -6,6 +6,8 @@ use std::rc::Rc;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
+use tracing::instrument;
+
 use super::{FileHandle, IOUringBackend, OpenFlags, StorageBackend};
 use crate::metadata::CHUNK_SIZE;
 
@@ -733,6 +735,7 @@ impl IOUringChunkStore {
 
     /// Write a chunk to file using io_uring
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "chunk_write", skip(self, data), fields(path = file_path, chunk = chunk_index, offset, len = data.len()))]
     pub async fn write_chunk(
         &self,
         file_path: &str,
@@ -740,15 +743,6 @@ impl IOUringChunkStore {
         offset: u64,
         data: &[u8],
     ) -> ChunkStoreResult<usize> {
-        let _span = tracing::trace_span!(
-            "chunk_write",
-            path = file_path,
-            chunk = chunk_index,
-            offset,
-            len = data.len()
-        )
-        .entered();
-
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
@@ -775,6 +769,7 @@ impl IOUringChunkStore {
 
     /// Read a chunk from file using io_uring
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "chunk_read", skip(self), fields(path = file_path, chunk = chunk_index, offset, len = length))]
     pub async fn read_chunk(
         &self,
         file_path: &str,
@@ -782,15 +777,6 @@ impl IOUringChunkStore {
         offset: u64,
         length: u64,
     ) -> ChunkStoreResult<Vec<u8>> {
-        let _span = tracing::trace_span!(
-            "chunk_read",
-            path = file_path,
-            chunk = chunk_index,
-            offset,
-            len = length
-        )
-        .entered();
-
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }

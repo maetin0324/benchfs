@@ -234,6 +234,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
     }
 
     #[async_backtrace::framed]
+    #[tracing::instrument(level = "info", name = "rpc_read_chunk_handler", skip(ctx, am_msg))]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -244,13 +245,12 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
             Err(e) => return Err((e, am_msg)),
         };
 
-        let _span = tracing::trace_span!(
-            "rpc_read_chunk",
+        tracing::trace!(
             chunk = header.chunk_index,
             offset = header.offset,
-            len = header.length
-        )
-        .entered();
+            len = header.length,
+            "ReadChunk request received"
+        );
 
         // Extract path from header
         let path = match header.path() {
@@ -633,6 +633,7 @@ impl AmRpc for WriteChunkRequest<'_> {
     }
 
     #[async_backtrace::framed]
+    #[tracing::instrument(level = "info", name = "rpc_write_chunk_handler", skip(ctx, am_msg))]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -643,13 +644,12 @@ impl AmRpc for WriteChunkRequest<'_> {
             Err(e) => return Err((e, am_msg)),
         };
 
-        let _span = tracing::trace_span!(
-            "rpc_write_chunk",
+        tracing::trace!(
             chunk = header.chunk_index,
             offset = header.offset,
-            len = header.length
-        )
-        .entered();
+            len = header.length,
+            "WriteChunk request received"
+        );
 
         // Receive path and data from client
         if !am_msg.contains_data() {

@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 
+use tracing::instrument;
+
 use crate::rpc::{AmRpc, Connection, RpcError};
 
 /// RPC client for making RPC calls
@@ -74,10 +76,9 @@ impl RpcClient {
     /// let response: ReadResponse = client.execute(&request).await?;
     /// ```
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "rpc_call", skip(self, request), fields(rpc_id = T::rpc_id()))]
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         let rpc_id = T::rpc_id();
-        let _span = tracing::trace_span!("rpc_call", rpc_id).entered();
-
         let reply_stream_id = T::reply_stream_id();
         let header = request.request_header();
         let data = request.request_data();
