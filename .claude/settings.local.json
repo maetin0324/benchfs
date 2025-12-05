@@ -102,7 +102,9 @@
       "Bash(git revert:*)",
       "Bash(spack load:*)",
       "Bash(tree:*)",
-      "WebFetch(domain:docs.rs)"
+      "WebFetch(domain:docs.rs)",
+      "Bash(spack find:*)",
+      "Bash(ldd:*)"
     ],
     "deny": [],
     "ask": []

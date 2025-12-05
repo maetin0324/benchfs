@@ -11,11 +11,16 @@
 
 set -euo pipefail
 
-# Increase file descriptor limit
-ulimit -n 1048576
+# Try to increase file descriptor limit (may fail on some job schedulers)
+ulimit -n 1048576 2>/dev/null || true
 
 # Load common utilities
 source "${SCRIPT_DIR}/../benchfs/common.sh"
+source "$HOME/.bashrc"
+
+# Load OpenMPI module
+module purge
+module load "openmpi/$NQSV_MPI_VER"
 
 # ============================================================
 # Job Environment Setup
@@ -37,16 +42,30 @@ IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 # Create output directories
 mkdir -p "${JOB_OUTPUT_DIR}" "${CHFS_LOG_DIR}" "${IOR_OUTPUT_DIR}" "${JOB_BACKEND_DIR}"
 
-# Load spack and mochi-margo for CHFS dependencies
+# Save OpenMPI mpirun path before loading spack (spack may override PATH)
+MPIRUN_CMD="$(which mpirun)"
+echo "OpenMPI mpirun: ${MPIRUN_CMD}"
+
+# Load CHFS and its dependencies via spack
 SPACK_SETUP="/work/NBB/rmaeda/spack/share/spack/setup-env.sh"
+echo "Loading spack from: ${SPACK_SETUP}"
 if [ -f "$SPACK_SETUP" ]; then
   source "$SPACK_SETUP"
-  spack load mochi-margo
+  echo "Spack loaded, loading chfs..."
+  spack load chfs || { echo "ERROR: Failed to load chfs"; exit 1; }
+else
+  echo "ERROR: Spack setup file not found at ${SPACK_SETUP}"
+  exit 1
 fi
 
-# Set up environment paths for CHFS
-export PATH="${CHFS_PREFIX}/bin:${CHFS_PREFIX}/sbin:$PATH"
-export LD_LIBRARY_PATH="${CHFS_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+# Verify chfsctl is accessible
+echo "PATH: ${PATH}"
+echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-}"
+if ! command -v chfsctl &> /dev/null; then
+  echo "ERROR: chfsctl not found in PATH"
+  exit 1
+fi
+echo "chfsctl found at: $(which chfsctl)"
 
 # Copy job artifacts
 cp "$0" "${JOB_OUTPUT_DIR}/"
@@ -78,7 +97,7 @@ fi
 
 # Build mpirun common command (use TCP for compatibility)
 cmd_mpirun_common=(
-  mpirun
+  "${MPIRUN_CMD}"
   "${nqsii_mpiopts_array[@]}"
   --mca pml ob1
   --mca btl tcp,vader,self
@@ -102,8 +121,13 @@ fi
 
 # Set defaults for optional parameters
 : ${CHFS_CHUNK_SIZE:=1048576}
-: ${CHFS_PROTOCOL:=sockets}
+: ${CHFS_PROTOCOL:=verbs}
 : ${CHFS_DB_SIZE:=10GB}
+
+echo "CHFS Parameters:"
+echo "  CHFS_PROTOCOL: ${CHFS_PROTOCOL}"
+echo "  CHFS_CHUNK_SIZE: ${CHFS_CHUNK_SIZE}"
+echo "  CHFS_DB_SIZE: ${CHFS_DB_SIZE}"
 
 # Save parameters as JSON
 cat > "${JOB_OUTPUT_DIR}/parameters.json" <<EOF
@@ -140,30 +164,49 @@ start_chfs_servers() {
   # Create hostfile
   cp "${PBS_NODEFILE}" "${JOB_OUTPUT_DIR}/hostfile"
 
-  # Create wrapper script to limit chfsd to 2 cores using taskset
-  # This ensures CHFS server doesn't consume all CPU cores
-  local WRAPPER_DIR="${JOB_OUTPUT_DIR}/bin"
-  mkdir -p "${WRAPPER_DIR}"
+  # Create scratch directory and deploy taskset wrapper on all nodes
+  echo "Creating scratch directory ${CHFS_SCRATCH_DIR} and deploying taskset wrapper on all nodes..."
+  local WRAPPER_DIR="${CHFS_SCRATCH_DIR}/bin"
+  local CHFSD_REAL=$(which chfsd)
+  echo "Real chfsd path: ${CHFSD_REAL}"
 
-  cat > "${WRAPPER_DIR}/chfsd" <<'WRAPPER_EOF'
+  # Create wrapper script locally first
+  local WRAPPER_SCRIPT="${JOB_OUTPUT_DIR}/chfsd_wrapper.sh"
+  cat > "${WRAPPER_SCRIPT}" <<EOF
 #!/bin/bash
-# Wrapper script to limit chfsd to 2 CPU cores (cores 0 and 1)
-REAL_CHFSD="__CHFS_PREFIX__/sbin/chfsd"
-exec taskset -c 0,1 "${REAL_CHFSD}" "$@"
-WRAPPER_EOF
+# Wrapper to limit chfsd to 2 CPU cores
+exec taskset -c 0,1 ${CHFSD_REAL} "\$@"
+EOF
+  chmod +x "${WRAPPER_SCRIPT}"
+  echo "Created wrapper script: ${WRAPPER_SCRIPT}"
+  cat "${WRAPPER_SCRIPT}"
 
-  # Replace placeholder with actual CHFS_PREFIX
-  sed -i "s|__CHFS_PREFIX__|${CHFS_PREFIX}|g" "${WRAPPER_DIR}/chfsd"
-  chmod +x "${WRAPPER_DIR}/chfsd"
+  # Deploy to all nodes
+  while IFS= read -r host; do
+    ssh -o StrictHostKeyChecking=no "$host" "mkdir -p ${CHFS_SCRATCH_DIR} && mkdir -p ${WRAPPER_DIR}" &
+  done < "${JOB_OUTPUT_DIR}/hostfile"
+  wait
 
-  echo "Created chfsd wrapper with taskset -c 0,1 at ${WRAPPER_DIR}/chfsd"
+  while IFS= read -r host; do
+    scp -o StrictHostKeyChecking=no "${WRAPPER_SCRIPT}" "${host}:${WRAPPER_DIR}/chfsd" &
+  done < "${JOB_OUTPUT_DIR}/hostfile"
+  wait
 
-  # Prepend wrapper directory to PATH so chfsctl uses our wrapper
+  echo "Scratch directories and taskset wrappers created"
+  echo "chfsd wrapper: ${WRAPPER_DIR}/chfsd (limits to cores 0,1)"
+
+  # Prepend wrapper directory to PATH so chfsctl finds it first
   export PATH="${WRAPPER_DIR}:${PATH}"
+  echo "Updated PATH to use taskset wrapper: ${WRAPPER_DIR}"
 
   # Start CHFS servers (no FUSE mount, using native API)
   echo "Running chfsctl start..."
-  eval $(chfsctl \
+  echo "chfsctl command: chfsctl -h ${JOB_OUTPUT_DIR}/hostfile -c ${CHFS_SCRATCH_DIR} -s ${db_size} -p ${protocol} -M -f 2 -n 32 -L ${CHFS_LOG_DIR} start"
+
+  # Run chfsctl and capture output
+  # Use -x to export environment variables to remote nodes (variable name only)
+  local chfsctl_output
+  chfsctl_output=$(chfsctl \
     -h "${JOB_OUTPUT_DIR}/hostfile" \
     -c "${CHFS_SCRATCH_DIR}" \
     -s "${db_size}" \
@@ -172,8 +215,29 @@ WRAPPER_EOF
     -f 2 \
     -n 32 \
     -L "${CHFS_LOG_DIR}" \
-    -ssh "ssh -o StrictHostKeyChecking=no" \
-    start 2>&1 | tee "${CHFS_LOG_DIR}/chfsctl_start.log")
+    -x PATH \
+    -x LD_LIBRARY_PATH \
+    start 2>&1) || {
+      echo "ERROR: chfsctl start failed with exit code $?"
+      echo "Output: ${chfsctl_output}"
+      echo ""
+      echo "=== CHFS Log Files ==="
+      ls -la "${CHFS_LOG_DIR}/" 2>&1 || true
+      echo ""
+      echo "=== chfsd log content (first 50 lines each) ==="
+      for logfile in "${CHFS_LOG_DIR}"/*.log; do
+        if [ -f "$logfile" ]; then
+          echo "--- $logfile ---"
+          head -50 "$logfile" 2>&1 || true
+        fi
+      done
+      return 1
+    }
+
+  echo "${chfsctl_output}" | tee "${CHFS_LOG_DIR}/chfsctl_start.log"
+
+  # Evaluate the output to set environment variables
+  eval "${chfsctl_output}"
 
   # Verify environment variables are set
   if [ -z "${CHFS_SERVER:-}" ]; then
@@ -214,14 +278,12 @@ stop_chfs_servers() {
   chfsctl \
     -h "${JOB_OUTPUT_DIR}/hostfile" \
     -M \
-    -ssh "ssh -o StrictHostKeyChecking=no" \
     stop > "${CHFS_LOG_DIR}/chfsctl_stop.log" 2>&1 || true
 
-  # Clean up scratch directories
+  # Clean up scratch directories (also removes the taskset wrapper)
   chfsctl \
     -h "${JOB_OUTPUT_DIR}/hostfile" \
     -c "${CHFS_SCRATCH_DIR}" \
-    -ssh "ssh -o StrictHostKeyChecking=no" \
     clean > "${CHFS_LOG_DIR}/chfsctl_clean.log" 2>&1 || true
 
   echo "CHFS servers stopped"

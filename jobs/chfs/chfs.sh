@@ -17,11 +17,11 @@ JOB_FILE="${SCRIPT_DIR}/chfs-job.sh"
 PROJECT_ROOT="$(to_fullpath "${SCRIPT_DIR}/../..")"
 OUTPUT_DIR="$PROJECT_ROOT/results/chfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/chfs"
-CHFS_PREFIX="/work/NBB/rmaeda/.local"  # CHFS installation directory
+CHFS_PREFIX="spack"  # CHFS is loaded via 'spack load chfs'
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"  # IOR with CHFS support
 
 # Resolve PARAM_FILE to absolute path BEFORE cd
-PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/../params/standard.conf}")"
+PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/../params/debug.conf}")"
 
 echo "=========================================="
 echo "CHFS Job Submission"
