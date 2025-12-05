@@ -27,6 +27,8 @@ module load "openmpi/$NQSV_MPI_VER"
 # - IOR_PREFIX
 # Optional:
 # - ENABLE_PERFETTO (default: 0) - Set to 1 to enable Perfetto tracing
+# - RUST_LOG_S (default: info) - RUST_LOG level for server (benchfsd_mpi)
+# - RUST_LOG_C (default: warn) - RUST_LOG level for client (IOR)
 
 source "$SCRIPT_DIR/common.sh"
 # NOTE: Disabled process substitution to avoid FD leak
@@ -46,6 +48,9 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 
 # Default ENABLE_PERFETTO to 0 if not set
 : ${ENABLE_PERFETTO:=0}
+# Default RUST_LOG levels for server and client
+: ${RUST_LOG_S:=info}
+: ${RUST_LOG_C:=warn}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -308,6 +313,8 @@ echo "Perfetto: ${ENABLE_PERFETTO} (0=disabled, 1=enabled)"
 if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
   echo "Perfetto Output: ${PERFETTO_OUTPUT_DIR}"
 fi
+echo "RUST_LOG (server): ${RUST_LOG_S}"
+echo "RUST_LOG (client): ${RUST_LOG_C}"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -390,7 +397,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=trace
+# RUST_LOG is now set separately for server (RUST_LOG_S) and client (RUST_LOG_C)
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
@@ -637,7 +644,7 @@ EOF
               -np "$server_np"
               --bind-to none
               -map-by "ppr:${server_ppn}:node"
-              -x RUST_LOG
+              -x RUST_LOG="${RUST_LOG_S}"
               -x RUST_BACKTRACE
               # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
               "${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -703,7 +710,7 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
-            -x RUST_LOG=warn
+            -x RUST_LOG="${RUST_LOG_C}"
             -x RUST_BACKTRACE
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"

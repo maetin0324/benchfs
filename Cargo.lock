@@ -140,6 +140,7 @@ dependencies = [
  "socket2 0.4.10",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "ucx1-sys",
 ]
 

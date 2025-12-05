@@ -6,18 +6,25 @@ TIMESTAMP="$(timestamp)"
 
 # default params
 : ${ELAPSTIM_REQ:="0:05:00"}
-: ${LABEL:=default}
 : ${ENABLE_PERFETTO:=0}  # Set to 1 to enable Perfetto tracing
+: ${RUST_LOG_S:=info}    # RUST_LOG for server (benchfsd_mpi)
+: ${RUST_LOG_C:=warn}    # RUST_LOG for client (IOR)
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
-OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
 BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 # Resolve PARAM_FILE to absolute path BEFORE cd (relative paths won't work after cd)
 PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/../params/standard.conf}")"
+
+# Set LABEL: use provided value, or derive from param file name (without .conf extension)
+if [ -z "${LABEL:-}" ]; then
+  LABEL="$(basename "${PARAM_FILE_RESOLVED}" .conf)"
+fi
+
+OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 
 # Debug: Print paths
 echo "=========================================="
@@ -27,6 +34,8 @@ echo "PROJECT_ROOT: $PROJECT_ROOT"
 echo "BENCHFS_PREFIX: $BENCHFS_PREFIX"
 echo "IOR_PREFIX: $IOR_PREFIX"
 echo "PARAM_FILE: $PARAM_FILE_RESOLVED"
+echo "RUST_LOG_S (server): $RUST_LOG_S"
+echo "RUST_LOG_C (client): $RUST_LOG_C"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -109,6 +118,8 @@ for nnodes in "${nnodes_list[@]}"; do
         -v IOR_PREFIX="$IOR_PREFIX"
         -v PARAM_FILE="$PARAM_FILE_RESOLVED"
         -v ENABLE_PERFETTO="$ENABLE_PERFETTO"
+        -v RUST_LOG_S="$RUST_LOG_S"
+        -v RUST_LOG_C="$RUST_LOG_C"
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

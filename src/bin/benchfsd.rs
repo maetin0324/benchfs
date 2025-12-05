@@ -102,8 +102,10 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     pluvio_runtime::set_runtime(runtime.clone());
 
     // Create io_uring reactor with minimal timeouts for low latency
+    // - queue_size: 4096 (increased from 2048 to reduce buffer pool exhaustion)
+    //   Memory usage: 4096 * 1MiB = 4 GiB (acceptable)
     let uring_reactor = IoUringReactor::builder()
-        .queue_size(2048)
+        .queue_size(4096)
         .buffer_size(1 << 20) // 1 MiB
         .submit_depth(64)
         .wait_submit_timeout(std::time::Duration::from_micros(10))
