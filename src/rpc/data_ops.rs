@@ -234,7 +234,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
     }
 
     #[async_backtrace::framed]
-    #[tracing::instrument(level = "info", name = "rpc_read_chunk_handler", skip(ctx, am_msg))]
+    #[tracing::instrument(level = "trace", name = "rpc_read_chunk_handler", skip(ctx, am_msg))]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -633,7 +633,7 @@ impl AmRpc for WriteChunkRequest<'_> {
     }
 
     #[async_backtrace::framed]
-    #[tracing::instrument(level = "info", name = "rpc_write_chunk_handler", skip(ctx, am_msg))]
+    #[tracing::instrument(level = "trace", name = "rpc_write_chunk_handler", skip(ctx, am_msg))]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,

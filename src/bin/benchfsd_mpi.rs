@@ -4,14 +4,19 @@
 //! It uses MPI to distribute servers across multiple nodes in an HPC cluster.
 //!
 //! Usage:
-//!   mpirun -n <num_nodes> benchfsd_mpi <config_file> <registry_dir>
+//!   mpirun -n <num_nodes> benchfsd_mpi <registry_dir> [config_file] [--trace-output <path>]
 //!
 //! Each MPI rank runs a BenchFS server instance:
 //! - Rank 0: Primary metadata server
 //! - Other ranks: Storage servers and secondary metadata servers
+//!
+//! Options:
+//!   --trace-output <path>  Enable Perfetto tracing and save to specified path.
+//!                          Each rank will create a separate trace file with suffix _rank<N>.json
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
+use benchfs::logging::{init_with_perfetto, PerfettoGuard};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
@@ -73,21 +78,57 @@ fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 2 {
+    // Parse --trace-output option
+    let mut trace_output: Option<PathBuf> = None;
+    let mut positional_args: Vec<&String> = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--trace-output" {
+            if i + 1 < args.len() {
+                // Create rank-specific trace file path
+                let base_path = PathBuf::from(&args[i + 1]);
+                let stem = base_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("trace");
+                let ext = base_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("json");
+                let parent = base_path.parent().unwrap_or(std::path::Path::new("."));
+                let rank_path = parent.join(format!("{}_rank{}.{}", stem, mpi_rank, ext));
+                trace_output = Some(rank_path);
+                i += 2;
+            } else {
+                if mpi_rank == 0 {
+                    eprintln!("Error: --trace-output requires a path argument");
+                }
+                std::process::exit(1);
+            }
+        } else {
+            positional_args.push(&args[i]);
+            i += 1;
+        }
+    }
+
+    if positional_args.is_empty() {
         if mpi_rank == 0 {
             eprintln!(
-                "Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file]",
+                "Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file] [--trace-output <path>]",
                 args[0]
             );
-            eprintln!("  registry_dir: Shared directory for service discovery (required)");
-            eprintln!("  config_file:  Configuration file (optional, default: benchfs.toml)");
+            eprintln!("  registry_dir:           Shared directory for service discovery (required)");
+            eprintln!("  config_file:            Configuration file (optional, default: benchfs.toml)");
+            eprintln!("  --trace-output <path>:  Enable Perfetto tracing (optional)");
+            eprintln!("                          Each rank creates <path>_rank<N>.json");
         }
         std::process::exit(1);
     }
 
-    let registry_dir = PathBuf::from(&args[1]);
-    let config_path = if args.len() > 2 {
-        &args[2]
+    let registry_dir = PathBuf::from(positional_args[0]);
+    let config_path = if positional_args.len() > 1 {
+        positional_args[1].as_str()
     } else {
         "benchfs.toml"
     };
@@ -132,7 +173,7 @@ fn main() {
     } else {
         "warn" // Less verbose for other ranks
     };
-    setup_logging(log_level);
+    let _perfetto_guard = setup_logging(log_level, trace_output.as_ref(), mpi_rank);
 
     tracing::info!("Starting BenchFS MPI server");
     tracing::info!("MPI Rank: {} / {}", mpi_rank, mpi_size);
@@ -505,8 +546,34 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn setup_logging(level: &str) {
-    benchfs::logging::init_with_hostname(level);
+/// Setup logging with optional Perfetto tracing
+///
+/// If `trace_output` is Some, enables Perfetto tracing with Chrome trace format output.
+/// The trace file will be flushed when the returned guard is dropped.
+fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> Option<PerfettoGuard> {
+    if let Some(trace_path) = trace_output {
+        // Create parent directory if needed
+        if let Some(parent) = trace_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!(
+                        "Rank {}: Failed to create trace output directory: {}",
+                        mpi_rank, e
+                    );
+                }
+            }
+        }
+
+        let guard = init_with_perfetto(level, trace_path);
+        tracing::info!(
+            "Perfetto tracing enabled, output: {}",
+            trace_path.display()
+        );
+        Some(guard)
+    } else {
+        benchfs::logging::init_with_hostname(level);
+        None
+    }
 }
 
 // Signal handlers moved to benchfs::server::signals module

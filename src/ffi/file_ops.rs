@@ -344,7 +344,7 @@ pub extern "C" fn benchfs_write(
         );
 
         let handle_clone = handle.clone();
-        let buf = slice::from_raw_parts(buffer, size).to_vec();
+        let buf = slice::from_raw_parts(buffer, size);
 
         // Execute async write synchronously
         // We need to work around the lifetime issue by using raw pointers
@@ -361,7 +361,7 @@ pub extern "C" fn benchfs_write(
             }
 
             block_on_with_name("write", async move {
-                fs_ref.benchfs_write(&handle_clone, &buf).await
+                fs_ref.benchfs_write(&handle_clone, buf).await
             })
             .map_err(|e| e.to_string())
         });
@@ -423,16 +423,13 @@ pub extern "C" fn benchfs_read(
         );
 
         let handle_clone = handle.clone();
-        let buf_ptr = buffer;
-        let buf_size = size;
+        let buf = slice::from_raw_parts_mut(buffer, size);
 
         // Execute async read synchronously
         // We need to work around the lifetime issue by using raw pointers
-        let mut temp_buf = vec![0u8; buf_size];
         let result = with_benchfs_ctx(|fs| {
             // Get raw pointer to BenchFS
             let fs_ptr = fs as *const BenchFS;
-            let temp_buf_ptr = temp_buf.as_mut_ptr();
 
             let fs_ref = &*fs_ptr;
 
@@ -441,16 +438,12 @@ pub extern "C" fn benchfs_read(
                 return Err(format!("Seek failed: {:?}", e));
             }
 
-            let mut local_buf = std::slice::from_raw_parts_mut(temp_buf_ptr, buf_size);
-
             let n = block_on_with_name("read", async move {
-                fs_ref.benchfs_read(&handle_clone, &mut local_buf).await
+                fs_ref.benchfs_read(&handle_clone, buf).await
             });
 
             match n {
                 Ok(bytes_read) => {
-                    // Copy data back to C buffer
-                    std::ptr::copy_nonoverlapping(temp_buf_ptr, buf_ptr, bytes_read);
                     Ok(bytes_read)
                 }
                 Err(e) => Err(e.to_string()),

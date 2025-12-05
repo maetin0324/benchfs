@@ -7,6 +7,7 @@ TIMESTAMP="$(timestamp)"
 # default params
 : ${ELAPSTIM_REQ:="0:05:00"}
 : ${LABEL:=default}
+: ${ENABLE_PERFETTO:=0}  # Set to 1 to enable Perfetto tracing
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -107,6 +108,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -v BENCHFS_PREFIX="$BENCHFS_PREFIX"
         -v IOR_PREFIX="$IOR_PREFIX"
         -v PARAM_FILE="$PARAM_FILE_RESOLVED"
+        -v ENABLE_PERFETTO="$ENABLE_PERFETTO"
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

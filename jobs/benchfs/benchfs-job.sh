@@ -25,6 +25,8 @@ module load "openmpi/$NQSV_MPI_VER"
 # - BACKEND_DIR
 # - BENCHFS_PREFIX
 # - IOR_PREFIX
+# Optional:
+# - ENABLE_PERFETTO (default: 0) - Set to 1 to enable Perfetto tracing
 
 source "$SCRIPT_DIR/common.sh"
 # NOTE: Disabled process substitution to avoid FD leak
@@ -40,6 +42,10 @@ BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
+PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
+
+# Default ENABLE_PERFETTO to 0 if not set
+: ${ENABLE_PERFETTO:=0}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -298,6 +304,10 @@ echo "IOR_PREFIX: ${IOR_PREFIX}"
 echo "BACKEND_DIR: ${BACKEND_DIR}"
 echo "Registry: ${BENCHFS_REGISTRY_DIR}"
 echo "Data: ${BENCHFS_DATA_DIR}"
+echo "Perfetto: ${ENABLE_PERFETTO} (0=disabled, 1=enabled)"
+if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
+  echo "Perfetto Output: ${PERFETTO_OUTPUT_DIR}"
+fi
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -333,6 +343,12 @@ mkdir -p "${BENCHFSD_LOG_BASE_DIR}"
 
 echo "prepare ior output dir: ${IOR_OUTPUT_DIR}"
 mkdir -p "${IOR_OUTPUT_DIR}"
+
+if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
+  echo "prepare perfetto output dir: ${PERFETTO_OUTPUT_DIR}"
+  mkdir -p "${PERFETTO_OUTPUT_DIR}"
+  echo "Perfetto tracing enabled - traces will be saved to ${PERFETTO_OUTPUT_DIR}"
+fi
 
 save_job_metadata() {
   local file_per_proc=0
@@ -374,7 +390,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=warn
+export RUST_LOG=trace
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
@@ -615,6 +631,7 @@ EOF
           ls -la "${config_file}" || echo "WARNING: Config file not found"
           ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "WARNING: Binary not found"
 
+            # Build benchfsd command with optional Perfetto tracing
             cmd_benchfsd=(
               "${cmd_mpirun_common[@]}"
               -np "$server_np"
@@ -627,6 +644,13 @@ EOF
               "${BENCHFS_REGISTRY_DIR}"
               "${config_file}"
             )
+
+            # Add Perfetto tracing option if enabled
+            if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
+              perfetto_trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.json"
+              cmd_benchfsd+=(--trace-output "${perfetto_trace_file}")
+              echo "Perfetto tracing enabled for this run: ${perfetto_trace_file}"
+            fi
 
           echo "${cmd_benchfsd[@]}"
           "${cmd_benchfsd[@]}" > "${run_log_dir}/benchfsd_stdout.log" 2> "${run_log_dir}/benchfsd_stderr.log" &

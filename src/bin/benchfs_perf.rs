@@ -476,7 +476,7 @@ fn run_client(
     Ok(())
 }
 
-#[instrument(level = "info", skip(pool))]
+#[instrument(level = "trace", skip(pool))]
 async fn run_benchmark(
     pool: &Rc<ConnectionPool>,
     server_node: &str,

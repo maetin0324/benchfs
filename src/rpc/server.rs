@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress, am::AmStream};
+use tracing::instrument;
 
 use crate::rpc::handlers::RpcHandlerContext;
 use crate::rpc::{AmRpc, RpcError, Serializable};
@@ -54,6 +55,7 @@ impl RpcServer {
     /// server.listen::<ReadChunkRequest, _, _>(runtime.clone()).await?;
     /// ```
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "rpc_listen", skip(self))]
     pub async fn listen<Rpc, ReqH, ResH>(&self) -> Result<(), RpcError>
     where
         ResH: Serializable + 'static,
@@ -145,6 +147,7 @@ impl RpcServer {
     /// server.register_all_handlers().await?;
     /// ```
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "register_all_handlers", skip(self))]
     pub async fn register_all_handlers(&self) -> Result<(), RpcError> {
         use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
         use crate::rpc::metadata_ops::{
@@ -265,6 +268,7 @@ impl RpcServer {
 
     /// Register only benchmark RPC handlers (Ping-Pong, Throughput, etc.)
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "register_bench_handlers", skip(self))]
     pub async fn register_bench_handlers(&self) -> Result<(), RpcError> {
         use crate::rpc::bench_ops::{BenchPingRequest, BenchShutdownRequest};
 
@@ -314,6 +318,7 @@ impl RpcServer {
     ///
     /// This will cause all `wait_msg()` calls to return `None`, allowing the
     /// listener tasks to exit gracefully.
+    #[instrument(level = "trace", name = "shutdown_all_streams", skip(self))]
     pub fn shutdown_all_streams(&self) {
         let streams = self.streams.borrow();
         let count = streams.len();

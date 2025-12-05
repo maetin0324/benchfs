@@ -7,6 +7,7 @@ use crate::cache::{CachePolicy, MetadataCache};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use tracing::instrument;
 
 /// メタデータ管理エラー
 #[derive(Debug, thiserror::Error)]
@@ -142,6 +143,7 @@ impl MetadataManager {
     ///
     /// # Arguments
     /// * `metadata` - 保存するファイルメタデータ
+    #[instrument(level = "trace", name = "metadata_store_file", skip(self, metadata), fields(path = %metadata.path))]
     pub fn store_file_metadata(&self, metadata: FileMetadata) -> MetadataResult<()> {
         let path = metadata.path.clone();
 
@@ -161,6 +163,7 @@ impl MetadataManager {
     ///
     /// # Arguments
     /// * `path` - ファイルパス
+    #[instrument(level = "trace", name = "metadata_get_file", skip(self), fields(path = ?path))]
     pub fn get_file_metadata(&self, path: &Path) -> MetadataResult<FileMetadata> {
         let path_str = path.to_str().ok_or_else(|| {
             MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
@@ -187,6 +190,7 @@ impl MetadataManager {
     }
 
     /// ファイルメタデータを更新
+    #[instrument(level = "trace", name = "metadata_update_file", skip(self, metadata), fields(path = %metadata.path))]
     pub fn update_file_metadata(&self, metadata: FileMetadata) -> MetadataResult<()> {
         let path = metadata.path.clone();
 
@@ -207,6 +211,7 @@ impl MetadataManager {
     }
 
     /// ファイルメタデータをローカルから削除
+    #[instrument(level = "trace", name = "metadata_remove_file", skip(self), fields(path = ?path))]
     pub fn remove_file_metadata(&self, path: &Path) -> MetadataResult<()> {
         let path_str = path.to_str().ok_or_else(|| {
             MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
@@ -227,6 +232,7 @@ impl MetadataManager {
     }
 
     /// ディレクトリメタデータをローカルに保存
+    #[instrument(level = "trace", name = "metadata_store_dir", skip(self, metadata), fields(path = %metadata.path))]
     pub fn store_dir_metadata(&self, metadata: DirectoryMetadata) -> MetadataResult<()> {
         let path = metadata.path.clone();
 
@@ -243,6 +249,7 @@ impl MetadataManager {
     }
 
     /// ディレクトリメタデータをローカルから取得
+    #[instrument(level = "trace", name = "metadata_get_dir", skip(self), fields(path = ?path))]
     pub fn get_dir_metadata(&self, path: &Path) -> MetadataResult<DirectoryMetadata> {
         let path_str = path.to_str().ok_or_else(|| {
             MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
@@ -269,6 +276,7 @@ impl MetadataManager {
     }
 
     /// ディレクトリメタデータを更新
+    #[instrument(level = "trace", name = "metadata_update_dir", skip(self, metadata), fields(path = %metadata.path))]
     pub fn update_dir_metadata(&self, metadata: DirectoryMetadata) -> MetadataResult<()> {
         let path = metadata.path.clone();
 
@@ -289,6 +297,7 @@ impl MetadataManager {
     }
 
     /// ディレクトリメタデータをローカルから削除
+    #[instrument(level = "trace", name = "metadata_remove_dir", skip(self), fields(path = ?path))]
     pub fn remove_dir_metadata(&self, path: &Path) -> MetadataResult<()> {
         let path_str = path.to_str().ok_or_else(|| {
             MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))

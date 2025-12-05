@@ -116,6 +116,7 @@ impl InMemoryChunkStore {
     /// * `offset` - Offset within the chunk
     /// * `data` - Data to write
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "inmemory_write_chunk", skip(self, data), fields(path, chunk = chunk_index, len = data.len()))]
     pub async fn write_chunk(
         &self,
         path: &str,
@@ -169,6 +170,7 @@ impl InMemoryChunkStore {
     /// * `offset` - Offset within the chunk
     /// * `length` - Number of bytes to read
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "inmemory_read_chunk", skip(self), fields(path, chunk = chunk_index, len = length))]
     pub async fn read_chunk(
         &self,
         path: &str,
@@ -207,6 +209,7 @@ impl InMemoryChunkStore {
 
     /// Delete a chunk from storage
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "inmemory_delete_chunk", skip(self), fields(path, chunk = chunk_index))]
     pub async fn delete_chunk(&self, path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
         let key = ChunkKey::new(path.to_string(), chunk_index);
         let mut chunks = self.chunks.borrow_mut();
@@ -223,6 +226,7 @@ impl InMemoryChunkStore {
 
     /// Delete all chunks for a file
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "inmemory_delete_file_chunks", skip(self), fields(path))]
     pub async fn delete_file_chunks(&self, path: &str) -> ChunkStoreResult<usize> {
         let mut chunks = self.chunks.borrow_mut();
         let mut deleted_count = 0;
@@ -806,6 +810,7 @@ impl IOUringChunkStore {
 
     /// Delete a chunk file
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "iouring_delete_chunk", skip(self), fields(path = file_path, chunk = chunk_index))]
     pub async fn delete_chunk(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
         // Close the file if it's open
         self.close_chunk_file(file_path, chunk_index).await?;
@@ -833,6 +838,7 @@ impl IOUringChunkStore {
 
     /// Delete all chunks for a file
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "iouring_delete_file_chunks", skip(self), fields(path = file_path))]
     pub async fn delete_file_chunks(&self, file_path: &str) -> ChunkStoreResult<usize> {
         let path_hash = self.hash_path(file_path);
         let dir = self.base_dir.join(path_hash);
@@ -880,6 +886,7 @@ impl IOUringChunkStore {
 
     /// Close all open file handles
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "iouring_close_all", skip(self))]
     pub async fn close_all(&self) -> ChunkStoreResult<()> {
         // First, close all evicted handles that were deferred to prevent deadlock
         let evicted: Vec<(ChunkKey, FileHandle)> =
@@ -936,6 +943,7 @@ impl IOUringChunkStore {
     /// * `fixed_buffer` - Pre-populated registered buffer
     /// * `data_len` - Actual data length in the buffer
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "iouring_write_chunk_fixed", skip(self, fixed_buffer), fields(path = file_path, chunk = chunk_index, offset, len = data_len))]
     pub async fn write_chunk_fixed(
         &self,
         file_path: &str,
@@ -988,6 +996,7 @@ impl IOUringChunkStore {
     /// # Returns
     /// A tuple of (bytes_read, buffer) where buffer is the FixedBuffer with data
     #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "iouring_read_chunk_fixed", skip(self, fixed_buffer), fields(path = file_path, chunk = chunk_index, offset))]
     pub async fn read_chunk_fixed(
         &self,
         file_path: &str,
