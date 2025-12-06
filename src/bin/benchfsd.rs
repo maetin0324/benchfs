@@ -2,19 +2,27 @@
 //!
 //! This is the main server binary for BenchFS distributed file system.
 //! It initializes the RPC server, storage backend, and handles incoming requests.
+//!
+//! Usage:
+//!   benchfsd [config_file] [--trace-output <path>]
+//!
+//! Options:
+//!   --trace-output <path>  Enable Perfetto tracing and save to specified path.
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
+use benchfs::logging::{init_with_chrome, init_with_perfetto, TraceGuard};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
 use benchfs::storage::{IOUringBackend, IOUringChunkStore};
 
-use pluvio_runtime::executor::Runtime;
+use pluvio_runtime::executor::{Runtime, SchedulingConfig};
 use pluvio_timer::TimerReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,8 +55,34 @@ fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
-    let config_path = if args.len() > 1 {
-        &args[1]
+    // Parse --trace-output option
+    let mut trace_output: Option<PathBuf> = None;
+    let mut positional_args: Vec<&String> = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--trace-output" {
+            if i + 1 < args.len() {
+                trace_output = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            } else {
+                eprintln!("Error: --trace-output requires a path argument");
+                eprintln!("Usage: {} [config_file] [--trace-output <path>]", args[0]);
+                std::process::exit(1);
+            }
+        } else if args[i] == "--help" || args[i] == "-h" {
+            eprintln!("Usage: {} [config_file] [--trace-output <path>]", args[0]);
+            eprintln!("  config_file:            Configuration file (optional, default: benchfs.toml)");
+            eprintln!("  --trace-output <path>:  Enable Perfetto tracing (optional)");
+            std::process::exit(0);
+        } else {
+            positional_args.push(&args[i]);
+            i += 1;
+        }
+    }
+
+    let config_path = if !positional_args.is_empty() {
+        positional_args[0].as_str()
     } else {
         "benchfs.toml"
     };
@@ -63,8 +97,8 @@ fn main() {
         }
     };
 
-    // Setup logging
-    setup_logging(&config.node.log_level);
+    // Setup logging (with optional Perfetto tracing)
+    let _perfetto_guard = setup_logging(&config.node.log_level, trace_output.as_ref());
 
     tracing::info!("Starting BenchFS server");
     tracing::info!("Node ID: {}", config.node.node_id);
@@ -83,8 +117,9 @@ fn main() {
     // Setup signal handlers
     benchfs::server::signals::setup_signal_handlers(state.running.clone());
 
-    // Run the server
-    if let Err(e) = run_server(state.clone()) {
+    // Run the server (enable perfetto tracks if tracing is enabled)
+    let enable_perfetto_tracks = trace_output.is_some();
+    if let Err(e) = run_server(state.clone(), enable_perfetto_tracks) {
         eprintln!("Server error: {}", e);
         std::process::exit(1);
     }
@@ -92,11 +127,19 @@ fn main() {
     tracing::info!("BenchFS server stopped");
 }
 
-fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = &state.config;
 
-    // Create pluvio runtime
-    let runtime = Runtime::new(256);
+    // Create pluvio runtime with optional Perfetto task tracking
+    let scheduling_config = SchedulingConfig {
+        enable_perfetto_tracks,
+        ..Default::default()
+    };
+    let runtime = Runtime::with_config(256, scheduling_config);
+
+    if enable_perfetto_tracks {
+        tracing::info!("Perfetto task tracking enabled - spawned tasks will have separate tracks");
+    }
 
     // Set runtime in TLS for TLS-based APIs
     pluvio_runtime::set_runtime(runtime.clone());
@@ -253,19 +296,61 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn setup_logging(level: &str) {
-    use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::fmt;
+/// Setup logging with optional trace output
+///
+/// Trace format is determined by environment variables:
+/// - ENABLE_PERFETTO=1: Use Perfetto format (.pftrace) with task-level tracks
+/// - ENABLE_CHROME=1: Use Chrome trace format (.json)
+/// - Neither set: No tracing (console logging only)
+///
+/// If `trace_output` is Some and a trace format is enabled, the trace file
+/// will be flushed when the returned guard is dropped.
+fn setup_logging(level: &str, trace_output: Option<&PathBuf>) -> Option<TraceGuard> {
+    // Check which trace format to use
+    let enable_perfetto = std::env::var("ENABLE_PERFETTO")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let enable_chrome = std::env::var("ENABLE_CHROME")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    if let Some(trace_path) = trace_output {
+        // Create parent directory if needed
+        if let Some(parent) = trace_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("Failed to create trace output directory: {}", e);
+                }
+            }
+        }
 
-    fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_file(true)
-        .with_line_number(true)
-        .init();
+        if enable_perfetto {
+            let guard = init_with_perfetto(level, trace_path);
+            tracing::info!(
+                "Perfetto tracing enabled (task-level tracks), output: {}",
+                trace_path.display()
+            );
+            Some(guard)
+        } else if enable_chrome {
+            let guard = init_with_chrome(level, trace_path);
+            tracing::info!(
+                "Chrome tracing enabled, output: {}",
+                trace_path.display()
+            );
+            Some(guard)
+        } else {
+            // Trace output path given but no format enabled - default to Perfetto
+            let guard = init_with_perfetto(level, trace_path);
+            tracing::info!(
+                "Perfetto tracing enabled (default), output: {}",
+                trace_path.display()
+            );
+            Some(guard)
+        }
+    } else {
+        benchfs::logging::init_with_hostname(level);
+        None
+    }
 }
 
 // Signal handlers moved to benchfs::server::signals module

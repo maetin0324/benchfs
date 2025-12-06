@@ -52,8 +52,14 @@ once_cell = "1.19"
 
 # MPI support
 mpi = { version = "0.8", features = ["derive"], optional = true }
-tracing-perfetto = "0.1.5"
-tracing-chrome = "0.7"
+
+# Tracing output formats
+tracing-perfetto = "0.1.5"  # Native Perfetto format with task-level tracks
+tracing-chrome = "0.7"      # Chrome trace format (also viewable in Perfetto)
+rand = "0.8"        # Used for track UUID generation
+bytes = "1.11"      # For protobuf encoding
+prost = "0.12"      # For protobuf encoding
+thread-id = "4"     # For thread ID in Perfetto traces
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }

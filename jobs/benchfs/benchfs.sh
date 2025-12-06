@@ -6,7 +6,8 @@ TIMESTAMP="$(timestamp)"
 
 # default params
 : ${ELAPSTIM_REQ:="0:05:00"}
-: ${ENABLE_PERFETTO:=0}  # Set to 1 to enable Perfetto tracing
+: ${ENABLE_PERFETTO:=0}  # Set to 1 to enable Perfetto tracing (native format with task tracks)
+: ${ENABLE_CHROME:=0}    # Set to 1 to enable Chrome tracing (JSON format)
 : ${RUST_LOG_S:=info}    # RUST_LOG for server (benchfsd_mpi)
 : ${RUST_LOG_C:=warn}    # RUST_LOG for client (IOR)
 
@@ -118,6 +119,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -v IOR_PREFIX="$IOR_PREFIX"
         -v PARAM_FILE="$PARAM_FILE_RESOLVED"
         -v ENABLE_PERFETTO="$ENABLE_PERFETTO"
+        -v ENABLE_CHROME="$ENABLE_CHROME"
         -v RUST_LOG_S="$RUST_LOG_S"
         -v RUST_LOG_C="$RUST_LOG_C"
         "${JOB_FILE}"
