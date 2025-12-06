@@ -134,40 +134,35 @@ pub fn init_with_hostname(level: &str) {
     tracing::info!("Logging initialized on host: {}", hostname);
 }
 
-/// Chrome tracing guard that holds the FlushGuard
+/// Tracing guard for trace file output.
 ///
 /// This guard must be kept alive for the duration of tracing.
 /// The trace file will be flushed when this guard is dropped.
-///
-/// Note: We use tracing-chrome instead of tracing-perfetto because
-/// tracing-perfetto has issues with duration tracking (all durations show as 0ms).
-/// tracing-chrome produces Chrome Trace Format JSON which Perfetto UI can read
-/// with accurate duration information.
-pub struct PerfettoGuard {
-    /// tracing-chrome FlushGuard
-    _guard: tracing_chrome::FlushGuard,
+pub enum TraceGuard {
+    /// Guard for Perfetto format traces
+    Perfetto,
+    /// Guard for Chrome trace format (holds the FlushGuard)
+    Chrome(tracing_chrome::FlushGuard),
 }
 
-/// Initialize tracing with Chrome trace format output for performance analysis
+/// Perfetto tracing guard (legacy alias)
+pub type PerfettoGuard = TraceGuard;
+
+/// Initialize tracing with native Perfetto trace format output for performance analysis
 ///
 /// This function sets up both console logging (with hostname prefix) and
-/// Chrome trace file output (compatible with Perfetto UI). The returned guard
-/// must be kept alive for the duration of tracing; dropping it will flush
-/// and close the trace file.
+/// Perfetto trace file output (.pftrace format) with task-level track support.
+/// Each spawned task (when using runtime with `enable_perfetto_tracks`) will
+/// appear on a separate track in the Perfetto UI.
 ///
 /// # Arguments
 /// * `level` - Log level filter (e.g., "info", "debug", "trace")
-/// * `trace_path` - Path to the output trace file (.json extension recommended)
+/// * `trace_path` - Path to the output trace file (.pftrace extension recommended)
 ///
 /// # Returns
-/// A `PerfettoGuard` that must be kept alive for tracing to work
-///
-/// # Note
-/// We use tracing-chrome instead of tracing-perfetto because tracing-perfetto
-/// has issues with duration tracking in async contexts (all durations show as 0ms).
-/// tracing-chrome produces Chrome Trace Format JSON which Perfetto UI can read
-/// with accurate duration information.
-pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> PerfettoGuard {
+/// A `TraceGuard` that must be kept alive for tracing to work
+pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> TraceGuard {
+    use crate::perfetto::TaskPerfettoLayer;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -180,9 +175,60 @@ pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> Perfetto
         .event_format(HostnameFormatter::new())
         .with_writer(std::io::stdout);
 
-    // Chrome trace file layer (compatible with Perfetto UI)
-    // This properly tracks span enter/exit for accurate duration measurement
-    let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+    // Create the trace output file
+    let trace_file = std::fs::File::create(trace_path)
+        .unwrap_or_else(|e| panic!("Failed to create trace file {:?}: {}", trace_path, e));
+
+    // Use our custom TaskPerfettoLayer with track ID integration
+    let perfetto_layer = TaskPerfettoLayer::new(std::sync::Mutex::new(trace_file))
+        .with_debug_annotations(true);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(perfetto_layer)
+        .init();
+
+    let hostname_os = gethostname::gethostname();
+    let hostname = hostname_os.to_str().unwrap_or("unknown");
+    tracing::info!(
+        "Logging initialized on host: {} with Perfetto trace output (task-level tracks): {}",
+        hostname,
+        trace_path.display()
+    );
+
+    TraceGuard::Perfetto
+}
+
+/// Initialize tracing with Chrome trace format output for performance analysis
+///
+/// This function sets up both console logging (with hostname prefix) and
+/// Chrome trace file output (.json format). The Chrome trace format can be
+/// viewed in Chrome's chrome://tracing or in Perfetto UI.
+///
+/// # Arguments
+/// * `level` - Log level filter (e.g., "info", "debug", "trace")
+/// * `trace_path` - Path to the output trace file (.json extension recommended)
+///
+/// # Returns
+/// A `TraceGuard` that must be kept alive for tracing to work.
+/// The trace file will be flushed when this guard is dropped.
+pub fn init_with_chrome(level: &str, trace_path: &std::path::Path) -> TraceGuard {
+    use tracing_chrome::ChromeLayerBuilder;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    // Console output layer with hostname formatter
+    let fmt_layer = fmt::layer()
+        .event_format(HostnameFormatter::new())
+        .with_writer(std::io::stdout);
+
+    // Create Chrome trace layer
+    let (chrome_layer, flush_guard) = ChromeLayerBuilder::new()
         .file(trace_path)
         .include_args(true)
         .build();
@@ -201,7 +247,7 @@ pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> Perfetto
         trace_path.display()
     );
 
-    PerfettoGuard { _guard: guard }
+    TraceGuard::Chrome(flush_guard)
 }
 
 /// Dump the current async task backtrace tree to stderr

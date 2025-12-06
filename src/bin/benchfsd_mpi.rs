@@ -16,14 +16,14 @@
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
-use benchfs::logging::{init_with_perfetto, PerfettoGuard};
+use benchfs::logging::{init_with_chrome, init_with_perfetto, TraceGuard};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
 use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
-use pluvio_runtime::executor::Runtime;
+use pluvio_runtime::executor::{Runtime, SchedulingConfig};
 use pluvio_timer::TimerReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
@@ -201,8 +201,9 @@ fn main() {
     // Synchronize all ranks before starting servers
     world.barrier();
 
-    // Run the server
-    if let Err(e) = run_server(state.clone()) {
+    // Run the server (enable perfetto tracks if tracing is enabled)
+    let enable_perfetto_tracks = trace_output.is_some();
+    if let Err(e) = run_server(state.clone(), enable_perfetto_tracks) {
         eprintln!("Rank {}: Server error: {}", mpi_rank, e);
         std::process::exit(1);
     }
@@ -213,7 +214,7 @@ fn main() {
     tracing::info!("Rank {}: BenchFS server stopped", mpi_rank);
 }
 
-fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = &state.config;
     let node_id = state.node_id();
     let registry_dir = state
@@ -221,8 +222,16 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         .to_str()
         .ok_or("Registry directory path is not valid UTF-8")?;
 
-    // Create pluvio runtime
-    let runtime = Runtime::new(256);
+    // Create pluvio runtime with optional Perfetto task tracking
+    let scheduling_config = SchedulingConfig {
+        enable_perfetto_tracks,
+        ..Default::default()
+    };
+    let runtime = Runtime::with_config(256, scheduling_config);
+
+    if enable_perfetto_tracks {
+        tracing::info!("Perfetto task tracking enabled - spawned tasks will have separate tracks");
+    }
 
     // Set runtime in TLS for TLS-based APIs
     pluvio_runtime::set_runtime(runtime.clone());
@@ -271,13 +280,13 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
         // Buffer size must be at least as large as the maximum transfer size used by IOR
         // IOR typically uses 2MB-4MB transfer sizes, so we use 4MB to be safe
         // Optimized parameters for high-throughput workloads:
-        // - queue_size: 1024 (increased from 256 to support 500+ concurrent clients)
+        // - queue_size: 2048 (increased from 1024 to reduce buffer pool exhaustion)
         //   With 32 nodes * 16 ppn = 512 clients, need enough buffers for concurrent I/O
-        //   Memory usage per server: 1024 * 4MiB = 4 GiB (acceptable)
+        //   Memory usage per server: 2048 * 4MiB = 8 GiB (acceptable for large-scale benchmarks)
         // - submit_depth: 128 for better batching and throughput
         // - Aggressive timeouts (1μs) to minimize latency in polling mode
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(1024)
+            .queue_size(2048)
             .buffer_size(4 << 20) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
             .submit_depth(128)
             .wait_submit_timeout(std::time::Duration::from_micros(1))
@@ -546,11 +555,24 @@ fn run_server(state: Rc<ServerState>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Setup logging with optional Perfetto tracing
+/// Setup logging with optional trace output
 ///
-/// If `trace_output` is Some, enables Perfetto tracing with Chrome trace format output.
-/// The trace file will be flushed when the returned guard is dropped.
-fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> Option<PerfettoGuard> {
+/// Trace format is determined by environment variables:
+/// - ENABLE_PERFETTO=1: Use Perfetto format (.pftrace) with task-level tracks
+/// - ENABLE_CHROME=1: Use Chrome trace format (.json)
+/// - Neither set: No tracing (console logging only)
+///
+/// If `trace_output` is Some and a trace format is enabled, the trace file
+/// will be flushed when the returned guard is dropped.
+fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> Option<TraceGuard> {
+    // Check which trace format to use
+    let enable_perfetto = std::env::var("ENABLE_PERFETTO")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let enable_chrome = std::env::var("ENABLE_CHROME")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
     if let Some(trace_path) = trace_output {
         // Create parent directory if needed
         if let Some(parent) = trace_path.parent() {
@@ -564,12 +586,29 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> 
             }
         }
 
-        let guard = init_with_perfetto(level, trace_path);
-        tracing::info!(
-            "Perfetto tracing enabled, output: {}",
-            trace_path.display()
-        );
-        Some(guard)
+        if enable_perfetto {
+            let guard = init_with_perfetto(level, trace_path);
+            tracing::info!(
+                "Perfetto tracing enabled (task-level tracks), output: {}",
+                trace_path.display()
+            );
+            Some(guard)
+        } else if enable_chrome {
+            let guard = init_with_chrome(level, trace_path);
+            tracing::info!(
+                "Chrome tracing enabled, output: {}",
+                trace_path.display()
+            );
+            Some(guard)
+        } else {
+            // Trace output path given but no format enabled - default to Perfetto
+            let guard = init_with_perfetto(level, trace_path);
+            tracing::info!(
+                "Perfetto tracing enabled (default), output: {}",
+                trace_path.display()
+            );
+            Some(guard)
+        }
     } else {
         benchfs::logging::init_with_hostname(level);
         None

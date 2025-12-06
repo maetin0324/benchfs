@@ -68,6 +68,7 @@ pub mod data;
 pub mod ffi;
 pub mod logging;
 pub mod metadata;
+pub mod perfetto;
 pub mod rpc;
 pub mod server;
 pub mod storage;

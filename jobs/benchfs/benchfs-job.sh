@@ -26,7 +26,10 @@ module load "openmpi/$NQSV_MPI_VER"
 # - BENCHFS_PREFIX
 # - IOR_PREFIX
 # Optional:
-# - ENABLE_PERFETTO (default: 0) - Set to 1 to enable Perfetto tracing
+# - ENABLE_PERFETTO (default: 0) - Set to 1 to enable Perfetto tracing (task-level tracks)
+# - ENABLE_CHROME (default: 0) - Set to 1 to enable Chrome trace format
+# - RUST_LOG_S (default: info) - RUST_LOG level for server (benchfsd_mpi)
+# - RUST_LOG_C (default: warn) - RUST_LOG level for client (IOR)
 
 source "$SCRIPT_DIR/common.sh"
 # NOTE: Disabled process substitution to avoid FD leak
@@ -44,8 +47,12 @@ BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 
-# Default ENABLE_PERFETTO to 0 if not set
+# Default trace format flags to 0 if not set
 : ${ENABLE_PERFETTO:=0}
+: ${ENABLE_CHROME:=0}
+# Default RUST_LOG levels for server and client
+: ${RUST_LOG_S:=info}
+: ${RUST_LOG_C:=warn}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -304,10 +311,12 @@ echo "IOR_PREFIX: ${IOR_PREFIX}"
 echo "BACKEND_DIR: ${BACKEND_DIR}"
 echo "Registry: ${BENCHFS_REGISTRY_DIR}"
 echo "Data: ${BENCHFS_DATA_DIR}"
-echo "Perfetto: ${ENABLE_PERFETTO} (0=disabled, 1=enabled)"
-if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
-  echo "Perfetto Output: ${PERFETTO_OUTPUT_DIR}"
+echo "Tracing: ENABLE_PERFETTO=${ENABLE_PERFETTO}, ENABLE_CHROME=${ENABLE_CHROME}"
+if [ "${ENABLE_PERFETTO}" -eq 1 ] || [ "${ENABLE_CHROME}" -eq 1 ]; then
+  echo "Trace Output: ${PERFETTO_OUTPUT_DIR}"
 fi
+echo "RUST_LOG (server): ${RUST_LOG_S}"
+echo "RUST_LOG (client): ${RUST_LOG_C}"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -344,10 +353,14 @@ mkdir -p "${BENCHFSD_LOG_BASE_DIR}"
 echo "prepare ior output dir: ${IOR_OUTPUT_DIR}"
 mkdir -p "${IOR_OUTPUT_DIR}"
 
-if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
-  echo "prepare perfetto output dir: ${PERFETTO_OUTPUT_DIR}"
+if [ "${ENABLE_PERFETTO}" -eq 1 ] || [ "${ENABLE_CHROME}" -eq 1 ]; then
+  echo "prepare trace output dir: ${PERFETTO_OUTPUT_DIR}"
   mkdir -p "${PERFETTO_OUTPUT_DIR}"
-  echo "Perfetto tracing enabled - traces will be saved to ${PERFETTO_OUTPUT_DIR}"
+  if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
+    echo "Perfetto tracing enabled (task-level tracks) - traces will be saved to ${PERFETTO_OUTPUT_DIR}"
+  elif [ "${ENABLE_CHROME}" -eq 1 ]; then
+    echo "Chrome tracing enabled - traces will be saved to ${PERFETTO_OUTPUT_DIR}"
+  fi
 fi
 
 save_job_metadata() {
@@ -390,7 +403,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=trace
+# RUST_LOG is now set separately for server (RUST_LOG_S) and client (RUST_LOG_C)
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
@@ -637,7 +650,7 @@ EOF
               -np "$server_np"
               --bind-to none
               -map-by "ppr:${server_ppn}:node"
-              -x RUST_LOG
+              -x RUST_LOG="${RUST_LOG_S}"
               -x RUST_BACKTRACE
               # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
               "${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -645,11 +658,17 @@ EOF
               "${config_file}"
             )
 
-            # Add Perfetto tracing option if enabled
+            # Add tracing option if enabled
             if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
-              perfetto_trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.json"
-              cmd_benchfsd+=(--trace-output "${perfetto_trace_file}")
-              echo "Perfetto tracing enabled for this run: ${perfetto_trace_file}"
+              trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.pftrace"
+              cmd_benchfsd=(-x ENABLE_PERFETTO=1 "${cmd_benchfsd[@]}")
+              cmd_benchfsd+=(--trace-output "${trace_file}")
+              echo "Perfetto tracing enabled for this run: ${trace_file}"
+            elif [ "${ENABLE_CHROME}" -eq 1 ]; then
+              trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.json"
+              cmd_benchfsd=(-x ENABLE_CHROME=1 "${cmd_benchfsd[@]}")
+              cmd_benchfsd+=(--trace-output "${trace_file}")
+              echo "Chrome tracing enabled for this run: ${trace_file}"
             fi
 
           echo "${cmd_benchfsd[@]}"
@@ -703,7 +722,7 @@ EOF
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
-            -x RUST_LOG=warn
+            -x RUST_LOG="${RUST_LOG_C}"
             -x RUST_BACKTRACE
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
