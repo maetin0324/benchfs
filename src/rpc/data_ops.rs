@@ -237,7 +237,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
     #[tracing::instrument(level = "trace", name = "rpc_read_chunk_handler", skip(ctx, am_msg))]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
-        mut am_msg: AmMsg,
+        am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
         let header: ReadChunkRequestHeader = match parse_header(&am_msg) {

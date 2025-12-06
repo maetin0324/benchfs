@@ -659,14 +659,17 @@ EOF
             )
 
             # Add tracing option if enabled
+            # Note: -x options must be inserted before the binary (3 elements from end: binary, registry, config)
             if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
               trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.pftrace"
-              cmd_benchfsd=(-x ENABLE_PERFETTO=1 "${cmd_benchfsd[@]}")
+              binary_idx=$((${#cmd_benchfsd[@]} - 3))
+              cmd_benchfsd=("${cmd_benchfsd[@]:0:binary_idx}" -x ENABLE_PERFETTO=1 "${cmd_benchfsd[@]:binary_idx}")
               cmd_benchfsd+=(--trace-output "${trace_file}")
               echo "Perfetto tracing enabled for this run: ${trace_file}"
             elif [ "${ENABLE_CHROME}" -eq 1 ]; then
               trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.json"
-              cmd_benchfsd=(-x ENABLE_CHROME=1 "${cmd_benchfsd[@]}")
+              binary_idx=$((${#cmd_benchfsd[@]} - 3))
+              cmd_benchfsd=("${cmd_benchfsd[@]:0:binary_idx}" -x ENABLE_CHROME=1 "${cmd_benchfsd[@]:binary_idx}")
               cmd_benchfsd+=(--trace-output "${trace_file}")
               echo "Chrome tracing enabled for this run: ${trace_file}"
             fi
