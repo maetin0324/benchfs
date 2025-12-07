@@ -10,6 +10,8 @@ TIMESTAMP="$(timestamp)"
 : ${ENABLE_CHROME:=0}    # Set to 1 to enable Chrome tracing (JSON format)
 : ${RUST_LOG_S:=info}    # RUST_LOG for server (benchfsd_mpi)
 : ${RUST_LOG_C:=warn}    # RUST_LOG for client (IOR)
+: ${TASKSET:=0}          # Set to 1 to enable taskset CPU pinning for benchfsd_mpi
+: ${TASKSET_CORES:=0,1}  # CPU cores to pin benchfsd_mpi to when TASKSET=1
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -122,6 +124,8 @@ for nnodes in "${nnodes_list[@]}"; do
         -v ENABLE_CHROME="$ENABLE_CHROME"
         -v RUST_LOG_S="$RUST_LOG_S"
         -v RUST_LOG_C="$RUST_LOG_C"
+        -v TASKSET="$TASKSET"
+        -v TASKSET_CORES="$TASKSET_CORES"
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

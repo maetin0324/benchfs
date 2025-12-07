@@ -676,7 +676,9 @@ impl IOUringChunkStore {
         self.ensure_path_dir(file_path)?;
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
-        // Open or create the file with O_DIRECT to bypass OS page cache
+        // Open or create the file
+        // - Write: O_DIRECT to bypass OS page cache for consistent write performance
+        // - Read: Buffered I/O to leverage OS page cache for better read performance
         let flags = if write {
             OpenFlags {
                 read: true,
@@ -687,7 +689,7 @@ impl IOUringChunkStore {
                 direct: true,
             }
         } else {
-            OpenFlags::read_only().with_direct()
+            OpenFlags::read_only() // Buffered I/O for reads (no O_DIRECT)
         };
 
         let handle = self.backend.open(&chunk_file_path, flags).await?;

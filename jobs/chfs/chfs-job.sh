@@ -164,40 +164,59 @@ start_chfs_servers() {
   # Create hostfile
   cp "${PBS_NODEFILE}" "${JOB_OUTPUT_DIR}/hostfile"
 
-  # Create scratch directory and deploy taskset wrapper on all nodes
-  echo "Creating scratch directory ${CHFS_SCRATCH_DIR} and deploying taskset wrapper on all nodes..."
-  local WRAPPER_DIR="${CHFS_SCRATCH_DIR}/bin"
+  # Create scratch directory on all nodes
+  echo "Creating scratch directory ${CHFS_SCRATCH_DIR} on all nodes..."
   local CHFSD_REAL=$(which chfsd)
   echo "Real chfsd path: ${CHFSD_REAL}"
 
-  # Create wrapper script locally first
-  local WRAPPER_SCRIPT="${JOB_OUTPUT_DIR}/chfsd_wrapper.sh"
-  cat > "${WRAPPER_SCRIPT}" <<EOF
+  # Check if TASKSET is enabled
+  : ${TASKSET:=0}
+  : ${TASKSET_CORES:=0,1}
+
+  if [ "${TASKSET}" = "1" ]; then
+    echo "TASKSET mode enabled: limiting chfsd to cores ${TASKSET_CORES}"
+
+    local WRAPPER_DIR="${CHFS_SCRATCH_DIR}/bin"
+
+    # Create wrapper script locally first
+    local WRAPPER_SCRIPT="${JOB_OUTPUT_DIR}/chfsd_wrapper.sh"
+    cat > "${WRAPPER_SCRIPT}" <<EOF
 #!/bin/bash
-# Wrapper to limit chfsd to 2 CPU cores
-exec taskset -c 0,1 ${CHFSD_REAL} "\$@"
+# Wrapper to limit chfsd to specified CPU cores
+exec taskset -c ${TASKSET_CORES} ${CHFSD_REAL} "\$@"
 EOF
-  chmod +x "${WRAPPER_SCRIPT}"
-  echo "Created wrapper script: ${WRAPPER_SCRIPT}"
-  cat "${WRAPPER_SCRIPT}"
+    chmod +x "${WRAPPER_SCRIPT}"
+    echo "Created wrapper script: ${WRAPPER_SCRIPT}"
+    cat "${WRAPPER_SCRIPT}"
 
-  # Deploy to all nodes
-  while IFS= read -r host; do
-    ssh -o StrictHostKeyChecking=no "$host" "mkdir -p ${CHFS_SCRATCH_DIR} && mkdir -p ${WRAPPER_DIR}" &
-  done < "${JOB_OUTPUT_DIR}/hostfile"
-  wait
+    # Deploy to all nodes
+    while IFS= read -r host; do
+      ssh -o StrictHostKeyChecking=no "$host" "mkdir -p ${CHFS_SCRATCH_DIR} && mkdir -p ${WRAPPER_DIR}" &
+    done < "${JOB_OUTPUT_DIR}/hostfile"
+    wait
 
-  while IFS= read -r host; do
-    scp -o StrictHostKeyChecking=no "${WRAPPER_SCRIPT}" "${host}:${WRAPPER_DIR}/chfsd" &
-  done < "${JOB_OUTPUT_DIR}/hostfile"
-  wait
+    while IFS= read -r host; do
+      scp -o StrictHostKeyChecking=no "${WRAPPER_SCRIPT}" "${host}:${WRAPPER_DIR}/chfsd" &
+    done < "${JOB_OUTPUT_DIR}/hostfile"
+    wait
 
-  echo "Scratch directories and taskset wrappers created"
-  echo "chfsd wrapper: ${WRAPPER_DIR}/chfsd (limits to cores 0,1)"
+    echo "Scratch directories and taskset wrappers created"
+    echo "chfsd wrapper: ${WRAPPER_DIR}/chfsd (limits to cores ${TASKSET_CORES})"
 
-  # Prepend wrapper directory to PATH so chfsctl finds it first
-  export PATH="${WRAPPER_DIR}:${PATH}"
-  echo "Updated PATH to use taskset wrapper: ${WRAPPER_DIR}"
+    # Prepend wrapper directory to PATH so chfsctl finds it first
+    export PATH="${WRAPPER_DIR}:${PATH}"
+    echo "Updated PATH to use taskset wrapper: ${WRAPPER_DIR}"
+  else
+    echo "TASKSET mode disabled: chfsd will use all available cores"
+
+    # Just create scratch directory on all nodes (no wrapper)
+    while IFS= read -r host; do
+      ssh -o StrictHostKeyChecking=no "$host" "mkdir -p ${CHFS_SCRATCH_DIR}" &
+    done < "${JOB_OUTPUT_DIR}/hostfile"
+    wait
+
+    echo "Scratch directories created"
+  fi
 
   # Start CHFS servers (no FUSE mount, using native API)
   echo "Running chfsctl start..."

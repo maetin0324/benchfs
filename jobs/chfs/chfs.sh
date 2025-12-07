@@ -12,6 +12,8 @@ TIMESTAMP="$(timestamp)"
 # Default parameters
 : ${ELAPSTIM_REQ:="0:30:00"}
 : ${LABEL:=default}
+: ${TASKSET:=0}         # Set to 1 to enable taskset CPU pinning for chfsd
+: ${TASKSET_CORES:=0,1} # CPU cores to pin chfsd to when TASKSET=1
 
 JOB_FILE="${SCRIPT_DIR}/chfs-job.sh"
 PROJECT_ROOT="$(to_fullpath "${SCRIPT_DIR}/../..")"
@@ -45,7 +47,7 @@ mkdir -p "${BACKEND_DIR}"
 
 # Node count list for benchmarks
 nnodes_list=(
-  # 1 2 4 8
+  # 2 4 8 16
   16
   # 32
 )
@@ -106,6 +108,8 @@ for nnodes in "${nnodes_list[@]}"; do
         -v CHFS_PREFIX="$CHFS_PREFIX"
         -v IOR_PREFIX="$IOR_PREFIX"
         -v PARAM_FILE="$PARAM_FILE_RESOLVED"
+        -v TASKSET="$TASKSET"
+        -v TASKSET_CORES="$TASKSET_CORES"
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

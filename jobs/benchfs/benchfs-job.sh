@@ -53,6 +53,9 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 # Default RUST_LOG levels for server and client
 : ${RUST_LOG_S:=info}
 : ${RUST_LOG_C:=warn}
+# Taskset configuration for CPU pinning
+: ${TASKSET:=0}
+: ${TASKSET_CORES:=0,1}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -317,6 +320,7 @@ if [ "${ENABLE_PERFETTO}" -eq 1 ] || [ "${ENABLE_CHROME}" -eq 1 ]; then
 fi
 echo "RUST_LOG (server): ${RUST_LOG_S}"
 echo "RUST_LOG (client): ${RUST_LOG_C}"
+echo "TASKSET: ${TASKSET} (cores: ${TASKSET_CORES})"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -644,6 +648,21 @@ EOF
           ls -la "${config_file}" || echo "WARNING: Config file not found"
           ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "WARNING: Binary not found"
 
+            # Determine the binary to use (with optional taskset wrapper)
+            BENCHFSD_BINARY="${BENCHFS_PREFIX}/benchfsd_mpi"
+            if [ "${TASKSET}" = "1" ]; then
+              echo "TASKSET mode enabled: limiting benchfsd_mpi to cores ${TASKSET_CORES}"
+              # Create a wrapper script that uses taskset
+              TASKSET_WRAPPER="${run_log_dir}/benchfsd_taskset_wrapper.sh"
+              cat > "${TASKSET_WRAPPER}" <<EOF
+#!/bin/bash
+exec taskset -c ${TASKSET_CORES} ${BENCHFS_PREFIX}/benchfsd_mpi "\$@"
+EOF
+              chmod +x "${TASKSET_WRAPPER}"
+              BENCHFSD_BINARY="${TASKSET_WRAPPER}"
+              echo "Created taskset wrapper: ${TASKSET_WRAPPER}"
+            fi
+
             # Build benchfsd command with optional Perfetto tracing
             cmd_benchfsd=(
               "${cmd_mpirun_common[@]}"
@@ -653,7 +672,7 @@ EOF
               -x RUST_LOG="${RUST_LOG_S}"
               -x RUST_BACKTRACE
               # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
-              "${BENCHFS_PREFIX}/benchfsd_mpi"
+              "${BENCHFSD_BINARY}"
               "${BENCHFS_REGISTRY_DIR}"
               "${config_file}"
             )
