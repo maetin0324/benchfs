@@ -42,6 +42,7 @@ echo ""
 
 # Build BenchFS library
 echo -e "${YELLOW}Building BenchFS library...${NC}"
+cargo build --release --features mpi-support
 cargo build --release --lib
 
 if [ $? -ne 0 ]; then

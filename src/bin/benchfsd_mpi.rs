@@ -225,9 +225,10 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
     // Create pluvio runtime with optional Perfetto task tracking
     let scheduling_config = SchedulingConfig {
         enable_perfetto_tracks,
+        task_batch_size: 1,
         ..Default::default()
     };
-    let runtime = Runtime::with_config(256, scheduling_config);
+    let runtime = Runtime::with_config(2048, scheduling_config);
 
     if enable_perfetto_tracks {
         tracing::info!("Perfetto task tracking enabled - spawned tasks will have separate tracks");
@@ -289,8 +290,8 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
             .queue_size(2048)
             .buffer_size(4 << 20) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
             .submit_depth(128)
-            .wait_submit_timeout(std::time::Duration::from_micros(1))
-            .wait_complete_timeout(std::time::Duration::from_micros(1))
+            .wait_submit_timeout(std::time::Duration::from_micros(10))
+            .wait_complete_timeout(std::time::Duration::from_micros(20))
             .build();
 
         let allocator = uring_reactor.allocator.clone();
