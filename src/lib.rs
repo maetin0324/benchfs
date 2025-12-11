@@ -72,3 +72,6 @@ pub mod perfetto;
 pub mod rpc;
 pub mod server;
 pub mod storage;
+
+#[cfg(feature = "daemon-mode")]
+pub mod daemon;

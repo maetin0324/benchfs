@@ -73,6 +73,7 @@ proptest-state-machine = "0.3"
 [features]
 default = []
 mpi-support = ["mpi"]
+daemon-mode = []
 
 [build-dependencies]
 cc = "1.0"
@@ -94,6 +95,11 @@ required-features = ["mpi-support"]
 [[bin]]
 name = "benchfs_perf"
 path = "src/bin/benchfs_perf.rs"
+
+[[bin]]
+name = "benchfs_daemon"
+path = "src/bin/benchfs_daemon.rs"
+required-features = ["daemon-mode"]
 
 # Benchmark configuration - currently disabled as benches/small.rs does not exist
 # [[bench]]

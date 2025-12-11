@@ -84,8 +84,14 @@ pub mod init;
 pub mod metadata;
 pub mod runtime;
 
+#[cfg(feature = "daemon-mode")]
+pub mod daemon_ops;
+
 // Re-exports for convenience
 pub use error::*;
 pub use file_ops::*;
 pub use init::*;
 pub use metadata::*;
+
+#[cfg(feature = "daemon-mode")]
+pub use daemon_ops::*;
