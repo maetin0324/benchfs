@@ -34,15 +34,15 @@ std::thread_local! {
     static DAEMON_STUB: std::cell::RefCell<Option<DaemonClientStub>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Opaque daemon context type for C code
+/// Opaque BenchFS context type for C code (daemon mode)
 #[repr(C)]
-pub struct benchfs_daemon_context_t {
+pub struct benchfs_context_t {
     _private: [u8; 0],
 }
 
-/// Opaque daemon file handle type for C code
+/// Opaque file handle type for C code (daemon mode)
 #[repr(C)]
-pub struct benchfs_daemon_file_t {
+pub struct benchfs_file_t {
     fd: u64,
 }
 
@@ -69,12 +69,12 @@ pub struct benchfs_daemon_file_t {
 /// - `node_id` and `registry_dir` must be valid, null-terminated C strings
 /// - `data_dir` and `shm_name` may be NULL
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_init(
+pub extern "C" fn benchfs_init(
     node_id: *const c_char,
     registry_dir: *const c_char,
     data_dir: *const c_char,
     shm_name: *const c_char,
-) -> *mut benchfs_daemon_context_t {
+) -> *mut benchfs_context_t {
     crate::logging::init_with_hostname("info");
 
     // Validate required pointers
@@ -162,7 +162,7 @@ pub extern "C" fn benchfs_daemon_init(
 
             // Return a non-null dummy pointer as context handle
             // We use thread-local storage, so the context is just a marker
-            Box::into_raw(Box::new(1u8)) as *mut benchfs_daemon_context_t
+            Box::into_raw(Box::new(1u8)) as *mut benchfs_context_t
         }
         Err(e) => {
             set_error_message(&format!("Failed to connect to daemon: {:?}", e));
@@ -177,10 +177,10 @@ pub extern "C" fn benchfs_daemon_init(
 ///
 /// # Safety
 ///
-/// - `ctx` must be a valid pointer from `benchfs_daemon_init`
+/// - `ctx` must be a valid pointer from `benchfs_init`
 /// - `ctx` must not be used after this call
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_finalize(ctx: *mut benchfs_daemon_context_t) {
+pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     if ctx.is_null() {
         return;
     }
@@ -217,7 +217,7 @@ where
 ///
 /// # Arguments
 ///
-/// * `ctx` - Daemon context (unused, uses thread-local)
+/// * `ctx` - BenchFS context (unused, uses thread-local)
 /// * `path` - File path
 /// * `flags` - Open flags (same as POSIX)
 ///
@@ -226,11 +226,11 @@ where
 /// * File handle pointer on success
 /// * NULL on error
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_open(
-    _ctx: *mut benchfs_daemon_context_t,
+pub extern "C" fn benchfs_open(
+    _ctx: *mut benchfs_context_t,
     path: *const c_char,
     flags: u32,
-) -> *mut benchfs_daemon_file_t {
+) -> *mut benchfs_file_t {
     if path.is_null() {
         set_error_message("path must not be null");
         return std::ptr::null_mut();
@@ -251,7 +251,7 @@ pub extern "C" fn benchfs_daemon_open(
     let result = with_daemon_stub(|stub| stub.open(path_str, flags));
 
     match result {
-        Ok(Ok(fd)) => Box::into_raw(Box::new(benchfs_daemon_file_t { fd })),
+        Ok(Ok(fd)) => Box::into_raw(Box::new(benchfs_file_t { fd })),
         Ok(Err(e)) => {
             set_error_message(&format!("open failed: {:?}", e));
             std::ptr::null_mut()
@@ -267,14 +267,14 @@ pub extern "C" fn benchfs_daemon_open(
 ///
 /// # Arguments
 ///
-/// * `file` - File handle from `benchfs_daemon_open`
+/// * `file` - File handle from `benchfs_open`
 ///
 /// # Returns
 ///
 /// * 0 on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_close(file: *mut benchfs_daemon_file_t) -> i32 {
+pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
     if file.is_null() {
         return BENCHFS_EINVAL;
     }
@@ -316,8 +316,8 @@ pub extern "C" fn benchfs_daemon_close(file: *mut benchfs_daemon_file_t) -> i32 
 /// * Number of bytes read on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_read(
-    file: *mut benchfs_daemon_file_t,
+pub extern "C" fn benchfs_read(
+    file: *mut benchfs_file_t,
     buffer: *mut u8,
     size: usize,
     offset: i64,
@@ -371,8 +371,8 @@ pub extern "C" fn benchfs_daemon_read(
 /// * Number of bytes written on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_write(
-    file: *mut benchfs_daemon_file_t,
+pub extern "C" fn benchfs_write(
+    file: *mut benchfs_file_t,
     buffer: *const u8,
     size: usize,
     offset: i64,
@@ -416,7 +416,7 @@ pub extern "C" fn benchfs_daemon_write(
 ///
 /// # Arguments
 ///
-/// * `ctx` - Daemon context (unused)
+/// * `ctx` - BenchFS context (unused)
 /// * `path` - File path
 ///
 /// # Returns
@@ -424,8 +424,8 @@ pub extern "C" fn benchfs_daemon_write(
 /// * 0 on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_remove(
-    _ctx: *mut benchfs_daemon_context_t,
+pub extern "C" fn benchfs_remove(
+    _ctx: *mut benchfs_context_t,
     path: *const c_char,
 ) -> i32 {
     if path.is_null() {
@@ -471,7 +471,7 @@ pub extern "C" fn benchfs_daemon_remove(
 /// * 0 on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_fsync(file: *mut benchfs_daemon_file_t) -> i32 {
+pub extern "C" fn benchfs_fsync(file: *mut benchfs_file_t) -> i32 {
     if file.is_null() {
         return BENCHFS_EINVAL;
     }
@@ -498,7 +498,7 @@ pub extern "C" fn benchfs_daemon_fsync(file: *mut benchfs_daemon_file_t) -> i32 
 ///
 /// # Arguments
 ///
-/// * `ctx` - Daemon context (unused)
+/// * `ctx` - BenchFS context (unused)
 /// * `path` - File path
 ///
 /// # Returns
@@ -506,8 +506,8 @@ pub extern "C" fn benchfs_daemon_fsync(file: *mut benchfs_daemon_file_t) -> i32 
 /// * File size on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_stat(
-    _ctx: *mut benchfs_daemon_context_t,
+pub extern "C" fn benchfs_stat(
+    _ctx: *mut benchfs_context_t,
     path: *const c_char,
 ) -> i64 {
     if path.is_null() {
@@ -546,7 +546,7 @@ pub extern "C" fn benchfs_daemon_stat(
 ///
 /// # Arguments
 ///
-/// * `ctx` - Daemon context (unused)
+/// * `ctx` - BenchFS context (unused)
 /// * `path` - Directory path
 ///
 /// # Returns
@@ -554,8 +554,8 @@ pub extern "C" fn benchfs_daemon_stat(
 /// * 0 on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_mkdir(
-    _ctx: *mut benchfs_daemon_context_t,
+pub extern "C" fn benchfs_mkdir(
+    _ctx: *mut benchfs_context_t,
     path: *const c_char,
 ) -> i32 {
     if path.is_null() {
@@ -603,8 +603,8 @@ pub extern "C" fn benchfs_daemon_mkdir(
 /// * New file position on success
 /// * Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn benchfs_daemon_lseek(
-    file: *mut benchfs_daemon_file_t,
+pub extern "C" fn benchfs_lseek(
+    file: *mut benchfs_file_t,
     offset: i64,
     _whence: i32,
 ) -> i64 {

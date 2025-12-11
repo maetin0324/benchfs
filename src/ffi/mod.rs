@@ -20,6 +20,12 @@
 //! - [`error`]: Error handling (error codes and message storage)
 //! - [`runtime`]: Global runtime management for async execution
 //!
+//! # Compile-time Mode Switching
+//!
+//! With `--features daemon-mode`, the FFI implementation switches to use
+//! shared memory communication with a client daemon instead of direct UCX connections.
+//! The C API remains the same (`benchfs_init`, `benchfs_open`, etc.).
+//!
 //! # Usage from C
 //!
 //! ```c
@@ -78,20 +84,32 @@
 //! This design allows multiple MPI ranks to use BenchFS concurrently without
 //! contention, as each MPI process typically runs in its own thread/process.
 
+// Common modules (always enabled)
 pub mod error;
+
+// Re-exports - common modules
+pub use error::*;
+
+// Direct mode (daemon-mode disabled) - uses UCX direct connections
+#[cfg(not(feature = "daemon-mode"))]
 pub mod file_ops;
+#[cfg(not(feature = "daemon-mode"))]
 pub mod init;
+#[cfg(not(feature = "daemon-mode"))]
 pub mod metadata;
+#[cfg(not(feature = "daemon-mode"))]
 pub mod runtime;
 
+#[cfg(not(feature = "daemon-mode"))]
+pub use file_ops::*;
+#[cfg(not(feature = "daemon-mode"))]
+pub use init::*;
+#[cfg(not(feature = "daemon-mode"))]
+pub use metadata::*;
+
+// Daemon mode (daemon-mode enabled) - uses shared memory via client daemon
 #[cfg(feature = "daemon-mode")]
 pub mod daemon_ops;
-
-// Re-exports for convenience
-pub use error::*;
-pub use file_ops::*;
-pub use init::*;
-pub use metadata::*;
 
 #[cfg(feature = "daemon-mode")]
 pub use daemon_ops::*;

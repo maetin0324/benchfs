@@ -43,7 +43,7 @@ echo ""
 # Build BenchFS library
 echo -e "${YELLOW}Building BenchFS library...${NC}"
 cargo build --release --features mpi-support
-cargo build --release --lib
+cargo build --release --lib --features daemon-mode
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Failed to build BenchFS library${NC}"
