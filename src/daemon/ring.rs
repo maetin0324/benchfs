@@ -348,9 +348,19 @@ mod tests {
     use super::*;
     use crate::daemon::protocol::OpType;
     use crate::daemon::shm::ShmConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn create_test_shm() -> SharedMemoryRegion {
-        let name = format!("/benchfs_test_{}", std::process::id());
+    // Unique counter to ensure each test gets a unique shared memory name
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn create_test_shm(test_name: &str) -> SharedMemoryRegion {
+        let unique_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let name = format!(
+            "/benchfs_ring_{}_{}_{}",
+            std::process::id(),
+            test_name,
+            unique_id
+        );
         let config = ShmConfig {
             num_slots: 2,
             data_buffer_size: 4096,
@@ -367,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_request_ring_push_pop() {
-        let shm = create_test_shm();
+        let shm = create_test_shm("req_push_pop");
         let ring = RequestRing::new(&shm, 0).unwrap();
 
         assert!(ring.is_empty());
@@ -402,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_response_ring_push_pop() {
-        let shm = create_test_shm();
+        let shm = create_test_shm("resp_push_pop");
         let ring = ResponseRing::new(&shm, 0).unwrap();
 
         assert!(ring.is_empty());
@@ -427,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_response_ring_pop_by_id() {
-        let shm = create_test_shm();
+        let shm = create_test_shm("resp_pop_by_id");
         let ring = ResponseRing::new(&shm, 0).unwrap();
 
         let entry = ResponseEntry::success(42, 100);
@@ -443,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_slot_view() {
-        let shm = create_test_shm();
+        let shm = create_test_shm("slot_view");
         let view = SlotView::new(&shm, 0).unwrap();
 
         assert_eq!(view.slot_id(), 0);
@@ -465,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_ring_wrap_around() {
-        let shm = create_test_shm();
+        let shm = create_test_shm("wrap_around");
         let req_ring = RequestRing::new(&shm, 0).unwrap();
         let resp_ring = ResponseRing::new(&shm, 0).unwrap();
 

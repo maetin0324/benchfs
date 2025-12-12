@@ -56,6 +56,8 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 # Taskset configuration for CPU pinning
 : ${TASKSET:=0}
 : ${TASKSET_CORES:=0,1}
+# Daemon mode configuration
+: ${DAEMON_MODE:=0}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -296,6 +298,10 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:${LD_LIBRARY_PATH:-}"
 
+# Set BENCHFS_DAEMON_BINARY for daemon mode
+# This environment variable is read by the BenchFS client library to locate the daemon binary
+export BENCHFS_DAEMON_BINARY="${PROJECT_ROOT}/target/release/benchfs_daemon"
+
 IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
 
 echo "prepare the output directory: ${JOB_OUTPUT_DIR}"
@@ -321,6 +327,10 @@ fi
 echo "RUST_LOG (server): ${RUST_LOG_S}"
 echo "RUST_LOG (client): ${RUST_LOG_C}"
 echo "TASKSET: ${TASKSET} (cores: ${TASKSET_CORES})"
+echo "DAEMON_MODE: ${DAEMON_MODE}"
+if [ "${DAEMON_MODE}" -eq 1 ]; then
+  echo "BENCHFS_DAEMON_BINARY: ${BENCHFS_DAEMON_BINARY}"
+fi
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -746,6 +756,7 @@ EOF
             --map-by "ppr:${ppn}:node"
             -x RUST_LOG="${RUST_LOG_C}"
             -x RUST_BACKTRACE
+            -x BENCHFS_DAEMON_BINARY="${BENCHFS_DAEMON_BINARY}"
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
             -vvv

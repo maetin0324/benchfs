@@ -29,18 +29,19 @@ use crate::daemon::client_stub::DaemonClientStub;
 use crate::daemon::launcher::LauncherConfig;
 use crate::daemon::shm::ShmConfig;
 
-/// Thread-local storage for daemon client stub
 std::thread_local! {
     static DAEMON_STUB: std::cell::RefCell<Option<DaemonClientStub>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Opaque BenchFS context type for C code (daemon mode)
+#[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct benchfs_context_t {
     _private: [u8; 0],
 }
 
 /// Opaque file handle type for C code (daemon mode)
+#[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct benchfs_file_t {
     fd: u64,
@@ -139,11 +140,40 @@ pub extern "C" fn benchfs_init(
         shm_name_str
     );
 
+    // Get daemon binary path from environment variable or use default
+    let daemon_binary = match std::env::var("BENCHFS_DAEMON_BINARY") {
+        Ok(path) => {
+            tracing::info!("Using daemon binary from BENCHFS_DAEMON_BINARY: {}", path);
+            PathBuf::from(path)
+        }
+        Err(_) => {
+            // Fallback: try to find the daemon binary relative to the library
+            // This works when both libbenchfs.so and benchfs_daemon are in target/release
+            let fallback = PathBuf::from("benchfs_daemon");
+            tracing::warn!(
+                "BENCHFS_DAEMON_BINARY not set, using default: {:?}. \
+                 Set BENCHFS_DAEMON_BINARY to the absolute path of benchfs_daemon binary.",
+                fallback
+            );
+            fallback
+        }
+    };
+
+    // Check if the binary exists
+    if !daemon_binary.exists() && !daemon_binary.is_absolute() {
+        tracing::warn!(
+            "Daemon binary {:?} not found in PATH. Consider setting BENCHFS_DAEMON_BINARY.",
+            daemon_binary
+        );
+    }
+
+    tracing::info!("Daemon binary path: {:?}", daemon_binary);
+
     // Create launcher config
     let config = LauncherConfig {
         shm_name: shm_name_str.unwrap_or_else(crate::daemon::default_shm_name),
         shm_config: ShmConfig::default(),
-        daemon_binary: PathBuf::from("benchfs_daemon"),
+        daemon_binary,
         registry_dir: PathBuf::from(registry_dir_str),
         data_dir: PathBuf::from(data_dir_str.unwrap_or("/tmp/benchfs_daemon_data")),
         startup_timeout: std::time::Duration::from_secs(30),
@@ -254,6 +284,64 @@ pub extern "C" fn benchfs_open(
         Ok(Ok(fd)) => Box::into_raw(Box::new(benchfs_file_t { fd })),
         Ok(Err(e)) => {
             set_error_message(&format!("open failed: {:?}", e));
+            std::ptr::null_mut()
+        }
+        Err(e) => {
+            set_error_message(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Create a file in daemon mode.
+///
+/// This is similar to `benchfs_open` but ensures the O_CREAT flag is set.
+///
+/// # Arguments
+///
+/// * `ctx` - BenchFS context (unused, uses thread-local)
+/// * `path` - File path
+/// * `flags` - Open flags (same as POSIX)
+/// * `mode` - File mode (unused, for POSIX compatibility)
+///
+/// # Returns
+///
+/// * File handle pointer on success
+/// * NULL on error
+#[unsafe(no_mangle)]
+pub extern "C" fn benchfs_create(
+    _ctx: *mut benchfs_context_t,
+    path: *const c_char,
+    flags: i32,
+    _mode: u32,
+) -> *mut benchfs_file_t {
+    if path.is_null() {
+        set_error_message("path must not be null");
+        return std::ptr::null_mut();
+    }
+
+    let path_str = unsafe {
+        match CStr::from_ptr(path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                set_error_message("Invalid UTF-8 in path");
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    // Ensure O_CREAT flag is set
+    const O_CREAT: u32 = 0x0040;
+    let flags_with_create = (flags as u32) | O_CREAT;
+
+    tracing::debug!("benchfs_create: path={}, flags={:#x}", path_str, flags_with_create);
+
+    let result = with_daemon_stub(|stub| stub.open(path_str, flags_with_create));
+
+    match result {
+        Ok(Ok(fd)) => Box::into_raw(Box::new(benchfs_file_t { fd })),
+        Ok(Err(e)) => {
+            set_error_message(&format!("create failed: {:?}", e));
             std::ptr::null_mut()
         }
         Err(e) => {
@@ -540,6 +628,26 @@ pub extern "C" fn benchfs_stat(
             BENCHFS_ERROR as i64
         }
     }
+}
+
+/// Get file size in daemon mode.
+///
+/// # Arguments
+///
+/// * `ctx` - BenchFS context (unused)
+/// * `path` - File path
+///
+/// # Returns
+///
+/// * File size in bytes on success
+/// * Negative error code on failure
+#[unsafe(no_mangle)]
+pub extern "C" fn benchfs_get_file_size(
+    _ctx: *mut benchfs_context_t,
+    path: *const c_char,
+) -> i64 {
+    // benchfs_get_file_size is just an alias for benchfs_stat
+    benchfs_stat(_ctx, path)
 }
 
 /// Create directory in daemon mode.

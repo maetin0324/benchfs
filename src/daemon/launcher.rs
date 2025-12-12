@@ -95,9 +95,11 @@ pub enum ConnectResult {
 
 /// Try to connect to an existing daemon or determine if we need to spawn one.
 pub fn try_connect_or_spawn(shm_name: &str) -> Result<ConnectResult, DaemonError> {
+    use super::shm::ShmError;
+
     // First, try to attach to existing shared memory
-    match SharedMemoryRegion::try_attach(shm_name)? {
-        Some(shm) => {
+    match SharedMemoryRegion::attach(shm_name) {
+        Ok(shm) => {
             // Shared memory exists, check if daemon is ready
             if shm.is_daemon_ready() {
                 debug!("Connected to existing daemon");
@@ -107,25 +109,47 @@ pub fn try_connect_or_spawn(shm_name: &str) -> Result<ConnectResult, DaemonError
             debug!("Shared memory exists but daemon not ready, waiting");
             // Drop shm so it can be recreated if needed
             drop(shm);
+            return Ok(ConnectResult::WaitForSpawn);
         }
-        None => {
+        Err(ShmError::OpenFailed(e)) if e.raw_os_error() == Some(libc::ENOENT) => {
             debug!("No existing shared memory found");
+        }
+        Err(ShmError::InvalidMagic) => {
+            // Shared memory exists but magic not set - daemon is still initializing
+            debug!("Shared memory exists but magic not initialized, waiting for spawn");
+            return Ok(ConnectResult::WaitForSpawn);
+        }
+        Err(e) => {
+            return Err(DaemonError::Shm(e));
         }
     }
 
-    // Try to acquire lock for spawning
+    // No shared memory exists, try to acquire lock for spawning
     match try_acquire_lock(shm_name).map_err(DaemonError::Io)? {
         Some(lock_file) => {
             // We got the lock - check again if shm was created while we were waiting
-            match SharedMemoryRegion::try_attach(shm_name)? {
-                Some(shm) if shm.is_daemon_ready() => {
+            match SharedMemoryRegion::attach(shm_name) {
+                Ok(shm) if shm.is_daemon_ready() => {
                     debug!("Daemon became ready while acquiring lock");
                     return Ok(ConnectResult::Connected(shm));
                 }
-                _ => {
-                    // We need to spawn the daemon
+                Ok(_) => {
+                    // Shared memory exists but not ready - unusual, but we should wait
+                    debug!("Shared memory exists but not ready after acquiring lock");
+                    return Ok(ConnectResult::WaitForSpawn);
+                }
+                Err(ShmError::InvalidMagic) => {
+                    // Someone else is initializing - wait for them
+                    debug!("Shared memory has invalid magic while holding lock, waiting");
+                    return Ok(ConnectResult::WaitForSpawn);
+                }
+                Err(ShmError::OpenFailed(e)) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    // Still no shm - we need to spawn the daemon
                     debug!("We need to spawn daemon");
                     return Ok(ConnectResult::NeedSpawn(lock_file));
+                }
+                Err(e) => {
+                    return Err(DaemonError::Shm(e));
                 }
             }
         }
@@ -196,14 +220,40 @@ fn wait_for_daemon_ready(
     shm_name: &str,
     timeout: Duration,
 ) -> Result<SharedMemoryRegion, DaemonError> {
+    use super::shm::ShmError;
+
     let start = Instant::now();
+    let mut last_log = Instant::now();
 
     loop {
         // Try to attach to shared memory
-        if let Some(shm) = SharedMemoryRegion::try_attach(shm_name)? {
-            if shm.is_daemon_ready() {
-                info!("Daemon is ready");
-                return Ok(shm);
+        // Note: We handle InvalidMagic as "daemon still initializing" because
+        // there's a race between shm_open and magic number initialization
+        match SharedMemoryRegion::attach(shm_name) {
+            Ok(shm) => {
+                if shm.is_daemon_ready() {
+                    info!("Daemon is ready");
+                    return Ok(shm);
+                }
+                // Shared memory exists but daemon not ready yet
+                debug!("Shared memory attached but daemon not ready yet");
+            }
+            Err(ShmError::OpenFailed(e)) if e.raw_os_error() == Some(libc::ENOENT) => {
+                // Shared memory doesn't exist yet - daemon still starting
+                debug!("Shared memory doesn't exist yet, waiting...");
+            }
+            Err(ShmError::InvalidMagic) => {
+                // Shared memory exists but magic not set yet - daemon still initializing
+                // This is a race condition: shm_open succeeded but daemon hasn't
+                // finished writing the magic number to the control block yet
+                if last_log.elapsed() >= Duration::from_secs(1) {
+                    debug!("Shared memory exists but magic not initialized yet, waiting...");
+                    last_log = Instant::now();
+                }
+            }
+            Err(e) => {
+                // Other errors are real failures
+                return Err(DaemonError::Shm(e));
             }
         }
 
@@ -212,8 +262,8 @@ fn wait_for_daemon_ready(
             return Err(DaemonError::DaemonStartupTimeout);
         }
 
-        // Busy poll with spin hint
-        std::hint::spin_loop();
+        // Small sleep to avoid busy spinning too aggressively
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 

@@ -33,8 +33,8 @@ mkdir -p "${OUTPUT_DIR}"
 cd "${OUTPUT_DIR}"
 mkdir -p "${BACKEND_DIR}"
 
-# Use 2 nodes for focused profiling (one server node being profiled)
-nnodes=2
+# Use 4 nodes for focused profiling (one server node being profiled)
+nnodes=4
 
 cmd_qsub=(
   qsub

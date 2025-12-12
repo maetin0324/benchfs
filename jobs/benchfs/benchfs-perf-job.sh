@@ -32,6 +32,9 @@ PERF_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perf_results"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:${LD_LIBRARY_PATH:-}"
 
+# Set BENCHFS_DAEMON_BINARY for daemon mode
+export BENCHFS_DAEMON_BINARY="${PROJECT_ROOT}/target/release/benchfs_daemon"
+
 IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
 
 echo "=========================================="
@@ -259,6 +262,7 @@ cmd_ior_perf=(
   --map-by "ppr:${ppn}:node"
   -x RUST_LOG=warn
   -x RUST_BACKTRACE
+  -x BENCHFS_DAEMON_BINARY="${BENCHFS_DAEMON_BINARY}"
   "${CLIENT_PERF_WRAPPER}"
   "${PERF_OUTPUT_DIR}"
   "${IOR_PREFIX}/src/ior"
