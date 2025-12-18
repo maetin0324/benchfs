@@ -259,13 +259,6 @@ fn run_server(
     std::fs::create_dir_all(data_dir)?;
 
     let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
-
-    // Setup signal handler
-    ctrlc::set_handler(move || {
-        tracing::info!("Received shutdown signal");
-        running_clone.store(false, Ordering::Release);
-    })?;
 
     // Create runtime
     let runtime = Runtime::new(256);
@@ -360,28 +353,9 @@ fn run_server(
                     if !running_clone.load(Ordering::Acquire) {
                         break;
                     }
-                    pluvio_timer::sleep(Duration::from_millis(100)).await;
+                    pluvio_timer::sleep(Duration::from_millis(1000)).await;
                 }
-
-                // Graceful shutdown
-                tracing::info!("Initiating graceful shutdown...");
-                rpc_server_clone.handler_context().set_shutdown_flag();
-                rpc_server_clone.shutdown_all_streams();
-
-                let shutdown_timeout = Duration::from_millis(500);
-                tracing::info!("Waiting {:?} for listener tasks to exit...", shutdown_timeout);
-                pluvio_timer::sleep(shutdown_timeout).await;
-
-                let remaining_tasks = runtime_clone.task_pool.borrow().len();
-                if remaining_tasks > 1 {
-                    tracing::warn!(
-                        "{} tasks still running after shutdown wait",
-                        remaining_tasks - 1
-                    );
-                    runtime_clone.request_shutdown();
-                }
-
-                tracing::info!("RPC server stopped");
+                
                 Ok::<(), std::io::Error>(())
             },
             "perf_server".to_string(),

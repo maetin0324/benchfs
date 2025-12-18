@@ -114,9 +114,6 @@ fn main() {
     // Create server state
     let state = Rc::new(ServerState::new(config.clone()));
 
-    // Setup signal handlers
-    benchfs::server::signals::setup_signal_handlers(state.running.clone());
-
     // Run the server (enable perfetto tracks if tracing is enabled)
     let enable_perfetto_tracks = trace_output.is_some();
     if let Err(e) = run_server(state.clone(), enable_perfetto_tracks) {
@@ -352,5 +349,3 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>) -> Option<TraceGua
         None
     }
 }
-
-// Signal handlers moved to benchfs::server::signals module

@@ -195,8 +195,6 @@ fn main() {
         registry_dir,
     ));
 
-    // Setup signal handlers
-    benchfs::server::signals::setup_signal_handlers(state.running.clone());
 
     // Synchronize all ranks before starting servers
     world.barrier();
@@ -614,5 +612,3 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> 
         None
     }
 }
-
-// Signal handlers moved to benchfs::server::signals module

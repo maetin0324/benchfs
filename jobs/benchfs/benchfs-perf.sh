@@ -11,7 +11,8 @@ JOB_FILE="${SCRIPT_DIR}/benchfs-perf-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
 OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
-BENCHFS_PREFIX="${PROJECT_ROOT}/target/debug"
+# Use release build with debug symbols (built via scripts/debug-install.sh)
+BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 echo "=========================================="
@@ -33,8 +34,8 @@ mkdir -p "${OUTPUT_DIR}"
 cd "${OUTPUT_DIR}"
 mkdir -p "${BACKEND_DIR}"
 
-# Use 2 nodes for focused profiling (one server node being profiled)
-nnodes=2
+# Use 4 nodes for focused profiling (one server node being profiled)
+nnodes=4
 
 cmd_qsub=(
   qsub

@@ -74,6 +74,11 @@ proptest-state-machine = "0.3"
 default = []
 mpi-support = ["mpi"]
 
+# Release profile with debug symbols for perf profiling
+[profile.release]
+debug = 2          # Full debug info (DWARF)
+strip = false      # Don't strip symbols
+
 [build-dependencies]
 cc = "1.0"
 
