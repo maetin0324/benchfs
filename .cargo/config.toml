@@ -1,0 +1,5 @@
+# Cargo configuration for perf profiling
+# Frame pointers are required for accurate call graph in perf
+
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]

@@ -104,7 +104,8 @@
       "Bash(tree:*)",
       "WebFetch(domain:docs.rs)",
       "Bash(spack find:*)",
-      "Bash(ldd:*)"
+      "Bash(ldd:*)",
+      "Bash(xxd:*)"
     ],
     "deny": [],
     "ask": []

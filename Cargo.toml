@@ -74,10 +74,17 @@ proptest-state-machine = "0.3"
 default = []
 mpi-support = ["mpi"]
 
+# Debug profile with full debug symbols for perf profiling
+[profile.dev]
+debug = 2                  # Full debug info (DWARF)
+split-debuginfo = "off"    # Don't split debug info into .dwp files
+strip = "none"             # Don't strip symbols
+
 # Release profile with debug symbols for perf profiling
 [profile.release]
-debug = 2          # Full debug info (DWARF)
-strip = false      # Don't strip symbols
+debug = 2                  # Full debug info (DWARF)
+split-debuginfo = "off"    # Don't split debug info into .dwp files
+strip = "none"             # Don't strip symbols
 
 [build-dependencies]
 cc = "1.0"

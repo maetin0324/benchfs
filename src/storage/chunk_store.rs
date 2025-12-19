@@ -677,19 +677,17 @@ impl IOUringChunkStore {
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
         // Open or create the file
-        // - Write: O_DIRECT to bypass OS page cache for consistent write performance
-        // - Read: Buffered I/O to leverage OS page cache for better read performance
-        let flags = if write {
-            OpenFlags {
-                read: true,
-                write: true,
-                create: true,
-                truncate: false,
-                append: false,
-                direct: true,
-            }
-        } else {
-            OpenFlags::read_only() // Buffered I/O for reads (no O_DIRECT)
+        // Both read and write use O_DIRECT to bypass OS page cache:
+        // - Avoids page cache memory pressure and expensive shrink_* kernel calls
+        // - Provides consistent, predictable I/O latency
+        // - FixedBuffer is already page-aligned, chunk offsets are 4MB-aligned
+        let flags = OpenFlags {
+            read: !write,
+            write: write,
+            create: write,
+            truncate: false,
+            append: false,
+            direct: true,
         };
 
         let handle = self.backend.open(&chunk_file_path, flags).await?;

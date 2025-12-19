@@ -30,8 +30,8 @@ IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 PERF_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perf_results"
 
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-# Use release build with debug symbols (built via scripts/debug-install.sh)
-export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:${LD_LIBRARY_PATH:-}"
+# Use debug build for perf profiling with full debug symbols
+export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/debug:${LD_LIBRARY_PATH:-}"
 
 IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
 
@@ -53,6 +53,11 @@ mkdir -p "${PERF_OUTPUT_DIR}"
 cp "$0" "${JOB_OUTPUT_DIR}"
 cp "${PBS_NODEFILE}" "${JOB_OUTPUT_DIR}"
 printenv >"${JOB_OUTPUT_DIR}/env.txt"
+
+# Check debug symbols in binaries
+echo "Checking debug symbols in ${BENCHFS_PREFIX}..."
+file "${BENCHFS_PREFIX}/benchfsd_mpi" 2>/dev/null | grep -q "not stripped" && echo "  benchfsd_mpi: has debug symbols" || echo "  WARNING: benchfsd_mpi may be stripped"
+file "${BENCHFS_PREFIX}/libbenchfs.so" 2>/dev/null | grep -q "not stripped" && echo "  libbenchfs.so: has debug symbols" || echo "  WARNING: libbenchfs.so may be stripped"
 
 trap 'rm -rf "${JOB_BACKEND_DIR}" ; exit 1' 1 2 3 15
 trap 'rm -rf "${JOB_BACKEND_DIR}" ; exit 0' EXIT
@@ -123,9 +128,9 @@ check_server_ready() {
 # Fixed parameters for profiling (matching the problematic scenario)
 transfer_size="4m"
 block_size="16g"
-ppn=16
+ppn=4
 server_ppn=1
-benchfs_chunk_size=33554432  # 32MB
+benchfs_chunk_size=4194304  # 4MB
 
 server_np=$((NNODES * server_ppn))
 np=$((NNODES * ppn))
@@ -181,6 +186,8 @@ FIRST_NODE=$(head -1 "${PBS_NODEFILE}")
 echo "Perf will record on node: $FIRST_NODE"
 
 # Create wrapper script that starts benchfsd and then attaches perf on rank 0
+# IMPORTANT: The wrapper MUST exit with 0 to prevent MPI from aborting the job
+# and killing perf before it can flush data
 PERF_WRAPPER="${JOB_OUTPUT_DIR}/perf_wrapper.sh"
 cat > "${PERF_WRAPPER}" <<'WRAPPER_EOF'
 #!/bin/bash
@@ -202,7 +209,7 @@ if [ "$RANK" -eq 0 ]; then
 
   # Attach perf to the running process
   echo "Rank 0: Attaching perf record to PID $BENCHFSD_PID"
-  perf record -g -F 99 --call-graph dwarf -o "${PERF_OUTPUT_DIR}/perf_server_rank0.data" -p $BENCHFSD_PID &
+  perf record -g -F 99 --call-graph fp -o "${PERF_OUTPUT_DIR}/perf_server_rank0.data" -p $BENCHFSD_PID &
   PERF_PID=$!
   echo "Rank 0: perf record started with PID $PERF_PID"
 
@@ -219,12 +226,23 @@ if [ "$RANK" -eq 0 ]; then
   if kill -0 $PERF_PID 2>/dev/null; then
     echo "Rank 0: Stopping perf gracefully (SIGINT)"
     kill -INT $PERF_PID
-    # Wait for perf to finish writing data
-    wait $PERF_PID 2>/dev/null || true
-    echo "Rank 0: perf stopped"
+    # Wait for perf with timeout (max 30 seconds)
+    PERF_WAIT=0
+    while kill -0 $PERF_PID 2>/dev/null && [ $PERF_WAIT -lt 30 ]; do
+      sleep 1
+      PERF_WAIT=$((PERF_WAIT + 1))
+    done
+    if kill -0 $PERF_PID 2>/dev/null; then
+      echo "Rank 0: perf did not stop after 30s, forcing"
+      kill -9 $PERF_PID 2>/dev/null || true
+    else
+      echo "Rank 0: perf stopped after ${PERF_WAIT}s"
+    fi
   fi
 
-  exit $BENCHFSD_EXIT
+  # IMPORTANT: Always exit 0 to prevent MPI from aborting and killing other processes
+  # The actual benchfsd exit code is logged above for debugging
+  exit 0
 else
   echo "Rank $RANK: Running without perf"
   exec "$BENCHFSD_BIN" "$@"
@@ -267,6 +285,7 @@ echo "Running Write+Read Benchmark with Perf on Client"
 echo "=========================================="
 
 # Create client perf wrapper (using attach mode for proper data flushing)
+# For client, IOR completes normally and exit code should be passed through
 CLIENT_PERF_WRAPPER="${JOB_OUTPUT_DIR}/client_perf_wrapper.sh"
 cat > "${CLIENT_PERF_WRAPPER}" <<'CLIENT_WRAPPER_EOF'
 #!/bin/bash
@@ -288,7 +307,7 @@ if [ "$RANK" -eq 0 ]; then
 
   # Attach perf to the running process
   echo "Client Rank 0: Attaching perf record to PID $IOR_PID"
-  perf record -g -F 99 --call-graph dwarf -o "${PERF_OUTPUT_DIR}/perf_client_rank0.data" -p $IOR_PID &
+  perf record -g -F 99 --call-graph fp -o "${PERF_OUTPUT_DIR}/perf_client_rank0.data" -p $IOR_PID &
   PERF_PID=$!
   echo "Client Rank 0: perf record started with PID $PERF_PID"
 
@@ -301,14 +320,25 @@ if [ "$RANK" -eq 0 ]; then
   IOR_EXIT=$?
   echo "Client Rank 0: IOR exited with code $IOR_EXIT"
 
-  # Stop perf gracefully with SIGINT
+  # Stop perf gracefully with SIGINT and timeout
   if kill -0 $PERF_PID 2>/dev/null; then
     echo "Client Rank 0: Stopping perf gracefully (SIGINT)"
     kill -INT $PERF_PID
-    wait $PERF_PID 2>/dev/null || true
-    echo "Client Rank 0: perf stopped"
+    # Wait for perf with timeout (max 30 seconds)
+    PERF_WAIT=0
+    while kill -0 $PERF_PID 2>/dev/null && [ $PERF_WAIT -lt 30 ]; do
+      sleep 1
+      PERF_WAIT=$((PERF_WAIT + 1))
+    done
+    if kill -0 $PERF_PID 2>/dev/null; then
+      echo "Client Rank 0: perf did not stop after 30s, forcing"
+      kill -9 $PERF_PID 2>/dev/null || true
+    else
+      echo "Client Rank 0: perf stopped after ${PERF_WAIT}s"
+    fi
   fi
 
+  # Pass through IOR exit code (IOR success/failure matters)
   exit $IOR_EXIT
 else
   exec "$IOR_BIN" "$@"
@@ -352,33 +382,46 @@ echo "=========================================="
 echo "Phase 3: Stopping Server and Collecting Perf Data"
 echo "=========================================="
 
-# First, ensure perf processes are stopped gracefully (fallback if wrapper cleanup fails)
+# Function to stop perf gracefully with extended timeout for data flushing
 stop_perf_gracefully() {
     local pid_file="$1"
     local name="$2"
+    local timeout="${3:-30}"  # Default 30 seconds
     if [ -f "$pid_file" ]; then
         local perf_pid=$(cat "$pid_file")
         if kill -0 "$perf_pid" 2>/dev/null; then
             echo "Stopping $name perf (PID: $perf_pid) gracefully..."
             kill -INT "$perf_pid" 2>/dev/null || true
-            # Wait up to 10 seconds for perf to finish
-            for i in $(seq 1 10); do
-                if ! kill -0 "$perf_pid" 2>/dev/null; then
-                    echo "$name perf stopped after ${i}s"
-                    break
-                fi
+            # Wait for perf to finish flushing data
+            local elapsed=0
+            while kill -0 "$perf_pid" 2>/dev/null && [ $elapsed -lt $timeout ]; do
                 sleep 1
+                elapsed=$((elapsed + 1))
+                if [ $((elapsed % 10)) -eq 0 ]; then
+                    echo "  $name perf still flushing data... ${elapsed}s"
+                fi
             done
-            # Force kill if still running
             if kill -0 "$perf_pid" 2>/dev/null; then
-                echo "WARNING: $name perf did not stop, forcing..."
+                echo "WARNING: $name perf did not stop after ${timeout}s, forcing..."
                 kill -9 "$perf_pid" 2>/dev/null || true
+            else
+                echo "$name perf stopped and data flushed after ${elapsed}s"
             fi
+        else
+            echo "$name perf already stopped"
         fi
+    else
+        echo "$name perf PID file not found"
     fi
 }
 
-echo "Sending SIGTERM to benchfsd_mpi for graceful shutdown..."
+# IMPORTANT: Stop perf BEFORE killing the server!
+# This allows perf to flush its data buffer while the target process is still alive
+echo "Step 1: Stopping server perf first (while server is still running)..."
+stop_perf_gracefully "${PERF_OUTPUT_DIR}/perf_server.pid" "server" 60
+
+echo ""
+echo "Step 2: Sending SIGTERM to benchfsd_mpi for graceful shutdown..."
 "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node pkill -TERM benchfsd_mpi || true
 
 echo "Waiting for server to shutdown gracefully (max 60 seconds)..."
@@ -393,10 +436,7 @@ while kill -0 $BENCHFSD_PID 2>/dev/null && [ $ELAPSED -lt $SHUTDOWN_TIMEOUT ]; d
 done
 
 if kill -0 $BENCHFSD_PID 2>/dev/null; then
-    echo "WARNING: Server did not shutdown within ${SHUTDOWN_TIMEOUT}s"
-    # Stop perf gracefully BEFORE killing benchfsd
-    stop_perf_gracefully "${PERF_OUTPUT_DIR}/perf_server.pid" "server"
-    echo "Now sending SIGKILL to benchfsd_mpi..."
+    echo "WARNING: Server did not shutdown within ${SHUTDOWN_TIMEOUT}s, sending SIGKILL..."
     "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node pkill -9 benchfsd_mpi || true
     kill -9 $BENCHFSD_PID 2>/dev/null || true
 else
@@ -404,11 +444,14 @@ else
 fi
 wait $BENCHFSD_PID 2>/dev/null || true
 
-# Final cleanup: ensure all perf processes are stopped
-stop_perf_gracefully "${PERF_OUTPUT_DIR}/perf_server.pid" "server"
-stop_perf_gracefully "${PERF_OUTPUT_DIR}/perf_client.pid" "client"
+# Final cleanup: ensure all perf processes are stopped (should already be stopped)
+echo ""
+echo "Step 3: Final cleanup..."
+stop_perf_gracefully "${PERF_OUTPUT_DIR}/perf_server.pid" "server" 10
+stop_perf_gracefully "${PERF_OUTPUT_DIR}/perf_client.pid" "client" 10
 
-echo "Waiting for perf data to be flushed..."
+echo "Waiting for filesystem to sync..."
+sync
 sleep 2
 
 # ============================================================
@@ -424,14 +467,7 @@ if [ -f "${PERF_OUTPUT_DIR}/perf_server_rank0.data" ]; then
   echo "Generating server perf report..."
   perf report -i "${PERF_OUTPUT_DIR}/perf_server_rank0.data" --stdio > "${PERF_OUTPUT_DIR}/perf_server_report.txt" 2>&1 || true
   perf report -i "${PERF_OUTPUT_DIR}/perf_server_rank0.data" --stdio --sort=dso,symbol > "${PERF_OUTPUT_DIR}/perf_server_by_dso.txt" 2>&1 || true
-
-  # Generate collapsed stack for flame graph (if stackcollapse-perf.pl is available)
-  if command -v stackcollapse-perf.pl >/dev/null 2>&1; then
-    perf script -i "${PERF_OUTPUT_DIR}/perf_server_rank0.data" | stackcollapse-perf.pl > "${PERF_OUTPUT_DIR}/server_collapsed.txt" 2>/dev/null || true
-  else
-    # Alternative: just generate perf script output
-    perf script -i "${PERF_OUTPUT_DIR}/perf_server_rank0.data" > "${PERF_OUTPUT_DIR}/perf_server_script.txt" 2>&1 || true
-  fi
+  perf script -i "${PERF_OUTPUT_DIR}/perf_server_rank0.data" > "${PERF_OUTPUT_DIR}/perf_server_script.txt" 2>&1 || true
 else
   echo "WARNING: Server perf data not found"
 fi
