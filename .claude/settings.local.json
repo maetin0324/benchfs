@@ -105,7 +105,9 @@
       "WebFetch(domain:docs.rs)",
       "Bash(spack find:*)",
       "Bash(ldd:*)",
-      "Bash(xxd:*)"
+      "Bash(xxd:*)",
+      "Bash(/work/NBB/rmaeda/workspace/rust/benchfs/scripts/debug-install.sh:*)",
+      "Bash(qdel:*)"
     ],
     "deny": [],
     "ask": []

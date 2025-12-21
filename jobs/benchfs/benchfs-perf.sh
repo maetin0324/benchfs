@@ -11,8 +11,8 @@ JOB_FILE="${SCRIPT_DIR}/benchfs-perf-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
 OUTPUT_DIR="$PROJECT_ROOT/results/benchfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/benchfs"
-# Use debug build for perf profiling with full debug symbols
-BENCHFS_PREFIX="${PROJECT_ROOT}/target/debug"
+# Use release build with debug symbols for perf profiling
+BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 echo "=========================================="
