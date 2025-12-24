@@ -283,6 +283,13 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
             // Ensure the requested length fits in the buffer
             let read_len = (header.length as usize).min(fixed_buffer.len());
 
+            // RPCの性能テストのために即時に返す実装
+            // (
+            //     ReadChunkResponseHeader::success(read_len as u64),
+            //     None,
+            //     Some((fixed_buffer, read_len)),
+            // )
+
             match io_uring_store
                 .read_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer)
                 .await

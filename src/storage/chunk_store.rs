@@ -785,16 +785,8 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        let chunk_file_path = self.chunk_path(file_path, chunk_index);
-
-        if !chunk_file_path.exists() {
-            return Err(ChunkStoreError::ChunkNotFound {
-                path: file_path.to_string(),
-                chunk_index,
-            });
-        }
-
-        // Open the chunk file
+        // Open the chunk file (will fail with StorageError if file doesn't exist)
+        // Note: Removed synchronous exists() check to avoid blocking async executor
         let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
 
         // Read data
@@ -1008,16 +1000,8 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        let chunk_file_path = self.chunk_path(file_path, chunk_index);
-
-        if !chunk_file_path.exists() {
-            return Err(ChunkStoreError::ChunkNotFound {
-                path: file_path.to_string(),
-                chunk_index,
-            });
-        }
-
-        // Open the chunk file
+        // Open the chunk file (will fail with StorageError if file doesn't exist)
+        // Note: Removed synchronous exists() check to avoid blocking async executor
         let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
 
         // Read data directly into registered buffer using DMA (zero-copy)

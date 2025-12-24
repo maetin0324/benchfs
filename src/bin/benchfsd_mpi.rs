@@ -282,13 +282,13 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         //   With 32 nodes * 16 ppn = 512 clients, need enough buffers for concurrent I/O
         //   Memory usage per server: 4096 * 4MiB = 16 GiB (acceptable for large-scale benchmarks)
         // - submit_depth: 128 for better batching and throughput
-        // - Aggressive timeouts (1μs) to minimize latency in polling mode
+        // - Aggressive timeouts (10μs) to minimize latency in polling mode
         let uring_reactor = IoUringReactor::builder()
             .queue_size(4096)
             .buffer_size(4 << 20) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
             .submit_depth(128)
-            .wait_submit_timeout(std::time::Duration::from_micros(1))
-            .wait_complete_timeout(std::time::Duration::from_micros(1))
+            .wait_submit_timeout(std::time::Duration::from_micros(10))
+            .wait_complete_timeout(std::time::Duration::from_micros(10))
             .build();
 
         let allocator = uring_reactor.allocator.clone();
@@ -299,9 +299,12 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
         // that has the registered buffers (fixes SEGFAULT with 4+ nodes)
         let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), reactor_for_backend));
-        let chunk_store = Rc::new(IOUringChunkStore::new(
+        // Increase LRU cache size to 32768 to reduce cache thrashing
+        // With 4 ppn × 4096 chunks = 16384 files per node, 8192 was causing ~50% miss rate
+        let chunk_store = Rc::new(IOUringChunkStore::with_capacity(
             &chunk_store_dir,
             io_backend.clone(),
+            32768, // Increased from default 8192 to handle large-scale benchmarks
         )?);
         (chunk_store, allocator)
     } else {

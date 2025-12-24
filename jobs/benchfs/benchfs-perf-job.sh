@@ -209,7 +209,7 @@ if [ "$RANK" -eq 0 ]; then
 
   # Attach perf to the running process
   echo "Rank 0: Attaching perf record to PID $BENCHFSD_PID"
-  perf record -g -F 99 --call-graph fp -o "${PERF_OUTPUT_DIR}/perf_server_rank0.data" -p $BENCHFSD_PID &
+  perf record -g -F 1000 --call-graph fp -o "${PERF_OUTPUT_DIR}/perf_server_rank0.data" -p $BENCHFSD_PID &
   PERF_PID=$!
   echo "Rank 0: perf record started with PID $PERF_PID"
 
@@ -307,7 +307,7 @@ if [ "$RANK" -eq 0 ]; then
 
   # Attach perf to the running process
   echo "Client Rank 0: Attaching perf record to PID $IOR_PID"
-  perf record -g -F 99 --call-graph fp -o "${PERF_OUTPUT_DIR}/perf_client_rank0.data" -p $IOR_PID &
+  perf record -g -F 1000 --call-graph fp -o "${PERF_OUTPUT_DIR}/perf_client_rank0.data" -p $IOR_PID &
   PERF_PID=$!
   echo "Client Rank 0: perf record started with PID $PERF_PID"
 
