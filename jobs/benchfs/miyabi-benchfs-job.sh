@@ -546,11 +546,11 @@ else
     # NOTE: block_size must be a multiple of transfer_size
     # WARNING: transfer_size > 4m can cause UCX Active Message deadlock
     transfer_size_list=(4m)
-    block_size_list=(64m 256m 512m 1g)
-    ppn_list=(1 2 4)
+    block_size_list=(16g)
+    ppn_list=(4)
     server_ppn_list=(1)
     ior_flags_list=("-w -r -F")
-    benchfs_chunk_size_list=(4194304 16777216)
+    benchfs_chunk_size_list=(4194304)
 fi
 
 # Default server_ppn_list if not defined in param file

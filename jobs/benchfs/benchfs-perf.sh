@@ -50,6 +50,7 @@ cmd_qsub=(
   -v LABEL="$LABEL"
   -v BENCHFS_PREFIX="$BENCHFS_PREFIX"
   -v IOR_PREFIX="$IOR_PREFIX"
+  -v SEP_SCR="yes"
   "${JOB_FILE}"
 )
 

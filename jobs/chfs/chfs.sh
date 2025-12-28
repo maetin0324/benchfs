@@ -47,8 +47,8 @@ mkdir -p "${BACKEND_DIR}"
 
 # Node count list for benchmarks
 nnodes_list=(
-  # 2 4 8 16
-  16
+  2 4 8 16
+  # 16
   # 32
 )
 niter=1

@@ -681,10 +681,15 @@ impl IOUringChunkStore {
         // - Avoids page cache memory pressure and expensive shrink_* kernel calls
         // - Provides consistent, predictable I/O latency
         // - FixedBuffer is already page-aligned, chunk offsets are 4MB-aligned
+        //
+        // IMPORTANT: Always open with read=true AND write=true (O_RDWR) so that
+        // cached file handles can be reused for both read and write operations.
+        // Previously, write-only handles were cached and incorrectly reused for reads,
+        // causing reads to return 0 bytes instantly (showing impossible ~1 TB/s bandwidth).
         let flags = OpenFlags {
-            read: !write,
-            write: write,
-            create: write,
+            read: true,   // Always enable read
+            write: true,  // Always enable write
+            create: write, // Only create on write operations
             truncate: false,
             append: false,
             direct: true,

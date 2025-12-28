@@ -16,7 +16,7 @@ BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"
 
 # Resolve PARAM_FILE to absolute path BEFORE cd (relative paths won't work after cd)
-PARAM_FILE="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/default_params.conf}")"
+PARAM_FILE="$(readlink -f "${PARAM_FILE:-${PROJECT_ROOT}/params/debug_large.conf}")"
 
 export JOB_FILE
 export PROJECT_ROOT

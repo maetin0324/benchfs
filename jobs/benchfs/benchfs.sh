@@ -126,6 +126,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -v RUST_LOG_C="$RUST_LOG_C"
         -v TASKSET="$TASKSET"
         -v TASKSET_CORES="$TASKSET_CORES"
+        # -v SEP_SCR=yes
         "${JOB_FILE}"
       )
       echo "${cmd_qsub[@]}"

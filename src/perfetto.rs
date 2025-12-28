@@ -36,12 +36,23 @@ thread_local! {
     static SENT_TRACK_DESCRIPTORS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
     /// Base UUID for generating track UUIDs (unique per thread)
     static BASE_TRACK_UUID: u64 = rand::random::<u64>();
+    /// Base sequence ID for generating per-task sequence IDs (unique per thread)
+    static BASE_SEQUENCE_ID: u64 = rand::random::<u64>();
 }
 
 /// Convert a track ID to a unique track UUID.
 fn track_id_to_uuid(track_id: u64) -> u64 {
     BASE_TRACK_UUID.with(|base| {
         base.wrapping_add(track_id.wrapping_mul(0x9E3779B97F4A7C15))
+    })
+}
+
+/// Convert a track ID to a unique sequence ID (32-bit for Perfetto protocol).
+/// Each task gets its own sequence_id to ensure proper event isolation in Perfetto.
+fn track_id_to_sequence_id(track_id: u64) -> u32 {
+    BASE_SEQUENCE_ID.with(|base| {
+        // Use a different multiplier from track_uuid to ensure distinct values
+        (base.wrapping_add(track_id.wrapping_mul(0x517CC1B727220A95))) as u32
     })
 }
 
@@ -76,8 +87,10 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoWriter for W {
 ///
 /// Each spawned task (when using runtime with `enable_perfetto_tracks`) will
 /// appear on a separate track in the Perfetto UI.
+///
+/// Note: sequence_id is now derived per-task from track_id via track_id_to_sequence_id()
+/// to ensure proper event isolation in Perfetto's execution sequence semantics.
 pub struct TaskPerfettoLayer<W = fn() -> std::io::Stdout> {
-    sequence_id: u64,
     process_track_uuid: u64,
     writer: W,
     with_debug_annotations: bool,
@@ -87,7 +100,6 @@ impl<W: PerfettoWriter> TaskPerfettoLayer<W> {
     /// Create a new TaskPerfettoLayer with the given writer.
     pub fn new(writer: W) -> Self {
         Self {
-            sequence_id: rand::random::<u64>(),
             process_track_uuid: rand::random::<u64>(),
             writer,
             with_debug_annotations: true,
@@ -190,6 +202,7 @@ impl<W: PerfettoWriter> TaskPerfettoLayer<W> {
 
 /// Data stored with each span to associate it with a track.
 struct SpanData {
+    track_id: u64,     // Store track_id to derive sequence_id in on_close()
     track_uuid: u64,
     trace: idl::Trace,
 }
@@ -294,14 +307,15 @@ where
             Some(idl::track_event::Type::SliceBegin),
         );
 
-        // Create trace packet
+        // Create trace packet with per-task sequence_id
+        let sequence_id = track_id_to_sequence_id(track_id);
         let mut packet = idl::TracePacket::default();
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64);
         packet.trusted_pid = Some(std::process::id() as i32);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
-                self.sequence_id as u32,
+                sequence_id,
             ),
         );
 
@@ -312,8 +326,9 @@ where
             packets.insert(0, desc);
         }
 
-        // Store span data for later
+        // Store span data for later (including track_id for sequence_id derivation in on_close)
         span.extensions_mut().insert(SpanData {
+            track_id,
             track_uuid,
             trace: idl::Trace { packet: packets },
         });
@@ -358,14 +373,15 @@ where
             Some(idl::track_event::Type::Instant),
         );
 
-        // Create packet
+        // Create packet with per-task sequence_id
+        let sequence_id = track_id_to_sequence_id(track_id);
         let mut packet = idl::TracePacket::default();
         packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
         packet.trusted_pid = Some(std::process::id() as i32);
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
-                self.sequence_id as u32,
+                sequence_id,
             ),
         );
 
@@ -406,14 +422,15 @@ where
             Some(idl::track_event::Type::SliceEnd),
         );
 
-        // Create closing packet
+        // Create closing packet with per-task sequence_id (derived from stored track_id)
+        let sequence_id = track_id_to_sequence_id(data.track_id);
         let mut packet = idl::TracePacket::default();
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64);
         packet.trusted_pid = Some(std::process::id() as i32);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
-                self.sequence_id as u32,
+                sequence_id,
             ),
         );
         data.trace.packet.push(packet);
