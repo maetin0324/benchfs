@@ -149,7 +149,9 @@ impl RpcServer {
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "register_all_handlers", skip(self))]
     pub async fn register_all_handlers(&self) -> Result<(), RpcError> {
-        use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
+        use crate::rpc::data_ops::{
+            ReadChunkByIdRequest, ReadChunkRequest, WriteChunkByIdRequest, WriteChunkRequest,
+        };
         use crate::rpc::metadata_ops::{
             MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
             MetadataLookupRequest, MetadataUpdateRequest,
@@ -180,6 +182,32 @@ impl RpcServer {
                     }
                 },
                 "rpc_write_chunk_handler".to_string(),
+            );
+        }
+
+        // Spawn ReadChunkById handler (compact FileId-based RPC)
+        {
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_polling_with_name(
+                async move {
+                    if let Err(e) = server.listen::<ReadChunkByIdRequest, _, _>().await {
+                        tracing::error!("ReadChunkById handler error: {:?}", e);
+                    }
+                },
+                "rpc_read_chunk_by_id_handler".to_string(),
+            );
+        }
+
+        // Spawn WriteChunkById handler (compact FileId-based RPC)
+        {
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_polling_with_name(
+                async move {
+                    if let Err(e) = server.listen::<WriteChunkByIdRequest, _, _>().await {
+                        tracing::error!("WriteChunkById handler error: {:?}", e);
+                    }
+                },
+                "rpc_write_chunk_by_id_handler".to_string(),
             );
         }
 

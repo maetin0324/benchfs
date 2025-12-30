@@ -5,6 +5,7 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
 use crate::rpc::buffer_pool::{PathBufferLease, PathBufferPool};
+use crate::rpc::file_id::FileIdRegistry;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
 use crate::storage::ChunkStore;
 
@@ -17,6 +18,8 @@ pub struct RpcHandlerContext {
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
     path_buffer_pool: Rc<PathBufferPool>,
+    /// FileId to path mapping registry for compact RPC
+    file_id_registry: Rc<FileIdRegistry>,
     /// Shutdown flag for graceful termination
     shutdown_flag: RefCell<bool>,
 }
@@ -32,6 +35,24 @@ impl RpcHandlerContext {
             chunk_store,
             allocator,
             path_buffer_pool: Rc::new(PathBufferPool::new(64)),
+            file_id_registry: Rc::new(FileIdRegistry::with_capacity(1024)),
+            shutdown_flag: RefCell::new(false),
+        }
+    }
+
+    /// Create a context with a custom FileIdRegistry
+    pub fn with_file_id_registry(
+        metadata_manager: Rc<MetadataManager>,
+        chunk_store: Rc<dyn ChunkStore>,
+        allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+        file_id_registry: Rc<FileIdRegistry>,
+    ) -> Self {
+        Self {
+            metadata_manager,
+            chunk_store,
+            allocator,
+            path_buffer_pool: Rc::new(PathBufferPool::new(64)),
+            file_id_registry,
             shutdown_flag: RefCell::new(false),
         }
     }
@@ -60,6 +81,7 @@ impl RpcHandlerContext {
             chunk_store,
             allocator,
             path_buffer_pool: Rc::new(PathBufferPool::new(16)),
+            file_id_registry: Rc::new(FileIdRegistry::new()),
             shutdown_flag: RefCell::new(false),
         }
     }
@@ -77,6 +99,19 @@ impl RpcHandlerContext {
 
     pub fn acquire_path_buffer(&self) -> PathBufferLease {
         self.path_buffer_pool.acquire()
+    }
+
+    /// Get a reference to the FileIdRegistry
+    ///
+    /// This registry maps path_hash (32-bit) to full file path for
+    /// FileId-based RPC operations.
+    pub fn file_id_registry(&self) -> &FileIdRegistry {
+        &self.file_id_registry
+    }
+
+    /// Get the shared FileIdRegistry reference
+    pub fn file_id_registry_rc(&self) -> Rc<FileIdRegistry> {
+        Rc::clone(&self.file_id_registry)
     }
 }
 
