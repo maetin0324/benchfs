@@ -11,19 +11,24 @@ TIMESTAMP="$(timestamp)"
 
 # Default parameters
 : ${ELAPSTIM_REQ:="0:30:00"}
-: ${LABEL:=default}
 : ${TASKSET:=0}         # Set to 1 to enable taskset CPU pinning for chfsd
 : ${TASKSET_CORES:=0,1} # CPU cores to pin chfsd to when TASKSET=1
 
 JOB_FILE="${SCRIPT_DIR}/chfs-job.sh"
 PROJECT_ROOT="$(to_fullpath "${SCRIPT_DIR}/../..")"
-OUTPUT_DIR="$PROJECT_ROOT/results/chfs/${TIMESTAMP}-${LABEL}"
 BACKEND_DIR="$PROJECT_ROOT/backend/chfs"
 CHFS_PREFIX="spack"  # CHFS is loaded via 'spack load chfs'
 IOR_PREFIX="${PROJECT_ROOT}/ior_integration/ior"  # IOR with CHFS support
 
 # Resolve PARAM_FILE to absolute path BEFORE cd
 PARAM_FILE_RESOLVED="$(readlink -f "${PARAM_FILE:-${SCRIPT_DIR}/../params/debug.conf}")"
+
+# Set LABEL: use provided value, or derive from param file name (without .conf extension)
+if [ -z "${LABEL:-}" ]; then
+  LABEL="$(basename "${PARAM_FILE_RESOLVED}" .conf)"
+fi
+
+OUTPUT_DIR="$PROJECT_ROOT/results/chfs/${TIMESTAMP}-${LABEL}"
 
 echo "=========================================="
 echo "CHFS Job Submission"
@@ -47,8 +52,8 @@ mkdir -p "${BACKEND_DIR}"
 
 # Node count list for benchmarks
 nnodes_list=(
-  2 4 8 16
-  # 16
+  # 2 4 8 16
+  16
   # 32
 )
 niter=1
