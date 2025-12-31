@@ -30,6 +30,7 @@ pub const MAX_RPC_PATH_LENGTH: usize = 256;
     zerocopy::KnownLayout,
     zerocopy::Immutable,
 )]
+#[deprecated(since = "0.2.0", note = "Use ReadChunkByIdRequest instead")]
 pub struct ReadChunkRequestHeader {
     /// Chunk index to read
     pub chunk_index: u64,
@@ -47,6 +48,7 @@ pub struct ReadChunkRequestHeader {
     pub path_buffer: [u8; MAX_RPC_PATH_LENGTH],
 }
 
+#[allow(deprecated)]
 impl ReadChunkRequestHeader {
     pub fn new(chunk_index: u64, offset: u64, length: u64, path: &str) -> Self {
         let mut path_buffer = [0u8; MAX_RPC_PATH_LENGTH];
@@ -118,6 +120,11 @@ impl ReadChunkResponseHeader {
 ///
 /// This version takes an external buffer reference to receive data directly,
 /// avoiding an extra copy from internal Vec to user buffer.
+///
+/// **DEPRECATED**: Use `ReadChunkByIdRequest` instead. Path-based RPCs have been
+/// replaced by FileId-based RPCs for reduced header overhead (32 bytes vs 288 bytes).
+#[allow(deprecated)]
+#[deprecated(since = "0.2.0", note = "Use ReadChunkByIdRequest instead")]
 pub struct ReadChunkRequest<'a> {
     header: ReadChunkRequestHeader,
     /// External buffer to receive response data directly
@@ -127,8 +134,10 @@ pub struct ReadChunkRequest<'a> {
 }
 
 // SAFETY: ReadChunkRequest is Send because all its fields are Send
+#[allow(deprecated)]
 unsafe impl<'a> Send for ReadChunkRequest<'a> {}
 
+#[allow(deprecated)]
 impl<'a> ReadChunkRequest<'a> {
     /// Create a new ReadChunkRequest with an external buffer
     ///
@@ -166,6 +175,7 @@ impl<'a> ReadChunkRequest<'a> {
     }
 }
 
+#[allow(deprecated)]
 impl<'a> AmRpc for ReadChunkRequest<'a> {
     type RequestHeader = ReadChunkRequestHeader;
     type ResponseHeader = ReadChunkResponseHeader;
@@ -472,6 +482,7 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
     zerocopy::KnownLayout,
     zerocopy::Immutable,
 )]
+#[deprecated(since = "0.2.0", note = "Use WriteChunkByIdRequest instead")]
 pub struct WriteChunkRequestHeader {
     /// Chunk index to write
     pub chunk_index: u64,
@@ -489,6 +500,7 @@ pub struct WriteChunkRequestHeader {
     pub path_buffer: [u8; MAX_RPC_PATH_LENGTH],
 }
 
+#[allow(deprecated)]
 impl WriteChunkRequestHeader {
     pub fn new(chunk_index: u64, offset: u64, length: u64, path: &str) -> Self {
         let mut path_buffer = [0u8; MAX_RPC_PATH_LENGTH];
@@ -559,6 +571,11 @@ impl WriteChunkResponseHeader {
 /// WriteChunk RPC request
 ///
 /// Path is now embedded in the header, so only data payload is sent.
+///
+/// **DEPRECATED**: Use `WriteChunkByIdRequest` instead. Path-based RPCs have been
+/// replaced by FileId-based RPCs for reduced header overhead (32 bytes vs 288 bytes).
+#[allow(deprecated)]
+#[deprecated(since = "0.2.0", note = "Use WriteChunkByIdRequest instead")]
 pub struct WriteChunkRequest<'a> {
     header: WriteChunkRequestHeader,
     data: &'a [u8],
@@ -567,8 +584,10 @@ pub struct WriteChunkRequest<'a> {
 }
 
 // SAFETY: WriteChunkRequest is Send because all its fields are Send
+#[allow(deprecated)]
 unsafe impl Send for WriteChunkRequest<'_> {}
 
+#[allow(deprecated)]
 impl<'a> WriteChunkRequest<'a> {
     pub fn new(chunk_index: u64, offset: u64, data: &'a [u8], path: String) -> Self {
         let length = data.len() as u64;
@@ -586,6 +605,7 @@ impl<'a> WriteChunkRequest<'a> {
     }
 }
 
+#[allow(deprecated)]
 impl AmRpc for WriteChunkRequest<'_> {
     type RequestHeader = WriteChunkRequestHeader;
     type ResponseHeader = WriteChunkResponseHeader;
@@ -1156,18 +1176,19 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
             "ReadChunkById request received"
         );
 
-        // Look up path from FileIdRegistry
+        // Look up path from FileIdRegistry, or use synthetic path if not registered
         let path = match ctx.file_id_registry().lookup(header.path_hash()) {
             Some(p) => p,
             None => {
-                tracing::error!("Unknown file_id: path_hash={:#x}", header.path_hash());
-                return Err((
-                    RpcError::HandlerError(format!(
-                        "Unknown file_id: path_hash={:#x}",
-                        header.path_hash()
-                    )),
-                    am_msg,
-                ));
+                // Generate synthetic path from path_hash for FileId-only access
+                // This allows FileId-based RPCs to work without prior path registration
+                let synthetic_path = format!("/benchfs/{:08x}", header.path_hash());
+                tracing::trace!(
+                    "Using synthetic path {} for unregistered path_hash={:#x}",
+                    synthetic_path,
+                    header.path_hash()
+                );
+                synthetic_path
             }
         };
 
@@ -1448,18 +1469,19 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
             ));
         }
 
-        // Look up path from FileIdRegistry
+        // Look up path from FileIdRegistry, or use synthetic path if not registered
         let path = match ctx.file_id_registry().lookup(header.path_hash()) {
             Some(p) => p,
             None => {
-                tracing::error!("Unknown file_id: path_hash={:#x}", header.path_hash());
-                return Err((
-                    RpcError::HandlerError(format!(
-                        "Unknown file_id: path_hash={:#x}",
-                        header.path_hash()
-                    )),
-                    am_msg,
-                ));
+                // Generate synthetic path from path_hash for FileId-only access
+                // This allows FileId-based RPCs to work without prior path registration
+                let synthetic_path = format!("/benchfs/{:08x}", header.path_hash());
+                tracing::trace!(
+                    "Using synthetic path {} for unregistered path_hash={:#x}",
+                    synthetic_path,
+                    header.path_hash()
+                );
+                synthetic_path
             }
         };
 
@@ -1629,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_read_chunk_request() {
         let mut buffer = vec![0u8; 1024];
         let request = ReadChunkRequest::new(0, 0, 1024, "/test/file.txt".to_string(), &mut buffer);
@@ -1643,6 +1666,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_write_chunk_request_header() {
         let header = WriteChunkRequestHeader::new(3, 512, 2048, "/my/test/path.dat");
         assert_eq!(header.chunk_index, 3);
@@ -1664,6 +1688,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_write_chunk_request() {
         let data = vec![0xAA; 512];
         let request = WriteChunkRequest::new(1, 0, &data[..], "/test/file.txt".to_string());
@@ -1689,6 +1714,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_rpc_ids() {
         assert_eq!(ReadChunkRequest::rpc_id(), RPC_READ_CHUNK);
         assert_eq!(WriteChunkRequest::rpc_id(), RPC_WRITE_CHUNK);

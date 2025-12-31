@@ -128,6 +128,9 @@ pub struct ReadChunkHandlerResponse {
 /// Handle ReadChunk RPC request
 ///
 /// Reads chunk data from local storage and returns it to the client via RDMA.
+///
+/// **DEPRECATED**: This handler is deprecated. Use `ReadChunkByIdRequest::server_handler` instead.
+#[allow(deprecated)]
 #[async_backtrace::framed]
 pub async fn handle_read_chunk(
     ctx: Rc<RpcHandlerContext>,
@@ -232,6 +235,9 @@ pub async fn handle_read_chunk(
 ///
 /// Receives chunk data from the client via RDMA and writes it to local storage.
 /// Uses registered buffers for zero-copy DMA writes.
+///
+/// **DEPRECATED**: This handler is deprecated. Use `WriteChunkByIdRequest::server_handler` instead.
+#[allow(deprecated)]
 #[async_backtrace::framed]
 pub async fn handle_write_chunk(
     ctx: Rc<RpcHandlerContext>,
