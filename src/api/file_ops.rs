@@ -20,7 +20,8 @@ use crate::metadata::{
 };
 use crate::rpc::AmRpc;
 use crate::rpc::connection::ConnectionPool;
-use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
+use crate::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
+use crate::rpc::file_id::FileId;
 use crate::rpc::metadata_ops::{MetadataCreateFileRequest, MetadataLookupRequest};
 use crate::storage::IOUringChunkStore;
 
@@ -627,12 +628,15 @@ impl BenchFS {
 
                                     match pool.get_or_connect(&node_id).await {
                                         Ok(client) => {
+                                            // Use FileId-based RPC for compact headers (32 bytes vs 288 bytes)
+                                            // FileId contains path_hash (lower 32 bits) and chunk_id (upper 32 bits)
+                                            let file_id = FileId::new(&file_path, chunk_index);
+
                                             // Zero-copy: Read directly into user buffer
-                                            let request = ReadChunkRequest::new(
-                                                chunk_index,
+                                            let request = ReadChunkByIdRequest::from_file_id(
+                                                file_id,
                                                 chunk_offset,
                                                 read_size,
-                                                file_path.clone(),
                                                 chunk_buf,
                                             );
 
@@ -640,7 +644,7 @@ impl BenchFS {
                                                 Ok(response) if response.is_success() => {
                                                     let bytes_read = response.bytes_read as usize;
                                                     tracing::debug!(
-                                                        "Successfully fetched {} bytes from remote node (zero-copy)",
+                                                        "Successfully fetched {} bytes from remote node (zero-copy, FileId)",
                                                         bytes_read
                                                     );
                                                     // Note: For zero-copy reads, we don't cache
@@ -649,7 +653,7 @@ impl BenchFS {
                                                 }
                                                 Ok(response) => {
                                                     tracing::warn!(
-                                                        "Remote read failed with status {}",
+                                                        "Remote read (FileId) failed with status {}",
                                                         response.status
                                                     );
                                                     // Fill with zeros on error
@@ -657,7 +661,7 @@ impl BenchFS {
                                                     (chunk_index, Ok(chunk_buf.len()))
                                                 }
                                                 Err(e) => {
-                                                    tracing::error!("RPC error: {:?}", e);
+                                                    tracing::error!("RPC error (FileId read): {:?}", e);
                                                     chunk_buf.fill(0);
                                                     (chunk_index, Ok(chunk_buf.len()))
                                                 }
@@ -799,29 +803,29 @@ impl BenchFS {
 
                             match pool.get_or_connect(&target_node).await {
                                 Ok(client) => {
-                                    // Create RPC request
-                                    let request = WriteChunkRequest::new(
-                                        chunk_index,
+                                    // Use FileId-based RPC for compact headers (32 bytes vs 288 bytes)
+                                    let file_id = FileId::new(&file_path, chunk_index);
+                                    let request = WriteChunkByIdRequest::from_file_id(
+                                        file_id,
                                         chunk_offset,
                                         chunk_data.as_slice(),
-                                        file_path.clone(),
                                     );
 
                                     // Execute RPC
                                     match request.call(&*client).await {
                                         Ok(response) if response.is_success() => {
                                             tracing::debug!(
-                                                "Successfully wrote {} bytes to remote node",
+                                                "Successfully wrote {} bytes to remote node (FileId)",
                                                 response.bytes_written
                                             );
                                             Ok(data_len)
                                         }
                                         Ok(response) => Err(ApiError::IoError(format!(
-                                            "Remote write failed with status {}",
+                                            "Remote write (FileId) failed with status {}",
                                             response.status
                                         ))),
                                         Err(e) => {
-                                            Err(ApiError::IoError(format!("RPC error: {:?}", e)))
+                                            Err(ApiError::IoError(format!("RPC error (FileId write): {:?}", e)))
                                         }
                                     }
                                 }

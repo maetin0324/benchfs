@@ -10,7 +10,8 @@
 use benchfs::logging::{init_with_perfetto, PerfettoGuard};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
-use benchfs::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
+use benchfs::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
+use benchfs::rpc::file_id::FileId;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
 use benchfs::rpc::AmRpc;
@@ -475,7 +476,8 @@ async fn run_benchmark(
     // Warmup
     tracing::info!("Running warmup...");
     for i in 0..10 {
-        let write_req = WriteChunkRequest::new(i as u64, 0, &test_data, test_path.clone());
+        let file_id = FileId::new(&test_path, i as u64);
+        let write_req = WriteChunkByIdRequest::from_file_id(file_id, 0, &test_data);
         let _ = write_req.call(&client).await;
     }
 
@@ -488,7 +490,8 @@ async fn run_benchmark(
         let chunk_index = i as u64;
         let start = Instant::now();
 
-        let write_req = WriteChunkRequest::new(chunk_index, 0, &test_data, test_path.clone());
+        let file_id = FileId::new(&test_path, chunk_index);
+        let write_req = WriteChunkByIdRequest::from_file_id(file_id, 0, &test_data);
         let response = write_req
             .call(&client)
             .await
@@ -519,11 +522,12 @@ async fn run_benchmark(
         let chunk_index = i as u64;
         let start = Instant::now();
 
-        let read_req = ReadChunkRequest::new(
-            chunk_index,
+        // Use FileId-based RPC for compact headers (32 bytes vs 288 bytes)
+        let file_id = FileId::new(&test_path, chunk_index);
+        let read_req = ReadChunkByIdRequest::from_file_id(
+            file_id,
             0,
             block_size as u64,
-            test_path.clone(),
             &mut read_buffer,
         );
         let response = read_req

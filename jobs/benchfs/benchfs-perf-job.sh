@@ -30,8 +30,9 @@ IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 PERF_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perf_results"
 
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-# Use debug build for perf profiling with full debug symbols
-export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/debug:${LD_LIBRARY_PATH:-}"
+# Use BENCHFS_PREFIX for library path (same as binary location)
+# Note: Release builds with debug symbols are preferred for perf profiling
+export LD_LIBRARY_PATH="${BENCHFS_PREFIX}:${LD_LIBRARY_PATH:-}"
 
 IFS=" " read -r -a nqsii_mpiopts_array <<<"$NQSII_MPIOPTS"
 

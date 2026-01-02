@@ -130,8 +130,8 @@ impl RpcServer {
     /// Register and start all standard RPC handlers
     ///
     /// This is a convenience method that starts listeners for all standard RPC types:
-    /// - ReadChunk (RPC_READ_CHUNK)
-    /// - WriteChunk (RPC_WRITE_CHUNK)
+    /// - ReadChunkById (RPC_READ_CHUNK_BY_ID) - FileId-based read
+    /// - WriteChunkById (RPC_WRITE_CHUNK_BY_ID) - FileId-based write
     /// - MetadataLookup (RPC_METADATA_LOOKUP)
     /// - MetadataCreateFile (RPC_METADATA_CREATE_FILE)
     /// - MetadataCreateDir (RPC_METADATA_CREATE_DIR)
@@ -149,7 +149,7 @@ impl RpcServer {
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "register_all_handlers", skip(self))]
     pub async fn register_all_handlers(&self) -> Result<(), RpcError> {
-        use crate::rpc::data_ops::{ReadChunkRequest, WriteChunkRequest};
+        use crate::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
         use crate::rpc::metadata_ops::{
             MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
             MetadataLookupRequest, MetadataUpdateRequest,
@@ -157,29 +157,29 @@ impl RpcServer {
 
         tracing::info!("Registering all RPC handlers...");
 
-        // Spawn ReadChunk handler with polling priority
+        // Spawn ReadChunkById handler (FileId-based RPC)
         {
             let server = self.clone_for_handler();
             pluvio_runtime::spawn_polling_with_name(
                 async move {
-                    if let Err(e) = server.listen::<ReadChunkRequest, _, _>().await {
-                        tracing::error!("ReadChunk handler error: {:?}", e);
+                    if let Err(e) = server.listen::<ReadChunkByIdRequest, _, _>().await {
+                        tracing::error!("ReadChunkById handler error: {:?}", e);
                     }
                 },
-                "rpc_read_chunk_handler".to_string(),
+                "rpc_read_chunk_by_id_handler".to_string(),
             );
         }
 
-        // Spawn WriteChunk handler with polling priority
+        // Spawn WriteChunkById handler (FileId-based RPC)
         {
             let server = self.clone_for_handler();
             pluvio_runtime::spawn_polling_with_name(
                 async move {
-                    if let Err(e) = server.listen::<WriteChunkRequest, _, _>().await {
-                        tracing::error!("WriteChunk handler error: {:?}", e);
+                    if let Err(e) = server.listen::<WriteChunkByIdRequest, _, _>().await {
+                        tracing::error!("WriteChunkById handler error: {:?}", e);
                     }
                 },
-                "rpc_write_chunk_handler".to_string(),
+                "rpc_write_chunk_by_id_handler".to_string(),
             );
         }
 

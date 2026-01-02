@@ -285,7 +285,7 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         // - Aggressive timeouts (10μs) to minimize latency in polling mode
         let uring_reactor = IoUringReactor::builder()
             .queue_size(4096)
-            .buffer_size(4 << 10) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
+            .buffer_size(4 << 20) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
             .submit_depth(128)
             .wait_submit_timeout(std::time::Duration::from_micros(10))
             .wait_complete_timeout(std::time::Duration::from_micros(10))
