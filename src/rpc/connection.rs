@@ -6,10 +6,40 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::rpc::address_registry::WorkerAddressRegistry;
 use crate::rpc::{RpcClient, RpcError};
 use pluvio_ucx::Worker;
+
+/// Global counter for total connections created across all pools
+static TOTAL_CONNECTIONS_CREATED: AtomicUsize = AtomicUsize::new(0);
+/// Global counter for total connections dropped/closed across all pools
+static TOTAL_CONNECTIONS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Statistics about connection pool usage
+///
+/// This provides insight into connection management behavior,
+/// useful for debugging connection-related issues.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionStats {
+    /// Number of currently active connections in the pool
+    pub active_connections: usize,
+    /// Total connections created since process start
+    pub total_created: usize,
+    /// Total connections dropped/closed since process start
+    pub total_dropped: usize,
+}
+
+impl std::fmt::Display for ConnectionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ConnectionStats {{ active: {}, created: {}, dropped: {} }}",
+            self.active_connections, self.total_created, self.total_dropped
+        )
+    }
+}
 
 /// Connection pool for managing RPC client connections to remote nodes
 ///
@@ -132,6 +162,16 @@ impl ConnectionPool {
             .borrow_mut()
             .insert(node_id.to_string(), client.clone());
 
+        // Track connection creation
+        TOTAL_CONNECTIONS_CREATED.fetch_add(1, Ordering::Relaxed);
+        let stats = self.connection_stats();
+        tracing::info!(
+            node_id = node_id,
+            active = stats.active_connections,
+            total_created = stats.total_created,
+            "Created new connection"
+        );
+
         Ok(client)
     }
 
@@ -190,6 +230,16 @@ impl ConnectionPool {
             .borrow_mut()
             .insert(node_id.to_string(), client.clone());
 
+        // Track connection creation
+        TOTAL_CONNECTIONS_CREATED.fetch_add(1, Ordering::Relaxed);
+        let stats = self.connection_stats();
+        tracing::info!(
+            node_id = node_id,
+            active = stats.active_connections,
+            total_created = stats.total_created,
+            "Created new connection (wait_and_connect)"
+        );
+
         Ok(client)
     }
 
@@ -200,20 +250,48 @@ impl ConnectionPool {
 
     /// Remove a connection from the pool
     pub fn disconnect(&self, node_addr: &str) {
-        self.connections.borrow_mut().remove(node_addr);
-        tracing::info!("Disconnected from {}", node_addr);
+        if self.connections.borrow_mut().remove(node_addr).is_some() {
+            TOTAL_CONNECTIONS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            let stats = self.connection_stats();
+            tracing::info!(
+                node_addr = node_addr,
+                active = stats.active_connections,
+                total_dropped = stats.total_dropped,
+                "Disconnected from node"
+            );
+        }
     }
 
     /// Clear all connections
     pub fn clear(&self) {
         let count = self.connections.borrow().len();
-        self.connections.borrow_mut().clear();
-        tracing::info!("Cleared {} connections", count);
+        if count > 0 {
+            TOTAL_CONNECTIONS_DROPPED.fetch_add(count, Ordering::Relaxed);
+            self.connections.borrow_mut().clear();
+            let stats = self.connection_stats();
+            tracing::info!(
+                cleared = count,
+                total_dropped = stats.total_dropped,
+                "Cleared all connections"
+            );
+        }
     }
 
     /// Get the number of active connections
     pub fn connection_count(&self) -> usize {
         self.connections.borrow().len()
+    }
+
+    /// Get detailed connection statistics
+    ///
+    /// Returns statistics about current and historical connection usage,
+    /// useful for debugging connection-related performance issues.
+    pub fn connection_stats(&self) -> ConnectionStats {
+        ConnectionStats {
+            active_connections: self.connections.borrow().len(),
+            total_created: TOTAL_CONNECTIONS_CREATED.load(Ordering::Relaxed),
+            total_dropped: TOTAL_CONNECTIONS_DROPPED.load(Ordering::Relaxed),
+        }
     }
 
     /// Get the registry directory path
