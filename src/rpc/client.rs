@@ -1,8 +1,22 @@
 use std::cell::RefCell;
+use std::time::Duration;
 
+use pluvio_timer::{timeout, TimeoutError};
 use tracing::instrument;
 
 use crate::rpc::{AmRpc, Connection, RpcError};
+
+/// Default RPC timeout duration (30 seconds)
+const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
+
+/// Get the RPC timeout from environment variable or use default
+fn get_rpc_timeout() -> Duration {
+    std::env::var("BENCHFS_RPC_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_RPC_TIMEOUT_SECS))
+}
 
 /// RPC client for making RPC calls
 ///
@@ -70,14 +84,21 @@ impl RpcClient {
     /// This is the main entry point for executing RPCs. Pass any struct that implements
     /// RpcCall and it will be sent to the server, with the response being returned.
     ///
+    /// The operation is subject to a timeout configured via the `BENCHFS_RPC_TIMEOUT`
+    /// environment variable (in seconds). Default timeout is 30 seconds.
+    ///
     /// # Example
     /// ```ignore
     /// let request = ReadRequest { offset: 0, len: 4096 };
     /// let response: ReadResponse = client.execute(&request).await?;
     /// ```
+    ///
+    /// # Environment Variables
+    /// * `BENCHFS_RPC_TIMEOUT` - Timeout in seconds (default: 30)
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "rpc_call", skip(self, request), fields(rpc_id = T::rpc_id()))]
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
+        let timeout_duration = get_rpc_timeout();
         let rpc_id = T::rpc_id();
         let reply_stream_id = T::reply_stream_id();
         let header = request.request_header();
@@ -86,11 +107,12 @@ impl RpcClient {
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
         tracing::debug!(
-            "RPC call: rpc_id={}, reply_stream_id={}, has_data={}, data_len={}",
+            "RPC call: rpc_id={}, reply_stream_id={}, has_data={}, data_len={}, timeout_secs={}",
             rpc_id,
             reply_stream_id,
             !data.is_empty(),
-            data.iter().map(|s| s.len()).sum::<usize>()
+            data.iter().map(|s| s.len()).sum::<usize>(),
+            timeout_duration.as_secs()
         );
 
         let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
@@ -109,7 +131,7 @@ impl RpcClient {
             ));
         }
 
-        // Send the RPC request (proto is set to None for now)
+        // Send the RPC request with timeout
         tracing::debug!(
             "Sending AM request: rpc_id={}, header_size={}, need_reply={}, proto={:?}",
             rpc_id,
@@ -118,40 +140,66 @@ impl RpcClient {
             proto
         );
 
-        self.conn
-            .endpoint()
-            .am_send_vectorized(
-                rpc_id as u32,
-                zerocopy::IntoBytes::as_bytes(header),
-                &data,
-                need_reply,
-                proto,
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to send AM request: rpc_id={}, error={:?}",
-                    rpc_id,
-                    e
-                );
-                RpcError::TransportError(format!("Failed to send AM: {:?}", e))
-            })?;
-
-        tracing::debug!(
-            "Waiting for reply on stream_id={}, rpc_id={}",
-            reply_stream_id,
-            rpc_id
+        let send_future = self.conn.endpoint().am_send_vectorized(
+            rpc_id as u32,
+            zerocopy::IntoBytes::as_bytes(header),
+            &data,
+            need_reply,
+            proto,
         );
 
-        // Wait for reply
-        let mut msg = reply_stream.wait_msg().await.ok_or_else(|| {
-            tracing::error!(
-                "RPC timeout: no reply received (rpc_id={}, reply_stream_id={})",
-                rpc_id,
-                reply_stream_id
-            );
-            RpcError::Timeout
-        })?;
+        match timeout(timeout_duration, Box::pin(send_future)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(
+                    rpc_id = rpc_id,
+                    error = ?e,
+                    "Failed to send AM request"
+                );
+                return Err(RpcError::TransportError(format!(
+                    "Failed to send AM: {:?}",
+                    e
+                )));
+            }
+            Err(TimeoutError) => {
+                tracing::error!(
+                    rpc_id = rpc_id,
+                    timeout_secs = timeout_duration.as_secs(),
+                    "RPC send timeout: failed to send request within timeout"
+                );
+                return Err(RpcError::Timeout);
+            }
+        }
+
+        tracing::debug!(
+            "Waiting for reply on stream_id={}, rpc_id={}, timeout_secs={}",
+            reply_stream_id,
+            rpc_id,
+            timeout_duration.as_secs()
+        );
+
+        // Wait for reply with timeout
+        let wait_future = reply_stream.wait_msg();
+        let mut msg = match timeout(timeout_duration, Box::pin(wait_future)).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                tracing::error!(
+                    rpc_id = rpc_id,
+                    reply_stream_id = reply_stream_id,
+                    "RPC failed: no reply received (stream closed)"
+                );
+                return Err(RpcError::Timeout);
+            }
+            Err(TimeoutError) => {
+                tracing::error!(
+                    rpc_id = rpc_id,
+                    reply_stream_id = reply_stream_id,
+                    timeout_secs = timeout_duration.as_secs(),
+                    "RPC timeout: no reply received within timeout"
+                );
+                return Err(RpcError::Timeout);
+            }
+        };
 
         tracing::debug!(
             "Received reply message: rpc_id={}, reply_stream_id={}",
@@ -166,12 +214,32 @@ impl RpcClient {
             .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
             .ok_or_else(|| RpcError::InvalidHeader)?;
 
-        // Receive response data if present
+        // Receive response data if present (with timeout)
         let response_buffer = request.response_buffer();
         if !response_buffer.is_empty() && msg.contains_data() {
-            msg.recv_data_vectored(response_buffer).await.map_err(|e| {
-                RpcError::TransportError(format!("Failed to recv response data: {:?}", e))
-            })?;
+            let recv_future = msg.recv_data_vectored(response_buffer);
+            match timeout(timeout_duration, Box::pin(recv_future)).await {
+                Ok(Ok(_bytes_received)) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        rpc_id = rpc_id,
+                        error = ?e,
+                        "Failed to receive response data"
+                    );
+                    return Err(RpcError::TransportError(format!(
+                        "Failed to recv response data: {:?}",
+                        e
+                    )));
+                }
+                Err(TimeoutError) => {
+                    tracing::error!(
+                        rpc_id = rpc_id,
+                        timeout_secs = timeout_duration.as_secs(),
+                        "RPC recv timeout: failed to receive response data within timeout"
+                    );
+                    return Err(RpcError::Timeout);
+                }
+            }
         }
 
         // Note: The caller should check the status field in the response header
@@ -181,25 +249,46 @@ impl RpcClient {
 
     /// Execute an RPC without expecting a reply
     /// Useful for fire-and-forget operations
+    ///
+    /// The send operation is subject to a timeout configured via the `BENCHFS_RPC_TIMEOUT`
+    /// environment variable (in seconds). Default timeout is 30 seconds.
     #[async_backtrace::framed]
     pub async fn execute_no_reply<T: AmRpc>(&self, request: &T) -> Result<(), RpcError> {
+        let timeout_duration = get_rpc_timeout();
         let rpc_id = T::rpc_id();
         let header = request.request_header();
         let data = request.request_data();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        self.conn
-            .endpoint()
-            .am_send_vectorized(
-                rpc_id as u32,
-                zerocopy::IntoBytes::as_bytes(header),
-                &data,
-                false, // need_reply = false
-                proto, // proto - TODO: pass actual proto when available
-            )
-            .await
-            .map_err(|e| RpcError::TransportError(format!("Failed to send AM: {:?}", e)))?;
+        let send_future = self.conn.endpoint().am_send_vectorized(
+            rpc_id as u32,
+            zerocopy::IntoBytes::as_bytes(header),
+            &data,
+            false, // need_reply = false
+            proto, // proto - TODO: pass actual proto when available
+        );
 
-        Ok(())
+        match timeout(timeout_duration, Box::pin(send_future)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::error!(
+                    rpc_id = rpc_id,
+                    error = ?e,
+                    "Failed to send AM request (no_reply)"
+                );
+                Err(RpcError::TransportError(format!(
+                    "Failed to send AM: {:?}",
+                    e
+                )))
+            }
+            Err(TimeoutError) => {
+                tracing::error!(
+                    rpc_id = rpc_id,
+                    timeout_secs = timeout_duration.as_secs(),
+                    "RPC send timeout (no_reply): failed to send request within timeout"
+                );
+                Err(RpcError::Timeout)
+            }
+        }
     }
 }
