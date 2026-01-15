@@ -1,12 +1,123 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress, am::AmStream};
 use tracing::instrument;
 
 use crate::rpc::handlers::RpcHandlerContext;
 use crate::rpc::{AmRpc, RpcError, Serializable};
+
+// ============================================================================
+// Server-side RPC Statistics
+// ============================================================================
+
+/// Global counter for currently ongoing RPC requests on the server
+static ONGOING_RPC_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+/// Global counter for total RPC requests received since process start
+static TOTAL_RPC_REQUESTS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+/// Global counter for total RPC requests completed since process start
+static TOTAL_RPC_REQUESTS_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+/// Peak concurrent RPC requests observed
+static PEAK_CONCURRENT_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Statistics about server-side RPC request handling
+///
+/// This provides insight into the server's concurrent request handling,
+/// useful for debugging connection/performance issues when connection count increases.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerRpcStats {
+    /// Number of currently ongoing (in-flight) RPC requests
+    pub ongoing_requests: usize,
+    /// Total RPC requests received since process start
+    pub total_received: usize,
+    /// Total RPC requests completed since process start
+    pub total_completed: usize,
+    /// Peak concurrent requests observed
+    pub peak_concurrent: usize,
+}
+
+impl std::fmt::Display for ServerRpcStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ServerRpcStats {{ ongoing: {}, received: {}, completed: {}, peak: {} }}",
+            self.ongoing_requests, self.total_received, self.total_completed, self.peak_concurrent
+        )
+    }
+}
+
+/// Get current server-side RPC statistics
+pub fn get_server_rpc_stats() -> ServerRpcStats {
+    ServerRpcStats {
+        ongoing_requests: ONGOING_RPC_REQUESTS.load(Ordering::Relaxed),
+        total_received: TOTAL_RPC_REQUESTS_RECEIVED.load(Ordering::Relaxed),
+        total_completed: TOTAL_RPC_REQUESTS_COMPLETED.load(Ordering::Relaxed),
+        peak_concurrent: PEAK_CONCURRENT_REQUESTS.load(Ordering::Relaxed),
+    }
+}
+
+/// Get the number of currently ongoing RPC requests
+pub fn get_ongoing_rpc_count() -> usize {
+    ONGOING_RPC_REQUESTS.load(Ordering::Relaxed)
+}
+
+/// Increment the ongoing RPC request counter (called when spawning a handler)
+fn increment_ongoing_requests() -> usize {
+    let new_count = ONGOING_RPC_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    TOTAL_RPC_REQUESTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+
+    // Update peak if necessary
+    let mut current_peak = PEAK_CONCURRENT_REQUESTS.load(Ordering::Relaxed);
+    while new_count > current_peak {
+        match PEAK_CONCURRENT_REQUESTS.compare_exchange_weak(
+            current_peak,
+            new_count,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current_peak = actual,
+        }
+    }
+
+    new_count
+}
+
+/// Decrement the ongoing RPC request counter (called when handler completes)
+fn decrement_ongoing_requests() -> usize {
+    TOTAL_RPC_REQUESTS_COMPLETED.fetch_add(1, Ordering::Relaxed);
+    ONGOING_RPC_REQUESTS.fetch_sub(1, Ordering::Relaxed) - 1
+}
+
+/// RAII guard for tracking RPC request lifetime
+struct RpcRequestGuard {
+    rpc_id: u16,
+}
+
+impl RpcRequestGuard {
+    fn new(rpc_id: u16) -> Self {
+        let ongoing_count = increment_ongoing_requests();
+        tracing::debug!(
+            rpc_id = rpc_id,
+            ongoing = ongoing_count,
+            "RPC request started"
+        );
+        Self { rpc_id }
+    }
+}
+
+impl Drop for RpcRequestGuard {
+    fn drop(&mut self) {
+        let remaining = decrement_ongoing_requests();
+        tracing::debug!(
+            rpc_id = self.rpc_id,
+            ongoing = remaining,
+            "RPC request completed"
+        );
+    }
+}
 
 struct SizeCheck<T, const N: usize>(PhantomData<T>);
 impl<T, const N: usize> SizeCheck<T, N> {
@@ -108,6 +219,9 @@ impl RpcServer {
             let ctx_clone = ctx.clone();
             let rpc_id = Rpc::rpc_id();
             pluvio_runtime::spawn(async move {
+                // Track this request's lifetime with RAII guard
+                let _guard = RpcRequestGuard::new(rpc_id);
+
                 match Rpc::server_handler(ctx_clone, am_msg).await {
                     Ok((_response, _am_msg)) => {
                         // Response was already sent within server_handler via reply_ep
@@ -121,6 +235,7 @@ impl RpcServer {
                         tracing::error!("Handler failed for RPC ID {}: {:?}", rpc_id, e);
                     }
                 }
+                // _guard is dropped here, decrementing the counter
             });
         }
 

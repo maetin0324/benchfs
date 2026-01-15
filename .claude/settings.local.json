@@ -107,7 +107,8 @@
       "Bash(ldd:*)",
       "Bash(xxd:*)",
       "Bash(/work/NBB/rmaeda/workspace/rust/benchfs/scripts/debug-install.sh:*)",
-      "Bash(qdel:*)"
+      "Bash(qdel:*)",
+      "Bash(./install.sh:*)"
     ],
     "deny": [],
     "ask": []

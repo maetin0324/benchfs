@@ -46,6 +46,7 @@ BENCHFS_DATA_DIR="/scr"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
 PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
+STATS_OUTPUT_DIR="${JOB_OUTPUT_DIR}/stats"
 
 # Default trace format flags to 0 if not set
 : ${ENABLE_PERFETTO:=0}
@@ -357,6 +358,9 @@ mkdir -p "${BENCHFSD_LOG_BASE_DIR}"
 echo "prepare ior output dir: ${IOR_OUTPUT_DIR}"
 mkdir -p "${IOR_OUTPUT_DIR}"
 
+echo "prepare stats output dir: ${STATS_OUTPUT_DIR}"
+mkdir -p "${STATS_OUTPUT_DIR}"
+
 if [ "${ENABLE_PERFETTO}" -eq 1 ] || [ "${ENABLE_CHROME}" -eq 1 ]; then
   echo "prepare trace output dir: ${PERFETTO_OUTPUT_DIR}"
   mkdir -p "${PERFETTO_OUTPUT_DIR}"
@@ -663,7 +667,8 @@ EOF
               echo "Created taskset wrapper: ${TASKSET_WRAPPER}"
             fi
 
-            # Build benchfsd command with optional Perfetto tracing
+            # Build benchfsd command with optional Perfetto tracing and stats output
+            stats_file="${STATS_OUTPUT_DIR}/stats_run${runid}.csv"
             cmd_benchfsd=(
               "${cmd_mpirun_common[@]}"
               -np "$server_np"
@@ -675,19 +680,21 @@ EOF
               "${BENCHFSD_BINARY}"
               "${BENCHFS_REGISTRY_DIR}"
               "${config_file}"
+              --stats-output "${stats_file}"
             )
+            echo "Stats output enabled for this run: ${stats_file}"
 
             # Add tracing option if enabled
-            # Note: -x options must be inserted before the binary (3 elements from end: binary, registry, config)
+            # Note: -x options must be inserted before the binary (4 elements from end: binary, registry, config, stats-output, stats_file)
             if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
               trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.pftrace"
-              binary_idx=$((${#cmd_benchfsd[@]} - 3))
+              binary_idx=$((${#cmd_benchfsd[@]} - 5))
               cmd_benchfsd=("${cmd_benchfsd[@]:0:binary_idx}" -x ENABLE_PERFETTO=1 "${cmd_benchfsd[@]:binary_idx}")
               cmd_benchfsd+=(--trace-output "${trace_file}")
               echo "Perfetto tracing enabled for this run: ${trace_file}"
             elif [ "${ENABLE_CHROME}" -eq 1 ]; then
               trace_file="${PERFETTO_OUTPUT_DIR}/trace_run${runid}.json"
-              binary_idx=$((${#cmd_benchfsd[@]} - 3))
+              binary_idx=$((${#cmd_benchfsd[@]} - 5))
               cmd_benchfsd=("${cmd_benchfsd[@]:0:binary_idx}" -x ENABLE_CHROME=1 "${cmd_benchfsd[@]:binary_idx}")
               cmd_benchfsd+=(--trace-output "${trace_file}")
               echo "Chrome tracing enabled for this run: ${trace_file}"

@@ -20,7 +20,7 @@ use benchfs::logging::{init_with_chrome, init_with_perfetto, TraceGuard};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
-use benchfs::rpc::server::RpcServer;
+use benchfs::rpc::server::{RpcServer, get_server_rpc_stats};
 use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
 
 use pluvio_runtime::executor::{Runtime, SchedulingConfig};
@@ -30,6 +30,8 @@ use pluvio_uring::reactor::IoUringReactor;
 
 use mpi::traits::*;
 
+use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -42,16 +44,24 @@ struct ServerState {
     mpi_rank: i32,
     mpi_size: i32,
     registry_dir: PathBuf,
+    stats_file: Option<PathBuf>,
 }
 
 impl ServerState {
-    fn new(config: ServerConfig, mpi_rank: i32, mpi_size: i32, registry_dir: PathBuf) -> Self {
+    fn new(
+        config: ServerConfig,
+        mpi_rank: i32,
+        mpi_size: i32,
+        registry_dir: PathBuf,
+        stats_file: Option<PathBuf>,
+    ) -> Self {
         Self {
             config,
             running: Arc::new(AtomicBool::new(true)),
             mpi_rank,
             mpi_size,
             registry_dir,
+            stats_file,
         }
     }
 
@@ -78,8 +88,9 @@ fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse --trace-output option
+    // Parse --trace-output and --stats-output options
     let mut trace_output: Option<PathBuf> = None;
+    let mut stats_output: Option<PathBuf> = None;
     let mut positional_args: Vec<&String> = Vec::new();
 
     let mut i = 1;
@@ -106,6 +117,28 @@ fn main() {
                 }
                 std::process::exit(1);
             }
+        } else if args[i] == "--stats-output" {
+            if i + 1 < args.len() {
+                // Create rank-specific stats file path
+                let base_path = PathBuf::from(&args[i + 1]);
+                let stem = base_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("stats");
+                let ext = base_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("csv");
+                let parent = base_path.parent().unwrap_or(std::path::Path::new("."));
+                let rank_path = parent.join(format!("{}_rank{}.{}", stem, mpi_rank, ext));
+                stats_output = Some(rank_path);
+                i += 2;
+            } else {
+                if mpi_rank == 0 {
+                    eprintln!("Error: --stats-output requires a path argument");
+                }
+                std::process::exit(1);
+            }
         } else {
             positional_args.push(&args[i]);
             i += 1;
@@ -115,13 +148,15 @@ fn main() {
     if positional_args.is_empty() {
         if mpi_rank == 0 {
             eprintln!(
-                "Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file] [--trace-output <path>]",
+                "Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file] [options]",
                 args[0]
             );
-            eprintln!("  registry_dir:           Shared directory for service discovery (required)");
-            eprintln!("  config_file:            Configuration file (optional, default: benchfs.toml)");
-            eprintln!("  --trace-output <path>:  Enable Perfetto tracing (optional)");
-            eprintln!("                          Each rank creates <path>_rank<N>.json");
+            eprintln!("  registry_dir:            Shared directory for service discovery (required)");
+            eprintln!("  config_file:             Configuration file (optional, default: benchfs.toml)");
+            eprintln!("  --trace-output <path>:   Enable Perfetto tracing (optional)");
+            eprintln!("                           Each rank creates <path>_rank<N>.json");
+            eprintln!("  --stats-output <path>:   Enable CSV stats output (optional)");
+            eprintln!("                           Each rank creates <path>_rank<N>.csv");
         }
         std::process::exit(1);
     }
@@ -193,7 +228,13 @@ fn main() {
         mpi_rank,
         mpi_size,
         registry_dir,
+        stats_output.clone(),
     ));
+
+    // Log stats output configuration
+    if let Some(ref stats_path) = stats_output {
+        tracing::info!("Stats output enabled: {}", stats_path.display());
+    }
 
 
     // Synchronize all ranks before starting servers
@@ -473,6 +514,65 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         },
         "node_registration".to_string(),
     );
+
+    // Spawn stats logging task (writes final stats on shutdown)
+    {
+        let state_clone = state.clone();
+        let node_id_clone = node_id.clone();
+        let stats_file_path = state.stats_file.clone();
+        pluvio_runtime::spawn_with_name(
+            async move {
+                if stats_file_path.is_some() {
+                    tracing::info!("Stats output enabled - will write final stats on shutdown");
+                }
+
+                // Wait for server to stop
+                loop {
+                    if !state_clone.is_running() {
+                        break;
+                    }
+                    pluvio_timer::sleep(std::time::Duration::from_millis(100)).await;
+                }
+
+                // Write final stats to CSV file
+                if let Some(ref path) = stats_file_path {
+                    // Create parent directory if needed
+                    if let Some(parent) = path.parent() {
+                        if !parent.exists() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                    }
+
+                    let stats = get_server_rpc_stats();
+                    match File::create(path) {
+                        Ok(mut file) => {
+                            // Write CSV header and data
+                            let _ = writeln!(file, "node_id,received,completed,peak");
+                            let _ = writeln!(
+                                file,
+                                "{},{},{},{}",
+                                node_id_clone,
+                                stats.total_received,
+                                stats.total_completed,
+                                stats.peak_concurrent
+                            );
+                            tracing::info!(
+                                "Stats written to {}: received={}, completed={}, peak={}",
+                                path.display(),
+                                stats.total_received,
+                                stats.total_completed,
+                                stats.peak_concurrent
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create stats file {}: {}", path.display(), e);
+                        }
+                    }
+                }
+            },
+            "server_stats_logger".to_string(),
+        );
+    }
 
     // Start server main loop
     let server_handle = {
