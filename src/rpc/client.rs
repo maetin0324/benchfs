@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pluvio_timer::{timeout, TimeoutError};
@@ -6,8 +7,147 @@ use tracing::instrument;
 
 use crate::rpc::{AmRpc, Connection, RpcError};
 
+// ============================================================================
+// Global retry statistics counters
+// ============================================================================
+
+static TOTAL_RPC_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_RETRIES: AtomicU64 = AtomicU64::new(0);
+static TOTAL_RETRY_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static TOTAL_RETRY_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Statistics for RPC retry operations
+#[derive(Debug, Clone, Default)]
+pub struct RetryStats {
+    /// Total number of RPC requests attempted
+    pub total_requests: u64,
+    /// Total number of retry attempts (not including initial attempt)
+    pub total_retries: u64,
+    /// Number of requests that succeeded after retry
+    pub retry_successes: u64,
+    /// Number of requests that failed after all retries
+    pub retry_failures: u64,
+}
+
+impl RetryStats {
+    /// Get the retry rate (retries / total_requests)
+    pub fn retry_rate(&self) -> f64 {
+        if self.total_requests == 0 {
+            0.0
+        } else {
+            self.total_retries as f64 / self.total_requests as f64
+        }
+    }
+
+    /// Get the retry success rate (retry_successes / (retry_successes + retry_failures))
+    pub fn retry_success_rate(&self) -> f64 {
+        let total_retried = self.retry_successes + self.retry_failures;
+        if total_retried == 0 {
+            0.0
+        } else {
+            self.retry_successes as f64 / total_retried as f64
+        }
+    }
+}
+
+/// Get current retry statistics
+pub fn get_retry_stats() -> RetryStats {
+    RetryStats {
+        total_requests: TOTAL_RPC_REQUESTS.load(Ordering::Relaxed),
+        total_retries: TOTAL_RETRIES.load(Ordering::Relaxed),
+        retry_successes: TOTAL_RETRY_SUCCESSES.load(Ordering::Relaxed),
+        retry_failures: TOTAL_RETRY_FAILURES.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset retry statistics (useful for testing)
+pub fn reset_retry_stats() {
+    TOTAL_RPC_REQUESTS.store(0, Ordering::Relaxed);
+    TOTAL_RETRIES.store(0, Ordering::Relaxed);
+    TOTAL_RETRY_SUCCESSES.store(0, Ordering::Relaxed);
+    TOTAL_RETRY_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// Write retry statistics to a CSV file
+///
+/// The CSV format is:
+/// ```csv
+/// node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate
+/// ```
+pub fn write_retry_stats_to_csv(path: &str, node_id: &str) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let stats = get_retry_stats();
+
+    // Create parent directory if needed
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut file = File::create(path)?;
+    writeln!(file, "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate")?;
+    writeln!(
+        file,
+        "{},{},{},{},{},{:.4}",
+        node_id,
+        stats.total_requests,
+        stats.total_retries,
+        stats.retry_successes,
+        stats.retry_failures,
+        stats.retry_rate()
+    )?;
+
+    tracing::info!(
+        "Retry stats written to {}: requests={}, retries={}, successes={}, failures={}, rate={:.4}",
+        path,
+        stats.total_requests,
+        stats.total_retries,
+        stats.retry_successes,
+        stats.retry_failures,
+        stats.retry_rate()
+    );
+
+    Ok(())
+}
+
+// Helper functions for incrementing counters
+fn increment_request_count() {
+    TOTAL_RPC_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn increment_retry_count() {
+    TOTAL_RETRIES.fetch_add(1, Ordering::Relaxed);
+}
+
+fn increment_retry_success() {
+    TOTAL_RETRY_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+}
+
+fn increment_retry_failure() {
+    TOTAL_RETRY_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Default RPC timeout duration (30 seconds)
 const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
+
+/// Default retry count
+const DEFAULT_RPC_RETRY_COUNT: u32 = 3;
+
+/// Default initial retry delay (100ms)
+const DEFAULT_RPC_RETRY_DELAY_MS: u64 = 100;
+
+/// Default backoff multiplier
+const DEFAULT_RPC_RETRY_BACKOFF: f64 = 2.0;
+
+/// Retry configuration for RPC calls
+struct RetryConfig {
+    max_retries: u32,
+    initial_delay: Duration,
+    backoff_multiplier: f64,
+}
 
 /// Get the RPC timeout from environment variable or use default
 fn get_rpc_timeout() -> Duration {
@@ -16,6 +156,26 @@ fn get_rpc_timeout() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(DEFAULT_RPC_TIMEOUT_SECS))
+}
+
+/// Get retry configuration from environment variables
+fn get_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: std::env::var("BENCHFS_RPC_RETRY_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_RPC_RETRY_COUNT),
+        initial_delay: Duration::from_millis(
+            std::env::var("BENCHFS_RPC_RETRY_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_RPC_RETRY_DELAY_MS),
+        ),
+        backoff_multiplier: std::env::var("BENCHFS_RPC_RETRY_BACKOFF")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_RPC_RETRY_BACKOFF),
+    }
 }
 
 /// RPC client for making RPC calls
@@ -79,6 +239,11 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Check if an error is retryable
+    fn is_retryable(error: &RpcError) -> bool {
+        matches!(error, RpcError::Timeout | RpcError::TransportError(_))
+    }
+
     /// Execute an RPC call using a request that implements RpcCall
     ///
     /// This is the main entry point for executing RPCs. Pass any struct that implements
@@ -86,6 +251,9 @@ impl RpcClient {
     ///
     /// The operation is subject to a timeout configured via the `BENCHFS_RPC_TIMEOUT`
     /// environment variable (in seconds). Default timeout is 30 seconds.
+    ///
+    /// On timeout or transport errors, the operation will be automatically retried
+    /// with exponential backoff. Retry behavior is configured via environment variables.
     ///
     /// # Example
     /// ```ignore
@@ -95,9 +263,64 @@ impl RpcClient {
     ///
     /// # Environment Variables
     /// * `BENCHFS_RPC_TIMEOUT` - Timeout in seconds (default: 30)
+    /// * `BENCHFS_RPC_RETRY_COUNT` - Max retry attempts (default: 3)
+    /// * `BENCHFS_RPC_RETRY_DELAY_MS` - Initial retry delay in ms (default: 100)
+    /// * `BENCHFS_RPC_RETRY_BACKOFF` - Backoff multiplier (default: 2.0)
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "rpc_call", skip(self, request), fields(rpc_id = T::rpc_id()))]
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
+        increment_request_count();
+
+        let retry_config = get_retry_config();
+        let mut attempt = 0u32;
+        let mut delay = retry_config.initial_delay;
+
+        loop {
+            attempt += 1;
+
+            match self.execute_once(request).await {
+                Ok(response) => {
+                    // Track if this was a retry success
+                    if attempt > 1 {
+                        increment_retry_success();
+                    }
+                    return Ok(response);
+                }
+                Err(e) if Self::is_retryable(&e) && attempt <= retry_config.max_retries => {
+                    increment_retry_count();
+                    tracing::warn!(
+                        rpc_id = T::rpc_id(),
+                        attempt = attempt,
+                        max_retries = retry_config.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        error = ?e,
+                        "RPC failed, retrying..."
+                    );
+                    pluvio_timer::sleep(delay).await;
+                    delay = Duration::from_secs_f64(
+                        delay.as_secs_f64() * retry_config.backoff_multiplier
+                    );
+                }
+                Err(e) => {
+                    // Track if retries were attempted but all failed
+                    if attempt > 1 {
+                        increment_retry_failure();
+                        tracing::error!(
+                            rpc_id = T::rpc_id(),
+                            attempts = attempt,
+                            error = ?e,
+                            "RPC failed after all retries"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Internal: Execute a single RPC attempt without retry
+    #[async_backtrace::framed]
+    async fn execute_once<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         let timeout_duration = get_rpc_timeout();
         let rpc_id = T::rpc_id();
         let reply_stream_id = T::reply_stream_id();
@@ -162,7 +385,7 @@ impl RpcClient {
                 )));
             }
             Err(TimeoutError) => {
-                tracing::error!(
+                tracing::warn!(
                     rpc_id = rpc_id,
                     timeout_secs = timeout_duration.as_secs(),
                     "RPC send timeout: failed to send request within timeout"
@@ -183,7 +406,7 @@ impl RpcClient {
         let mut msg = match timeout(timeout_duration, Box::pin(wait_future)).await {
             Ok(Some(msg)) => msg,
             Ok(None) => {
-                tracing::error!(
+                tracing::warn!(
                     rpc_id = rpc_id,
                     reply_stream_id = reply_stream_id,
                     "RPC failed: no reply received (stream closed)"
@@ -191,7 +414,7 @@ impl RpcClient {
                 return Err(RpcError::Timeout);
             }
             Err(TimeoutError) => {
-                tracing::error!(
+                tracing::warn!(
                     rpc_id = rpc_id,
                     reply_stream_id = reply_stream_id,
                     timeout_secs = timeout_duration.as_secs(),
@@ -232,7 +455,7 @@ impl RpcClient {
                     )));
                 }
                 Err(TimeoutError) => {
-                    tracing::error!(
+                    tracing::warn!(
                         rpc_id = rpc_id,
                         timeout_secs = timeout_duration.as_secs(),
                         "RPC recv timeout: failed to receive response data within timeout"
@@ -252,8 +475,69 @@ impl RpcClient {
     ///
     /// The send operation is subject to a timeout configured via the `BENCHFS_RPC_TIMEOUT`
     /// environment variable (in seconds). Default timeout is 30 seconds.
+    ///
+    /// On timeout or transport errors, the operation will be automatically retried
+    /// with exponential backoff.
+    ///
+    /// # Environment Variables
+    /// * `BENCHFS_RPC_TIMEOUT` - Timeout in seconds (default: 30)
+    /// * `BENCHFS_RPC_RETRY_COUNT` - Max retry attempts (default: 3)
+    /// * `BENCHFS_RPC_RETRY_DELAY_MS` - Initial retry delay in ms (default: 100)
+    /// * `BENCHFS_RPC_RETRY_BACKOFF` - Backoff multiplier (default: 2.0)
     #[async_backtrace::framed]
     pub async fn execute_no_reply<T: AmRpc>(&self, request: &T) -> Result<(), RpcError> {
+        increment_request_count();
+
+        let retry_config = get_retry_config();
+        let mut attempt = 0u32;
+        let mut delay = retry_config.initial_delay;
+
+        loop {
+            attempt += 1;
+
+            match self.execute_no_reply_once(request).await {
+                Ok(()) => {
+                    // Track if this was a retry success
+                    if attempt > 1 {
+                        increment_retry_success();
+                    }
+                    return Ok(());
+                }
+                Err(e) if Self::is_retryable(&e) && attempt <= retry_config.max_retries => {
+                    increment_retry_count();
+                    tracing::warn!(
+                        rpc_id = T::rpc_id(),
+                        attempt = attempt,
+                        max_retries = retry_config.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        error = ?e,
+                        "RPC (no_reply) failed, retrying..."
+                    );
+                    pluvio_timer::sleep(delay).await;
+                    delay = Duration::from_secs_f64(
+                        delay.as_secs_f64() * retry_config.backoff_multiplier
+                    );
+                }
+                Err(e) => {
+                    // Track if retries were attempted but all failed
+                    if attempt > 1 {
+                        increment_retry_failure();
+                        tracing::error!(
+                            rpc_id = T::rpc_id(),
+                            attempts = attempt,
+                            error = ?e,
+                            "RPC (no_reply) failed after all retries"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Internal: Execute a single no-reply RPC attempt without retry
+    #[async_backtrace::framed]
+    async fn execute_no_reply_once<T: AmRpc>(&self, request: &T) -> Result<(), RpcError> {
         let timeout_duration = get_rpc_timeout();
         let rpc_id = T::rpc_id();
         let header = request.request_header();
@@ -282,7 +566,7 @@ impl RpcClient {
                 )))
             }
             Err(TimeoutError) => {
-                tracing::error!(
+                tracing::warn!(
                     rpc_id = rpc_id,
                     timeout_secs = timeout_duration.as_secs(),
                     "RPC send timeout (no_reply): failed to send request within timeout"

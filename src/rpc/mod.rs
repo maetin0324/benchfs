@@ -26,6 +26,9 @@ pub use crate::constants::{
     RDMA_THRESHOLD, SHUTDOWN_MAGIC, WORKER_ADDRESS_BUFFER_SIZE, should_use_rdma,
 };
 
+// Re-export retry statistics from client module
+pub use client::{RetryStats, get_retry_stats, reset_retry_stats, write_retry_stats_to_csv};
+
 /// Unified server response structure
 /// Contains response header and optional data payload
 pub struct ServerResponse<H> {

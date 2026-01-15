@@ -13,7 +13,8 @@ use std::rc::Rc;
 
 use super::error::*;
 use super::runtime::{
-    block_on_with_name, set_benchfs_ctx, set_connection_pool, set_rpc_server, set_runtime,
+    block_on_with_name, get_node_id, set_benchfs_ctx, set_connection_pool, set_node_id,
+    set_rpc_server, set_runtime,
 };
 use crate::api::file_ops::BenchFS;
 use crate::metadata::MetadataManager;
@@ -619,6 +620,9 @@ pub extern "C" fn benchfs_init(
     // Store in thread-local context
     set_benchfs_ctx(benchfs.clone());
 
+    // Store node_id for use in statistics output during finalization
+    set_node_id(node_id_str.to_string());
+
     // Return opaque pointer
     // We box the Rc to pass ownership to C
     let boxed = Box::new(benchfs);
@@ -686,6 +690,28 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     //
     // Therefore, benchfs_finalize() should only clean up local resources,
     // not send shutdown RPCs to other nodes.
+
+    // Write retry statistics to CSV if BENCHFS_RETRY_STATS_OUTPUT is set
+    // The path can be either:
+    // - A directory: stats will be written to <dir>/<node_id>.csv
+    // - A file path: stats will be written to the specified file
+    if let Ok(stats_path) = std::env::var("BENCHFS_RETRY_STATS_OUTPUT") {
+        let node_id = get_node_id().unwrap_or_else(|| "unknown".to_string());
+
+        // Determine the actual file path
+        let actual_path = if std::path::Path::new(&stats_path).is_dir() {
+            format!("{}/{}.csv", stats_path, node_id)
+        } else if stats_path.ends_with('/') {
+            // Path ends with / but directory doesn't exist yet - treat as directory
+            format!("{}{}.csv", stats_path, node_id)
+        } else {
+            stats_path
+        };
+
+        if let Err(e) = crate::rpc::write_retry_stats_to_csv(&actual_path, &node_id) {
+            tracing::error!("Failed to write retry stats to {}: {}", actual_path, e);
+        }
+    }
 
     // Convert back to Rc<BenchFS> and drop it
     // This will automatically trigger Drop implementations for all components

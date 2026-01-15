@@ -745,6 +745,10 @@ EOF
           ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
           ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
 
+          # Create directory for retry stats from IOR clients
+          retry_stats_dir="${STATS_OUTPUT_DIR}/retry_stats_run${runid}"
+          mkdir -p "${retry_stats_dir}"
+
           cmd_ior=(
             time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
             "${cmd_mpirun_common[@]}"
@@ -753,6 +757,7 @@ EOF
             --map-by "ppr:${ppn}:node"
             -x RUST_LOG="${RUST_LOG_C}"
             -x RUST_BACKTRACE
+            -x BENCHFS_RETRY_STATS_OUTPUT="${retry_stats_dir}/"
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
             -vvv
@@ -766,6 +771,7 @@ EOF
             -O summaryFormat=JSON
             -O summaryFile="${ior_json_file}"
           )
+          echo "Retry stats output enabled for IOR clients: ${retry_stats_dir}/"
 
           save_job_metadata
 
