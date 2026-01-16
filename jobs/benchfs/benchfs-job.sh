@@ -764,6 +764,7 @@ EOF
             -a BENCHFS
             -t "$transfer_size"
             -b "$block_size"
+            -D 300
             $ior_flags
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"
@@ -830,6 +831,23 @@ EOF
 
             # Wait for cleanup and FD release
             sleep 3
+          fi
+
+          # Merge client retry stats into a single CSV file
+          merged_retry_stats="${STATS_OUTPUT_DIR}/retry_stats_run${runid}.csv"
+          if [ -d "${retry_stats_dir}" ]; then
+            echo "Merging client retry stats into ${merged_retry_stats}..."
+            # Write header once
+            echo "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate" > "${merged_retry_stats}"
+            # Append data rows from all client CSVs (skip headers)
+            for csv_file in "${retry_stats_dir}"/*.csv; do
+              if [ -f "$csv_file" ]; then
+                tail -n +2 "$csv_file" >> "${merged_retry_stats}"
+              fi
+            done
+            # Remove individual CSV files directory
+            rm -rf "${retry_stats_dir}"
+            echo "Merged $(wc -l < "${merged_retry_stats}" | tr -d ' ') lines (including header) into ${merged_retry_stats}"
           fi
 
             runid=$((runid + 1))
