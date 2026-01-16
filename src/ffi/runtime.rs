@@ -62,6 +62,14 @@ thread_local! {
 }
 
 thread_local! {
+    /// Thread-local node ID
+    ///
+    /// Stores the node identifier passed to `benchfs_init()` for use in
+    /// statistics output and logging during `benchfs_finalize()`.
+    pub static NODE_ID: RefCell<Option<String>> = RefCell::new(None);
+}
+
+thread_local! {
     /// Thread-local RPC server (for server mode only)
     ///
     /// When BenchFS is initialized in server mode, this stores the RPC server
@@ -102,6 +110,27 @@ pub fn set_benchfs_ctx(benchfs: Rc<BenchFS>) {
     BENCHFS_CTX.with(|ctx| {
         *ctx.borrow_mut() = Some(benchfs);
     });
+}
+
+/// Set the node ID for the current thread
+///
+/// This function stores the node identifier in thread-local storage for use in
+/// statistics output during finalization.
+///
+/// # Arguments
+///
+/// * `node_id` - Node identifier string
+pub fn set_node_id(node_id: String) {
+    NODE_ID.with(|id| {
+        *id.borrow_mut() = Some(node_id);
+    });
+}
+
+/// Get the node ID for the current thread
+///
+/// Returns the node identifier if set, or None if not initialized.
+pub fn get_node_id() -> Option<String> {
+    NODE_ID.with(|id| id.borrow().clone())
 }
 
 /// Set the RPC server for the current thread (server mode only)
@@ -274,6 +303,10 @@ pub fn cleanup_runtime() {
 
     CONNECTION_POOL.with(|pool| {
         *pool.borrow_mut() = None;
+    });
+
+    NODE_ID.with(|id| {
+        *id.borrow_mut() = None;
     });
 
     // Clear the pluvio_runtime TLS

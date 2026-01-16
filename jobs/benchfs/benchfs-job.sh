@@ -745,6 +745,10 @@ EOF
           ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
           ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
 
+          # Create directory for retry stats from IOR clients
+          retry_stats_dir="${STATS_OUTPUT_DIR}/retry_stats_run${runid}"
+          mkdir -p "${retry_stats_dir}"
+
           cmd_ior=(
             time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
             "${cmd_mpirun_common[@]}"
@@ -753,12 +757,14 @@ EOF
             --map-by "ppr:${ppn}:node"
             -x RUST_LOG="${RUST_LOG_C}"
             -x RUST_BACKTRACE
+            -x BENCHFS_RETRY_STATS_OUTPUT="${retry_stats_dir}/"
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
             -vvv
             -a BENCHFS
             -t "$transfer_size"
             -b "$block_size"
+            -D 300
             $ior_flags
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"
@@ -766,6 +772,7 @@ EOF
             -O summaryFormat=JSON
             -O summaryFile="${ior_json_file}"
           )
+          echo "Retry stats output enabled for IOR clients: ${retry_stats_dir}/"
 
           save_job_metadata
 
@@ -824,6 +831,23 @@ EOF
 
             # Wait for cleanup and FD release
             sleep 3
+          fi
+
+          # Merge client retry stats into a single CSV file
+          merged_retry_stats="${STATS_OUTPUT_DIR}/retry_stats_run${runid}.csv"
+          if [ -d "${retry_stats_dir}" ]; then
+            echo "Merging client retry stats into ${merged_retry_stats}..."
+            # Write header once
+            echo "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate" > "${merged_retry_stats}"
+            # Append data rows from all client CSVs (skip headers)
+            for csv_file in "${retry_stats_dir}"/*.csv; do
+              if [ -f "$csv_file" ]; then
+                tail -n +2 "$csv_file" >> "${merged_retry_stats}"
+              fi
+            done
+            # Remove individual CSV files directory
+            rm -rf "${retry_stats_dir}"
+            echo "Merged $(wc -l < "${merged_retry_stats}" | tr -d ' ') lines (including header) into ${merged_retry_stats}"
           fi
 
             runid=$((runid + 1))
