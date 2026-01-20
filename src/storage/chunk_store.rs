@@ -3,9 +3,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use lru::LruCache;
-use std::num::NonZeroUsize;
-
 use tracing::instrument;
 
 use super::{FileHandle, IOUringBackend, OpenFlags, StorageBackend};
@@ -548,13 +545,18 @@ impl ChunkStore for FileChunkStore {
 /// IO_uring-based chunk storage
 ///
 /// Stores chunks in the local filesystem using io_uring for high-performance async I/O.
-/// Directory structure: <base_dir>/<path_hash>/<chunk_index>
-/// where path_hash is a hash of the full file path.
+/// Directory structure: <base_dir>/<path_hash>/<shard>/<chunk_index>
+/// where path_hash is a hash of the full file path, and shard = chunk_index % SHARD_COUNT.
 ///
 /// This implementation uses IOUringBackend for all file operations, providing:
 /// - Non-blocking async I/O
 /// - Zero-copy data transfer (with registered buffers)
 /// - High IOPS and low latency
+///
+/// ## O_DIRECT Strategy
+/// - WRITE operations use O_DIRECT to bypass page cache, maximizing NVMe write buffer utilization
+/// - READ operations do NOT use O_DIRECT, allowing the OS page cache to be utilized
+/// - This hybrid approach provides high WRITE throughput while enabling cache hits on READ
 pub struct IOUringChunkStore {
     /// Base directory for chunk storage
     base_dir: PathBuf,
@@ -564,29 +566,14 @@ pub struct IOUringChunkStore {
 
     /// IO_uring backend for async file operations
     backend: Rc<IOUringBackend>,
-
-    /// LRU cache of open file handles (path, chunk_index) -> FileHandle
-    /// This avoids repeatedly opening the same chunk file while preventing
-    /// file descriptor exhaustion by automatically closing least-recently-used files
-    open_handles: RefCell<LruCache<ChunkKey, FileHandle>>,
-
-    /// Evicted file handles pending deferred cleanup
-    /// These are closed in batch during close_all() to avoid async/await deadlock
-    /// that occurs when calling async close() from within synchronous LRU eviction callback
-    evicted_handles: RefCell<Vec<(ChunkKey, FileHandle)>>,
 }
 
 impl IOUringChunkStore {
-    /// Default maximum number of open file handles to cache
-    /// This prevents file descriptor exhaustion while maintaining good performance
-    /// Set to 262144 to handle large-scale distributed benchmarks (16GiB × 736 clients / 4MB chunks)
-    /// without excessive LRU eviction, which can cause convoy effect and severe READ performance degradation.
-    /// Can be overridden via BENCHFS_MAX_OPEN_FILES environment variable.
-    const DEFAULT_MAX_OPEN_FILES: usize = 262144;
-
-    /// Threshold for batch cleanup of evicted handles
-    /// When evicted_handles exceeds this count, trigger cleanup to prevent FD exhaustion
-    const EVICTED_HANDLES_CLEANUP_THRESHOLD: usize = 1024;
+    /// Number of shard subdirectories for chunk storage
+    /// Chunks are distributed across shards based on chunk_index % SHARD_COUNT
+    /// Reduced from 256 to 16 to minimize directory overhead while still avoiding
+    /// excessive files per directory
+    const SHARD_COUNT: u64 = 16;
 
     /// Create a new IO_uring-based chunk store
     ///
@@ -594,23 +581,6 @@ impl IOUringChunkStore {
     /// * `base_dir` - Base directory for chunk storage
     /// * `backend` - IO_uring backend for file operations
     pub fn new<P: AsRef<Path>>(base_dir: P, backend: Rc<IOUringBackend>) -> ChunkStoreResult<Self> {
-        Self::with_capacity(base_dir, backend, Self::DEFAULT_MAX_OPEN_FILES)
-    }
-
-    /// Create a new IO_uring-based chunk store with custom capacity
-    ///
-    /// # Arguments
-    /// * `base_dir` - Base directory for chunk storage
-    /// * `backend` - IO_uring backend for file operations
-    /// * `max_open_files` - Maximum number of file handles to keep open
-    ///
-    /// # Environment Variables
-    /// * `BENCHFS_MAX_OPEN_FILES` - Override the max_open_files parameter
-    pub fn with_capacity<P: AsRef<Path>>(
-        base_dir: P,
-        backend: Rc<IOUringBackend>,
-        max_open_files: usize,
-    ) -> ChunkStoreResult<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
 
         // Create base directory if it doesn't exist
@@ -618,35 +588,31 @@ impl IOUringChunkStore {
             std::fs::create_dir_all(&base_dir)?;
         }
 
-        // Check for environment variable override
-        let effective_max_open_files = std::env::var("BENCHFS_MAX_OPEN_FILES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(max_open_files);
-
-        let capacity = NonZeroUsize::new(effective_max_open_files)
-            .unwrap_or_else(|| NonZeroUsize::new(Self::DEFAULT_MAX_OPEN_FILES).unwrap());
-
         tracing::info!(
-            "IOUringChunkStore initialized with max_open_files={} (requested={}, env_override={})",
-            capacity,
-            max_open_files,
-            std::env::var("BENCHFS_MAX_OPEN_FILES").is_ok()
+            "IOUringChunkStore initialized (no file handle caching, READ uses page cache, WRITE uses O_DIRECT)"
         );
 
         Ok(Self {
             base_dir,
             chunk_size: CHUNK_SIZE,
             backend,
-            open_handles: RefCell::new(LruCache::new(capacity)),
-            evicted_handles: RefCell::new(Vec::new()),
         })
     }
 
-    /// Number of shard subdirectories for chunk storage
-    /// Chunks are distributed across shards based on chunk_index % SHARD_COUNT
-    /// This prevents directory lookup slowdown when storing hundreds of thousands of chunks
-    const SHARD_COUNT: u64 = 256;
+    /// Create a new IO_uring-based chunk store with custom capacity
+    ///
+    /// # Arguments
+    /// * `base_dir` - Base directory for chunk storage
+    /// * `backend` - IO_uring backend for file operations
+    /// * `_max_open_files` - Deprecated: no longer used (kept for API compatibility)
+    #[deprecated(note = "max_open_files is no longer used, use new() instead")]
+    pub fn with_capacity<P: AsRef<Path>>(
+        base_dir: P,
+        backend: Rc<IOUringBackend>,
+        _max_open_files: usize,
+    ) -> ChunkStoreResult<Self> {
+        Self::new(base_dir, backend)
+    }
 
     /// Hash a file path to create a valid directory name
     fn hash_path(&self, path: &str) -> String {
@@ -662,12 +628,12 @@ impl IOUringChunkStore {
     /// Chunks are distributed across SHARD_COUNT subdirectories to improve
     /// filesystem performance when handling large numbers of chunks
     fn shard_dir(&self, chunk_index: u64) -> String {
-        format!("{:02x}", chunk_index % Self::SHARD_COUNT)
+        format!("{:x}", chunk_index % Self::SHARD_COUNT)
     }
 
     /// Get the path for a chunk file
     /// Directory structure: base_dir/path_hash/shard/chunk_index
-    /// where shard = chunk_index % 256 (hex formatted)
+    /// where shard = chunk_index % 16 (hex formatted)
     fn chunk_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
         let path_hash = self.hash_path(file_path);
         let shard = self.shard_dir(chunk_index);
@@ -688,127 +654,54 @@ impl IOUringChunkStore {
         Ok(dir)
     }
 
-    /// Open a chunk file, creating it if necessary
+    /// Open a chunk file for reading or writing
     ///
-    /// Returns a cached handle if the file is already open.
-    /// Uses LRU eviction to automatically close least-recently-used files
-    /// when the cache is full, preventing file descriptor exhaustion.
+    /// This method opens files without caching - each operation gets a fresh file handle.
+    /// This allows different O_DIRECT settings for READ vs WRITE:
+    /// - WRITE: Uses O_DIRECT to bypass page cache, maximizing NVMe write buffer utilization
+    /// - READ: Does NOT use O_DIRECT, allowing OS page cache to be utilized for repeated reads
+    ///
+    /// File handles are closed immediately after each operation.
     async fn open_chunk_file(
         &self,
         file_path: &str,
         chunk_index: u64,
         write: bool,
     ) -> ChunkStoreResult<FileHandle> {
-        // Cleanup evicted handles if they've accumulated beyond threshold
-        // This prevents file descriptor exhaustion during heavy cache churn
-        self.cleanup_evicted_handles_if_needed().await?;
-
-        let key = ChunkKey::new(file_path.to_string(), chunk_index);
-
-        // Check if already open (this also updates LRU order)
-        if let Some(&handle) = self.open_handles.borrow_mut().get(&key) {
-            tracing::trace!(
-                "Reusing cached file handle for chunk (path={}, chunk={})",
-                file_path,
-                chunk_index
-            );
-            return Ok(handle);
-        }
-
         // Ensure shard directory exists (includes path_hash and shard subdirectory)
-        self.ensure_chunk_dir(file_path, chunk_index)?;
+        if write {
+            self.ensure_chunk_dir(file_path, chunk_index)?;
+        }
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
-        // Open or create the file
-        // Both read and write use O_DIRECT to bypass OS page cache:
-        // - Avoids page cache memory pressure and expensive shrink_* kernel calls
-        // - Provides consistent, predictable I/O latency
-        // - FixedBuffer is already page-aligned, chunk offsets are 4MB-aligned
+        // O_DIRECT strategy:
+        // - WRITE: Use O_DIRECT to bypass page cache and utilize NVMe write buffers
+        //   This provides maximum write throughput by avoiding page cache overhead
+        // - READ: Do NOT use O_DIRECT, allowing OS page cache to cache data
+        //   This significantly improves read performance when data is accessed repeatedly
         //
-        // IMPORTANT: Always open with read=true AND write=true (O_RDWR) so that
-        // cached file handles can be reused for both read and write operations.
-        // Previously, write-only handles were cached and incorrectly reused for reads,
-        // causing reads to return 0 bytes instantly (showing impossible ~1 TB/s bandwidth).
+        // This hybrid approach addresses the READ performance problem where O_DIRECT
+        // forced every read to go to disk, even for recently written data.
         let flags = OpenFlags {
-            read: true,   // Always enable read
-            write: true,  // Always enable write
+            read: !write,  // READ-only for read operations
+            write: write,  // WRITE-only for write operations
             create: write, // Only create on write operations
             truncate: false,
             append: false,
-            direct: true,
+            direct: write, // O_DIRECT only for WRITE, not for READ
         };
 
         let handle = self.backend.open(&chunk_file_path, flags).await?;
 
-        tracing::debug!("Opened file: {:?} with fd={:?}", chunk_file_path, handle);
-
-        // Insert into LRU cache. If cache is full, this will evict the least-recently-used entry.
-        let mut cache = self.open_handles.borrow_mut();
-        if let Some((evicted_key, evicted_handle)) = cache.push(key, handle) {
-            // A file handle was evicted from the cache.
-            // IMPORTANT: We do NOT close it here because:
-            // 1. Calling async close() from within eviction creates async/await deadlock
-            // 2. The await can block indefinitely if runtime is busy
-            // 3. File descriptors will be closed in close_all() during cleanup
-            //
-            // Instead, we store evicted handles for deferred cleanup.
-            // The large cache size (8192) means evictions are rare in practice.
-            tracing::debug!(
-                "Evicting file handle from LRU cache (path={}, chunk={}), fd={:?} - deferred close",
-                evicted_key.path,
-                evicted_key.chunk_index,
-                evicted_handle
-            );
-
-            // Store for deferred cleanup to prevent file descriptor leaks
-            self.evicted_handles
-                .borrow_mut()
-                .push((evicted_key, evicted_handle));
-        }
+        tracing::trace!(
+            "Opened file: {:?} with fd={:?} (write={}, direct={})",
+            chunk_file_path,
+            handle,
+            write,
+            write
+        );
 
         Ok(handle)
-    }
-
-    /// Cleanup evicted handles if they exceed the threshold
-    /// This prevents file descriptor exhaustion during heavy cache churn
-    async fn cleanup_evicted_handles_if_needed(&self) -> ChunkStoreResult<()> {
-        let count = self.evicted_handles.borrow().len();
-        if count >= Self::EVICTED_HANDLES_CLEANUP_THRESHOLD {
-            tracing::info!(
-                "Cleaning up {} evicted file handles (threshold={})",
-                count,
-                Self::EVICTED_HANDLES_CLEANUP_THRESHOLD
-            );
-            let handles: Vec<(ChunkKey, FileHandle)> =
-                self.evicted_handles.borrow_mut().drain(..).collect();
-            for (key, handle) in handles {
-                if let Err(e) = self.backend.close(handle).await {
-                    tracing::warn!(
-                        "Failed to close evicted chunk file (path={}, chunk={}): {:?}",
-                        key.path,
-                        key.chunk_index,
-                        e
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Close a chunk file handle
-    async fn close_chunk_file(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
-        let key = ChunkKey::new(file_path.to_string(), chunk_index);
-
-        if let Some(handle) = self.open_handles.borrow_mut().pop(&key) {
-            tracing::debug!(
-                "Explicitly closing file handle (path={}, chunk={})",
-                file_path,
-                chunk_index
-            );
-            self.backend.close(handle).await?;
-        }
-
-        Ok(())
     }
 
     /// Write a chunk to file using io_uring
@@ -825,20 +718,23 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file
+        // Open the chunk file with O_DIRECT for write
         let handle = self.open_chunk_file(file_path, chunk_index, true).await?;
 
         // Write data directly at the specified offset
         // io_uring's pwrite handles sparse files efficiently - no need for read-modify-write
         let bytes_to_write = data.len().min(self.chunk_size - offset as usize);
-        self.backend
+        let result = self
+            .backend
             .write(handle, offset, &data[..bytes_to_write])
-            .await?;
+            .await;
 
-        // NOTE: fsync is disabled for performance. Data is cached by OS and written
-        // asynchronously. For durability guarantees, users should explicitly call fsync.
-        // This is a common trade-off in high-performance filesystems.
-        // self.backend.fsync(handle).await?;
+        // Close the file handle immediately (no caching)
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after write: {:?}", e);
+        }
+
+        result?;
 
         tracing::trace!("Wrote {} bytes", bytes_to_write);
 
@@ -859,14 +755,20 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file (will fail with StorageError if file doesn't exist)
-        // Note: Removed synchronous exists() check to avoid blocking async executor
+        // Open the chunk file without O_DIRECT (uses page cache for better read performance)
+        // Note: Will fail with StorageError if file doesn't exist
         let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
 
         // Read data
         let mut buffer = vec![0u8; length as usize];
-        let bytes_read = self.backend.read(handle, offset, &mut buffer).await?;
+        let result = self.backend.read(handle, offset, &mut buffer).await;
 
+        // Close the file handle immediately (no caching)
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after read: {:?}", e);
+        }
+
+        let bytes_read = result?;
         buffer.truncate(bytes_read);
 
         tracing::trace!("Read {} bytes", bytes_read);
@@ -878,9 +780,6 @@ impl IOUringChunkStore {
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "iouring_delete_chunk", skip(self), fields(path = file_path, chunk = chunk_index))]
     pub async fn delete_chunk(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
-        // Close the file if it's open
-        self.close_chunk_file(file_path, chunk_index).await?;
-
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
         if !chunk_file_path.exists() {
@@ -915,19 +814,6 @@ impl IOUringChunkStore {
         }
 
         let mut deleted_count = 0;
-
-        // Close all open handles for this file path
-        let keys_to_close: Vec<ChunkKey> = self
-            .open_handles
-            .borrow()
-            .iter()
-            .filter(|(k, _)| k.path == file_path)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        for key in keys_to_close {
-            self.close_chunk_file(&key.path, key.chunk_index).await?;
-        }
 
         // Delete all chunk files in all shard directories
         for shard_entry in std::fs::read_dir(&dir)? {
@@ -966,44 +852,14 @@ impl IOUringChunkStore {
     }
 
     /// Close all open file handles
+    ///
+    /// With the removal of file handle caching, this method is now a no-op.
+    /// File handles are closed immediately after each read/write operation.
+    /// Kept for API compatibility.
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "iouring_close_all", skip(self))]
     pub async fn close_all(&self) -> ChunkStoreResult<()> {
-        // First, close all evicted handles that were deferred to prevent deadlock
-        let evicted: Vec<(ChunkKey, FileHandle)> =
-            self.evicted_handles.borrow_mut().drain(..).collect();
-        for (key, handle) in evicted {
-            if let Err(e) = self.backend.close(handle).await {
-                tracing::warn!(
-                    "Failed to close evicted chunk file (path={}, chunk={}): {:?}",
-                    key.path,
-                    key.chunk_index,
-                    e
-                );
-            }
-        }
-
-        // Then, close all currently cached handles
-        let handles: Vec<(ChunkKey, FileHandle)> = self
-            .open_handles
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-
-        for (key, handle) in handles {
-            if let Err(e) = self.backend.close(handle).await {
-                tracing::warn!(
-                    "Failed to close chunk file (path={}, chunk={}): {:?}",
-                    key.path,
-                    key.chunk_index,
-                    e
-                );
-            }
-        }
-
-        self.open_handles.borrow_mut().clear();
-
+        // No-op: file handles are closed immediately after each operation
         Ok(())
     }
 
@@ -1037,15 +893,22 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file
+        // Open the chunk file with O_DIRECT for write
         let handle = self.open_chunk_file(file_path, chunk_index, true).await?;
 
         // Write data directly from registered buffer using DMA (zero-copy)
         let bytes_to_write = data_len.min(self.chunk_size - offset as usize);
-        let bytes_written = self
+        let result = self
             .backend
             .write_fixed_direct(handle, offset, fixed_buffer, bytes_to_write)
-            .await?;
+            .await;
+
+        // Close the file handle immediately (no caching)
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after write_fixed: {:?}", e);
+        }
+
+        let bytes_written = result?;
 
         tracing::debug!(
             "Wrote {} bytes (zero-copy) to chunk (path={}, chunk_index={}, offset={})",
@@ -1089,15 +952,22 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file (will fail with StorageError if file doesn't exist)
-        // Note: Removed synchronous exists() check to avoid blocking async executor
+        // Open the chunk file without O_DIRECT (uses page cache for better read performance)
+        // Note: Will fail with StorageError if file doesn't exist
         let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
 
         // Read data directly into registered buffer using DMA (zero-copy)
-        let (bytes_read, fixed_buffer) = self
+        let result = self
             .backend
             .read_fixed_direct(handle, offset, fixed_buffer)
-            .await?;
+            .await;
+
+        // Close the file handle immediately (no caching)
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after read_fixed: {:?}", e);
+        }
+
+        let (bytes_read, fixed_buffer) = result?;
 
         tracing::debug!(
             "Read {} bytes (zero-copy) from chunk (path={}, chunk_index={}, offset={})",

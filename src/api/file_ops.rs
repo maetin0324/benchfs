@@ -1565,14 +1565,21 @@ impl BenchFSBuilder {
 mod tests {
     use super::*;
     use crate::storage::IOUringBackend;
-    use pluvio_runtime::executor::Runtime;
+    use pluvio_runtime::executor::{set_runtime, Runtime};
     use pluvio_uring::reactor::IoUringReactor;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn create_test_chunk_store(runtime: &Runtime) -> Rc<IOUringChunkStore> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        // Create io_uring reactor
+    /// Setup io_uring reactor and register it with the runtime.
+    /// Returns (allocator, reactor) for creating IOUringBackend.
+    /// Must be called BEFORE run_with_name_and_runtime to register the reactor.
+    fn setup_reactor(
+        runtime: &Runtime,
+    ) -> (
+        Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+        Rc<IoUringReactor>,
+    ) {
         let uring_reactor = IoUringReactor::builder()
             .queue_size(256)
             .buffer_size(1 << 20)
@@ -1585,8 +1592,16 @@ mod tests {
         let reactor_for_backend = uring_reactor.clone();
         runtime.register_reactor("io_uring", uring_reactor);
 
-        // Create IOUringBackend and chunk store with unique directory per test
-        let io_backend = Rc::new(IOUringBackend::new(allocator, reactor_for_backend));
+        (allocator, reactor_for_backend)
+    }
+
+    /// Create chunk store inside async context.
+    /// Must be called INSIDE the async block after runtime is set in thread-local storage.
+    fn create_chunk_store_in_async(
+        allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+        reactor: Rc<IoUringReactor>,
+    ) -> Rc<IOUringChunkStore> {
+        let io_backend = Rc::new(IOUringBackend::new(allocator, reactor));
         let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir = format!("/tmp/benchfs_test_{}_{}", std::process::id(), test_id);
         let chunk_store_dir = format!("{}/chunks", temp_dir);
@@ -1597,29 +1612,39 @@ mod tests {
 
     fn run_test<F>(test: F)
     where
-        F: FnOnce(
-                Rc<Runtime>,
-                Rc<IOUringChunkStore>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+        F: FnOnce(Rc<IOUringChunkStore>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
             + 'static,
     {
         let runtime = Runtime::new(256);
-        let chunk_store = create_test_chunk_store(&runtime);
-        let future = test(runtime.clone(), chunk_store);
-        runtime.run_with_name_and_runtime("benchfs_file_ops_test", future);
+        // Setup reactor before entering async context
+        let (allocator, reactor) = setup_reactor(&runtime);
+
+        // Set thread-local runtime for TLS-based spawn functions (spawn_with_name, etc.)
+        set_runtime(runtime.clone());
+
+        runtime.clone().run_with_name_and_runtime(
+            "benchfs_file_ops_test",
+            async move {
+                // Create chunk store inside async context where runtime is available
+                let chunk_store = create_chunk_store_in_async(allocator, reactor);
+                test(chunk_store).await;
+            },
+        );
     }
 
     #[test]
     fn test_benbenchfs_creation() {
-        let runtime = Runtime::new(256);
-        let chunk_store = create_test_chunk_store(&runtime);
-        let fs = BenchFS::new("node1".to_string(), chunk_store);
-        assert_eq!(fs.metadata_manager.self_node_id(), "node1");
+        run_test(|chunk_store| {
+            Box::pin(async move {
+                let fs = BenchFS::new("node1".to_string(), chunk_store);
+                assert_eq!(fs.metadata_manager.self_node_id(), "node1");
+            })
+        })
     }
 
     #[test]
     fn test_create_and_open_file() {
-        run_test(|_runtime, chunk_store| {
+        run_test(|chunk_store| {
             Box::pin(async move {
                 let fs = BenchFS::new("node1".to_string(), chunk_store);
 
@@ -1638,7 +1663,7 @@ mod tests {
 
     #[test]
     fn test_write_and_read_file() {
-        run_test(|_runtime, chunk_store| {
+        run_test(|chunk_store| {
             Box::pin(async move {
                 let fs = BenchFS::new("node1".to_string(), chunk_store);
 
@@ -1672,7 +1697,7 @@ mod tests {
 
     #[test]
     fn test_unlink_file() {
-        run_test(|_runtime, chunk_store| {
+        run_test(|chunk_store| {
             Box::pin(async move {
                 let fs = BenchFS::new("node1".to_string(), chunk_store);
 
@@ -1695,7 +1720,7 @@ mod tests {
 
     #[test]
     fn test_mkdir_and_rmdir() {
-        run_test(|_runtime, chunk_store| {
+        run_test(|chunk_store| {
             Box::pin(async move {
                 let fs = BenchFS::new("node1".to_string(), chunk_store);
 
@@ -1710,7 +1735,7 @@ mod tests {
 
     #[test]
     fn test_seek() {
-        run_test(|_runtime, chunk_store| {
+        run_test(|chunk_store| {
             Box::pin(async move {
                 let fs = BenchFS::new("node1".to_string(), chunk_store);
 
