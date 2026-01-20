@@ -7,7 +7,6 @@ use pluvio_uring::file::DmaFile;
 use pluvio_uring::reactor::IoUringReactor;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -53,27 +52,18 @@ impl IOUringBackend {
         fd
     }
 
-    /// OpenFlagsからOpenOptionsを作成
-    fn flags_to_open_options(flags: OpenFlags) -> OpenOptions {
-        let mut opts = OpenOptions::new();
-
-        opts.read(flags.read)
-            .write(flags.write)
-            .create(flags.create)
-            .truncate(flags.truncate)
-            .append(flags.append);
-
-        // O_DIRECTを有効化してOSページキャッシュをバイパス
-        // アライメント要件: バッファ、オフセット、サイズが512バイト境界
-        if flags.direct {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(libc::O_DIRECT);
+    /// Map std::io::Error to StorageError with path context
+    fn map_io_error(e: std::io::Error, path: &Path) -> StorageError {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => StorageError::NotFound(path.display().to_string()),
+            std::io::ErrorKind::PermissionDenied => {
+                StorageError::PermissionDenied(path.display().to_string())
             }
+            std::io::ErrorKind::AlreadyExists => {
+                StorageError::AlreadyExists(path.display().to_string())
+            }
+            _ => StorageError::IoError(e),
         }
-
-        opts
     }
 
     /// Write data directly from a registered buffer (zero-copy DMA)
@@ -204,26 +194,28 @@ impl IOUringBackend {
 #[async_trait::async_trait(?Send)]
 impl StorageBackend for IOUringBackend {
     async fn open(&self, path: &Path, flags: OpenFlags) -> StorageResult<FileHandle> {
-        let opts = Self::flags_to_open_options(flags);
-
-        let file = opts.open(path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => StorageError::NotFound(path.display().to_string()),
-            std::io::ErrorKind::PermissionDenied => {
-                StorageError::PermissionDenied(path.display().to_string())
-            }
-            std::io::ErrorKind::AlreadyExists => {
-                StorageError::AlreadyExists(path.display().to_string())
-            }
-            _ => StorageError::IoError(e),
+        let path_str = path.to_str().ok_or_else(|| {
+            StorageError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains invalid UTF-8: {}", path.display()),
+            ))
         })?;
 
-        let dma_file = Rc::new(DmaFile::with_reactor(file, self.reactor.clone()));
+        let linux_flags = flags.to_linux_flags();
+        let mode = 0o644u32;
+
+        // Async file open via io_uring OpenAt
+        let dma_file = DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
+            .await
+            .map_err(|e| Self::map_io_error(e, path))?;
+
+        let dma_file = Rc::new(dma_file);
         let fd = self.allocate_fd();
 
         let mut files = self.files.borrow_mut();
         files.insert(fd, dma_file);
 
-        tracing::debug!("Opened file: {} with fd={}", path.display(), fd);
+        tracing::debug!("Opened file: {} with fd={} (async)", path.display(), fd);
 
         Ok(FileHandle(fd))
     }
@@ -340,33 +332,28 @@ impl StorageBackend for IOUringBackend {
     }
 
     async fn create(&self, path: &Path, mode: u32) -> StorageResult<FileHandle> {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(false);
-
-        // Unix パーミッション設定
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(mode);
-        }
-
-        let file = opts.open(path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                StorageError::PermissionDenied(path.display().to_string())
-            }
-            std::io::ErrorKind::AlreadyExists => {
-                StorageError::AlreadyExists(path.display().to_string())
-            }
-            _ => StorageError::IoError(e),
+        let path_str = path.to_str().ok_or_else(|| {
+            StorageError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains invalid UTF-8: {}", path.display()),
+            ))
         })?;
 
-        let dma_file = Rc::new(DmaFile::with_reactor(file, self.reactor.clone()));
+        // O_WRONLY | O_CREAT (without O_TRUNC to maintain original behavior)
+        let linux_flags = libc::O_WRONLY | libc::O_CREAT;
+
+        // Async file create via io_uring OpenAt
+        let dma_file = DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
+            .await
+            .map_err(|e| Self::map_io_error(e, path))?;
+
+        let dma_file = Rc::new(dma_file);
         let fd = self.allocate_fd();
 
         let mut files = self.files.borrow_mut();
         files.insert(fd, dma_file);
 
-        tracing::debug!("Created file: {} with fd={}", path.display(), fd);
+        tracing::debug!("Created file: {} with fd={} (async)", path.display(), fd);
 
         Ok(FileHandle(fd))
     }

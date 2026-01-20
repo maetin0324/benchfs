@@ -579,8 +579,14 @@ pub struct IOUringChunkStore {
 impl IOUringChunkStore {
     /// Default maximum number of open file handles to cache
     /// This prevents file descriptor exhaustion while maintaining good performance
-    /// Increased to 8192 to handle 32GiB IOR tests (4MB chunks = 8192 chunks) without eviction
-    const DEFAULT_MAX_OPEN_FILES: usize = 8192;
+    /// Set to 262144 to handle large-scale distributed benchmarks (16GiB × 736 clients / 4MB chunks)
+    /// without excessive LRU eviction, which can cause convoy effect and severe READ performance degradation.
+    /// Can be overridden via BENCHFS_MAX_OPEN_FILES environment variable.
+    const DEFAULT_MAX_OPEN_FILES: usize = 262144;
+
+    /// Threshold for batch cleanup of evicted handles
+    /// When evicted_handles exceeds this count, trigger cleanup to prevent FD exhaustion
+    const EVICTED_HANDLES_CLEANUP_THRESHOLD: usize = 1024;
 
     /// Create a new IO_uring-based chunk store
     ///
@@ -597,6 +603,9 @@ impl IOUringChunkStore {
     /// * `base_dir` - Base directory for chunk storage
     /// * `backend` - IO_uring backend for file operations
     /// * `max_open_files` - Maximum number of file handles to keep open
+    ///
+    /// # Environment Variables
+    /// * `BENCHFS_MAX_OPEN_FILES` - Override the max_open_files parameter
     pub fn with_capacity<P: AsRef<Path>>(
         base_dir: P,
         backend: Rc<IOUringBackend>,
@@ -609,8 +618,21 @@ impl IOUringChunkStore {
             std::fs::create_dir_all(&base_dir)?;
         }
 
-        let capacity = NonZeroUsize::new(max_open_files)
+        // Check for environment variable override
+        let effective_max_open_files = std::env::var("BENCHFS_MAX_OPEN_FILES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(max_open_files);
+
+        let capacity = NonZeroUsize::new(effective_max_open_files)
             .unwrap_or_else(|| NonZeroUsize::new(Self::DEFAULT_MAX_OPEN_FILES).unwrap());
+
+        tracing::info!(
+            "IOUringChunkStore initialized with max_open_files={} (requested={}, env_override={})",
+            capacity,
+            max_open_files,
+            std::env::var("BENCHFS_MAX_OPEN_FILES").is_ok()
+        );
 
         Ok(Self {
             base_dir,
@@ -620,6 +642,11 @@ impl IOUringChunkStore {
             evicted_handles: RefCell::new(Vec::new()),
         })
     }
+
+    /// Number of shard subdirectories for chunk storage
+    /// Chunks are distributed across shards based on chunk_index % SHARD_COUNT
+    /// This prevents directory lookup slowdown when storing hundreds of thousands of chunks
+    const SHARD_COUNT: u64 = 256;
 
     /// Hash a file path to create a valid directory name
     fn hash_path(&self, path: &str) -> String {
@@ -631,18 +658,30 @@ impl IOUringChunkStore {
         format!("{:x}", hasher.finish())
     }
 
+    /// Get the shard directory for a chunk
+    /// Chunks are distributed across SHARD_COUNT subdirectories to improve
+    /// filesystem performance when handling large numbers of chunks
+    fn shard_dir(&self, chunk_index: u64) -> String {
+        format!("{:02x}", chunk_index % Self::SHARD_COUNT)
+    }
+
     /// Get the path for a chunk file
+    /// Directory structure: base_dir/path_hash/shard/chunk_index
+    /// where shard = chunk_index % 256 (hex formatted)
     fn chunk_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
         let path_hash = self.hash_path(file_path);
+        let shard = self.shard_dir(chunk_index);
         self.base_dir
             .join(path_hash)
+            .join(shard)
             .join(format!("{}", chunk_index))
     }
 
-    /// Ensure the directory for a file path exists
-    fn ensure_path_dir(&self, file_path: &str) -> ChunkStoreResult<PathBuf> {
+    /// Ensure the directory for a chunk exists (including shard subdirectory)
+    fn ensure_chunk_dir(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<PathBuf> {
         let path_hash = self.hash_path(file_path);
-        let dir = self.base_dir.join(path_hash);
+        let shard = self.shard_dir(chunk_index);
+        let dir = self.base_dir.join(path_hash).join(shard);
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
         }
@@ -660,6 +699,10 @@ impl IOUringChunkStore {
         chunk_index: u64,
         write: bool,
     ) -> ChunkStoreResult<FileHandle> {
+        // Cleanup evicted handles if they've accumulated beyond threshold
+        // This prevents file descriptor exhaustion during heavy cache churn
+        self.cleanup_evicted_handles_if_needed().await?;
+
         let key = ChunkKey::new(file_path.to_string(), chunk_index);
 
         // Check if already open (this also updates LRU order)
@@ -672,8 +715,8 @@ impl IOUringChunkStore {
             return Ok(handle);
         }
 
-        // Ensure directory exists
-        self.ensure_path_dir(file_path)?;
+        // Ensure shard directory exists (includes path_hash and shard subdirectory)
+        self.ensure_chunk_dir(file_path, chunk_index)?;
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
         // Open or create the file
@@ -724,6 +767,32 @@ impl IOUringChunkStore {
         }
 
         Ok(handle)
+    }
+
+    /// Cleanup evicted handles if they exceed the threshold
+    /// This prevents file descriptor exhaustion during heavy cache churn
+    async fn cleanup_evicted_handles_if_needed(&self) -> ChunkStoreResult<()> {
+        let count = self.evicted_handles.borrow().len();
+        if count >= Self::EVICTED_HANDLES_CLEANUP_THRESHOLD {
+            tracing::info!(
+                "Cleaning up {} evicted file handles (threshold={})",
+                count,
+                Self::EVICTED_HANDLES_CLEANUP_THRESHOLD
+            );
+            let handles: Vec<(ChunkKey, FileHandle)> =
+                self.evicted_handles.borrow_mut().drain(..).collect();
+            for (key, handle) in handles {
+                if let Err(e) = self.backend.close(handle).await {
+                    tracing::warn!(
+                        "Failed to close evicted chunk file (path={}, chunk={}): {:?}",
+                        key.path,
+                        key.chunk_index,
+                        e
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Close a chunk file handle
@@ -834,6 +903,7 @@ impl IOUringChunkStore {
     }
 
     /// Delete all chunks for a file
+    /// Handles the sharded directory structure: base_dir/path_hash/shard/chunk_index
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "iouring_delete_file_chunks", skip(self), fields(path = file_path))]
     pub async fn delete_file_chunks(&self, file_path: &str) -> ChunkStoreResult<usize> {
@@ -859,16 +929,30 @@ impl IOUringChunkStore {
             self.close_chunk_file(&key.path, key.chunk_index).await?;
         }
 
-        // Delete all chunk files
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            if entry.path().is_file() {
-                self.backend.unlink(&entry.path()).await?;
+        // Delete all chunk files in all shard directories
+        for shard_entry in std::fs::read_dir(&dir)? {
+            let shard_entry = shard_entry?;
+            let shard_path = shard_entry.path();
+
+            if shard_path.is_dir() {
+                // Delete all chunk files in this shard directory
+                for chunk_entry in std::fs::read_dir(&shard_path)? {
+                    let chunk_entry = chunk_entry?;
+                    if chunk_entry.path().is_file() {
+                        self.backend.unlink(&chunk_entry.path()).await?;
+                        deleted_count += 1;
+                    }
+                }
+                // Remove the shard directory
+                self.backend.rmdir(&shard_path).await?;
+            } else if shard_path.is_file() {
+                // Handle legacy non-sharded files (backward compatibility)
+                self.backend.unlink(&shard_path).await?;
                 deleted_count += 1;
             }
         }
 
-        // Remove the directory using io_uring backend
+        // Remove the path_hash directory
         self.backend.rmdir(&dir).await?;
 
         tracing::debug!("Deleted {} chunks for path {}", deleted_count, file_path);

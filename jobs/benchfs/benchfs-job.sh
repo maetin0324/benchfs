@@ -382,7 +382,7 @@ run_node_diagnostics() {
 
     echo "Running diagnostics on ${node}..."
 
-    # 1. fio READ performance test
+    # 1. fio READ performance test (single file)
     ssh "$node" "cd /scr && fio --name=read_test --rw=read --bs=4M --size=1G \
         --direct=1 --runtime=${FIO_RUNTIME} --time_based --output-format=json \
         --filename=/scr/fio_test_read_\$(hostname).dat" 2>/dev/null > "$diag_dir/fio_read.json" &
@@ -394,20 +394,45 @@ run_node_diagnostics() {
         --direct=1 --runtime=${FIO_RUNTIME} --time_based --output-format=json \
         --filename=/scr/fio_test_write_\$(hostname).dat" 2>/dev/null > "$diag_dir/fio_write.json"
 
-    # 3. NVMe SMART information
+    # 3. Multi-file fio READ test (simulates BenchFS workload)
+    # Creates 100 files of 4MB each to test directory/metadata performance
+    ssh "$node" "test_dir=/scr/fio_multifile_test_\$(hostname) && \
+        mkdir -p \$test_dir && \
+        cd \$test_dir && \
+        fio --name=multifile_write --rw=write --bs=4M --filesize=4M \
+            --nrfiles=100 --directory=\$test_dir \
+            --direct=1 --runtime=${FIO_RUNTIME} --time_based \
+            --output-format=json 2>/dev/null && \
+        fio --name=multifile_read --rw=read --bs=4M --filesize=4M \
+            --nrfiles=100 --directory=\$test_dir \
+            --direct=1 --runtime=${FIO_RUNTIME} --time_based \
+            --output-format=json" 2>/dev/null > "$diag_dir/fio_multifile_read.json" &
+    local multifile_pid=$!
+
+    # 4. iostat baseline (r_await analysis)
+    # Collect 5 samples at 1-second intervals to get average r_await
+    ssh "$node" "iostat -x 1 5 2>/dev/null | grep -E '^(Device|nvme|md|sd)'" > "$diag_dir/iostat_baseline.txt" &
+
+    # 5. RAID status check
+    ssh "$node" "cat /proc/mdstat 2>/dev/null || echo 'No RAID'" > "$diag_dir/mdstat.txt" &
+
+    # 6. NVMe SMART information
     ssh "$node" "sudo nvme smart-log /dev/nvme0n1 2>/dev/null || echo 'NVMe SMART not available'" > "$diag_dir/nvme_smart.txt" &
 
-    # 4. Current I/O status
-    ssh "$node" "iostat -x 1 3 2>/dev/null || echo 'iostat not available'" > "$diag_dir/iostat.txt" &
-
-    # 5. Other processes' I/O status
+    # 7. Other processes' I/O status
     ssh "$node" "ps aux --sort=-%mem | head -20" > "$diag_dir/processes.txt" &
 
-    # 6. Disk usage
+    # 8. Disk usage
     ssh "$node" "df -h /scr" > "$diag_dir/disk_usage.txt" &
 
-    # 7. Clean up test files
+    # Wait for multifile test to complete
+    wait $multifile_pid
+
+    # 9. Clean up test files (single file tests)
     ssh "$node" "rm -f /scr/fio_test_read_*.dat /scr/fio_test_write_*.dat" &
+
+    # 10. Clean up multi-file test directory
+    ssh "$node" "rm -rf /scr/fio_multifile_test_\$(hostname)" &
 
     wait
     echo "Diagnostics completed for ${node}"
@@ -450,16 +475,45 @@ run_all_node_diagnostics() {
 
     # Quick summary of results
     echo "Quick diagnostic summary:"
+    printf "  %-12s %12s %12s %12s %12s %12s\n" "Node" "READ" "WRITE" "MF_READ" "md0_r_await" "RAID"
+    printf "  %-12s %12s %12s %12s %12s %12s\n" "----" "----" "-----" "-------" "-----------" "----"
     for node in "${nodes[@]}"; do
         local read_bw="N/A"
         local write_bw="N/A"
+        local mf_read_bw="N/A"
+        local md0_rawait="N/A"
+        local raid_status="N/A"
+
         if [ -f "${DIAGNOSTICS_DIR}/${node}/fio_read.json" ]; then
-            read_bw=$(jq -r '.jobs[0].read.bw_bytes // 0' "${DIAGNOSTICS_DIR}/${node}/fio_read.json" 2>/dev/null | awk '{printf "%.1f", $1/1024/1024}')
+            read_bw=$(jq -r '.jobs[0].read.bw_bytes // 0' "${DIAGNOSTICS_DIR}/${node}/fio_read.json" 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}')
         fi
         if [ -f "${DIAGNOSTICS_DIR}/${node}/fio_write.json" ]; then
-            write_bw=$(jq -r '.jobs[0].write.bw_bytes // 0' "${DIAGNOSTICS_DIR}/${node}/fio_write.json" 2>/dev/null | awk '{printf "%.1f", $1/1024/1024}')
+            write_bw=$(jq -r '.jobs[0].write.bw_bytes // 0' "${DIAGNOSTICS_DIR}/${node}/fio_write.json" 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}')
         fi
-        echo "  ${node}: READ=${read_bw} MiB/s, WRITE=${write_bw} MiB/s"
+        if [ -f "${DIAGNOSTICS_DIR}/${node}/fio_multifile_read.json" ]; then
+            mf_read_bw=$(jq -r '.jobs[0].read.bw_bytes // 0' "${DIAGNOSTICS_DIR}/${node}/fio_multifile_read.json" 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}')
+        fi
+        if [ -f "${DIAGNOSTICS_DIR}/${node}/iostat_baseline.txt" ]; then
+            # Get r_await (column 6 in newer iostat, or extract from the line)
+            # iostat -x output: Device r/s rkB/s rrqm/s %rrqm r_await ...
+            md0_rawait=$(grep "^md0" "${DIAGNOSTICS_DIR}/${node}/iostat_baseline.txt" 2>/dev/null | tail -1 | awk '{print $6}')
+            if [ -z "$md0_rawait" ]; then
+                md0_rawait="N/A"
+            fi
+        fi
+        if [ -f "${DIAGNOSTICS_DIR}/${node}/mdstat.txt" ]; then
+            if grep -q "No RAID" "${DIAGNOSTICS_DIR}/${node}/mdstat.txt" 2>/dev/null; then
+                raid_status="NoRAID"
+            elif grep -q "rebuilding\|recovery" "${DIAGNOSTICS_DIR}/${node}/mdstat.txt" 2>/dev/null; then
+                raid_status="REBUILD"
+            elif grep -q "active" "${DIAGNOSTICS_DIR}/${node}/mdstat.txt" 2>/dev/null; then
+                raid_status="OK"
+            else
+                raid_status="UNKNOWN"
+            fi
+        fi
+
+        printf "  %-12s %12s %12s %12s %12s %12s\n" "$node" "${read_bw}" "${write_bw}" "${mf_read_bw}" "${md0_rawait}" "${raid_status}"
     done
     echo "=========================================="
     echo ""
