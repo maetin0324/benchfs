@@ -4,3 +4,6 @@
 [submodule "lib/pluvio"]
 	path = lib/pluvio
 	url = https://github.com/maetin0324/pluvio.git
+[submodule "ior_integration/io500"]
+	path = ior_integration/io500
+	url = https://github.com/maetin0324/io500.git

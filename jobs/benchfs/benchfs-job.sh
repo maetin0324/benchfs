@@ -57,6 +57,9 @@ STATS_OUTPUT_DIR="${JOB_OUTPUT_DIR}/stats"
 # Taskset configuration for CPU pinning
 : ${TASKSET:=0}
 : ${TASKSET_CORES:=0,1}
+# Node diagnostics configuration
+: ${ENABLE_NODE_DIAGNOSTICS:=0}
+: ${FIO_RUNTIME:=30}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -322,6 +325,7 @@ fi
 echo "RUST_LOG (server): ${RUST_LOG_S}"
 echo "RUST_LOG (client): ${RUST_LOG_C}"
 echo "TASKSET: ${TASKSET} (cores: ${TASKSET_CORES})"
+echo "Node Diagnostics: ENABLE_NODE_DIAGNOSTICS=${ENABLE_NODE_DIAGNOSTICS:-0} (FIO_RUNTIME=${FIO_RUNTIME:-30}s)"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -360,6 +364,146 @@ mkdir -p "${IOR_OUTPUT_DIR}"
 
 echo "prepare stats output dir: ${STATS_OUTPUT_DIR}"
 mkdir -p "${STATS_OUTPUT_DIR}"
+
+# ==============================================================================
+# Node Diagnostics Functions
+# ==============================================================================
+# These functions perform pre-benchmark diagnostics to identify nodes with
+# potential I/O performance issues before the actual benchmark runs.
+
+DIAGNOSTICS_DIR="${JOB_OUTPUT_DIR}/diagnostics"
+
+# Run diagnostics on a single node
+# Usage: run_node_diagnostics <node>
+run_node_diagnostics() {
+    local node=$1
+    local diag_dir="${DIAGNOSTICS_DIR}/${node}"
+    mkdir -p "$diag_dir"
+
+    echo "Running diagnostics on ${node}..."
+
+    # 1. fio READ performance test
+    ssh "$node" "cd /scr && fio --name=read_test --rw=read --bs=4M --size=1G \
+        --direct=1 --runtime=${FIO_RUNTIME} --time_based --output-format=json \
+        --filename=/scr/fio_test_read_\$(hostname).dat" 2>/dev/null > "$diag_dir/fio_read.json" &
+    local read_pid=$!
+
+    # 2. fio WRITE performance test (runs after read completes)
+    wait $read_pid
+    ssh "$node" "cd /scr && fio --name=write_test --rw=write --bs=4M --size=1G \
+        --direct=1 --runtime=${FIO_RUNTIME} --time_based --output-format=json \
+        --filename=/scr/fio_test_write_\$(hostname).dat" 2>/dev/null > "$diag_dir/fio_write.json"
+
+    # 3. NVMe SMART information
+    ssh "$node" "sudo nvme smart-log /dev/nvme0n1 2>/dev/null || echo 'NVMe SMART not available'" > "$diag_dir/nvme_smart.txt" &
+
+    # 4. Current I/O status
+    ssh "$node" "iostat -x 1 3 2>/dev/null || echo 'iostat not available'" > "$diag_dir/iostat.txt" &
+
+    # 5. Other processes' I/O status
+    ssh "$node" "ps aux --sort=-%mem | head -20" > "$diag_dir/processes.txt" &
+
+    # 6. Disk usage
+    ssh "$node" "df -h /scr" > "$diag_dir/disk_usage.txt" &
+
+    # 7. Clean up test files
+    ssh "$node" "rm -f /scr/fio_test_read_*.dat /scr/fio_test_write_*.dat" &
+
+    wait
+    echo "Diagnostics completed for ${node}"
+}
+
+# Run diagnostics on all nodes in parallel
+# Usage: run_all_node_diagnostics
+run_all_node_diagnostics() {
+    if [ "${ENABLE_NODE_DIAGNOSTICS}" -ne 1 ]; then
+        echo "Node diagnostics disabled (set ENABLE_NODE_DIAGNOSTICS=1 to enable)"
+        return 0
+    fi
+
+    echo "=========================================="
+    echo "Running Pre-Benchmark Node Diagnostics"
+    echo "=========================================="
+
+    mkdir -p "${DIAGNOSTICS_DIR}"
+
+    # Get unique nodes from PBS_NODEFILE
+    local nodes=($(sort -u "${PBS_NODEFILE}"))
+    local pids=()
+
+    echo "Running diagnostics on ${#nodes[@]} nodes..."
+
+    # Run diagnostics on all nodes in parallel
+    for node in "${nodes[@]}"; do
+        run_node_diagnostics "$node" &
+        pids+=($!)
+    done
+
+    # Wait for all diagnostics to complete
+    for pid in "${pids[@]}"; do
+        wait $pid
+    done
+
+    echo "All node diagnostics completed"
+    echo "Results saved to: ${DIAGNOSTICS_DIR}"
+    echo ""
+
+    # Quick summary of results
+    echo "Quick diagnostic summary:"
+    for node in "${nodes[@]}"; do
+        local read_bw="N/A"
+        local write_bw="N/A"
+        if [ -f "${DIAGNOSTICS_DIR}/${node}/fio_read.json" ]; then
+            read_bw=$(jq -r '.jobs[0].read.bw_bytes // 0' "${DIAGNOSTICS_DIR}/${node}/fio_read.json" 2>/dev/null | awk '{printf "%.1f", $1/1024/1024}')
+        fi
+        if [ -f "${DIAGNOSTICS_DIR}/${node}/fio_write.json" ]; then
+            write_bw=$(jq -r '.jobs[0].write.bw_bytes // 0' "${DIAGNOSTICS_DIR}/${node}/fio_write.json" 2>/dev/null | awk '{printf "%.1f", $1/1024/1024}')
+        fi
+        echo "  ${node}: READ=${read_bw} MiB/s, WRITE=${write_bw} MiB/s"
+    done
+    echo "=========================================="
+    echo ""
+}
+
+# Start background iostat monitoring on a node
+# Usage: start_iostat_monitoring <node> <output_file>
+start_iostat_monitoring() {
+    local node=$1
+    local output_file=$2
+    ssh "$node" "iostat -x 5 > ${output_file} 2>&1 &" &
+}
+
+# Start iostat monitoring on all nodes
+# Usage: start_all_iostat_monitoring <run_id>
+start_all_iostat_monitoring() {
+    if [ "${ENABLE_NODE_DIAGNOSTICS}" -ne 1 ]; then
+        return 0
+    fi
+
+    local run_id=$1
+    local nodes=($(sort -u "${PBS_NODEFILE}"))
+
+    echo "Starting iostat monitoring on all nodes for run ${run_id}..."
+    for node in "${nodes[@]}"; do
+        local diag_dir="${DIAGNOSTICS_DIR}/${node}"
+        mkdir -p "$diag_dir"
+        start_iostat_monitoring "$node" "${diag_dir}/iostat_during_run${run_id}.txt"
+    done
+}
+
+# Stop iostat monitoring on all nodes
+# Usage: stop_all_iostat_monitoring
+stop_all_iostat_monitoring() {
+    if [ "${ENABLE_NODE_DIAGNOSTICS}" -ne 1 ]; then
+        return 0
+    fi
+
+    local nodes=($(sort -u "${PBS_NODEFILE}"))
+    echo "Stopping iostat monitoring on all nodes..."
+    for node in "${nodes[@]}"; do
+        ssh "$node" "pkill -f 'iostat -x 5'" 2>/dev/null || true
+    done
+}
 
 if [ "${ENABLE_PERFETTO}" -eq 1 ] || [ "${ENABLE_CHROME}" -eq 1 ]; then
   echo "prepare trace output dir: ${PERFETTO_OUTPUT_DIR}"
@@ -477,6 +621,9 @@ cmd_mpirun_kill=(
 
 echo "Kill any previous benchfsd instances"
 "${cmd_mpirun_kill[@]}" || true
+
+# Run pre-benchmark node diagnostics (if enabled)
+run_all_node_diagnostics
 
 # Load benchmark parameters from configuration file
 PARAM_FILE="${PARAM_FILE:-${SCRIPT_DIR}/../params/standard.conf}"
@@ -776,11 +923,17 @@ EOF
 
           save_job_metadata
 
+          # Start iostat monitoring during benchmark (if enabled)
+          start_all_iostat_monitoring "$runid"
+
           echo "${cmd_ior[@]}"
           # NOTE: Use simple redirection instead of process substitution to avoid FD leak
           "${cmd_ior[@]}" \
             > "${ior_stdout_file}" \
             2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || true
+
+          # Stop iostat monitoring
+          stop_all_iostat_monitoring
 
           # Stop BenchFS servers gracefully (for perf compatibility)
           # Using SIGTERM allows graceful shutdown so perf can flush its data

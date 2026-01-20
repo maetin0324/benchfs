@@ -103,11 +103,16 @@ impl IOUringBackend {
                 .ok_or(StorageError::InvalidHandle(handle))?
         };
 
+        // Measure io_uring write_fixed operation time
+        let start = std::time::Instant::now();
+
         // Write data using write_fixed with registered buffer (zero-copy DMA)
         let (bytes_written_raw, _fixed_buffer) = dma_file
             .write_fixed(fixed_buffer, offset)
             .await
             .map_err(StorageError::IoError)?;
+
+        let elapsed = start.elapsed();
 
         if bytes_written_raw < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
@@ -117,11 +122,13 @@ impl IOUringBackend {
 
         let bytes_written = data_len.min(bytes_written_raw as usize);
 
-        tracing::trace!(
-            "Wrote {} bytes (zero-copy) to fd={} at offset={}",
+        tracing::debug!(
+            "write_fixed_direct: {} bytes in {:?} to fd={} at offset={} ({:.2} MiB/s)",
             bytes_written,
+            elapsed,
             handle.0,
-            offset
+            offset,
+            (bytes_written as f64 / elapsed.as_secs_f64()) / (1024.0 * 1024.0)
         );
 
         Ok(bytes_written)
@@ -160,11 +167,16 @@ impl IOUringBackend {
                 .ok_or(StorageError::InvalidHandle(handle))?
         };
 
+        // Measure io_uring read_fixed operation time
+        let start = std::time::Instant::now();
+
         // Read data using read_fixed with registered buffer (zero-copy DMA)
         let (bytes_read_raw, fixed_buffer) = dma_file
             .read_fixed(fixed_buffer, offset)
             .await
             .map_err(StorageError::IoError)?;
+
+        let elapsed = start.elapsed();
 
         if bytes_read_raw < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
@@ -174,11 +186,13 @@ impl IOUringBackend {
 
         let bytes_read = bytes_read_raw as usize;
 
-        tracing::trace!(
-            "Read {} bytes (zero-copy) from fd={} at offset={}",
+        tracing::debug!(
+            "read_fixed_direct: {} bytes in {:?} from fd={} at offset={} ({:.2} MiB/s)",
             bytes_read,
+            elapsed,
             handle.0,
-            offset
+            offset,
+            (bytes_read as f64 / elapsed.as_secs_f64()) / (1024.0 * 1024.0)
         );
 
         Ok((bytes_read, fixed_buffer))

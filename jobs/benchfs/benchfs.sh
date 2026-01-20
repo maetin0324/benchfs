@@ -12,6 +12,7 @@ TIMESTAMP="$(timestamp)"
 : ${RUST_LOG_C:=warn}    # RUST_LOG for client (IOR)
 : ${TASKSET:=0}          # Set to 1 to enable taskset CPU pinning for benchfsd_mpi
 : ${TASKSET_CORES:=0,1}  # CPU cores to pin benchfsd_mpi to when TASKSET=1
+: ${ENABLE_NODE_DIAGNOSTICS:=0}  # Set to 1 to enable pre-benchmark node diagnostics
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -126,6 +127,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -v RUST_LOG_C="$RUST_LOG_C"
         -v TASKSET="$TASKSET"
         -v TASKSET_CORES="$TASKSET_CORES"
+        -v ENABLE_NODE_DIAGNOSTICS="$ENABLE_NODE_DIAGNOSTICS"
         # -v SEP_SCR=yes
         "${JOB_FILE}"
       )
