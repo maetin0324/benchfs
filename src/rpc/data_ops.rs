@@ -1615,6 +1615,248 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
     }
 }
 
+// ============================================================================
+// FsyncChunk RPC
+// ============================================================================
+
+/// RPC ID for fsync chunk operation
+pub const RPC_FSYNC_CHUNK: RpcId = 14;
+
+/// FsyncChunk request header with embedded path
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct FsyncChunkRequestHeader {
+    /// Chunk index to fsync
+    pub chunk_index: u64,
+
+    /// Actual path length (valid bytes in path_buffer)
+    pub path_len: u64,
+
+    /// Fixed-size path buffer (256 bytes)
+    pub path_buffer: [u8; MAX_RPC_PATH_LENGTH],
+}
+
+impl FsyncChunkRequestHeader {
+    pub fn new(chunk_index: u64, path: &str) -> Self {
+        let mut path_buffer = [0u8; MAX_RPC_PATH_LENGTH];
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len().min(MAX_RPC_PATH_LENGTH);
+        path_buffer[..path_len].copy_from_slice(&path_bytes[..path_len]);
+
+        Self {
+            chunk_index,
+            path_len: path_len as u64,
+            path_buffer,
+        }
+    }
+
+    /// Get the path as a string slice
+    pub fn path(&self) -> Result<&str, std::str::Utf8Error> {
+        let path_len = self.path_len as usize;
+        std::str::from_utf8(&self.path_buffer[..path_len])
+    }
+}
+
+/// FsyncChunk response header
+#[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct FsyncChunkResponseHeader {
+    /// Status code (0 = success, non-zero = error)
+    pub status: i32,
+
+    /// Padding for alignment
+    _padding: [u8; 4],
+}
+
+impl FsyncChunkResponseHeader {
+    pub fn success() -> Self {
+        Self {
+            status: 0,
+            _padding: [0; 4],
+        }
+    }
+
+    pub fn error(status: i32) -> Self {
+        Self {
+            status,
+            _padding: [0; 4],
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.status == 0
+    }
+}
+
+/// FsyncChunk RPC request
+pub struct FsyncChunkRequest {
+    header: FsyncChunkRequestHeader,
+}
+
+impl FsyncChunkRequest {
+    pub fn new(path: String, chunk_index: u64) -> Self {
+        Self {
+            header: FsyncChunkRequestHeader::new(chunk_index, &path),
+        }
+    }
+}
+
+impl AmRpc for FsyncChunkRequest {
+    type RequestHeader = FsyncChunkRequestHeader;
+    type ResponseHeader = FsyncChunkResponseHeader;
+
+    fn rpc_id() -> RpcId {
+        RPC_FSYNC_CHUNK
+    }
+
+    fn call_type(&self) -> AmRpcCallType {
+        AmRpcCallType::Put // Fsync is a write-like operation
+    }
+
+    fn request_header(&self) -> &Self::RequestHeader {
+        &self.header
+    }
+
+    fn request_data(&self) -> &[IoSlice<'_>] {
+        &[]
+    }
+
+    #[async_backtrace::framed]
+    async fn call(&self, client: &RpcClient) -> Result<Self::ResponseHeader, RpcError> {
+        client.execute(self).await
+    }
+
+    #[async_backtrace::framed]
+    async fn call_no_reply(&self, client: &RpcClient) -> Result<(), RpcError> {
+        client.execute_no_reply(self).await
+    }
+
+    #[async_backtrace::framed]
+    #[tracing::instrument(level = "trace", name = "rpc_fsync_chunk_handler", skip(ctx, am_msg))]
+    async fn server_handler(
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        am_msg: AmMsg,
+    ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        let header: Self::RequestHeader = match parse_header(&am_msg) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Failed to parse FsyncChunk request header: {:?}", e);
+                return Err((RpcError::InvalidHeader, am_msg));
+            }
+        };
+
+        let path = match header.path() {
+            Ok(p) => p.to_string(),
+            Err(_) => {
+                tracing::error!("Invalid path in FsyncChunk request");
+                return Err((RpcError::InvalidHeader, am_msg));
+            }
+        };
+
+        let chunk_index = header.chunk_index;
+
+        tracing::trace!(
+            "FsyncChunk RPC received: path={}, chunk={}",
+            path,
+            chunk_index
+        );
+
+        // Fsync the chunk using the chunk store
+        use crate::storage::chunk_store::IOUringChunkStore;
+        use std::any::Any;
+
+        let chunk_store_any = &*ctx.chunk_store as &dyn Any;
+
+        let response_header = if let Some(io_uring_store) =
+            chunk_store_any.downcast_ref::<IOUringChunkStore>()
+        {
+            match io_uring_store.fsync_chunk(&path, chunk_index).await {
+                Ok(()) => {
+                    tracing::trace!(
+                        "Fsynced chunk (path={}, chunk={})",
+                        path,
+                        chunk_index
+                    );
+                    FsyncChunkResponseHeader::success()
+                }
+                Err(e) => {
+                    tracing::error!("Failed to fsync chunk: {:?}", e);
+                    FsyncChunkResponseHeader::error(-5)
+                }
+            }
+        } else {
+            // No io_uring store, fsync is a no-op for in-memory store
+            tracing::trace!(
+                "FsyncChunk: No io_uring store, returning success (path={}, chunk={})",
+                path,
+                chunk_index
+            );
+            FsyncChunkResponseHeader::success()
+        };
+
+        // Send response
+        if !am_msg.need_reply() {
+            tracing::error!("Message does not support reply");
+            return Err((
+                RpcError::HandlerError("Message does not support reply".to_string()),
+                am_msg,
+            ));
+        }
+
+        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
+        let header_bytes: &[u8] = &header_vec;
+
+        let result = unsafe {
+            am_msg
+                .reply_vectorized(
+                    Self::rpc_id() as u32,
+                    header_bytes,
+                    &[],
+                    false,
+                    None,
+                )
+                .await
+        };
+
+        if let Err(e) = result {
+            tracing::error!("Failed to send FsyncChunk reply: {:?}", e);
+            return Err((
+                RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
+                am_msg,
+            ));
+        }
+
+        Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
+    }
+
+    fn error_response(error: &RpcError) -> Self::ResponseHeader {
+        let status = match error {
+            RpcError::InvalidHeader => -1,
+            RpcError::TransportError(_) => -2,
+            RpcError::HandlerError(_) => -3,
+            RpcError::ConnectionError(_) => -4,
+            RpcError::Timeout => -5,
+        };
+        FsyncChunkResponseHeader::error(status)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

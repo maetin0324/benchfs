@@ -246,7 +246,7 @@ STATS_OUTPUT_DIR="${JOB_OUTPUT_DIR}/stats"
 # ゼロコピーとRendezvousプロトコルの最適化
 
 # export UCX_ZCOPY_THRESH=0                # ゼロコピー常時有効（0 = 常時）
-# export UCX_RNDV_SCHEME=auto              # Rendezvous方式: GET with zero-copy
+export UCX_RNDV_SCHEME=get_zcopy              
 
 # InfiniBand固有設定
 # export UCX_IB_NUM_PATHS=2                # IBパス数

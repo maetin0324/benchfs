@@ -776,6 +776,51 @@ impl IOUringChunkStore {
         Ok(buffer)
     }
 
+    /// Fsync a chunk file to ensure data is persisted to disk
+    ///
+    /// This opens the chunk file, calls fsync, and closes it.
+    /// Used to ensure write durability before returning from fsync operations.
+    #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "chunk_fsync", skip(self), fields(path = file_path, chunk = chunk_index))]
+    pub async fn fsync_chunk(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+
+        if !chunk_file_path.exists() {
+            // File doesn't exist, nothing to sync
+            return Ok(());
+        }
+
+        // Open the chunk file for reading (just need to get a handle for fsync)
+        let flags = OpenFlags {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+            append: false,
+            direct: false,
+        };
+
+        let handle = self.backend.open(&chunk_file_path, flags).await?;
+
+        // Call fsync on the file
+        let result = self.backend.fsync(handle).await;
+
+        // Close the file handle
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after fsync: {:?}", e);
+        }
+
+        result?;
+
+        tracing::trace!(
+            "Fsynced chunk (path={}, chunk_index={})",
+            file_path,
+            chunk_index
+        );
+
+        Ok(())
+    }
+
     /// Delete a chunk file
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "iouring_delete_chunk", skip(self), fields(path = file_path, chunk = chunk_index))]

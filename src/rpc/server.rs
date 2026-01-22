@@ -247,6 +247,7 @@ impl RpcServer {
     /// This is a convenience method that starts listeners for all standard RPC types:
     /// - ReadChunkById (RPC_READ_CHUNK_BY_ID) - FileId-based read
     /// - WriteChunkById (RPC_WRITE_CHUNK_BY_ID) - FileId-based write
+    /// - FsyncChunk (RPC_FSYNC_CHUNK) - Fsync chunk data to disk
     /// - MetadataLookup (RPC_METADATA_LOOKUP)
     /// - MetadataCreateFile (RPC_METADATA_CREATE_FILE)
     /// - MetadataCreateDir (RPC_METADATA_CREATE_DIR)
@@ -360,6 +361,20 @@ impl RpcServer {
                     }
                 },
                 "rpc_metadata_update_handler".to_string(),
+            );
+        }
+
+        // Spawn FsyncChunk handler
+        {
+            use crate::rpc::data_ops::FsyncChunkRequest;
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<FsyncChunkRequest, _, _>().await {
+                        tracing::error!("FsyncChunk handler error: {:?}", e);
+                    }
+                },
+                "rpc_fsync_chunk_handler".to_string(),
             );
         }
 

@@ -593,96 +593,135 @@ impl BenchFS {
                         // NOTE: Chunk cache disabled for read operations to ensure consistency
                         // in distributed environments where other nodes may modify the same data.
 
+                        // Calculate target node for this chunk
+                        let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                        let target_node = fs.get_chunk_node(&chunk_key);
+                        let self_node_id = fs.metadata_manager.self_node_id().to_string();
+                        let is_local = target_node == self_node_id;
+
                         tracing::trace!(
-                            "Reading chunk {} (offset={}, size={}, buf_offset={})",
+                            "Reading chunk {} (offset={}, size={}, buf_offset={}, is_local={})",
                             chunk_index,
                             chunk_offset,
                             read_size,
-                            buf_offset
+                            buf_offset,
+                            is_local
                         );
 
-                        // Try local storage first with actual offset and size
-                        match fs
-                            .chunk_store
-                            .read_chunk(&file_path, chunk_index, chunk_offset, read_size)
-                            .await
-                        {
-                            Ok(chunk_data) => {
-                                // Copy to user buffer (no caching for consistency)
-                                let copy_len = chunk_data.len().min(chunk_buf.len());
-                                chunk_buf[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
-                                (chunk_index, Ok::<usize, ()>(copy_len))
-                            }
-                            Err(_) => {
-                                if let Some(pool) = &fs.connection_pool {
-                                    let chunk_key = format!("{}/{}", &file_path, chunk_index);
-                                    let node_id = fs.get_chunk_node(&chunk_key);
-
-                                    tracing::debug!(
-                                        "Fetching chunk {} from remote node {} (offset={}, size={})",
-                                        chunk_index,
-                                        node_id,
-                                        chunk_offset,
-                                        read_size
+                        if is_local {
+                            // Read from local storage
+                            match fs
+                                .chunk_store
+                                .read_chunk(&file_path, chunk_index, chunk_offset, read_size)
+                                .await
+                            {
+                                Ok(chunk_data) => {
+                                    // Copy to user buffer (no caching for consistency)
+                                    let copy_len = chunk_data.len().min(chunk_buf.len());
+                                    chunk_buf[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
+                                    // Debug logging for load distribution analysis
+                                    tracing::info!(
+                                        target: "node_transfer",
+                                        op = "READ",
+                                        target_node = %self_node_id,
+                                        bytes = copy_len,
+                                        chunk_index = chunk_index,
+                                        is_local = true,
+                                        "NODE_TRANSFER"
                                     );
-
-                                    match pool.get_or_connect(&node_id).await {
-                                        Ok(client) => {
-                                            // Use FileId-based RPC for compact headers (32 bytes vs 288 bytes)
-                                            // FileId contains path_hash (lower 32 bits) and chunk_id (upper 32 bits)
-                                            let file_id = FileId::new(&file_path, chunk_index);
-
-                                            // Zero-copy: Read directly into user buffer
-                                            let request = ReadChunkByIdRequest::from_file_id(
-                                                file_id,
-                                                chunk_offset,
-                                                read_size,
-                                                chunk_buf,
-                                            );
-
-                                            match request.call(&*client).await {
-                                                Ok(response) if response.is_success() => {
-                                                    let bytes_read = response.bytes_read as usize;
-                                                    tracing::debug!(
-                                                        "Successfully fetched {} bytes from remote node (zero-copy, FileId)",
-                                                        bytes_read
-                                                    );
-                                                    // Note: For zero-copy reads, we don't cache
-                                                    // because the data is already in the user buffer
-                                                    (chunk_index, Ok(bytes_read))
-                                                }
-                                                Ok(response) => {
-                                                    tracing::warn!(
-                                                        "Remote read (FileId) failed with status {}",
-                                                        response.status
-                                                    );
-                                                    // Fill with zeros on error
-                                                    chunk_buf.fill(0);
-                                                    (chunk_index, Ok(chunk_buf.len()))
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!("RPC error (FileId read): {:?}", e);
-                                                    chunk_buf.fill(0);
-                                                    (chunk_index, Ok(chunk_buf.len()))
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to connect to {}: {:?}",
-                                                node_id,
-                                                e
-                                            );
-                                            chunk_buf.fill(0);
-                                            (chunk_index, Ok(chunk_buf.len()))
-                                        }
-                                    }
-                                } else {
-                                    // No connection pool, fill with zeros (sparse file)
+                                    (chunk_index, Ok::<usize, ()>(copy_len))
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to read local chunk {}: {:?}",
+                                        chunk_index,
+                                        e
+                                    );
+                                    // Fill with zeros on error
                                     chunk_buf.fill(0);
                                     (chunk_index, Ok(chunk_buf.len()))
                                 }
                             }
+                        } else if let Some(pool) = &fs.connection_pool {
+                            // Read from remote node
+                            let node_id = target_node.clone();
+
+                            tracing::debug!(
+                                "Fetching chunk {} from remote node {} (offset={}, size={})",
+                                chunk_index,
+                                node_id,
+                                chunk_offset,
+                                read_size
+                            );
+
+                            match pool.get_or_connect(&node_id).await {
+                                Ok(client) => {
+                                    // Use FileId-based RPC for compact headers (32 bytes vs 288 bytes)
+                                    // FileId contains path_hash (lower 32 bits) and chunk_id (upper 32 bits)
+                                    let file_id = FileId::new(&file_path, chunk_index);
+
+                                    // Zero-copy: Read directly into user buffer
+                                    let request = ReadChunkByIdRequest::from_file_id(
+                                        file_id,
+                                        chunk_offset,
+                                        read_size,
+                                        chunk_buf,
+                                    );
+
+                                    match request.call(&*client).await {
+                                        Ok(response) if response.is_success() => {
+                                            let bytes_read = response.bytes_read as usize;
+                                            tracing::debug!(
+                                                "Successfully fetched {} bytes from remote node (zero-copy, FileId)",
+                                                bytes_read
+                                            );
+                                            // Debug logging for load distribution analysis
+                                            tracing::info!(
+                                                target: "node_transfer",
+                                                op = "READ",
+                                                target_node = %node_id,
+                                                bytes = bytes_read,
+                                                chunk_index = chunk_index,
+                                                is_local = false,
+                                                "NODE_TRANSFER"
+                                            );
+                                            (chunk_index, Ok(bytes_read))
+                                        }
+                                        Ok(response) => {
+                                            tracing::warn!(
+                                                "Remote read (FileId) failed with status {}",
+                                                response.status
+                                            );
+                                            // Fill with zeros on error
+                                            chunk_buf.fill(0);
+                                            (chunk_index, Ok(chunk_buf.len()))
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("RPC error (FileId read): {:?}", e);
+                                            chunk_buf.fill(0);
+                                            (chunk_index, Ok(chunk_buf.len()))
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to connect to {}: {:?}",
+                                        node_id,
+                                        e
+                                    );
+                                    chunk_buf.fill(0);
+                                    (chunk_index, Ok(chunk_buf.len()))
+                                }
+                            }
+                        } else {
+                            // No connection pool and chunk is not local - fill with zeros
+                            tracing::warn!(
+                                "Chunk {} is on node {} but no connection pool available",
+                                chunk_index,
+                                target_node
+                            );
+                            chunk_buf.fill(0);
+                            (chunk_index, Ok(chunk_buf.len()))
                         }
                     },
                     format!("benchfs_read_chunk_{}", chunk_index),
@@ -792,6 +831,16 @@ impl BenchFS {
                                         chunk_index, e
                                     ))
                                 })?;
+                            // Debug logging for load distribution analysis
+                            tracing::info!(
+                                target: "node_transfer",
+                                op = "WRITE",
+                                target_node = %target_node,
+                                bytes = data_len,
+                                chunk_index = chunk_index,
+                                is_local = true,
+                                "NODE_TRANSFER"
+                            );
                             Ok::<usize, ApiError>(data_len)
                         } else if let Some(pool) = &fs.connection_pool {
                             // Write to remote node using node_id
@@ -817,6 +866,16 @@ impl BenchFS {
                                             tracing::debug!(
                                                 "Successfully wrote {} bytes to remote node (FileId)",
                                                 response.bytes_written
+                                            );
+                                            // Debug logging for load distribution analysis
+                                            tracing::info!(
+                                                target: "node_transfer",
+                                                op = "WRITE",
+                                                target_node = %target_node,
+                                                bytes = data_len,
+                                                chunk_index = chunk_index,
+                                                is_local = false,
+                                                "NODE_TRANSFER"
                                             );
                                             Ok(data_len)
                                         }
@@ -1122,33 +1181,115 @@ impl BenchFS {
     /// * `handle` - File handle
     ///
     /// # Note
-    /// For InMemoryChunkStore, this is a no-op since data is already in memory.
-    /// For persistent backends (IOUringChunkStore), this ensures all writes are
-    /// flushed to disk before returning.
+    /// This ensures all writes are flushed to disk before returning.
+    /// For distributed mode, fsync RPCs are sent to remote nodes holding chunks.
     #[async_backtrace::framed]
     pub async fn benchfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
+        use futures::future::join_all;
         use std::path::Path;
+
         let path_ref = Path::new(&handle.path);
 
-        // Get file metadata to get inode and chunk information
+        // Get file metadata to get chunk information
         let file_meta = self
             .metadata_manager
             .get_file_metadata(path_ref)
             .map_err(|e| ApiError::Internal(format!("Failed to get metadata: {:?}", e)))?;
 
-        // For each chunk in the file, ensure it's synced to disk
-        // Note: InMemoryChunkStore doesn't need fsync, but IOUringChunkStore would
-        // Since we can't call fsync on InMemoryChunkStore directly, we log the operation
+        let chunk_count = file_meta.calculate_chunk_count();
+        let file_path = file_meta.path.clone();
+
         tracing::debug!(
             "fsync called for file {} with {} chunks",
             handle.path,
-            file_meta.calculate_chunk_count()
+            chunk_count
         );
 
-        // In the future, when using IOUringChunkStore, we would call:
-        // for chunk_idx in 0..file_meta.chunk_count {
-        //     self.chunk_store.fsync_chunk(file_meta.inode, chunk_idx).await?;
-        // }
+        if chunk_count == 0 {
+            return Ok(());
+        }
+
+        // Group chunks by target node
+        let self_node_id = self.metadata_manager.self_node_id().to_string();
+        let fs_ptr = self as *const BenchFS;
+
+        // Create fsync futures for all chunks
+        let fsync_futures: Vec<_> = (0..chunk_count)
+            .map(|chunk_index| {
+                let file_path = file_path.clone();
+                let self_node_id = self_node_id.clone();
+
+                spawn_with_name(
+                    async move {
+                        let fs = unsafe { &*fs_ptr };
+                        let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                        let target_node = fs.get_chunk_node(&chunk_key);
+                        let is_local = target_node == self_node_id;
+
+                        if is_local {
+                            // Fsync local chunk
+                            fs.chunk_store
+                                .fsync_chunk(&file_path, chunk_index)
+                                .await
+                                .map_err(|e| {
+                                    ApiError::IoError(format!(
+                                        "Failed to fsync chunk {}: {:?}",
+                                        chunk_index, e
+                                    ))
+                                })
+                        } else if let Some(pool) = &fs.connection_pool {
+                            // Send fsync RPC to remote node
+                            match pool.get_or_connect(&target_node).await {
+                                Ok(client) => {
+                                    use crate::rpc::data_ops::FsyncChunkRequest;
+
+                                    let request =
+                                        FsyncChunkRequest::new(file_path.clone(), chunk_index);
+                                    match request.call(&*client).await {
+                                        Ok(response) if response.is_success() => {
+                                            tracing::trace!(
+                                                "Remote fsync chunk {} on node {} succeeded",
+                                                chunk_index,
+                                                target_node
+                                            );
+                                            Ok(())
+                                        }
+                                        Ok(response) => Err(ApiError::IoError(format!(
+                                            "Remote fsync chunk {} failed with status {}",
+                                            chunk_index, response.status
+                                        ))),
+                                        Err(e) => Err(ApiError::IoError(format!(
+                                            "RPC error for fsync chunk {}: {:?}",
+                                            chunk_index, e
+                                        ))),
+                                    }
+                                }
+                                Err(e) => Err(ApiError::IoError(format!(
+                                    "Failed to connect to {} for fsync: {:?}",
+                                    target_node, e
+                                ))),
+                            }
+                        } else {
+                            // No connection pool in standalone mode, local fsync only
+                            Ok(())
+                        }
+                    },
+                    format!("benchfs_fsync_chunk_{}", chunk_index),
+                )
+            })
+            .collect();
+
+        // Execute all fsync operations concurrently
+        let results = join_all(fsync_futures).await;
+
+        // Check for any errors
+        for result in results {
+            let chunk_result = result
+                .map_err(|e| ApiError::Internal(format!("Fsync task failed: {}", e)))?;
+            chunk_result?;
+        }
+
+        tracing::debug!("fsync completed for file {} ({} chunks)", handle.path, chunk_count);
 
         Ok(())
     }
