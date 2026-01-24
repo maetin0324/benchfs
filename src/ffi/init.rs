@@ -234,13 +234,33 @@ pub struct benchfs_context_t {
 /// - Chunk store directory creation fails
 /// - Server registration fails
 /// - Client cannot connect to server (timeout after 30 seconds)
+/// Initialize a BenchFS context
+///
+/// # Arguments
+///
+/// * `node_id` - Node identifier (unique per process)
+/// * `registry_dir` - Directory for service discovery
+/// * `data_dir` - Data storage directory (required for server, optional for client)
+/// * `is_server` - Non-zero for server mode, zero for client mode
+/// * `chunk_size` - Chunk size in bytes (0 to use default 4MiB)
+///
+/// # Returns
+///
+/// Pointer to initialized context, or NULL on error
 #[unsafe(no_mangle)]
 pub extern "C" fn benchfs_init(
     node_id: *const c_char,
     registry_dir: *const c_char,
     data_dir: *const c_char,
     is_server: i32,
+    chunk_size: usize,
 ) -> *mut benchfs_context_t {
+    // Use default chunk size if 0 is passed
+    let chunk_size = if chunk_size == 0 {
+        crate::metadata::CHUNK_SIZE
+    } else {
+        chunk_size
+    };
     crate::logging::init_with_hostname("info");
 
     // Validate pointers
@@ -323,9 +343,11 @@ pub extern "C" fn benchfs_init(
         tracing::info!("Starting IoUringReactor initialization...");
         let start = std::time::Instant::now();
 
+        tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
+            chunk_size, chunk_size / (1024 * 1024));
         let uring_reactor = IoUringReactor::builder()
             .queue_size(512) // Reduced to prevent kernel resource contention
-            .buffer_size(1 << 20) // 1 MiB per buffer (512 × 1MiB = 512MiB total)
+            .buffer_size(chunk_size) // Match chunk_size from config
             .submit_depth(64) // Reduced from 128
             .wait_submit_timeout(std::time::Duration::from_micros(1))
             .wait_complete_timeout(std::time::Duration::from_micros(1))
@@ -433,6 +455,7 @@ pub extern "C" fn benchfs_init(
             connection_pool.clone(),
             data_nodes,
             metadata_nodes,
+            chunk_size,
         ));
 
         // Store in thread-local storage
@@ -555,9 +578,11 @@ pub extern "C" fn benchfs_init(
         tracing::info!("Starting IoUringReactor initialization...");
         let start = std::time::Instant::now();
 
+        tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
+            chunk_size, chunk_size / (1024 * 1024));
         let uring_reactor = IoUringReactor::builder()
             .queue_size(512) // Reduced from 2048 to prevent kernel resource contention
-            .buffer_size(1 << 20) // 1 MiB (512 × 1MiB = 512MiB total, reduced from 8GiB)
+            .buffer_size(chunk_size) // Match chunk_size from config
             .submit_depth(64) // Reduced from 128
             .wait_submit_timeout(std::time::Duration::from_micros(1))
             .wait_complete_timeout(std::time::Duration::from_micros(1))
@@ -609,6 +634,7 @@ pub extern "C" fn benchfs_init(
             connection_pool.clone(),
             data_nodes,
             metadata_nodes,
+            chunk_size,
         ));
 
         // Runtime already stored in thread-local storage above

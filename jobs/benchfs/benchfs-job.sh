@@ -246,7 +246,7 @@ STATS_OUTPUT_DIR="${JOB_OUTPUT_DIR}/stats"
 # ゼロコピーとRendezvousプロトコルの最適化
 
 # export UCX_ZCOPY_THRESH=0                # ゼロコピー常時有効（0 = 常時）
-export UCX_RNDV_SCHEME=get_zcopy              
+# export UCX_RNDV_SCHEME=put_zcopy             
 
 # InfiniBand固有設定
 # export UCX_IB_NUM_PATHS=2                # IBパス数
@@ -965,10 +965,11 @@ EOF
             -a BENCHFS
             -t "$transfer_size"
             -b "$block_size"
-            -D 300
+            -D 120
             $ior_flags
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"
+            --benchfs.chunk-size="${benchfs_chunk_size}"
             -o "${BENCHFS_DATA_DIR}/testfile"
             -O summaryFormat=JSON
             -O summaryFile="${ior_json_file}"

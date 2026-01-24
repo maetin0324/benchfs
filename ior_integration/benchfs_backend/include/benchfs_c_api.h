@@ -59,13 +59,15 @@ typedef struct {
  * @param registry_dir Shared directory for service discovery
  * @param data_dir Data directory (for server nodes)
  * @param is_server 1 if this node is a server, 0 for client
+ * @param chunk_size Chunk size in bytes (0 to use default 4MiB)
  * @return Pointer to context on success, NULL on failure
  */
 benchfs_context_t* benchfs_init(
     const char* node_id,
     const char* registry_dir,
     const char* data_dir,
-    int is_server
+    int is_server,
+    size_t chunk_size
 );
 
 /**

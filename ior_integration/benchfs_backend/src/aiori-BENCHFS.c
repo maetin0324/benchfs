@@ -30,6 +30,7 @@ typedef struct {
   char *registry_dir;     /* Shared directory for service discovery */
   char *data_dir;         /* Data directory for server nodes */
   int use_mpi_rank;       /* Use MPI rank for node ID */
+  size_t chunk_size;      /* Chunk size in bytes (0 = use default 4MiB) */
 } benchfs_options_t;
 
 /* Global state */
@@ -54,6 +55,7 @@ static option_help * BENCHFS_options(
     o->registry_dir = strdup("/tmp/benchfs_registry");
     o->data_dir = strdup("/tmp/benchfs_data");
     o->use_mpi_rank = 1;
+    o->chunk_size = 0;  /* 0 means use default (4MiB) */
   }
 
   *init_backend_options = (aiori_mod_opt_t*)o;
@@ -65,6 +67,8 @@ static option_help * BENCHFS_options(
        OPTION_OPTIONAL_ARGUMENT, 's', &o->data_dir},
       {0, "benchfs.use-mpi-rank", "Use MPI rank for node ID",
        OPTION_FLAG, 'd', &o->use_mpi_rank},
+      {0, "benchfs.chunk-size", "Chunk size in bytes (0 = default 4MiB)",
+       OPTION_OPTIONAL_ARGUMENT, 'l', &o->chunk_size},
       LAST_OPTION
   };
 
@@ -103,7 +107,10 @@ static void BENCHFS_Initialize(aiori_mod_opt_t *options) {
   /* All ranks initialize as clients */
   char node_id[64];
   snprintf(node_id, sizeof(node_id), "ior_client_%d", benchfs_rank);
-  benchfs_ctx = benchfs_init(node_id, o->registry_dir, NULL, 0);
+  if (benchfs_rank == 0) {
+    fprintf(out_logfile, "BENCHFS: Chunk size: %zu bytes\n", o->chunk_size);
+  }
+  benchfs_ctx = benchfs_init(node_id, o->registry_dir, NULL, 0, o->chunk_size);
   if (benchfs_ctx == NULL) {
     ERRF("BENCHFS client initialization failed: %s", benchfs_get_error());
   }

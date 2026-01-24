@@ -364,6 +364,7 @@ cmd_ior_perf=(
   -w -r
   --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
   --benchfs.datadir="${BENCHFS_DATA_DIR}"
+  --benchfs.chunk-size="${benchfs_chunk_size}"
   -o "${BENCHFS_DATA_DIR}/testfile"
   -O summaryFormat=JSON
   -O summaryFile="${IOR_OUTPUT_DIR}/ior_result.json"

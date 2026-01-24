@@ -316,17 +316,19 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         tracing::info!("Using io_uring for storage backend");
 
         // Create io_uring reactor
-        // Buffer size must be at least as large as the maximum transfer size used by IOR
-        // IOR typically uses 2MB-4MB transfer sizes, so we use 4MB to be safe
+        // Buffer size must match the chunk_size from config to support chunk-sized I/O operations
         // Optimized parameters for high-throughput workloads:
         // - queue_size: 4096 (increased from 2048 to improve read performance)
         //   With 32 nodes * 16 ppn = 512 clients, need enough buffers for concurrent I/O
-        //   Memory usage per server: 4096 * 4MiB = 16 GiB (acceptable for large-scale benchmarks)
+        //   Memory usage per server: 4096 * chunk_size (e.g., 4096 * 4MiB = 16 GiB)
         // - submit_depth: 128 for better batching and throughput
-        // - Aggressive timeouts (10μs) to minimize latency in polling mode
+        // - Aggressive timeouts (10ms) to minimize latency in polling mode
+        let chunk_size = config.storage.chunk_size;
+        tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
+            chunk_size, chunk_size / (1024 * 1024));
         let uring_reactor = IoUringReactor::builder()
             .queue_size(4096)
-            .buffer_size(4 << 20) // 4 MiB (increased from 1 MiB to support larger IOR transfer sizes)
+            .buffer_size(chunk_size)
             .submit_depth(128)
             .wait_submit_timeout(std::time::Duration::from_millis(10))
             .wait_complete_timeout(std::time::Duration::from_millis(10))

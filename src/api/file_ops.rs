@@ -5,7 +5,7 @@ use std::collections::HashMap;
 /// This module provides POSIX-like file operations that work with
 /// the distributed metadata and data storage.
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use futures_timer::Delay;
@@ -118,17 +118,20 @@ impl BenchFS {
     /// * `connection_pool` - Connection pool for RPC communication
     /// * `data_nodes` - List of data nodes for chunk placement
     /// * `metadata_nodes` - List of metadata server nodes
+    /// * `chunk_size` - Chunk size for data partitioning (must match server config)
     pub fn with_distributed_metadata(
         node_id: String,
         chunk_store: Rc<IOUringChunkStore>,
         connection_pool: Rc<ConnectionPool>,
         data_nodes: Vec<String>,
         metadata_nodes: Vec<String>,
+        chunk_size: usize,
     ) -> Self {
         BenchFSBuilder::new(node_id, chunk_store)
             .with_connection_pool(connection_pool)
             .with_data_nodes(data_nodes)
             .with_metadata_nodes(metadata_nodes)
+            .with_chunk_size(chunk_size)
             .build()
     }
 
@@ -620,7 +623,7 @@ impl BenchFS {
                                     let copy_len = chunk_data.len().min(chunk_buf.len());
                                     chunk_buf[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
                                     // Debug logging for load distribution analysis
-                                    tracing::info!(
+                                    tracing::debug!(
                                         target: "node_transfer",
                                         op = "READ",
                                         target_node = %self_node_id,
@@ -668,15 +671,40 @@ impl BenchFS {
                                         chunk_buf,
                                     );
 
-                                    match request.call(&*client).await {
+                                    // RPC_TRANSFER_TIMING: Measure RPC read time (remove later if overhead is concern)
+                                    let rpc_start = Instant::now();
+                                    let rpc_result = request.call(&*client).await;
+                                    let rpc_elapsed = rpc_start.elapsed();
+                                    // END RPC_TRANSFER_TIMING
+
+                                    match rpc_result {
                                         Ok(response) if response.is_success() => {
                                             let bytes_read = response.bytes_read as usize;
+
+                                            // RPC_TRANSFER_TIMING: Log read transfer timing (remove later if overhead is concern)
+                                            let elapsed_us = rpc_elapsed.as_micros() as f64;
+                                            let bandwidth_mib_s = if elapsed_us > 0.0 {
+                                                (bytes_read as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
+                                            } else {
+                                                0.0
+                                            };
+                                            tracing::debug!(
+                                                target: "rpc_transfer",
+                                                op = "READ",
+                                                target_node = %node_id,
+                                                bytes = bytes_read,
+                                                elapsed_us = elapsed_us as u64,
+                                                bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
+                                                "RPC_TRANSFER"
+                                            );
+                                            // END RPC_TRANSFER_TIMING
+
                                             tracing::debug!(
                                                 "Successfully fetched {} bytes from remote node (zero-copy, FileId)",
                                                 bytes_read
                                             );
                                             // Debug logging for load distribution analysis
-                                            tracing::info!(
+                                            tracing::debug!(
                                                 target: "node_transfer",
                                                 op = "READ",
                                                 target_node = %node_id,
@@ -832,7 +860,7 @@ impl BenchFS {
                                     ))
                                 })?;
                             // Debug logging for load distribution analysis
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "node_transfer",
                                 op = "WRITE",
                                 target_node = %target_node,
@@ -860,15 +888,39 @@ impl BenchFS {
                                         chunk_data.as_slice(),
                                     );
 
+                                    // RPC_TRANSFER_TIMING: Measure RPC write time (remove later if overhead is concern)
+                                    let rpc_start = Instant::now();
+                                    let rpc_result = request.call(&*client).await;
+                                    let rpc_elapsed = rpc_start.elapsed();
+                                    // END RPC_TRANSFER_TIMING
+
                                     // Execute RPC
-                                    match request.call(&*client).await {
+                                    match rpc_result {
                                         Ok(response) if response.is_success() => {
+                                            // RPC_TRANSFER_TIMING: Log write transfer timing (remove later if overhead is concern)
+                                            let elapsed_us = rpc_elapsed.as_micros() as f64;
+                                            let bandwidth_mib_s = if elapsed_us > 0.0 {
+                                                (data_len as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
+                                            } else {
+                                                0.0
+                                            };
+                                            tracing::debug!(
+                                                target: "rpc_transfer",
+                                                op = "WRITE",
+                                                target_node = %target_node,
+                                                bytes = data_len,
+                                                elapsed_us = elapsed_us as u64,
+                                                bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
+                                                "RPC_TRANSFER"
+                                            );
+                                            // END RPC_TRANSFER_TIMING
+
                                             tracing::debug!(
                                                 "Successfully wrote {} bytes to remote node (FileId)",
                                                 response.bytes_written
                                             );
                                             // Debug logging for load distribution analysis
-                                            tracing::info!(
+                                            tracing::debug!(
                                                 target: "node_transfer",
                                                 op = "WRITE",
                                                 target_node = %target_node,
@@ -1606,6 +1658,7 @@ pub struct BenchFSBuilder {
     data_nodes: Option<Vec<String>>,
     metadata_nodes: Option<Vec<String>>,
     chunk_cache_mb: usize,
+    chunk_size: usize,
 }
 
 impl BenchFSBuilder {
@@ -1622,7 +1675,16 @@ impl BenchFSBuilder {
             data_nodes: None,
             metadata_nodes: None,
             chunk_cache_mb: crate::config::defaults::CHUNK_CACHE_MB,
+            chunk_size: crate::metadata::CHUNK_SIZE,
         }
+    }
+
+    /// Set the chunk size for data partitioning
+    ///
+    /// This must match the server's chunk_size configuration.
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
     }
 
     /// Set the connection pool for distributed mode
@@ -1653,7 +1715,9 @@ impl BenchFSBuilder {
     pub fn build(self) -> BenchFS {
         let metadata_manager = Rc::new(MetadataManager::new(self.node_id.clone()));
         let chunk_cache = ChunkCache::with_memory_limit(self.chunk_cache_mb);
-        let chunk_manager = ChunkManager::new();
+        let chunk_manager = ChunkManager::with_chunk_size(self.chunk_size);
+        tracing::info!("BenchFS configured with chunk_size={} bytes ({} MiB)",
+            self.chunk_size, self.chunk_size / (1024 * 1024));
 
         // Determine placement nodes
         let placement_nodes = self
