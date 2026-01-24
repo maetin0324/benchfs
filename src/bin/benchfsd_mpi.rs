@@ -93,6 +93,9 @@ fn main() {
     let mut stats_output: Option<PathBuf> = None;
     let mut positional_args: Vec<&String> = Vec::new();
 
+    // Set BENCHFS_RPC_TIMEOUT to 3 second for MPI environment
+    unsafe { std::env::set_var("BENCHFS_RPC_TIMEOUT", "3"); }
+
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--trace-output" {
@@ -318,18 +321,30 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         // Create io_uring reactor
         // Buffer size must match the chunk_size from config to support chunk-sized I/O operations
         // Optimized parameters for high-throughput workloads:
-        // - queue_size: 4096 (increased from 2048 to improve read performance)
-        //   With 32 nodes * 16 ppn = 512 clients, need enough buffers for concurrent I/O
-        //   Memory usage per server: 4096 * chunk_size (e.g., 4096 * 4MiB = 16 GiB)
+        // - queue_size: Scales inversely with chunk_size to handle more concurrent operations
+        //   Base: 4 MiB chunk -> 4096 buffers (16 GiB memory)
+        //   Smaller chunks = more RPCs per transfer, need proportionally more buffers
+        //   Example: 1 MiB chunk -> 16384 buffers (still 16 GiB memory)
         // - submit_depth: 128 for better batching and throughput
         // - Aggressive timeouts (10ms) to minimize latency in polling mode
         let chunk_size = config.storage.chunk_size;
-        tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
-            chunk_size, chunk_size / (1024 * 1024));
+        let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
+        let chunk_multiplier = (base_chunk_size / chunk_size).max(1);
+        let queue_size = (4096 * chunk_multiplier as u32).min(65536); // Cap at 65536
+        let submit_depth = (128 * chunk_multiplier as u32).min(512); // Cap at 512
+
+        tracing::info!(
+            "Configuring io_uring: buffer_size={} bytes ({} MiB), queue_size={}, submit_depth={}, memory={}GiB",
+            chunk_size,
+            chunk_size / (1024 * 1024),
+            queue_size,
+            submit_depth,
+            (queue_size as usize * chunk_size) / (1024 * 1024 * 1024)
+        );
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(4096)
+            .queue_size(queue_size)
             .buffer_size(chunk_size)
-            .submit_depth(128)
+            .submit_depth(submit_depth)
             .wait_submit_timeout(std::time::Duration::from_millis(10))
             .wait_complete_timeout(std::time::Duration::from_millis(10))
             .build();

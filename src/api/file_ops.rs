@@ -414,6 +414,48 @@ impl BenchFS {
 
                                     0 // Dummy inode
                                 }
+                                Ok(response) if response.status == -17 => {
+                                    // EEXIST: File already exists (race condition with other clients)
+                                    // POSIX O_CREAT without O_EXCL semantics: open existing file instead of failing
+                                    tracing::debug!(
+                                        "Remote create returned EEXIST for {}, opening existing file",
+                                        path
+                                    );
+
+                                    // Fetch metadata from remote server to cache locally
+                                    let lookup_request = MetadataLookupRequest::new(path.to_string());
+                                    match lookup_request.call(&*client).await {
+                                        Ok(lookup_response) if lookup_response.is_success() && lookup_response.is_file() => {
+                                            // Cache the existing file metadata locally
+                                            let file_meta = FileMetadata::new(path.to_string(), lookup_response.size);
+                                            if let Err(e) = self.metadata_manager.store_file_metadata(file_meta) {
+                                                tracing::warn!(
+                                                    "Failed to cache metadata after EEXIST fallback: {:?}",
+                                                    e
+                                                );
+                                            } else {
+                                                tracing::debug!(
+                                                    "Cached existing file metadata for {} after EEXIST",
+                                                    path
+                                                );
+                                            }
+                                            0 // Dummy inode - file exists, continue with open
+                                        }
+                                        Ok(_) => {
+                                            // File disappeared between create and lookup - very rare race condition
+                                            return Err(ApiError::Internal(format!(
+                                                "File {} disappeared after EEXIST during lookup",
+                                                path
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            return Err(ApiError::Internal(format!(
+                                                "Failed to lookup file {} after EEXIST: {:?}",
+                                                path, e
+                                            )));
+                                        }
+                                    }
+                                }
                                 Ok(response) => {
                                     return Err(ApiError::Internal(format!(
                                         "Remote create failed with status {}",
@@ -817,12 +859,19 @@ impl BenchFS {
             self.chunk_cache.invalidate(&chunk_id);
         }
 
-        // Write all chunks concurrently
-        tracing::trace!("Writing {} chunks concurrently", chunks.len());
-        use futures::future::join_all;
+        // Write chunks with bounded concurrency to prevent server overload
+        // When transfer_size > chunk_size, multiple RPCs are generated per transfer.
+        // Unbounded concurrency (join_all) can overwhelm the server, causing timeouts.
+        use crate::config::defaults::MAX_CONCURRENT_CHUNK_RPCS;
+        use futures::stream::{self, StreamExt};
+        tracing::trace!(
+            "Writing {} chunks with max {} concurrent RPCs",
+            chunks.len(),
+            MAX_CONCURRENT_CHUNK_RPCS
+        );
 
         let fs_ptr = self as *const BenchFS;
-        let chunk_write_futures: Vec<_> = chunks
+        let chunk_write_futures = chunks
             .iter()
             .enumerate()
             .map(|(idx, (chunk_index, chunk_offset, write_size))| {
@@ -956,10 +1005,14 @@ impl BenchFS {
                     format!("benchfs_write_chunk_{}", chunk_index),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        // Execute all writes concurrently
-        let write_results_handles = join_all(chunk_write_futures).await;
+        // Execute writes with bounded concurrency
+        // buffer_unordered allows up to MAX_CONCURRENT_CHUNK_RPCS in-flight at once
+        let write_results_handles: Vec<_> = stream::iter(chunk_write_futures)
+            .buffer_unordered(MAX_CONCURRENT_CHUNK_RPCS)
+            .collect()
+            .await;
 
         // Check results and calculate total bytes written
         tracing::trace!("Completed {} chunk writes", write_results_handles.len());
