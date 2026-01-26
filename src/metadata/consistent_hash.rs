@@ -94,7 +94,9 @@ impl ConsistentHashRing {
 
     /// 指定されたキーに対応するノードを取得
     ///
-    /// ファイル名をkoyama_hashでハッシュ化し、モジュロ演算でノードを選択する。
+    /// ファイル名をkoyama_hashでハッシュ化し、黄金比を使った混合関数でノードを選択する。
+    /// 単純なモジュロ演算と異なり、連続したチャンクインデックスが異なるノードに
+    /// 分散されるため、block_sizeがノード数の倍数でも負荷が偏らない。
     ///
     /// # Arguments
     /// * `key` - 検索するキー (通常はファイルパス)
@@ -107,7 +109,16 @@ impl ConsistentHashRing {
         }
 
         let hash = koyama_hash(key.as_bytes());
-        let index = (hash as usize) % self.nodes.len();
+
+        // Use golden ratio-based multiplicative hashing for better distribution
+        // This breaks the linear relationship between consecutive chunk indices
+        // and their assigned nodes, preventing load imbalance when block_size
+        // is a multiple of the node count.
+        //
+        // Golden ratio constant: (sqrt(5) - 1) / 2 * 2^32 ≈ 0x9e3779b9
+        const PHI: u64 = 0x9e3779b9;
+        let mixed = ((hash as u64).wrapping_mul(PHI)) >> 32;
+        let index = (mixed as usize) % self.nodes.len();
 
         Some(self.nodes[index].clone())
     }
@@ -245,30 +256,50 @@ mod tests {
     }
 
     #[test]
-    fn test_modulo_distribution() {
+    fn test_golden_ratio_distribution() {
         let mut ring = ConsistentHashRing::new();
 
         ring.add_node("node_0".to_string());
         ring.add_node("node_1".to_string());
         ring.add_node("node_2".to_string());
 
-        // koyama_hashはファイル名の数字を数値として解釈するため、
-        // /file/0, /file/1, /file/2 は異なるノードに配置される
+        // 黄金比ハッシュにより、連続したチャンクインデックスが異なるノードに分散される
+        // 同じキーは常に同じノードにマッピングされることを確認
         let node0 = ring.get_node("/file/0").unwrap();
         let node1 = ring.get_node("/file/1").unwrap();
         let node2 = ring.get_node("/file/2").unwrap();
 
-        // hash("/file/0") = '/' + 'f' + 'i' + 'l' + 'e' + '/' + 0 = 47+102+105+108+101+47+0 = 510
-        // 510 % 3 = 0 => node_0
-        assert_eq!(node0, "node_0");
+        // 全てのノードが有効なノードにマッピングされる
+        assert!(["node_0", "node_1", "node_2"].contains(&node0.as_str()));
+        assert!(["node_0", "node_1", "node_2"].contains(&node1.as_str()));
+        assert!(["node_0", "node_1", "node_2"].contains(&node2.as_str()));
 
-        // hash("/file/1") = 510 + 1 = 511
-        // 511 % 3 = 1 => node_1
-        assert_eq!(node1, "node_1");
+        // 同じキーは常に同じノードにマッピングされる（決定論的）
+        assert_eq!(ring.get_node("/file/0").unwrap(), node0);
+        assert_eq!(ring.get_node("/file/1").unwrap(), node1);
+        assert_eq!(ring.get_node("/file/2").unwrap(), node2);
 
-        // hash("/file/2") = 510 + 2 = 512
-        // 512 % 3 = 2 => node_2
-        assert_eq!(node2, "node_2");
+        // 黄金比ハッシュにより、16ノードでの連続チャンク分散を確認
+        let mut ring16 = ConsistentHashRing::new();
+        for i in 0..16 {
+            ring16.add_node(format!("node_{}", i));
+        }
+
+        // 連続した16チャンクが全ノードに分散されることを確認
+        let mut node_counts = std::collections::HashMap::new();
+        for i in 0..16 {
+            let key = format!("/scr/testfile/{}", i);
+            let node = ring16.get_node(&key).unwrap();
+            *node_counts.entry(node).or_insert(0) += 1;
+        }
+
+        // 理想的には16チャンクが16ノードに1つずつ分散される
+        // 黄金比ハッシュにより、少なくとも半分以上のノードが使用される
+        assert!(
+            node_counts.len() >= 8,
+            "Expected at least 8 different nodes, got {}",
+            node_counts.len()
+        );
     }
 
     #[test]

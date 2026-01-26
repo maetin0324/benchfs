@@ -41,11 +41,18 @@ use pluvio_uring::reactor::IoUringReactor;
 ///
 /// * `Ok(Vec<String>)` - List of discovered node IDs (e.g., ["node_0", "node_1", ...])
 /// * `Err(String)` - Error message if discovery fails
+///
+/// # Environment Variables
+///
+/// * `BENCHFS_EXPECTED_NODES` - Expected number of data nodes. If set, the function will
+///   wait until this many nodes are registered before returning. This prevents load imbalance
+///   issues when servers take different amounts of time to start (e.g., due to large buffer
+///   allocations with small chunk sizes).
 fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
     use std::fs;
     use std::path::Path;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let registry_path = Path::new(registry_dir);
     if !registry_path.exists() {
@@ -55,26 +62,42 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
         ));
     }
 
-    // Retry logic to handle race conditions when 256 clients simultaneously scan directory
-    const MAX_RETRIES: u32 = 5;
-    const RETRY_DELAY_MS: u64 = 100;
+    // Check if expected node count is specified via environment variable
+    let expected_nodes: Option<usize> = std::env::var("BENCHFS_EXPECTED_NODES")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
-    for attempt in 0..MAX_RETRIES {
+    if let Some(expected) = expected_nodes {
+        tracing::info!(
+            "BENCHFS_EXPECTED_NODES={}: Will wait for all {} nodes to register",
+            expected,
+            expected
+        );
+    }
+
+    // Extended retry logic when waiting for expected nodes
+    // With expected_nodes: wait up to 60 seconds with 500ms intervals
+    // Without expected_nodes: use original 5 retries with 100ms intervals
+    let max_wait_secs = if expected_nodes.is_some() { 60 } else { 1 };
+    let retry_delay = Duration::from_millis(if expected_nodes.is_some() { 500 } else { 100 });
+    let start_time = Instant::now();
+
+    loop {
         let entries = match fs::read_dir(registry_path) {
             Ok(e) => e,
             Err(err) => {
-                if attempt < MAX_RETRIES - 1 {
+                if start_time.elapsed().as_secs() < max_wait_secs {
                     tracing::debug!(
-                        "Failed to read registry (attempt {}): {}. Retrying...",
-                        attempt + 1,
-                        err
+                        "Failed to read registry: {}. Retrying in {:?}...",
+                        err,
+                        retry_delay
                     );
-                    thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+                    thread::sleep(retry_delay);
                     continue;
                 }
                 return Err(format!(
-                    "Failed to read registry directory {} after {} retries: {}",
-                    registry_dir, MAX_RETRIES, err
+                    "Failed to read registry directory {} after {} seconds: {}",
+                    registry_dir, max_wait_secs, err
                 ));
             }
         };
@@ -98,34 +121,79 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
                 // Extract node ID: "node_0.addr" -> "node_0"
                 let node_id = &filename_str[..filename_str.len() - 5]; // Remove ".addr" suffix
                 node_ids.push(node_id.to_string());
-                tracing::debug!("Discovered data node: {}", node_id);
             }
         }
 
         if !node_ids.is_empty() {
-            // Sort node IDs for deterministic ordering
-            node_ids.sort();
+            // Sort node IDs numerically (e.g., node_0, node_1, ..., node_10, node_11)
+            // Alphabetical sort would produce: node_0, node_1, node_10, node_11, ..., node_2
+            // which causes uneven chunk distribution with koyama_hash
+            node_ids.sort_by(|a, b| {
+                // Extract numeric suffix from node_N format
+                let extract_num = |s: &str| -> Option<u32> {
+                    s.strip_prefix("node_").and_then(|n| n.parse().ok())
+                };
+                match (extract_num(a), extract_num(b)) {
+                    (Some(na), Some(nb)) => na.cmp(&nb),
+                    _ => a.cmp(b), // Fallback to alphabetical for non-standard names
+                }
+            });
 
-            tracing::info!(
-                "Discovered {} data nodes: {:?} (attempt {})",
-                node_ids.len(),
-                node_ids,
-                attempt + 1
-            );
-
-            return Ok(node_ids);
+            // If expected_nodes is set, wait until we have that many nodes
+            if let Some(expected) = expected_nodes {
+                if node_ids.len() >= expected {
+                    tracing::info!(
+                        "Discovered all {} expected data nodes: {:?} (waited {:.1}s)",
+                        node_ids.len(),
+                        node_ids,
+                        start_time.elapsed().as_secs_f64()
+                    );
+                    return Ok(node_ids);
+                } else if start_time.elapsed().as_secs() < max_wait_secs {
+                    tracing::debug!(
+                        "Found {}/{} nodes so far, waiting for more... (elapsed: {:.1}s)",
+                        node_ids.len(),
+                        expected,
+                        start_time.elapsed().as_secs_f64()
+                    );
+                    thread::sleep(retry_delay);
+                    continue;
+                } else {
+                    // Timeout reached but not all nodes found - proceed with what we have
+                    tracing::warn!(
+                        "Timeout waiting for {} nodes. Proceeding with {} nodes: {:?}",
+                        expected,
+                        node_ids.len(),
+                        node_ids
+                    );
+                    return Ok(node_ids);
+                }
+            } else {
+                // No expected_nodes set - return as soon as we find any nodes
+                tracing::info!(
+                    "Discovered {} data nodes: {:?}",
+                    node_ids.len(),
+                    node_ids
+                );
+                return Ok(node_ids);
+            }
         }
 
-        // No nodes found, retry
-        if attempt < MAX_RETRIES - 1 {
-            tracing::debug!("No nodes found in attempt {}, retrying...", attempt + 1);
-            thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+        // No nodes found yet
+        if start_time.elapsed().as_secs() < max_wait_secs {
+            tracing::debug!(
+                "No nodes found yet, retrying... (elapsed: {:.1}s)",
+                start_time.elapsed().as_secs_f64()
+            );
+            thread::sleep(retry_delay);
+        } else {
+            break;
         }
     }
 
     Err(format!(
-        "No data nodes found in registry directory: {} after {} retries",
-        registry_dir, MAX_RETRIES
+        "No data nodes found in registry directory: {} after {} seconds",
+        registry_dir, max_wait_secs
     ))
 }
 
@@ -346,9 +414,9 @@ pub extern "C" fn benchfs_init(
         tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
             chunk_size, chunk_size / (1024 * 1024));
         let uring_reactor = IoUringReactor::builder()
-            .queue_size(512) // Reduced to prevent kernel resource contention
+            .queue_size(32) // Reduced to prevent kernel resource contention
             .buffer_size(chunk_size) // Match chunk_size from config
-            .submit_depth(64) // Reduced from 128
+            .submit_depth(16) // Reduced from 128
             .wait_submit_timeout(std::time::Duration::from_micros(1))
             .wait_complete_timeout(std::time::Duration::from_micros(1))
             .build();
@@ -568,69 +636,20 @@ pub extern "C" fn benchfs_init(
             }
         }
 
-        // Get data_dir for client (use temp dir if not specified)
-        let client_data_dir = match data_dir_str {
-            Some(d) => d.to_string(),
-            None => format!("/tmp/benchfs_client_{}", node_id_str),
-        };
-
-        // Create io_uring reactor (same as server)
-        tracing::info!("Starting IoUringReactor initialization...");
-        let start = std::time::Instant::now();
-
-        tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
-            chunk_size, chunk_size / (1024 * 1024));
-        let uring_reactor = IoUringReactor::builder()
-            .queue_size(512) // Reduced from 2048 to prevent kernel resource contention
-            .buffer_size(chunk_size) // Match chunk_size from config
-            .submit_depth(64) // Reduced from 128
-            .wait_submit_timeout(std::time::Duration::from_micros(1))
-            .wait_complete_timeout(std::time::Duration::from_micros(1))
-            .build();
-
-        tracing::info!(
-            "IoUringReactor initialization completed in {:?}",
-            start.elapsed()
-        );
-
-        let allocator = uring_reactor.allocator.clone();
-        let reactor_for_backend = uring_reactor.clone();
-        runtime.register_reactor("io_uring", uring_reactor);
-
-        // Create IOUringBackend and ChunkStore for client
-        // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
-        let io_backend = Rc::new(IOUringBackend::new(allocator, reactor_for_backend));
-        let chunk_store_dir = format!("{}/chunks", client_data_dir);
-        if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
-            set_error_message(&format!(
-                "Failed to create client chunk store directory: {}",
-                e
-            ));
-            return std::ptr::null_mut();
-        }
-
-        let chunk_store = match IOUringChunkStore::new(&chunk_store_dir, io_backend.clone()) {
-            Ok(store) => Rc::new(store),
-            Err(e) => {
-                set_error_message(&format!("Failed to create client chunk store: {:?}", e));
-                return std::ptr::null_mut();
-            }
-        };
-
-        // Create BenchFS instance with distributed metadata
+        // Create BenchFS client instance with distributed metadata
+        // Client mode does NOT need io_uring or local chunk store - all I/O goes via RPC
         // In MPI mode: node_0 is the metadata server, all nodes are data servers
         // Use the nodes discovered earlier during connection setup
         let metadata_nodes = vec!["node_0".to_string()];
         let data_nodes = discovered_nodes; // Reuse nodes discovered earlier
 
         tracing::info!(
-            "Creating BenchFS client with {} data nodes for distributed storage",
+            "Creating BenchFS client with {} data nodes for distributed storage (no local io_uring)",
             data_nodes.len()
         );
 
-        let benchfs = Rc::new(BenchFS::with_distributed_metadata(
+        let benchfs = Rc::new(BenchFS::new_distributed_client(
             node_id_str.to_string(),
-            chunk_store,
             connection_pool.clone(),
             data_nodes,
             metadata_nodes,

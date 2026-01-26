@@ -589,7 +589,7 @@ impl IOUringChunkStore {
         }
 
         tracing::info!(
-            "IOUringChunkStore initialized (no file handle caching, READ uses page cache, WRITE uses O_DIRECT)"
+            "IOUringChunkStore initialized (no file handle caching, O_DIRECT enabled for both READ and WRITE)"
         );
 
         Ok(Self {
@@ -688,7 +688,7 @@ impl IOUringChunkStore {
             create: write, // Only create on write operations
             truncate: false,
             append: false,
-            direct: write, // O_DIRECT only for WRITE, not for READ
+            direct: true, // Always use O_DIRECT for writes
         };
 
         let handle = self.backend.open(&chunk_file_path, flags).await?;

@@ -521,10 +521,11 @@ run_all_node_diagnostics() {
 
 # Start background iostat monitoring on a node
 # Usage: start_iostat_monitoring <node> <output_file>
+# Note: -t option adds timestamps for time-series analysis
 start_iostat_monitoring() {
     local node=$1
     local output_file=$2
-    ssh "$node" "iostat -x 5 > ${output_file} 2>&1 &" &
+    ssh "$node" "iostat -xt 5 > ${output_file} 2>&1 &" &
 }
 
 # Start iostat monitoring on all nodes
@@ -555,7 +556,7 @@ stop_all_iostat_monitoring() {
     local nodes=($(sort -u "${PBS_NODEFILE}"))
     echo "Stopping iostat monitoring on all nodes..."
     for node in "${nodes[@]}"; do
-        ssh "$node" "pkill -f 'iostat -x 5'" 2>/dev/null || true
+        ssh "$node" "pkill -f 'iostat -xt 5'" 2>/dev/null || true
     done
 }
 
@@ -959,6 +960,7 @@ EOF
             -x RUST_LOG="${RUST_LOG_C}"
             -x RUST_BACKTRACE
             -x BENCHFS_RETRY_STATS_OUTPUT="${retry_stats_dir}/"
+            -x BENCHFS_EXPECTED_NODES="${server_np}"
             # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
             "${IOR_PREFIX}/src/ior"
             -vvv
@@ -966,6 +968,7 @@ EOF
             -t "$transfer_size"
             -b "$block_size"
             -D 120
+            -e
             $ior_flags
             --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
             --benchfs.datadir="${BENCHFS_DATA_DIR}"

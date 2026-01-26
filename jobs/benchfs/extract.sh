@@ -22,6 +22,7 @@
 #   - io_depth_raw.csv, io_depth_aggregated.csv, io_depth_summary.txt
 #   - io_timing_raw.csv, io_timing_aggregated.csv, io_timing_summary.txt
 #   - rpc_transfer_raw.csv, rpc_transfer_aggregated.csv, rpc_transfer_summary.txt
+#   - iostat_raw.csv, iostat_aggregated.csv, iostat_summary.txt
 # ==============================================================================
 
 set -euo pipefail
@@ -128,6 +129,7 @@ run_script "extract_node_transfer_csv.sh" || true
 run_script "extract_io_depth_csv.sh" || true
 run_script "extract_io_timing_csv.sh" || true
 run_script "extract_rpc_transfer_csv.sh" || true
+run_script "extract_iostat_csv.sh" || true
 
 # Summary
 echo ""

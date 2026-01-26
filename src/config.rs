@@ -52,6 +52,13 @@ pub mod defaults {
     pub const fn default_log_level() -> &'static str {
         "info"
     }
+
+    // Client-side RPC limits
+    /// Maximum concurrent chunk RPCs per client operation
+    /// This limits how many chunk read/write RPCs can be in-flight simultaneously
+    /// to prevent overwhelming the server when transfer_size > chunk_size.
+    /// Default: 16 (allows good parallelism while avoiding server overload)
+    pub const MAX_CONCURRENT_CHUNK_RPCS: usize = 16;
 }
 
 /// BenchFS server configuration
