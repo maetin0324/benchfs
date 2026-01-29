@@ -71,4 +71,5 @@ pub mod metadata;
 pub mod perfetto;
 pub mod rpc;
 pub mod server;
+pub mod stats;
 pub mod storage;

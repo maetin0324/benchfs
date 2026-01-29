@@ -13,6 +13,7 @@ TIMESTAMP="$(timestamp)"
 : ${TASKSET:=0}          # Set to 1 to enable taskset CPU pinning for benchfsd_mpi
 : ${TASKSET_CORES:=0,1}  # CPU cores to pin benchfsd_mpi to when TASKSET=1
 : ${ENABLE_NODE_DIAGNOSTICS:=0}  # Set to 1 to enable pre-benchmark node diagnostics
+: ${ENABLE_STATS:=0}     # Set to 1 to enable detailed timing statistics collection
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -128,6 +129,7 @@ for nnodes in "${nnodes_list[@]}"; do
         -v TASKSET="$TASKSET"
         -v TASKSET_CORES="$TASKSET_CORES"
         -v ENABLE_NODE_DIAGNOSTICS="$ENABLE_NODE_DIAGNOSTICS"
+        -v ENABLE_STATS="$ENABLE_STATS"
         # -v SEP_SCR=yes
         "${JOB_FILE}"
       )

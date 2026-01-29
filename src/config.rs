@@ -59,6 +59,12 @@ pub mod defaults {
     /// to prevent overwhelming the server when transfer_size > chunk_size.
     /// Default: 16 (allows good parallelism while avoiding server overload)
     pub const MAX_CONCURRENT_CHUNK_RPCS: usize = 16;
+
+    // Stats/diagnostics
+    /// Enable detailed timing statistics collection (default: false)
+    /// When enabled, collects std::time::Instant measurements for performance analysis
+    /// Disable in production benchmarks to avoid measurement overhead
+    pub const ENABLE_STATS: bool = false;
 }
 
 /// BenchFS server configuration
@@ -89,6 +95,16 @@ pub struct NodeConfig {
     /// Log level (trace, debug, info, warn, error)
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Enable detailed timing statistics collection
+    /// When enabled, collects std::time::Instant measurements for performance analysis
+    /// Disable in production benchmarks to avoid measurement overhead
+    #[serde(default = "default_enable_stats")]
+    pub enable_stats: bool,
+}
+
+fn default_enable_stats() -> bool {
+    defaults::ENABLE_STATS
 }
 
 fn default_log_level() -> String {
@@ -196,6 +212,7 @@ impl Default for ServerConfig {
                 node_id: "node1".to_string(),
                 data_dir: PathBuf::from("/tmp/benchfs"),
                 log_level: default_log_level(),
+                enable_stats: default_enable_stats(),
             },
             storage: StorageConfig {
                 chunk_size: default_chunk_size(),

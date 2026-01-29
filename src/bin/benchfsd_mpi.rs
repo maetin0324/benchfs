@@ -88,9 +88,10 @@ fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse --trace-output and --stats-output options
+    // Parse --trace-output, --stats-output, and --enable-stats options
     let mut trace_output: Option<PathBuf> = None;
     let mut stats_output: Option<PathBuf> = None;
+    let mut enable_stats: bool = false;
     let mut positional_args: Vec<&String> = Vec::new();
 
     // Set BENCHFS_RPC_TIMEOUT to 3 second for MPI environment
@@ -142,6 +143,9 @@ fn main() {
                 }
                 std::process::exit(1);
             }
+        } else if args[i] == "--enable-stats" {
+            enable_stats = true;
+            i += 1;
         } else {
             positional_args.push(&args[i]);
             i += 1;
@@ -160,6 +164,8 @@ fn main() {
             eprintln!("                           Each rank creates <path>_rank<N>.json");
             eprintln!("  --stats-output <path>:   Enable CSV stats output (optional)");
             eprintln!("                           Each rank creates <path>_rank<N>.csv");
+            eprintln!("  --enable-stats:          Enable detailed timing statistics collection (optional)");
+            eprintln!("                           Adds overhead, use only for performance analysis");
         }
         std::process::exit(1);
     }
@@ -170,6 +176,14 @@ fn main() {
     } else {
         "benchfs.toml"
     };
+
+    // Enable detailed timing statistics if requested
+    if enable_stats {
+        benchfs::stats::set_stats_enabled(true);
+        if mpi_rank == 0 {
+            eprintln!("Stats collection enabled - timing overhead will be incurred");
+        }
+    }
 
     // Verify registry directory exists (only rank 0)
     if mpi_rank == 0 {

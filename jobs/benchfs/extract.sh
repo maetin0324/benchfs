@@ -130,6 +130,8 @@ run_script "extract_io_depth_csv.sh" || true
 run_script "extract_io_timing_csv.sh" || true
 run_script "extract_rpc_transfer_csv.sh" || true
 run_script "extract_iostat_csv.sh" || true
+run_script "extract_server_rpc_timing.sh" || true
+run_script "extract_am_timing.sh" || true
 
 # Summary
 echo ""

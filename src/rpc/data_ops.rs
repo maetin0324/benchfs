@@ -7,6 +7,7 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 use crate::metadata::NodeId;
 use crate::rpc::helpers::parse_header;
 use crate::rpc::{AmRpc, AmRpcCallType, RpcClient, RpcError, RpcId};
+use crate::stats::is_stats_enabled;
 
 /// RPC IDs for data operations
 pub const RPC_READ_CHUNK: RpcId = 10;
@@ -1161,11 +1162,17 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Start timing for performance analysis (only when stats enabled)
+        let stats_enabled = is_stats_enabled();
+        let handler_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+
         // Parse request header
         let header: ReadChunkByIdRequestHeader = match parse_header(&am_msg) {
             Ok(h) => h,
             Err(e) => return Err((e, am_msg)),
         };
+
+        let parse_elapsed = handler_start.map(|s| s.elapsed());
 
         tracing::trace!(
             file_id = header.file_id,
@@ -1201,19 +1208,25 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
         let chunk_store_any = &*ctx.chunk_store as &dyn Any;
         let chunk_index = header.chunk_id() as u64;
 
-        let (response_header, response_data, fixed_buffer_opt) = if let Some(io_uring_store) =
+        let (response_header, response_data, fixed_buffer_opt, buffer_acquire_us, io_read_us) = if let Some(io_uring_store) =
             chunk_store_any.downcast_ref::<IOUringChunkStore>()
         {
             tracing::trace!("Using zero-copy path for ReadChunkById");
 
+            // Step 1: Buffer acquisition timing (only when stats enabled)
+            let buffer_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
             let fixed_buffer = ctx.allocator.acquire().await;
+            let buffer_acquire_us = buffer_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
             let read_len = (header.length as usize).min(fixed_buffer.len());
 
+            // Step 2: io_uring READ operation timing (only when stats enabled)
+            let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
             match io_uring_store
                 .read_chunk_fixed(&path, chunk_index, header.offset, fixed_buffer)
                 .await
             {
                 Ok((bytes_read, fixed_buffer)) => {
+                    let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                     let actual_bytes = bytes_read.min(read_len);
                     tracing::trace!(
                         "Read {} bytes (zero-copy) from storage (path={}, chunk={})",
@@ -1225,30 +1238,54 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
                         ReadChunkResponseHeader::success(actual_bytes as u64),
                         None,
                         Some((fixed_buffer, actual_bytes)),
+                        buffer_acquire_us,
+                        io_us,
                     )
                 }
                 Err(e) => {
+                    let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                     tracing::error!("Failed to read chunk (zero-copy): {:?}", e);
-                    (ReadChunkResponseHeader::error(-2), None, None)
+                    (
+                        ReadChunkResponseHeader::error(-2),
+                        None,
+                        None,
+                        buffer_acquire_us,
+                        io_us,
+                    )
                 }
             }
         } else {
             // Fallback path
             tracing::trace!("Using fallback path for ReadChunkById");
 
+            let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
             match ctx
                 .chunk_store
                 .read_chunk(&path, chunk_index, header.offset, header.length)
                 .await
             {
                 Ok(data) => {
+                    let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                     let bytes_read = data.len() as u64;
                     tracing::trace!("Read {} bytes from storage", bytes_read);
-                    (ReadChunkResponseHeader::success(bytes_read), Some(data), None)
+                    (
+                        ReadChunkResponseHeader::success(bytes_read),
+                        Some(data),
+                        None,
+                        0u64,
+                        io_us,
+                    )
                 }
                 Err(e) => {
+                    let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                     tracing::error!("Failed to read chunk: {:?}", e);
-                    (ReadChunkResponseHeader::error(-2), None, None)
+                    (
+                        ReadChunkResponseHeader::error(-2),
+                        None,
+                        None,
+                        0u64,
+                        io_us,
+                    )
                 }
             }
         };
@@ -1262,9 +1299,13 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
             ));
         }
 
+        // Step 3: Response construction timing (only when stats enabled)
+        let response_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
         let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
         let header_bytes: &[u8] = &header_vec;
 
+        // Step 4: RDMA/UCX reply timing (only when stats enabled)
+        let reply_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
         let result = if let Some((mut fixed_buffer, bytes_read)) = fixed_buffer_opt {
             let data_slice = &fixed_buffer.as_mut_slice()[..bytes_read];
             let data_slices = [std::io::IoSlice::new(data_slice)];
@@ -1319,6 +1360,8 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
                     .await
             }
         };
+        let reply_us = reply_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let response_construct_us = response_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
         if let Err(e) = result {
             tracing::error!("Failed to send reply: {:?}", e);
@@ -1326,6 +1369,24 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
                 RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
                 am_msg,
             ));
+        }
+
+        // Log detailed timing breakdown for READ performance analysis (only when stats enabled)
+        if let Some(handler_start) = handler_start {
+            let total_us = handler_start.elapsed().as_micros() as u64;
+            let parse_us = parse_elapsed.map(|d| d.as_micros() as u64).unwrap_or(0);
+            tracing::debug!(
+                rpc_type = "READ",
+                chunk_id = header.chunk_id(),
+                total_us = total_us,
+                parse_us = parse_us,
+                buffer_acquire_us = buffer_acquire_us,
+                io_read_us = io_read_us,
+                response_construct_us = response_construct_us,
+                reply_us = reply_us,
+                bytes = header.length,
+                "RPC_TIMING_READ"
+            );
         }
 
         Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
@@ -1446,11 +1507,17 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
+        // Start timing for performance analysis (only when stats enabled)
+        let stats_enabled = is_stats_enabled();
+        let handler_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+
         // Parse request header
         let header: WriteChunkByIdRequestHeader = match parse_header(&am_msg) {
             Ok(h) => h,
             Err(e) => return Err((e, am_msg)),
         };
+
+        let parse_elapsed = handler_start.map(|s| s.elapsed());
 
         tracing::trace!(
             file_id = header.file_id,
@@ -1495,12 +1562,15 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
         let chunk_store_any = &*ctx.chunk_store as &dyn Any;
         let chunk_index = header.chunk_id() as u64;
 
-        let response_header = if let Some(io_uring_store) =
+        let (response_header, buffer_acquire_us, recv_data_us, io_write_us) = if let Some(io_uring_store) =
             chunk_store_any.downcast_ref::<IOUringChunkStore>()
         {
             tracing::trace!("Using zero-copy path for WriteChunkById");
 
+            // Step 1: Buffer acquisition timing (only when stats enabled)
+            let buffer_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
             let mut fixed_buffer = ctx.allocator.acquire().await;
+            let buffer_acquire_us = buffer_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
             if data_len > fixed_buffer.len() {
                 tracing::error!(
@@ -1508,30 +1578,39 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
                     data_len,
                     fixed_buffer.len()
                 );
-                WriteChunkResponseHeader::error(-22)
+                (WriteChunkResponseHeader::error(-22), buffer_acquire_us, 0u64, 0u64)
             } else {
                 let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
+                // Step 2: Receive data timing (RDMA/UCX) (only when stats enabled)
+                let recv_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
                 if let Err(e) = am_msg.recv_data_single(buffer_slice).await {
+                    let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                     tracing::error!("Failed to receive data (zero-copy): {:?}", e);
-                    WriteChunkResponseHeader::error(-5)
+                    (WriteChunkResponseHeader::error(-5), buffer_acquire_us, recv_us, 0u64)
                 } else {
+                    let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+
+                    // Step 3: io_uring WRITE operation timing (only when stats enabled)
+                    let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
                     match io_uring_store
                         .write_chunk_fixed(&path, chunk_index, header.offset, fixed_buffer, data_len)
                         .await
                     {
                         Ok(bytes_written) => {
+                            let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                             tracing::trace!(
                                 "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
                                 bytes_written,
                                 path,
                                 chunk_index
                             );
-                            WriteChunkResponseHeader::success(header.length)
+                            (WriteChunkResponseHeader::success(header.length), buffer_acquire_us, recv_us, io_us)
                         }
                         Err(e) => {
+                            let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                             tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
-                            WriteChunkResponseHeader::error(-5)
+                            (WriteChunkResponseHeader::error(-5), buffer_acquire_us, recv_us, io_us)
                         }
                     }
                 }
@@ -1542,27 +1621,34 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
 
             let mut data = vec![0u8; data_len];
 
+            let recv_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
             if let Err(e) = am_msg.recv_data_single(&mut data).await {
+                let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                 tracing::error!("Failed to receive data: {:?}", e);
-                WriteChunkResponseHeader::error(-5)
+                (WriteChunkResponseHeader::error(-5), 0u64, recv_us, 0u64)
             } else {
+                let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+
+                let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
                 match ctx
                     .chunk_store
                     .write_chunk(&path, chunk_index, header.offset, &data)
                     .await
                 {
                     Ok(_bytes_written) => {
+                        let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                         tracing::trace!(
                             "Wrote {} bytes to storage (path={}, chunk={})",
                             data.len(),
                             path,
                             chunk_index
                         );
-                        WriteChunkResponseHeader::success(header.length)
+                        (WriteChunkResponseHeader::success(header.length), 0u64, recv_us, io_us)
                     }
                     Err(e) => {
+                        let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
                         tracing::error!("Failed to write chunk: {:?}", e);
-                        WriteChunkResponseHeader::error(-5)
+                        (WriteChunkResponseHeader::error(-5), 0u64, recv_us, io_us)
                     }
                 }
             }
@@ -1577,9 +1663,13 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
             ));
         }
 
+        // Step 4: Response construction timing (only when stats enabled)
+        let response_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
         let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
         let header_bytes: &[u8] = &header_vec;
 
+        // Step 5: Reply timing (only when stats enabled)
+        let reply_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
         let result = unsafe {
             am_msg
                 .reply_vectorized(
@@ -1591,6 +1681,8 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
                 )
                 .await
         };
+        let reply_us = reply_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let response_construct_us = response_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
         if let Err(e) = result {
             tracing::error!("Failed to send reply: {:?}", e);
@@ -1598,6 +1690,25 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
                 RpcError::TransportError(format!("Failed to send reply: {:?}", e)),
                 am_msg,
             ));
+        }
+
+        // Log detailed timing breakdown for WRITE performance analysis (only when stats enabled)
+        if let Some(handler_start) = handler_start {
+            let total_us = handler_start.elapsed().as_micros() as u64;
+            let parse_us = parse_elapsed.map(|d| d.as_micros() as u64).unwrap_or(0);
+            tracing::debug!(
+                rpc_type = "WRITE",
+                chunk_id = header.chunk_id(),
+                total_us = total_us,
+                parse_us = parse_us,
+                buffer_acquire_us = buffer_acquire_us,
+                recv_data_us = recv_data_us,
+                io_write_us = io_write_us,
+                response_construct_us = response_construct_us,
+                reply_us = reply_us,
+                bytes = header.length,
+                "RPC_TIMING_WRITE"
+            );
         }
 
         Ok((crate::rpc::ServerResponse::new(response_header), am_msg))

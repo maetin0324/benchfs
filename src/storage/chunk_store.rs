@@ -668,30 +668,42 @@ impl IOUringChunkStore {
         chunk_index: u64,
         write: bool,
     ) -> ChunkStoreResult<FileHandle> {
+        let open_start = std::time::Instant::now();
+
         // Ensure shard directory exists (includes path_hash and shard subdirectory)
         if write {
             self.ensure_chunk_dir(file_path, chunk_index)?;
         }
+        let ensure_dir_elapsed = open_start.elapsed();
+
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
-        // O_DIRECT strategy:
-        // - WRITE: Use O_DIRECT to bypass page cache and utilize NVMe write buffers
-        //   This provides maximum write throughput by avoiding page cache overhead
-        // - READ: Do NOT use O_DIRECT, allowing OS page cache to cache data
-        //   This significantly improves read performance when data is accessed repeatedly
-        //
-        // This hybrid approach addresses the READ performance problem where O_DIRECT
-        // forced every read to go to disk, even for recently written data.
+        // O_DIRECT is used for both READ and WRITE operations.
+        // Past benchmarks showed no performance difference between buffered and direct I/O,
+        // so O_DIRECT is used consistently to bypass page cache and reduce memory pressure.
         let flags = OpenFlags {
             read: !write,  // READ-only for read operations
             write: write,  // WRITE-only for write operations
             create: write, // Only create on write operations
             truncate: false,
             append: false,
-            direct: true, // Always use O_DIRECT for writes
+            direct: true,  // O_DIRECT for both READ and WRITE
         };
 
+        let open_syscall_start = std::time::Instant::now();
         let handle = self.backend.open(&chunk_file_path, flags).await?;
+        let open_syscall_elapsed = open_syscall_start.elapsed();
+        let total_elapsed = open_start.elapsed();
+
+        // Log file open timing for performance analysis
+        tracing::debug!(
+            op_type = if write { "WRITE" } else { "READ" },
+            chunk_index = chunk_index,
+            ensure_dir_us = ensure_dir_elapsed.as_micros() as u64,
+            open_syscall_us = open_syscall_elapsed.as_micros() as u64,
+            total_open_us = total_elapsed.as_micros() as u64,
+            "CHUNK_FILE_OPEN"
+        );
 
         tracing::trace!(
             "Opened file: {:?} with fd={:?} (write={}, direct={})",
@@ -934,26 +946,47 @@ impl IOUringChunkStore {
         fixed_buffer: pluvio_uring::allocator::FixedBuffer,
         data_len: usize,
     ) -> ChunkStoreResult<usize> {
+        let total_start = std::time::Instant::now();
+
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
         // Open the chunk file with O_DIRECT for write
+        let open_start = std::time::Instant::now();
         let handle = self.open_chunk_file(file_path, chunk_index, true).await?;
+        let open_elapsed = open_start.elapsed();
 
         // Write data directly from registered buffer using DMA (zero-copy)
         let bytes_to_write = data_len.min(self.chunk_size - offset as usize);
+        let write_start = std::time::Instant::now();
         let result = self
             .backend
             .write_fixed_direct(handle, offset, fixed_buffer, bytes_to_write)
             .await;
+        let write_elapsed = write_start.elapsed();
 
         // Close the file handle immediately (no caching)
+        let close_start = std::time::Instant::now();
         if let Err(e) = self.backend.close(handle).await {
             tracing::warn!("Failed to close chunk file after write_fixed: {:?}", e);
         }
+        let close_elapsed = close_start.elapsed();
 
         let bytes_written = result?;
+        let total_elapsed = total_start.elapsed();
+
+        // Log detailed timing breakdown for WRITE performance analysis
+        tracing::debug!(
+            op_type = "WRITE_CHUNK_FIXED",
+            chunk_index = chunk_index,
+            bytes_written = bytes_written,
+            open_us = open_elapsed.as_micros() as u64,
+            write_us = write_elapsed.as_micros() as u64,
+            close_us = close_elapsed.as_micros() as u64,
+            total_us = total_elapsed.as_micros() as u64,
+            "CHUNK_IO_TIMING"
+        );
 
         tracing::debug!(
             "Wrote {} bytes (zero-copy) to chunk (path={}, chunk_index={}, offset={})",
@@ -993,26 +1026,47 @@ impl IOUringChunkStore {
         offset: u64,
         fixed_buffer: pluvio_uring::allocator::FixedBuffer,
     ) -> ChunkStoreResult<(usize, pluvio_uring::allocator::FixedBuffer)> {
+        let total_start = std::time::Instant::now();
+
         if offset >= self.chunk_size as u64 {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
         // Open the chunk file without O_DIRECT (uses page cache for better read performance)
         // Note: Will fail with StorageError if file doesn't exist
+        let open_start = std::time::Instant::now();
         let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
+        let open_elapsed = open_start.elapsed();
 
         // Read data directly into registered buffer using DMA (zero-copy)
+        let read_start = std::time::Instant::now();
         let result = self
             .backend
             .read_fixed_direct(handle, offset, fixed_buffer)
             .await;
+        let read_elapsed = read_start.elapsed();
 
         // Close the file handle immediately (no caching)
+        let close_start = std::time::Instant::now();
         if let Err(e) = self.backend.close(handle).await {
             tracing::warn!("Failed to close chunk file after read_fixed: {:?}", e);
         }
+        let close_elapsed = close_start.elapsed();
 
         let (bytes_read, fixed_buffer) = result?;
+        let total_elapsed = total_start.elapsed();
+
+        // Log detailed timing breakdown for READ performance analysis
+        tracing::debug!(
+            op_type = "READ_CHUNK_FIXED",
+            chunk_index = chunk_index,
+            bytes_read = bytes_read,
+            open_us = open_elapsed.as_micros() as u64,
+            read_us = read_elapsed.as_micros() as u64,
+            close_us = close_elapsed.as_micros() as u64,
+            total_us = total_elapsed.as_micros() as u64,
+            "CHUNK_IO_TIMING"
+        );
 
         tracing::debug!(
             "Read {} bytes (zero-copy) from chunk (path={}, chunk_index={}, offset={})",

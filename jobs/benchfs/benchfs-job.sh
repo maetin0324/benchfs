@@ -902,6 +902,12 @@ EOF
               echo "Chrome tracing enabled for this run: ${trace_file}"
             fi
 
+            # Add --enable-stats option if detailed timing statistics are requested
+            if [ "${ENABLE_STATS:-0}" -eq 1 ]; then
+              cmd_benchfsd+=(--enable-stats)
+              echo "Detailed timing statistics collection enabled"
+            fi
+
           echo "${cmd_benchfsd[@]}"
           "${cmd_benchfsd[@]}" > "${run_log_dir}/benchfsd_stdout.log" 2> "${run_log_dir}/benchfsd_stderr.log" &
           BENCHFSD_PID=$!

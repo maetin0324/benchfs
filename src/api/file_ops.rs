@@ -23,6 +23,7 @@ use crate::rpc::connection::ConnectionPool;
 use crate::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
 use crate::rpc::file_id::FileId;
 use crate::rpc::metadata_ops::{MetadataCreateFileRequest, MetadataLookupRequest};
+use crate::stats::is_stats_enabled;
 use crate::storage::IOUringChunkStore;
 
 /// BenchFS Filesystem Client
@@ -748,33 +749,32 @@ impl BenchFS {
                                         chunk_buf,
                                     );
 
-                                    // RPC_TRANSFER_TIMING: Measure RPC read time (remove later if overhead is concern)
-                                    let rpc_start = Instant::now();
+                                    // RPC_TRANSFER_TIMING: Measure RPC read time (only when stats enabled)
+                                    let rpc_start = if is_stats_enabled() { Some(Instant::now()) } else { None };
                                     let rpc_result = request.call(&*client).await;
-                                    let rpc_elapsed = rpc_start.elapsed();
-                                    // END RPC_TRANSFER_TIMING
 
                                     match rpc_result {
                                         Ok(response) if response.is_success() => {
                                             let bytes_read = response.bytes_read as usize;
 
-                                            // RPC_TRANSFER_TIMING: Log read transfer timing (remove later if overhead is concern)
-                                            let elapsed_us = rpc_elapsed.as_micros() as f64;
-                                            let bandwidth_mib_s = if elapsed_us > 0.0 {
-                                                (bytes_read as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
-                                            } else {
-                                                0.0
-                                            };
-                                            tracing::debug!(
-                                                target: "rpc_transfer",
-                                                op = "READ",
-                                                target_node = %node_id,
-                                                bytes = bytes_read,
-                                                elapsed_us = elapsed_us as u64,
-                                                bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
-                                                "RPC_TRANSFER"
-                                            );
-                                            // END RPC_TRANSFER_TIMING
+                                            // RPC_TRANSFER_TIMING: Log read transfer timing (only when stats enabled)
+                                            if let Some(start) = rpc_start {
+                                                let elapsed_us = start.elapsed().as_micros() as f64;
+                                                let bandwidth_mib_s = if elapsed_us > 0.0 {
+                                                    (bytes_read as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
+                                                } else {
+                                                    0.0
+                                                };
+                                                tracing::debug!(
+                                                    target: "rpc_transfer",
+                                                    op = "READ",
+                                                    target_node = %node_id,
+                                                    bytes = bytes_read,
+                                                    elapsed_us = elapsed_us as u64,
+                                                    bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
+                                                    "RPC_TRANSFER"
+                                                );
+                                            }
 
                                             tracing::debug!(
                                                 "Successfully fetched {} bytes from remote node (zero-copy, FileId)",
@@ -979,32 +979,31 @@ impl BenchFS {
                                         chunk_data.as_slice(),
                                     );
 
-                                    // RPC_TRANSFER_TIMING: Measure RPC write time (remove later if overhead is concern)
-                                    let rpc_start = Instant::now();
+                                    // RPC_TRANSFER_TIMING: Measure RPC write time (only when stats enabled)
+                                    let rpc_start = if is_stats_enabled() { Some(Instant::now()) } else { None };
                                     let rpc_result = request.call(&*client).await;
-                                    let rpc_elapsed = rpc_start.elapsed();
-                                    // END RPC_TRANSFER_TIMING
 
                                     // Execute RPC
                                     match rpc_result {
                                         Ok(response) if response.is_success() => {
-                                            // RPC_TRANSFER_TIMING: Log write transfer timing (remove later if overhead is concern)
-                                            let elapsed_us = rpc_elapsed.as_micros() as f64;
-                                            let bandwidth_mib_s = if elapsed_us > 0.0 {
-                                                (data_len as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
-                                            } else {
-                                                0.0
-                                            };
-                                            tracing::debug!(
-                                                target: "rpc_transfer",
-                                                op = "WRITE",
-                                                target_node = %target_node,
-                                                bytes = data_len,
-                                                elapsed_us = elapsed_us as u64,
-                                                bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
-                                                "RPC_TRANSFER"
-                                            );
-                                            // END RPC_TRANSFER_TIMING
+                                            // RPC_TRANSFER_TIMING: Log write transfer timing (only when stats enabled)
+                                            if let Some(start) = rpc_start {
+                                                let elapsed_us = start.elapsed().as_micros() as f64;
+                                                let bandwidth_mib_s = if elapsed_us > 0.0 {
+                                                    (data_len as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
+                                                } else {
+                                                    0.0
+                                                };
+                                                tracing::debug!(
+                                                    target: "rpc_transfer",
+                                                    op = "WRITE",
+                                                    target_node = %target_node,
+                                                    bytes = data_len,
+                                                    elapsed_us = elapsed_us as u64,
+                                                    bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
+                                                    "RPC_TRANSFER"
+                                                );
+                                            }
 
                                             tracing::debug!(
                                                 "Successfully wrote {} bytes to remote node (FileId)",
