@@ -340,7 +340,8 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         //   Smaller chunks = more RPCs per transfer, need proportionally more buffers
         //   Example: 1 MiB chunk -> 16384 buffers (still 16 GiB memory)
         // - submit_depth: 128 for better batching and throughput
-        // - Aggressive timeouts (10ms) to minimize latency in polling mode
+        // - wait_submit_timeout: 50ms to allow SQE batching for READ operations
+        //   (READ lacks natural batching points unlike WRITE which batches via UCX recv)
         let chunk_size = config.storage.chunk_size;
         let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
         let chunk_multiplier = (base_chunk_size / chunk_size).max(1);
@@ -359,8 +360,8 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
             .queue_size(queue_size)
             .buffer_size(chunk_size)
             .submit_depth(submit_depth)
-            .wait_submit_timeout(std::time::Duration::from_millis(10))
-            .wait_complete_timeout(std::time::Duration::from_millis(10))
+            .wait_submit_timeout(std::time::Duration::from_millis(50))
+            .wait_complete_timeout(std::time::Duration::from_millis(50))
             .build();
 
         let allocator = uring_reactor.allocator.clone();
@@ -602,6 +603,26 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                 }
             },
             "server_stats_logger".to_string(),
+        );
+    }
+
+    // Spawn periodic RPC concurrency logging task for time-series analysis
+    {
+        use benchfs::rpc::server::log_rpc_concurrency_stats;
+        let state_clone = state.clone();
+        pluvio_runtime::spawn_with_name(
+            async move {
+                // Wait for server to start up
+                pluvio_timer::sleep(std::time::Duration::from_secs(1)).await;
+
+                // Log RPC concurrency stats every 100ms for detailed time-series analysis
+                let interval = std::time::Duration::from_millis(100);
+                while state_clone.is_running() {
+                    log_rpc_concurrency_stats();
+                    pluvio_timer::sleep(interval).await;
+                }
+            },
+            "rpc_concurrency_logger".to_string(),
         );
     }
 

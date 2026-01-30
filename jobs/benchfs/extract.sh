@@ -132,6 +132,7 @@ run_script "extract_rpc_transfer_csv.sh" || true
 run_script "extract_iostat_csv.sh" || true
 run_script "extract_server_rpc_timing.sh" || true
 run_script "extract_am_timing.sh" || true
+run_script "extract_rpc_concurrency_csv.sh" || true
 
 # Summary
 echo ""
