@@ -54,6 +54,7 @@ cd "${OUTPUT_DIR}"
 mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
+  # 2
   # 1 2 4 8
   # 4
   # 2 4 8 16

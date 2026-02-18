@@ -385,6 +385,7 @@ run_ior_benchmark() {
     -x CHFS_CHUNK_SIZE="${CHFS_CHUNK_SIZE}"
     "${IOR_PREFIX}/src/ior"
     -vvv
+    -D 120
     -a CHFS
     --chfs.chunk_size="${CHFS_CHUNK_SIZE}"
     -t "$transfer_size"

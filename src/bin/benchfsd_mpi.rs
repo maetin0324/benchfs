@@ -335,17 +335,16 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         // Create io_uring reactor
         // Buffer size must match the chunk_size from config to support chunk-sized I/O operations
         // Optimized parameters for high-throughput workloads:
-        // - queue_size: Scales inversely with chunk_size to handle more concurrent operations
-        //   Base: 4 MiB chunk -> 4096 buffers (16 GiB memory)
-        //   Smaller chunks = more RPCs per transfer, need proportionally more buffers
-        //   Example: 1 MiB chunk -> 16384 buffers (still 16 GiB memory)
+        // - queue_size: Fixed at 4096 buffers (kernel io_uring register_buffers limit)
+        //   Memory usage scales with chunk_size: 4 MiB -> 16 GiB, 512 KiB -> 2 GiB
         // - submit_depth: 128 for better batching and throughput
-        // - wait_submit_timeout: 50ms to allow SQE batching for READ operations
-        //   (READ lacks natural batching points unlike WRITE which batches via UCX recv)
+        // - wait_submit_timeout/wait_complete_timeout: 10ms for reactor polling
         let chunk_size = config.storage.chunk_size;
         let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
         let chunk_multiplier = (base_chunk_size / chunk_size).max(1);
-        let queue_size = (4096 * chunk_multiplier as u32).min(65536); // Cap at 65536
+        // Cap at 4096: io_uring register_buffers() is limited by IORING_MAX_REG_BUFFERS
+        // in the kernel (kernel 5.15: between 4096-32768). Exceeding causes EINVAL.
+        let queue_size = (4096 * chunk_multiplier as u32).min(4096);
         let submit_depth = (128 * chunk_multiplier as u32).min(512); // Cap at 512
 
         tracing::info!(
@@ -360,8 +359,8 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
             .queue_size(queue_size)
             .buffer_size(chunk_size)
             .submit_depth(submit_depth)
-            .wait_submit_timeout(std::time::Duration::from_millis(50))
-            .wait_complete_timeout(std::time::Duration::from_millis(50))
+            .wait_submit_timeout(std::time::Duration::from_millis(10))
+            .wait_complete_timeout(std::time::Duration::from_millis(10))
             .build();
 
         let allocator = uring_reactor.allocator.clone();
