@@ -88,9 +88,10 @@ fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse --trace-output and --stats-output options
+    // Parse --trace-output, --stats-output, and --enable-stats options
     let mut trace_output: Option<PathBuf> = None;
     let mut stats_output: Option<PathBuf> = None;
+    let mut enable_stats: bool = false;
     let mut positional_args: Vec<&String> = Vec::new();
 
     // Set BENCHFS_RPC_TIMEOUT to 3 second for MPI environment
@@ -142,6 +143,9 @@ fn main() {
                 }
                 std::process::exit(1);
             }
+        } else if args[i] == "--enable-stats" {
+            enable_stats = true;
+            i += 1;
         } else {
             positional_args.push(&args[i]);
             i += 1;
@@ -160,6 +164,8 @@ fn main() {
             eprintln!("                           Each rank creates <path>_rank<N>.json");
             eprintln!("  --stats-output <path>:   Enable CSV stats output (optional)");
             eprintln!("                           Each rank creates <path>_rank<N>.csv");
+            eprintln!("  --enable-stats:          Enable detailed timing statistics collection (optional)");
+            eprintln!("                           Adds overhead, use only for performance analysis");
         }
         std::process::exit(1);
     }
@@ -170,6 +176,14 @@ fn main() {
     } else {
         "benchfs.toml"
     };
+
+    // Enable detailed timing statistics if requested
+    if enable_stats {
+        benchfs::stats::set_stats_enabled(true);
+        if mpi_rank == 0 {
+            eprintln!("Stats collection enabled - timing overhead will be incurred");
+        }
+    }
 
     // Verify registry directory exists (only rank 0)
     if mpi_rank == 0 {
@@ -321,16 +335,16 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         // Create io_uring reactor
         // Buffer size must match the chunk_size from config to support chunk-sized I/O operations
         // Optimized parameters for high-throughput workloads:
-        // - queue_size: Scales inversely with chunk_size to handle more concurrent operations
-        //   Base: 4 MiB chunk -> 4096 buffers (16 GiB memory)
-        //   Smaller chunks = more RPCs per transfer, need proportionally more buffers
-        //   Example: 1 MiB chunk -> 16384 buffers (still 16 GiB memory)
+        // - queue_size: Fixed at 4096 buffers (kernel io_uring register_buffers limit)
+        //   Memory usage scales with chunk_size: 4 MiB -> 16 GiB, 512 KiB -> 2 GiB
         // - submit_depth: 128 for better batching and throughput
-        // - Aggressive timeouts (10ms) to minimize latency in polling mode
+        // - wait_submit_timeout/wait_complete_timeout: 10ms for reactor polling
         let chunk_size = config.storage.chunk_size;
         let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
         let chunk_multiplier = (base_chunk_size / chunk_size).max(1);
-        let queue_size = (4096 * chunk_multiplier as u32).min(65536); // Cap at 65536
+        // Cap at 4096: io_uring register_buffers() is limited by IORING_MAX_REG_BUFFERS
+        // in the kernel (kernel 5.15: between 4096-32768). Exceeding causes EINVAL.
+        let queue_size = (4096 * chunk_multiplier as u32).min(4096);
         let submit_depth = (128 * chunk_multiplier as u32).min(512); // Cap at 512
 
         tracing::info!(
@@ -588,6 +602,26 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                 }
             },
             "server_stats_logger".to_string(),
+        );
+    }
+
+    // Spawn periodic RPC concurrency logging task for time-series analysis
+    {
+        use benchfs::rpc::server::log_rpc_concurrency_stats;
+        let state_clone = state.clone();
+        pluvio_runtime::spawn_with_name(
+            async move {
+                // Wait for server to start up
+                pluvio_timer::sleep(std::time::Duration::from_secs(1)).await;
+
+                // Log RPC concurrency stats every 100ms for detailed time-series analysis
+                let interval = std::time::Duration::from_millis(100);
+                while state_clone.is_running() {
+                    log_rpc_concurrency_stats();
+                    pluvio_timer::sleep(interval).await;
+                }
+            },
+            "rpc_concurrency_logger".to_string(),
         );
     }
 

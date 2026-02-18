@@ -58,6 +58,21 @@ pub fn get_server_rpc_stats() -> ServerRpcStats {
     }
 }
 
+/// Log RPC concurrency statistics for time-series analysis
+///
+/// This function logs the current RPC stats in a format that can be extracted
+/// and analyzed with extract_rpc_concurrency_csv.sh
+pub fn log_rpc_concurrency_stats() {
+    let stats = get_server_rpc_stats();
+    tracing::debug!(
+        ongoing = stats.ongoing_requests,
+        received = stats.total_received,
+        completed = stats.total_completed,
+        peak = stats.peak_concurrent,
+        "RPC_CONCURRENCY_STATS"
+    );
+}
+
 /// Get the number of currently ongoing RPC requests
 pub fn get_ongoing_rpc_count() -> usize {
     ONGOING_RPC_REQUESTS.load(Ordering::Relaxed)

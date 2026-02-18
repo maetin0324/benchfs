@@ -158,49 +158,193 @@ if let Some(buffer) = this.allocator.acquire_inner() {
 
 ---
 
-## 問題のメカニズム（確定）
+## 問題のメカニズム（確定） - 更新版
 
+### 最初の仮説（却下）
+最初は「同時RPC数の過多」が原因と考えたが、修正後も問題が解消しなかった。
+
+### 真の根本原因: ノード発見のタイミング問題
+
+**比較データ**:
+| ケース | RPCターゲットノード分布 | 発見されたノード数 |
+|--------|------------------------|-------------------|
+| 正常 (4m/4m) | 16ノードに均等 (~365K/ノード) | 16 |
+| 問題 (2m/1m) | **8ノードのみ** (~1473/ノード) | 8 |
+
+**問題のメカニズム**:
 ```
-[クライアント側]
-  736クライアント × 2チャンク/transfer = 1472 同時RPC
+[サーバー起動フェーズ]
+  chunk_size=1MiB → 16384バッファ × 1MiB = 16GB メモリ割り当て
                     ↓
-[サーバー側]
-  1472タスクが同時spawn → バッファプール枯渇
+  メモリ割り当てに時間がかかる → サーバー起動遅延
                     ↓
-  後続リクエストがバッファ待ち → 処理遅延累積
+[クライアント起動フェーズ]
+  discover_data_nodes() が呼ばれる
                     ↓
-  30秒タイムアウト発生 → リトライ発生
+  この時点で8/16サーバーしか登録されていない
                     ↓
-  リトライで負荷増加 → さらにタイムアウト増加
+  discover_data_nodes() は「1つ以上見つかれば即座にリターン」
                     ↓
-  **タイムアウト/リトライのカスケード** (34%リトライ率)
+  クライアントは8ノードしか知らない状態で動作開始
+                    ↓
+[I/O実行フェーズ]
+  全RPCが8ノードに集中 → 8ノードが過負荷
+                    ↓
+  30秒タイムアウト → リトライ → カスケード障害
+```
+
+**コードの問題箇所** (`src/ffi/init.rs:105`):
+```rust
+if !node_ids.is_empty() {
+    // ← 1つでもノードが見つかれば即座にリターン！
+    return Ok(node_ids);
+}
 ```
 
 ---
 
-## Phase 5: 改善案 📋準備中
+## Phase 5: 改善案 ✅実装完了
 
-### 考えられる改善方向
+### 最初の修正（効果なし）
 
-1. **クライアント側のRPC同時発行数制限** (最優先)
-   - Semaphoreで同時発行RPC数を制限
-   - transfer_size > chunk_sizeの場合でも安定動作
+#### クライアント側のRPC同時発行数制限
 
-2. **サーバー側のリクエストキューイング**
-   - 同時処理タスク数の上限設定
-   - バックプレッシャー機構の導入
+**変更ファイル:**
+1. `src/config.rs` - デフォルト定数追加
+2. `src/api/file_ops.rs` - 読み書き・fsync操作の同時実行制限
 
-3. **タイムアウト値の調整**
-   - クライアント側タイムアウトを短縮してリトライを早期化
-   - または、タイムアウトを延長してリトライ頻度を下げる
+**変更内容:**
 
-4. **バッファプールサイズの動的調整**
-   - 負荷に応じてバッファプールを拡張
-   - メモリ使用量とのトレードオフ
+```rust
+// src/config.rs
+pub const MAX_CONCURRENT_CHUNK_RPCS: usize = 16;
+```
 
-### 推奨アプローチ
-**クライアント側のRPC同時発行数制限**が最も効果的。
-サーバー側の変更なしで問題を解決できる可能性が高い。
+```rust
+// src/api/file_ops.rs (benchfs_read, benchfs_write, benchfs_fsync)
+// 変更前: join_all で全チャンクを同時実行
+let results = join_all(chunk_futures).await;
+
+// 変更後: buffer_unordered で同時実行数を制限
+use futures::stream::{self, StreamExt};
+let results: Vec<_> = stream::iter(chunk_futures)
+    .buffer_unordered(MAX_CONCURRENT_CHUNK_RPCS)
+    .collect()
+    .await;
+```
+
+**結果:** ❌ 問題は解消せず。仮説が誤りであった。
+
+---
+
+### 修正2（ノード発見タイミング問題）- 部分的に効果あり
+
+**変更ファイル:**
+1. `src/ffi/init.rs` - `discover_data_nodes()` 関数を修正
+2. `jobs/benchfs/benchfs-job.sh` - 環境変数を追加
+
+**変更内容:**
+- `BENCHFS_EXPECTED_NODES` 環境変数で期待するノード数を指定可能に
+- 期待ノード数が指定されている場合は最大60秒待機
+
+**結果:** 16ノード全てを発見するようになったが、負荷分散は依然として不均一。
+
+---
+
+### 修正3（ノードソート順問題）❌ 不十分
+
+**発見した問題:**
+
+ノードIDがアルファベット順にソートされていた：
+```
+node_0, node_1, node_10, node_11, node_12, node_13, node_14, node_15, node_2, node_3, ...
+```
+
+**変更内容 (`src/ffi/init.rs`):**
+
+```rust
+// 変更前: アルファベット順ソート
+node_ids.sort();
+
+// 変更後: 数値順ソート
+node_ids.sort_by(|a, b| {
+    let extract_num = |s: &str| -> Option<u32> {
+        s.strip_prefix("node_").and_then(|n| n.parse().ok())
+    };
+    match (extract_num(a), extract_num(b)) {
+        (Some(na), Some(nb)) => na.cmp(&nb),
+        _ => a.cmp(b), // Fallback to alphabetical
+    }
+});
+```
+
+**結果:** ❌ ノードは正しくソートされたが、負荷分散は依然として偏っていた。
+
+---
+
+### 修正4（黄金比ハッシュ）✅ 真の根本原因を解決
+
+**発見した真の問題:**
+
+`block_size`と`node_count`の関係による負荷偏り：
+
+```
+block_size = 16 GiB = 16384 MiB = 16384 chunks
+16384 % 16 = 0  ← 全クライアントが同じモジュロパターンを持つ
+
+koyama_hash("/scr/testfile/{N}") = 1333 + N  ← 線形なハッシュ値
+単純モジュロ: (1333 + N) % 16 = (5 + N) % 16
+
+結果:
+- chunk 0 → node_5
+- chunk 1 → node_6
+- chunk 2 → node_7
+- ...
+- 全736クライアントの最初の2チャンク → node_5とnode_6に集中！
+```
+
+**旧ロジックでの分布 (736クライアント × 2チャンク = 1472チャンク):**
+```
+node_0-4:   0 chunks each
+node_5:   736 chunks (50%)
+node_6:   736 chunks (50%)
+node_7-15:  0 chunks each
+不均衡度: 800%
+```
+
+**変更内容 (`src/metadata/consistent_hash.rs`):**
+
+```rust
+// 変更前: 単純モジュロ
+let index = (hash as usize) % self.nodes.len();
+
+// 変更後: 黄金比ベースの乗算ハッシュ
+const PHI: u64 = 0x9e3779b9;  // (sqrt(5) - 1) / 2 * 2^32
+let mixed = ((hash as u64).wrapping_mul(PHI)) >> 32;
+let index = (mixed as usize) % self.nodes.len();
+```
+
+**新ロジックでの分布:**
+```
+node_0:   92 chunks (6.2%)
+node_1:   93 chunks (6.3%)
+node_2:   94 chunks (6.4%)
+...
+node_15:  92 chunks (6.2%)
+不均衡度: 6.52%
+```
+
+**改善効果:**
+| 指標 | 旧 (単純モジュロ) | 新 (黄金比ハッシュ) |
+|------|-----------------|-------------------|
+| 使用ノード数 | 2/16 (12.5%) | 16/16 (100%) |
+| 不均衡度 | 800% | 6.52% |
+| チャンク/ノード | 0 or 736 | 88-94 |
+
+**なぜ黄金比ハッシュが効果的か:**
+- 黄金比 (φ = (1 + √5) / 2 ≈ 1.618) は最も「無理数的」な数
+- 連続した整数を黄金比で乗算すると、結果が円周上に均等に分散される
+- これにより、連続したチャンクインデックスが異なるノードに割り当てられる
 
 ---
 
@@ -208,6 +352,9 @@ if let Some(buffer) = this.allocator.acquire_inner() {
 
 | ファイル | 内容 |
 |---------|------|
+| `src/metadata/consistent_hash.rs` | **修正対象** - 黄金比ハッシュによる負荷分散 |
+| `src/ffi/init.rs` | **修正対象** - ノード発見ロジック (`discover_data_nodes`) |
+| `jobs/benchfs/benchfs-job.sh` | **修正対象** - IORクライアントへの環境変数設定 |
 | `src/api/file_ops.rs` | クライアント側チャンク分割・RPC発行ロジック |
 | `src/rpc/server.rs` | サーバーRPC処理ロジック |
 | `src/rpc/client.rs` | RPCクライアント（タイムアウト・リトライ） |

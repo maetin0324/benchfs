@@ -23,6 +23,7 @@ use crate::rpc::connection::ConnectionPool;
 use crate::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
 use crate::rpc::file_id::FileId;
 use crate::rpc::metadata_ops::{MetadataCreateFileRequest, MetadataLookupRequest};
+use crate::stats::is_stats_enabled;
 use crate::storage::IOUringChunkStore;
 
 /// BenchFS Filesystem Client
@@ -42,8 +43,8 @@ pub struct BenchFS {
     /// Metadata consistent hash ring (for distributed metadata)
     metadata_ring: Option<Rc<ConsistentHashRing>>,
 
-    /// Chunk store (for local operations)
-    chunk_store: Rc<IOUringChunkStore>,
+    /// Chunk store (for local operations, None for pure client mode)
+    chunk_store: Option<Rc<IOUringChunkStore>>,
 
     /// Chunk cache
     chunk_cache: ChunkCache,
@@ -110,7 +111,7 @@ impl BenchFS {
             .build()
     }
 
-    /// Create a new BenchFS client with distributed metadata support
+    /// Create a new BenchFS client with distributed metadata support (server mode with chunk store)
     ///
     /// # Arguments
     /// * `node_id` - This client's node ID
@@ -128,6 +129,32 @@ impl BenchFS {
         chunk_size: usize,
     ) -> Self {
         BenchFSBuilder::new(node_id, chunk_store)
+            .with_connection_pool(connection_pool)
+            .with_data_nodes(data_nodes)
+            .with_metadata_nodes(metadata_nodes)
+            .with_chunk_size(chunk_size)
+            .build()
+    }
+
+    /// Create a new BenchFS client for distributed mode (client mode without local chunk store)
+    ///
+    /// This is for pure clients that only communicate with servers via RPC.
+    /// No local io_uring or chunk store is needed.
+    ///
+    /// # Arguments
+    /// * `node_id` - This client's node ID
+    /// * `connection_pool` - Connection pool for RPC communication
+    /// * `data_nodes` - List of data nodes for chunk placement
+    /// * `metadata_nodes` - List of metadata server nodes
+    /// * `chunk_size` - Chunk size for data partitioning (must match server config)
+    pub fn new_distributed_client(
+        node_id: String,
+        connection_pool: Rc<ConnectionPool>,
+        data_nodes: Vec<String>,
+        metadata_nodes: Vec<String>,
+        chunk_size: usize,
+    ) -> Self {
+        BenchFSBuilder::new_client(node_id)
             .with_connection_pool(connection_pool)
             .with_data_nodes(data_nodes)
             .with_metadata_nodes(metadata_nodes)
@@ -597,9 +624,16 @@ impl BenchFS {
             .calculate_read_chunks(offset, actual_length, file_meta.size)
             .map_err(|e| ApiError::Internal(format!("Failed to calculate chunks: {:?}", e)))?;
 
-        // Read all chunks concurrently with zero-copy directly into user buffer
-        tracing::trace!("Reading {} chunks concurrently (zero-copy)", chunks.len());
-        use futures::future::join_all;
+        // Read chunks with bounded concurrency to prevent server overload
+        // When transfer_size > chunk_size, multiple RPCs are generated per transfer.
+        // Unbounded concurrency (join_all) can overwhelm the server, causing timeouts.
+        use crate::config::defaults::MAX_CONCURRENT_CHUNK_RPCS;
+        use futures::stream::{self, StreamExt};
+        tracing::trace!(
+            "Reading {} chunks with max {} concurrent RPCs (zero-copy)",
+            chunks.len(),
+            MAX_CONCURRENT_CHUNK_RPCS
+        );
 
         let file_path = file_meta.path.clone();
         let fs_ptr = self as *const BenchFS;
@@ -654,9 +688,11 @@ impl BenchFS {
                         );
 
                         if is_local {
-                            // Read from local storage
-                            match fs
-                                .chunk_store
+                            // Read from local storage (requires chunk_store)
+                            let chunk_store = fs.chunk_store.as_ref().expect(
+                                "is_local=true but chunk_store is None; this indicates a bug"
+                            );
+                            match chunk_store
                                 .read_chunk(&file_path, chunk_index, chunk_offset, read_size)
                                 .await
                             {
@@ -713,33 +749,32 @@ impl BenchFS {
                                         chunk_buf,
                                     );
 
-                                    // RPC_TRANSFER_TIMING: Measure RPC read time (remove later if overhead is concern)
-                                    let rpc_start = Instant::now();
+                                    // RPC_TRANSFER_TIMING: Measure RPC read time (only when stats enabled)
+                                    let rpc_start = if is_stats_enabled() { Some(Instant::now()) } else { None };
                                     let rpc_result = request.call(&*client).await;
-                                    let rpc_elapsed = rpc_start.elapsed();
-                                    // END RPC_TRANSFER_TIMING
 
                                     match rpc_result {
                                         Ok(response) if response.is_success() => {
                                             let bytes_read = response.bytes_read as usize;
 
-                                            // RPC_TRANSFER_TIMING: Log read transfer timing (remove later if overhead is concern)
-                                            let elapsed_us = rpc_elapsed.as_micros() as f64;
-                                            let bandwidth_mib_s = if elapsed_us > 0.0 {
-                                                (bytes_read as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
-                                            } else {
-                                                0.0
-                                            };
-                                            tracing::debug!(
-                                                target: "rpc_transfer",
-                                                op = "READ",
-                                                target_node = %node_id,
-                                                bytes = bytes_read,
-                                                elapsed_us = elapsed_us as u64,
-                                                bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
-                                                "RPC_TRANSFER"
-                                            );
-                                            // END RPC_TRANSFER_TIMING
+                                            // RPC_TRANSFER_TIMING: Log read transfer timing (only when stats enabled)
+                                            if let Some(start) = rpc_start {
+                                                let elapsed_us = start.elapsed().as_micros() as f64;
+                                                let bandwidth_mib_s = if elapsed_us > 0.0 {
+                                                    (bytes_read as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
+                                                } else {
+                                                    0.0
+                                                };
+                                                tracing::debug!(
+                                                    target: "rpc_transfer",
+                                                    op = "READ",
+                                                    target_node = %node_id,
+                                                    bytes = bytes_read,
+                                                    elapsed_us = elapsed_us as u64,
+                                                    bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
+                                                    "RPC_TRANSFER"
+                                                );
+                                            }
 
                                             tracing::debug!(
                                                 "Successfully fetched {} bytes from remote node (zero-copy, FileId)",
@@ -797,10 +832,14 @@ impl BenchFS {
                     format!("benchfs_read_chunk_{}", chunk_index),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        // Execute all reads concurrently
-        let chunk_results_handles = join_all(chunk_futures).await;
+        // Execute reads with bounded concurrency
+        // buffer_unordered allows up to MAX_CONCURRENT_CHUNK_RPCS in-flight at once
+        let chunk_results_handles: Vec<_> = stream::iter(chunk_futures)
+            .buffer_unordered(MAX_CONCURRENT_CHUNK_RPCS)
+            .collect()
+            .await;
 
         // Sum up bytes read from all chunks
         let mut bytes_read = 0;
@@ -893,8 +932,11 @@ impl BenchFS {
                     async move {
                         let fs = unsafe { &*fs_ptr };
                         if is_local {
-                            // Write to local chunk store
-                            fs.chunk_store
+                            // Write to local chunk store (requires chunk_store)
+                            let chunk_store = fs.chunk_store.as_ref().expect(
+                                "is_local=true but chunk_store is None; this indicates a bug"
+                            );
+                            chunk_store
                                 .write_chunk(
                                     &file_path,
                                     chunk_index,
@@ -937,32 +979,31 @@ impl BenchFS {
                                         chunk_data.as_slice(),
                                     );
 
-                                    // RPC_TRANSFER_TIMING: Measure RPC write time (remove later if overhead is concern)
-                                    let rpc_start = Instant::now();
+                                    // RPC_TRANSFER_TIMING: Measure RPC write time (only when stats enabled)
+                                    let rpc_start = if is_stats_enabled() { Some(Instant::now()) } else { None };
                                     let rpc_result = request.call(&*client).await;
-                                    let rpc_elapsed = rpc_start.elapsed();
-                                    // END RPC_TRANSFER_TIMING
 
                                     // Execute RPC
                                     match rpc_result {
                                         Ok(response) if response.is_success() => {
-                                            // RPC_TRANSFER_TIMING: Log write transfer timing (remove later if overhead is concern)
-                                            let elapsed_us = rpc_elapsed.as_micros() as f64;
-                                            let bandwidth_mib_s = if elapsed_us > 0.0 {
-                                                (data_len as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
-                                            } else {
-                                                0.0
-                                            };
-                                            tracing::debug!(
-                                                target: "rpc_transfer",
-                                                op = "WRITE",
-                                                target_node = %target_node,
-                                                bytes = data_len,
-                                                elapsed_us = elapsed_us as u64,
-                                                bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
-                                                "RPC_TRANSFER"
-                                            );
-                                            // END RPC_TRANSFER_TIMING
+                                            // RPC_TRANSFER_TIMING: Log write transfer timing (only when stats enabled)
+                                            if let Some(start) = rpc_start {
+                                                let elapsed_us = start.elapsed().as_micros() as f64;
+                                                let bandwidth_mib_s = if elapsed_us > 0.0 {
+                                                    (data_len as f64 / (1024.0 * 1024.0)) / (elapsed_us / 1_000_000.0)
+                                                } else {
+                                                    0.0
+                                                };
+                                                tracing::debug!(
+                                                    target: "rpc_transfer",
+                                                    op = "WRITE",
+                                                    target_node = %target_node,
+                                                    bytes = data_len,
+                                                    elapsed_us = elapsed_us as u64,
+                                                    bandwidth_mib_s = format!("{:.2}", bandwidth_mib_s),
+                                                    "RPC_TRANSFER"
+                                                );
+                                            }
 
                                             tracing::debug!(
                                                 "Successfully wrote {} bytes to remote node (FileId)",
@@ -1157,8 +1198,10 @@ impl BenchFS {
         // Invalidate all cached chunks for this file
         self.chunk_cache.invalidate_path(&file_meta.path);
 
-        // Delete all chunks
-        let _ = self.chunk_store.delete_file_chunks(&file_meta.path).await;
+        // Delete all chunks (only if chunk_store is available, i.e., server mode)
+        if let Some(chunk_store) = &self.chunk_store {
+            let _ = chunk_store.delete_file_chunks(&file_meta.path).await;
+        }
 
         // Delete metadata
         self.metadata_manager
@@ -1290,7 +1333,8 @@ impl BenchFS {
     /// For distributed mode, fsync RPCs are sent to remote nodes holding chunks.
     #[async_backtrace::framed]
     pub async fn benchfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
-        use futures::future::join_all;
+        use crate::config::defaults::MAX_CONCURRENT_CHUNK_RPCS;
+        use futures::stream::{self, StreamExt};
         use std::path::Path;
 
         let path_ref = Path::new(&handle.path);
@@ -1332,8 +1376,11 @@ impl BenchFS {
                         let is_local = target_node == self_node_id;
 
                         if is_local {
-                            // Fsync local chunk
-                            fs.chunk_store
+                            // Fsync local chunk (requires chunk_store)
+                            let chunk_store = fs.chunk_store.as_ref().expect(
+                                "is_local=true but chunk_store is None; this indicates a bug"
+                            );
+                            chunk_store
                                 .fsync_chunk(&file_path, chunk_index)
                                 .await
                                 .map_err(|e| {
@@ -1382,10 +1429,13 @@ impl BenchFS {
                     format!("benchfs_fsync_chunk_{}", chunk_index),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        // Execute all fsync operations concurrently
-        let results = join_all(fsync_futures).await;
+        // Execute fsync operations with bounded concurrency
+        let results: Vec<_> = stream::iter(fsync_futures)
+            .buffer_unordered(MAX_CONCURRENT_CHUNK_RPCS)
+            .collect()
+            .await;
 
         // Check for any errors
         for result in results {
@@ -1582,18 +1632,19 @@ impl BenchFS {
                 // Invalidate cache
                 self.chunk_cache.invalidate(&chunk_id);
 
-                // Delete from chunk store
-                if let Err(e) = self
-                    .chunk_store
-                    .delete_chunk(&file_meta.path, chunk_idx)
-                    .await
-                {
-                    tracing::warn!(
-                        "Failed to delete chunk {} for path {}: {:?}",
-                        chunk_idx,
-                        file_meta.path,
-                        e
-                    );
+                // Delete from chunk store (only if available)
+                if let Some(chunk_store) = &self.chunk_store {
+                    if let Err(e) = chunk_store
+                        .delete_chunk(&file_meta.path, chunk_idx)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to delete chunk {} for path {}: {:?}",
+                            chunk_idx,
+                            file_meta.path,
+                            e
+                        );
+                    }
                 }
             }
 
@@ -1605,11 +1656,11 @@ impl BenchFS {
                 let last_chunk_offset = size % chunk_size;
                 let bytes_to_zero = chunk_size - last_chunk_offset;
 
-                if bytes_to_zero > 0 {
+                if bytes_to_zero > 0 && self.chunk_store.is_some() {
+                    let chunk_store = self.chunk_store.as_ref().unwrap();
                     // Write zeros to the end of the last chunk
                     let zeros = vec![0u8; bytes_to_zero as usize];
-                    if let Err(e) = self
-                        .chunk_store
+                    if let Err(e) = chunk_store
                         .write_chunk(&file_meta.path, last_chunk_idx, last_chunk_offset, &zeros)
                         .await
                     {
@@ -1706,7 +1757,7 @@ impl BenchFS {
 /// ```
 pub struct BenchFSBuilder {
     node_id: String,
-    chunk_store: Rc<IOUringChunkStore>,
+    chunk_store: Option<Rc<IOUringChunkStore>>,
     connection_pool: Option<Rc<ConnectionPool>>,
     data_nodes: Option<Vec<String>>,
     metadata_nodes: Option<Vec<String>>,
@@ -1715,7 +1766,7 @@ pub struct BenchFSBuilder {
 }
 
 impl BenchFSBuilder {
-    /// Create a new BenchFS builder
+    /// Create a new BenchFS builder with chunk store (for server mode)
     ///
     /// # Arguments
     /// * `node_id` - Node identifier
@@ -1723,7 +1774,23 @@ impl BenchFSBuilder {
     pub fn new(node_id: String, chunk_store: Rc<IOUringChunkStore>) -> Self {
         Self {
             node_id,
-            chunk_store,
+            chunk_store: Some(chunk_store),
+            connection_pool: None,
+            data_nodes: None,
+            metadata_nodes: None,
+            chunk_cache_mb: crate::config::defaults::CHUNK_CACHE_MB,
+            chunk_size: crate::metadata::CHUNK_SIZE,
+        }
+    }
+
+    /// Create a new BenchFS builder for client mode (no local chunk store)
+    ///
+    /// # Arguments
+    /// * `node_id` - Node identifier
+    pub fn new_client(node_id: String) -> Self {
+        Self {
+            node_id,
+            chunk_store: None,
             connection_pool: None,
             data_nodes: None,
             metadata_nodes: None,

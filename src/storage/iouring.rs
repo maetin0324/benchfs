@@ -2,6 +2,7 @@ use super::{
     FileHandle, FileStat, OpenFlags, StorageBackend,
     error::{StorageError, StorageResult},
 };
+use crate::stats::is_stats_enabled;
 use pluvio_uring::allocator::FixedBufferAllocator;
 use pluvio_uring::file::DmaFile;
 use pluvio_uring::reactor::IoUringReactor;
@@ -93,16 +94,14 @@ impl IOUringBackend {
                 .ok_or(StorageError::InvalidHandle(handle))?
         };
 
-        // Measure io_uring write_fixed operation time
-        let start = std::time::Instant::now();
+        // Measure io_uring write_fixed operation time (only when stats enabled)
+        let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
 
         // Write data using write_fixed with registered buffer (zero-copy DMA)
         let (bytes_written_raw, _fixed_buffer) = dma_file
             .write_fixed(fixed_buffer, offset)
             .await
             .map_err(StorageError::IoError)?;
-
-        let elapsed = start.elapsed();
 
         if bytes_written_raw < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
@@ -112,14 +111,17 @@ impl IOUringBackend {
 
         let bytes_written = data_len.min(bytes_written_raw as usize);
 
-        tracing::debug!(
-            "write_fixed_direct: {} bytes in {:?} to fd={} at offset={} ({:.2} MiB/s)",
-            bytes_written,
-            elapsed,
-            handle.0,
-            offset,
-            (bytes_written as f64 / elapsed.as_secs_f64()) / (1024.0 * 1024.0)
-        );
+        if let Some(start) = start {
+            let elapsed = start.elapsed();
+            tracing::debug!(
+                "write_fixed_direct: {} bytes in {:?} to fd={} at offset={} ({:.2} MiB/s)",
+                bytes_written,
+                elapsed,
+                handle.0,
+                offset,
+                (bytes_written as f64 / elapsed.as_secs_f64()) / (1024.0 * 1024.0)
+            );
+        }
 
         Ok(bytes_written)
     }
@@ -157,16 +159,14 @@ impl IOUringBackend {
                 .ok_or(StorageError::InvalidHandle(handle))?
         };
 
-        // Measure io_uring read_fixed operation time
-        let start = std::time::Instant::now();
+        // Measure io_uring read_fixed operation time (only when stats enabled)
+        let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
 
         // Read data using read_fixed with registered buffer (zero-copy DMA)
         let (bytes_read_raw, fixed_buffer) = dma_file
             .read_fixed(fixed_buffer, offset)
             .await
             .map_err(StorageError::IoError)?;
-
-        let elapsed = start.elapsed();
 
         if bytes_read_raw < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
@@ -176,14 +176,17 @@ impl IOUringBackend {
 
         let bytes_read = bytes_read_raw as usize;
 
-        tracing::debug!(
-            "read_fixed_direct: {} bytes in {:?} from fd={} at offset={} ({:.2} MiB/s)",
-            bytes_read,
-            elapsed,
-            handle.0,
-            offset,
-            (bytes_read as f64 / elapsed.as_secs_f64()) / (1024.0 * 1024.0)
-        );
+        if let Some(start) = start {
+            let elapsed = start.elapsed();
+            tracing::debug!(
+                "read_fixed_direct: {} bytes in {:?} from fd={} at offset={} ({:.2} MiB/s)",
+                bytes_read,
+                elapsed,
+                handle.0,
+                offset,
+                (bytes_read as f64 / elapsed.as_secs_f64()) / (1024.0 * 1024.0)
+            );
+        }
 
         Ok((bytes_read, fixed_buffer))
     }
