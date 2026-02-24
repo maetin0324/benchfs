@@ -57,8 +57,8 @@ pub mod defaults {
     /// Maximum concurrent chunk RPCs per client operation
     /// This limits how many chunk read/write RPCs can be in-flight simultaneously
     /// to prevent overwhelming the server when transfer_size > chunk_size.
-    /// Default: 16 (allows good parallelism while avoiding server overload)
-    pub const MAX_CONCURRENT_CHUNK_RPCS: usize = 16;
+    /// Default: 64 (NVMe drives thrive on high queue depth; increased from 16)
+    pub const MAX_CONCURRENT_CHUNK_RPCS: usize = 64;
 
     // Stats/diagnostics
     /// Enable detailed timing statistics collection (default: false)

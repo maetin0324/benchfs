@@ -87,5 +87,17 @@ time_json() {
 }
 EOF
 )
-    /usr/bin/time -f "$FORMAT" "$@"
+    local time_cmd
+    if [ -x /usr/bin/time ]; then
+        time_cmd=/usr/bin/time
+    elif command -v gtime >/dev/null 2>&1; then
+        time_cmd=gtime
+    else
+        # Fallback: skip time measurement, just run the command
+        # Parse and discard the -o flag if present
+        while [[ "$1" == -o ]]; do shift 2; done
+        "$@"
+        return $?
+    fi
+    "$time_cmd" -f "$FORMAT" "$@"
 }

@@ -109,7 +109,8 @@
       "Bash(/work/NBB/rmaeda/workspace/rust/benchfs/scripts/debug-install.sh:*)",
       "Bash(qdel:*)",
       "Bash(./install.sh:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(qsub:*)"
     ],
     "deny": [],
     "ask": []
