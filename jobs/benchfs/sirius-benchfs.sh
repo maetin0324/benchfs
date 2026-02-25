@@ -90,7 +90,7 @@ mkdir -p "${BACKEND_DIR}"
 # On Sirius: select=1 gives 1 chunk (24 CPUs) with /scr scratch provisioning.
 # Client processes use --oversubscribe to exceed the 24-slot limit.
 nnodes_list=(
-  16
+  60
 )
 niter=1
 

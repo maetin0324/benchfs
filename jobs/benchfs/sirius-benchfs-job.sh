@@ -61,28 +61,26 @@ BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 
 # Sirius scratch directory detection:
 #   Each vnode gets 1 of 4 NVMe SSDs (/scr0-/scr3).
-#   PBS creates /scr{n}/${PBS_JOBID} on the allocated SSD and
-#   a symlink /scr/${PBS_JOBID} -> /scr{n}/${PBS_JOBID}.
-#   For multi-node: use the symlink path so each node resolves to its own local NVMe.
-#   For fallback: search /scr0-/scr3 directly.
-detect_scratch_dir() {
-  # Prefer /scr/${PBS_JOBID} symlink — resolves to the correct local NVMe on each node
-  if [ -d "/scr/${PBS_JOBID}" ]; then
-    echo "/scr/${PBS_JOBID}"
-    return 0
-  fi
-  # Fallback: search /scr0-/scr3 directly
+#   PBS creates /scr{n}/${PBS_JOBID} on each allocated SSD.
+#   For multi-vnode jobs, we detect ALL available scratch dirs so each
+#   server rank can use its own local NVMe for maximum I/O throughput.
+detect_all_scratch_dirs() {
+  BENCHFS_ALL_SCRATCH_DIRS=()
   for n in 0 1 2 3; do
     local candidate="/scr${n}/${PBS_JOBID}"
     if [ -d "$candidate" ]; then
-      echo "$candidate"
-      return 0
+      BENCHFS_ALL_SCRATCH_DIRS+=("$candidate")
     fi
   done
-  echo "ERROR: No scratch directory found for job ${PBS_JOBID}" >&2
-  return 1
+  if [ ${#BENCHFS_ALL_SCRATCH_DIRS[@]} -eq 0 ]; then
+    echo "ERROR: No scratch directories found for job ${PBS_JOBID}" >&2
+    return 1
+  fi
+  echo "Detected ${#BENCHFS_ALL_SCRATCH_DIRS[@]} scratch directories: ${BENCHFS_ALL_SCRATCH_DIRS[*]}"
 }
-BENCHFS_DATA_DIR="$(detect_scratch_dir)"
+detect_all_scratch_dirs
+BENCHFS_DATA_DIR="${BENCHFS_ALL_SCRATCH_DIRS[0]}"  # Primary (for IOR client and general use)
+BENCHFS_SCRATCH_DIRS_CSV=$(IFS=','; echo "${BENCHFS_ALL_SCRATCH_DIRS[*]}")
 
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
@@ -119,7 +117,7 @@ echo "BENCHFS_PREFIX: ${BENCHFS_PREFIX}"
 echo "IOR_PREFIX: ${IOR_PREFIX}"
 echo "BACKEND_DIR: ${BACKEND_DIR}"
 echo "Registry: ${BENCHFS_REGISTRY_DIR}"
-echo "Data: ${BENCHFS_DATA_DIR}"
+echo "Data dirs: ${BENCHFS_ALL_SCRATCH_DIRS[*]}"
 echo "Tracing: ENABLE_PERFETTO=${ENABLE_PERFETTO}, ENABLE_CHROME=${ENABLE_CHROME}"
 echo "RUST_LOG (server): ${RUST_LOG_S}"
 echo "RUST_LOG (client): ${RUST_LOG_C}"
@@ -136,8 +134,10 @@ echo ""
 echo "Checking IOR:"
 ls -la "${IOR_PREFIX}/src/ior" || echo "ERROR: IOR not found at ${IOR_PREFIX}/src/ior"
 echo ""
-echo "Scratch directory:"
-ls -la "${BENCHFS_DATA_DIR}" 2>/dev/null || echo "WARNING: ${BENCHFS_DATA_DIR} not accessible yet"
+echo "Scratch directories:"
+for _scratch_dir in "${BENCHFS_ALL_SCRATCH_DIRS[@]}"; do
+  ls -la "${_scratch_dir}" 2>/dev/null || echo "WARNING: ${_scratch_dir} not accessible yet"
+done
 echo "=========================================="
 echo ""
 
@@ -169,12 +169,14 @@ trap 'rm -rf "${JOB_BACKEND_DIR}" 2>/dev/null || true; exit 0' EXIT
 echo "prepare benchfs registry dir: ${BENCHFS_REGISTRY_DIR}"
 mkdir -p "${BENCHFS_REGISTRY_DIR}"
 
-echo "prepare benchfs data dir: ${BENCHFS_DATA_DIR}"
-# Scratch dir is pre-created by PBS; ensure it exists
-if [ ! -d "${BENCHFS_DATA_DIR}" ]; then
-  echo "ERROR: Scratch directory not found: ${BENCHFS_DATA_DIR}"
-  exit 1
-fi
+echo "prepare benchfs data dirs: ${BENCHFS_ALL_SCRATCH_DIRS[*]}"
+# Scratch dirs are pre-created by PBS; ensure they all exist
+for _scratch_dir in "${BENCHFS_ALL_SCRATCH_DIRS[@]}"; do
+  if [ ! -d "${_scratch_dir}" ]; then
+    echo "ERROR: Scratch directory not found: ${_scratch_dir}"
+    exit 1
+  fi
+done
 
 echo "prepare benchfsd log dir: ${BENCHFSD_LOG_BASE_DIR}"
 mkdir -p "${BENCHFSD_LOG_BASE_DIR}"
@@ -391,7 +393,9 @@ start_benchfsd() {
 
   # Clean up registry and data directories
   rm -rf "${BENCHFS_REGISTRY_DIR}"/*
-  rm -rf "${BENCHFS_DATA_DIR}"/* 2>/dev/null || true
+  for _scratch_dir in "${BENCHFS_ALL_SCRATCH_DIRS[@]}"; do
+    rm -rf "${_scratch_dir}"/* 2>/dev/null || true
+  done
 
   server_log_dir="${BENCHFSD_LOG_BASE_DIR}/server_${config_id}"
   mkdir -p "${server_log_dir}"
@@ -427,7 +431,7 @@ EOF
   echo "  Server PPN: ${server_ppn}, NP: ${server_np}"
   echo "  Chunk size: ${benchfs_chunk_size_str} (${benchfs_chunk_size} bytes)"
   echo "  Config file: ${config_file}"
-  echo "  Data dir: ${BENCHFS_DATA_DIR}"
+  echo "  Data dirs: ${BENCHFS_ALL_SCRATCH_DIRS[*]}"
   echo "=========================================="
 
   # Network debug info (only on first start)
@@ -466,13 +470,40 @@ EOF2
     echo "Created taskset wrapper: ${TASKSET_WRAPPER}"
   fi
 
+  # Create per-rank data_dir wrapper to distribute server ranks across NVMe SSDs.
+  # Each MPI rank selects its own local NVMe based on OMPI_COMM_WORLD_LOCAL_RANK.
+  DATADIR_WRAPPER="${server_log_dir}/benchfsd_datadir_wrapper.sh"
+  export BENCHFS_INNER_BINARY="${BENCHFSD_BINARY}"
+  cat > "${DATADIR_WRAPPER}" <<'WRAPPER_EOF'
+#!/bin/bash
+LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK:-0}
+IFS=',' read -ra SCRATCH_DIRS <<< "${BENCHFS_SCRATCH_DIRS}"
+NUM_DIRS=${#SCRATCH_DIRS[@]}
+DIR_INDEX=$((LOCAL_RANK % NUM_DIRS))
+RANK_DATA_DIR="${SCRATCH_DIRS[$DIR_INDEX]}"
+
+# Create rank-specific config with correct data_dir
+CONFIG_FILE="$2"
+RANK_CONFIG="${CONFIG_FILE%.toml}_rank${LOCAL_RANK}.toml"
+sed "s|^data_dir = .*|data_dir = \"${RANK_DATA_DIR}\"|" "${CONFIG_FILE}" > "${RANK_CONFIG}"
+
+echo "Rank ${LOCAL_RANK}: data_dir=${RANK_DATA_DIR}, config=${RANK_CONFIG}"
+exec "${BENCHFS_INNER_BINARY}" "$1" "${RANK_CONFIG}" "${@:3}"
+WRAPPER_EOF
+  chmod +x "${DATADIR_WRAPPER}"
+  BENCHFSD_BINARY="${DATADIR_WRAPPER}"
+  echo "Created per-rank data_dir wrapper: ${DATADIR_WRAPPER}"
+
   stats_file="${STATS_OUTPUT_DIR}/stats_server${config_id}.csv"
   cmd_benchfsd=(
     "${cmd_mpirun_common[@]}"
     -np "$server_np"
     --bind-to none
+    --oversubscribe
     -x RUST_LOG="${RUST_LOG_S}"
     -x RUST_BACKTRACE
+    -x BENCHFS_SCRATCH_DIRS="${BENCHFS_SCRATCH_DIRS_CSV}"
+    -x BENCHFS_INNER_BINARY
     "${BENCHFSD_BINARY}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -560,8 +591,10 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
             echo "BenchFS chunk size: $benchfs_chunk_size_str ($benchfs_chunk_size bytes)"
             echo "=========================================="
 
-            # Clean data directory between IOR runs (but keep registry)
-            rm -rf "${BENCHFS_DATA_DIR}"/* 2>/dev/null || true
+            # Clean data directories between IOR runs (but keep registry)
+            for _scratch_dir in "${BENCHFS_ALL_SCRATCH_DIRS[@]}"; do
+              rm -rf "${_scratch_dir}"/* 2>/dev/null || true
+            done
 
             # Create run_${runid} symlink in benchfsd_logs/ for extract script compatibility
             # Extract scripts expect: benchfsd_logs/run_*/
