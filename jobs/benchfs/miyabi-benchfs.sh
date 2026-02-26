@@ -6,6 +6,17 @@ TIMESTAMP="$(timestamp)"
 
 # default params
 : ${ELAPSTIM_REQ:="0:05:00"}
+: ${ENABLE_PERFETTO:=0}  # Set to 1 to enable Perfetto tracing (native format with task tracks)
+: ${ENABLE_CHROME:=0}    # Set to 1 to enable Chrome tracing (JSON format)
+: ${RUST_LOG_S:=info}    # RUST_LOG for server (benchfsd_mpi)
+: ${RUST_LOG_C:=warn}    # RUST_LOG for client (IOR)
+: ${TASKSET:=0}          # Set to 1 to enable taskset CPU pinning for benchfsd_mpi
+: ${TASKSET_CORES:=0,1}  # CPU cores to pin benchfsd_mpi to when TASKSET=1
+: ${ENABLE_NODE_DIAGNOSTICS:=0}  # Set to 1 to enable pre-benchmark node diagnostics
+: ${ENABLE_STATS:=0}     # Set to 1 to enable detailed timing statistics collection
+: ${SEPARATE:=0}         # Set to 1 to use separate nodes for server and client
+: ${SERVER_NODES:=}      # Number of server nodes (default: floor(NNODES/2))
+: ${CLIENT_NODES:=}      # Number of client nodes (default: NNODES - SERVER_NODES)
 : ${LABEL:=default}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
@@ -29,12 +40,14 @@ export PARAM_FILE
 
 # Debug: Print paths
 echo "=========================================="
-echo "BenchFS Job Submission"
+echo "BenchFS Job Submission (Miyabi)"
 echo "=========================================="
 echo "PROJECT_ROOT: $PROJECT_ROOT"
 echo "BENCHFS_PREFIX: $BENCHFS_PREFIX"
 echo "IOR_PREFIX: $IOR_PREFIX"
 echo "PARAM_FILE: $PARAM_FILE"
+echo "RUST_LOG_S (server): $RUST_LOG_S"
+echo "RUST_LOG_C (client): $RUST_LOG_C"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"

@@ -28,6 +28,9 @@ TIMESTAMP="$(timestamp)"
 : ${TASKSET_CORES:=0,1}
 : ${ENABLE_NODE_DIAGNOSTICS:=0}
 : ${ENABLE_STATS:=0}
+: ${SEPARATE:=0}         # Set to 1 to use separate nodes for server and client
+: ${SERVER_NODES:=}      # Number of server nodes (default: floor(NNODES/2))
+: ${CLIENT_NODES:=}      # Number of client nodes (default: NNODES - SERVER_NODES)
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -63,6 +66,9 @@ export TASKSET
 export TASKSET_CORES
 export ENABLE_NODE_DIAGNOSTICS
 export ENABLE_STATS
+export SEPARATE
+export SERVER_NODES
+export CLIENT_NODES
 
 # Debug: Print paths
 echo "=========================================="

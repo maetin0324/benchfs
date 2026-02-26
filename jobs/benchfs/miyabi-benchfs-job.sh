@@ -94,6 +94,21 @@ BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 BENCHFS_DATA_DIR="/local/benchfs_${JOBID}"
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 IOR_OUTPUT_DIR="${JOB_OUTPUT_DIR}/ior_results"
+STATS_OUTPUT_DIR="${JOB_OUTPUT_DIR}/stats"
+PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
+
+# Default configurable variables (may be overridden by miyabi-benchfs.sh via -V)
+: ${ENABLE_PERFETTO:=0}
+: ${ENABLE_CHROME:=0}
+: ${RUST_LOG_S:=info}
+: ${RUST_LOG_C:=warn}
+: ${TASKSET:=0}
+: ${TASKSET_CORES:=0,1}
+: ${ENABLE_NODE_DIAGNOSTICS:=0}
+: ${ENABLE_STATS:=0}
+: ${SEPARATE:=0}
+: ${SERVER_NODES:=}
+: ${CLIENT_NODES:=}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -352,6 +367,13 @@ echo "IOR_PREFIX: ${IOR_PREFIX}"
 echo "BACKEND_DIR: ${BACKEND_DIR}"
 echo "Registry: ${BENCHFS_REGISTRY_DIR}"
 echo "Data: ${BENCHFS_DATA_DIR}"
+echo "Tracing: ENABLE_PERFETTO=${ENABLE_PERFETTO}, ENABLE_CHROME=${ENABLE_CHROME}"
+echo "RUST_LOG (server): ${RUST_LOG_S}"
+echo "RUST_LOG (client): ${RUST_LOG_C}"
+echo "TASKSET: ${TASKSET} (cores: ${TASKSET_CORES})"
+echo "ENABLE_STATS: ${ENABLE_STATS}"
+echo "SEPARATE: ${SEPARATE} (server_nodes: ${SERVER_NODES:-auto}, client_nodes: ${CLIENT_NODES:-auto})"
+echo "ENABLE_NODE_DIAGNOSTICS: ${ENABLE_NODE_DIAGNOSTICS}"
 echo ""
 echo "Checking binary:"
 ls -la "${BENCHFS_PREFIX}/benchfsd_mpi" || echo "ERROR: Binary not found at ${BENCHFS_PREFIX}/benchfsd_mpi"
@@ -384,7 +406,11 @@ cleanup_and_exit() {
   echo "Current Run ID: ${runid:-N/A}"
   echo "Cleaning up backend and data directories..."
   echo "=========================================="
-  stop_benchfsd 2>/dev/null || true
+  # Note: stop_benchfsd may not be defined yet when traps are set,
+  # so use type check to avoid errors during early initialization
+  if type stop_benchfsd &>/dev/null; then
+    stop_benchfsd 2>/dev/null || true
+  fi
   rm -rf "${JOB_BACKEND_DIR}" "${BENCHFS_DATA_DIR}" 2>/dev/null || true
   exit "$exit_code"
 }
@@ -409,6 +435,14 @@ mkdir -p "${BENCHFSD_LOG_BASE_DIR}"
 echo "prepare ior output dir: ${IOR_OUTPUT_DIR}"
 mkdir -p "${IOR_OUTPUT_DIR}"
 
+echo "prepare stats output dir: ${STATS_OUTPUT_DIR}"
+mkdir -p "${STATS_OUTPUT_DIR}"
+
+if [ "${ENABLE_PERFETTO}" -eq 1 ] || [ "${ENABLE_CHROME}" -eq 1 ]; then
+  echo "prepare trace output dir: ${PERFETTO_OUTPUT_DIR}"
+  mkdir -p "${PERFETTO_OUTPUT_DIR}"
+fi
+
 save_job_metadata() {
   local file_per_proc=0
   [[ "$ior_flags" == *"-F"* ]] && file_per_proc=1
@@ -417,6 +451,10 @@ save_job_metadata() {
   "jobid": "$JOBID",
   "runid": ${runid},
   "nnodes": ${NNODES},
+  "system": "miyabi",
+  "separate": ${SEPARATE},
+  "server_nnodes": ${SERVER_NNODES},
+  "client_nnodes": ${CLIENT_NNODES},
   "server_ppn": ${server_ppn},
   "server_np": ${server_np},
   "client_ppn": ${ppn},
@@ -449,7 +487,7 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export OMPI_MCA_mpi_show_handle_leaks=0
 
-export RUST_LOG=debug
+# RUST_LOG is now set separately for server (RUST_LOG_S) and client (RUST_LOG_C)
 export RUST_BACKTRACE=full
 
 # MPI Configuration Fix for UCX Transport Layer Issues
@@ -523,6 +561,60 @@ else
   )
 fi
 
+# ==============================================================================
+# Separate server/client node mode
+# ==============================================================================
+# When SEPARATE=1, server and client processes run on different physical nodes.
+# This eliminates resource contention (CPU, memory, NVMe I/O) between them.
+
+if [ "${SEPARATE}" -eq 1 ]; then
+  # Default: floor(NNODES/2) for server, remainder for client (client gets extra if odd)
+  : ${SERVER_NODES:=$((NNODES / 2))}
+  : ${CLIENT_NODES:=$((NNODES - SERVER_NODES))}
+
+  if [ $((SERVER_NODES + CLIENT_NODES)) -ne "$NNODES" ]; then
+    echo "ERROR: SERVER_NODES($SERVER_NODES) + CLIENT_NODES($CLIENT_NODES) != NNODES($NNODES)"
+    exit 1
+  fi
+  if [ "$SERVER_NODES" -lt 1 ] || [ "$CLIENT_NODES" -lt 1 ]; then
+    echo "ERROR: Both SERVER_NODES and CLIENT_NODES must be >= 1"
+    exit 1
+  fi
+
+  # Create separate hostfiles from PBS_NODEFILE
+  all_unique_nodes=($(sort -u "${PBS_NODEFILE}"))
+  SERVER_NODEFILE="${JOB_OUTPUT_DIR}/server_nodes.txt"
+  CLIENT_NODEFILE="${JOB_OUTPUT_DIR}/client_nodes.txt"
+
+  printf '%s\n' "${all_unique_nodes[@]:0:${SERVER_NODES}}" > "${SERVER_NODEFILE}"
+  printf '%s\n' "${all_unique_nodes[@]:${SERVER_NODES}:${CLIENT_NODES}}" > "${CLIENT_NODEFILE}"
+
+  # Build separate mpirun commands with different hostfiles
+  if [[ "${USE_UCX_PML}" -eq 1 ]]; then
+    cmd_mpirun_server=(mpirun --hostfile "${SERVER_NODEFILE}" --mca mca_base_env_list "" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_client=(mpirun --hostfile "${CLIENT_NODEFILE}" --mca mca_base_env_list "" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+  else
+    cmd_mpirun_server=(mpirun --hostfile "${SERVER_NODEFILE}" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,vader,self --mca btl_openib_allow_ib 0 -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_client=(mpirun --hostfile "${CLIENT_NODEFILE}" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,vader,self --mca btl_openib_allow_ib 0 -x PATH -x LD_LIBRARY_PATH)
+  fi
+
+  SERVER_NNODES=${SERVER_NODES}
+  CLIENT_NNODES=${CLIENT_NODES}
+
+  echo "=========================================="
+  echo "SEPARATE Mode Configuration"
+  echo "=========================================="
+  echo "  Total nodes: $NNODES"
+  echo "  Server nodes ($SERVER_NNODES): $(tr '\n' ' ' < "${SERVER_NODEFILE}")"
+  echo "  Client nodes ($CLIENT_NNODES): $(tr '\n' ' ' < "${CLIENT_NODEFILE}")"
+  echo "=========================================="
+else
+  cmd_mpirun_server=("${cmd_mpirun_common[@]}")
+  cmd_mpirun_client=("${cmd_mpirun_common[@]}")
+  SERVER_NNODES=${NNODES}
+  CLIENT_NNODES=${NNODES}
+fi
+
 # Kill any previous benchfsd instances
 cmd_mpirun_kill=(
   "${cmd_mpirun_common[@]}"
@@ -578,7 +670,11 @@ parse_size_to_bytes() {
 cat > "${JOB_OUTPUT_DIR}/parameters.json" <<EOF
 {
   "parameter_file": "$PARAM_FILE",
+  "system": "miyabi",
   "nnodes": ${NNODES},
+  "separate": ${SEPARATE},
+  "server_nnodes": ${SERVER_NNODES},
+  "client_nnodes": ${CLIENT_NNODES},
   "transfer_sizes": [$(printf '"%s",' "${transfer_size_list[@]}" | sed 's/,$//; s/,$//')],
   "block_sizes": [$(printf '"%s",' "${block_size_list[@]}" | sed 's/,$//; s/,$//')],
   "client_ppn_values": [$(printf '%s,' "${ppn_list[@]}" | sed 's/,$//; s/,$//')],
@@ -628,23 +724,17 @@ check_server_ready() {
 
 stop_benchfsd() {
   if [ -n "${BENCHFSD_PID:-}" ]; then
-    echo "Stopping BenchFS servers (graceful shutdown for perf compatibility)..."
+    echo "Stopping BenchFS servers (graceful shutdown)..."
 
-    # Graceful shutdown timeout in seconds
-    # This must be long enough for perf to flush its data
     local graceful_timeout=${BENCHFS_SHUTDOWN_TIMEOUT:-30}
 
-    # First, try graceful shutdown with SIGTERM via mpirun
-    # This sends SIGTERM to benchfsd_mpi processes on all nodes
     echo "Sending SIGTERM to benchfsd_mpi processes..."
     "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
       pkill -TERM benchfsd_mpi 2>/dev/null || true
 
-    # Wait for graceful shutdown - poll until process exits or timeout
     echo "Waiting up to ${graceful_timeout}s for graceful shutdown..."
     local elapsed=0
     while [ $elapsed -lt $graceful_timeout ]; do
-      # Check if mpirun process has exited
       if ! kill -0 $BENCHFSD_PID 2>/dev/null; then
         echo "BenchFS servers stopped gracefully after ${elapsed}s"
         wait $BENCHFSD_PID 2>/dev/null || true
@@ -654,28 +744,21 @@ stop_benchfsd() {
       sleep 1
       elapsed=$((elapsed + 1))
 
-      # Show progress every 5 seconds
       if [ $((elapsed % 5)) -eq 0 ]; then
         echo "  Still waiting for graceful shutdown... (${elapsed}s/${graceful_timeout}s)"
       fi
     done
 
-    # Graceful shutdown timed out - now use SIGKILL as last resort
     echo "WARNING: Graceful shutdown timed out after ${graceful_timeout}s"
-    echo "WARNING: perf results may be incomplete due to forced termination"
 
-    # Kill the mpirun process that launched benchfsd
     kill $BENCHFSD_PID 2>/dev/null || true
     wait $BENCHFSD_PID 2>/dev/null || true
 
-    # Force cleanup of any orphaned processes with SIGKILL
     "${cmd_mpirun_common[@]}" -np "$NNODES" -map-by ppr:1:node \
       pkill -9 benchfsd_mpi 2>/dev/null || true
     pkill -9 benchfsd_mpi 2>/dev/null || true
 
-    # Wait for cleanup and FD release
     sleep 3
-
     unset BENCHFSD_PID
   fi
 }
@@ -745,17 +828,54 @@ EOF
     echo ""
   fi
 
+  # Determine the binary to use (with optional taskset wrapper)
+  BENCHFSD_BINARY="${BENCHFS_PREFIX}/benchfsd_mpi"
+  if [ "${TASKSET}" = "1" ]; then
+    echo "TASKSET mode enabled: limiting benchfsd_mpi to cores ${TASKSET_CORES}"
+    TASKSET_WRAPPER="${server_log_dir}/benchfsd_taskset_wrapper.sh"
+    cat > "${TASKSET_WRAPPER}" <<EOF2
+#!/bin/bash
+exec taskset -c ${TASKSET_CORES} ${BENCHFS_PREFIX}/benchfsd_mpi "\$@"
+EOF2
+    chmod +x "${TASKSET_WRAPPER}"
+    BENCHFSD_BINARY="${TASKSET_WRAPPER}"
+    echo "Created taskset wrapper: ${TASKSET_WRAPPER}"
+  fi
+
+  stats_file="${STATS_OUTPUT_DIR}/stats_server${config_id}.csv"
   cmd_benchfsd=(
-    "${cmd_mpirun_common[@]}"
+    "${cmd_mpirun_server[@]}"
     -np "$server_np"
     --bind-to none
     -map-by "ppr:${server_ppn}:node"
-    -x RUST_LOG
+    -x RUST_LOG="${RUST_LOG_S}"
     -x RUST_BACKTRACE
-    "${BENCHFS_PREFIX}/benchfsd_mpi"
+    "${BENCHFSD_BINARY}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
+    --stats-output "${stats_file}"
   )
+
+  # Add tracing option if enabled
+  if [ "${ENABLE_PERFETTO}" -eq 1 ]; then
+    trace_file="${PERFETTO_OUTPUT_DIR}/trace_server${config_id}.pftrace"
+    binary_idx=$((${#cmd_benchfsd[@]} - 5))
+    cmd_benchfsd=("${cmd_benchfsd[@]:0:binary_idx}" -x ENABLE_PERFETTO=1 "${cmd_benchfsd[@]:binary_idx}")
+    cmd_benchfsd+=(--trace-output "${trace_file}")
+    echo "Perfetto tracing enabled: ${trace_file}"
+  elif [ "${ENABLE_CHROME}" -eq 1 ]; then
+    trace_file="${PERFETTO_OUTPUT_DIR}/trace_server${config_id}.json"
+    binary_idx=$((${#cmd_benchfsd[@]} - 5))
+    cmd_benchfsd=("${cmd_benchfsd[@]:0:binary_idx}" -x ENABLE_CHROME=1 "${cmd_benchfsd[@]:binary_idx}")
+    cmd_benchfsd+=(--trace-output "${trace_file}")
+    echo "Chrome tracing enabled: ${trace_file}"
+  fi
+
+  # Add --enable-stats option if detailed timing statistics are requested
+  if [ "${ENABLE_STATS:-0}" -eq 1 ]; then
+    cmd_benchfsd+=(--enable-stats)
+    echo "Detailed timing statistics collection enabled"
+  fi
 
   echo "${cmd_benchfsd[@]}"
   "${cmd_benchfsd[@]}" > "${server_log_dir}/benchfsd_stdout.log" 2> "${server_log_dir}/benchfsd_stderr.log" &
@@ -791,7 +911,7 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
   benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
 
   for server_ppn in "${server_ppn_list[@]}"; do
-    server_np=$((NNODES * server_ppn))
+    server_np=$((SERVER_NNODES * server_ppn))
 
     # Start benchfsd with current server configuration
     stop_benchfsd
@@ -799,14 +919,14 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
 
     # Run all IOR parameter combinations with this server configuration
     for ppn in "${ppn_list[@]}"; do
-      np=$((NNODES * ppn))
+      np=$((CLIENT_NNODES * ppn))
 
       for transfer_size in "${transfer_size_list[@]}"; do
         for block_size in "${block_size_list[@]}"; do
           for ior_flags in "${ior_flags_list[@]}"; do
             echo "=========================================="
             echo "Run ID: $runid"
-            echo "Nodes: $NNODES"
+            echo "Nodes: $NNODES (server: $SERVER_NNODES, client: $CLIENT_NNODES, separate: $SEPARATE)"
             echo "Server: PPN=$server_ppn, NP=$server_np (config_id=$server_config_id)"
             echo "Client: PPN=$ppn, NP=$np"
             echo "Transfer size: $transfer_size, Block size: $block_size"
@@ -817,9 +937,12 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
             # Clean data directory between IOR runs (but keep registry)
             rm -rf "${BENCHFS_DATA_DIR}"/*
 
+            # Create run_${runid} symlink in benchfsd_logs/ for extract script compatibility
+            ln -sfn "server_${server_config_id}" "${BENCHFSD_LOG_BASE_DIR}/run_${runid}"
+
             # MPI Debug: Testing MPI communication before IOR
             echo "MPI Debug: Testing MPI communication before IOR"
-            "${cmd_mpirun_common[@]}" -np "$np" --map-by "ppr:${ppn}:node" hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
+            "${cmd_mpirun_client[@]}" -np "$np" --map-by "ppr:${ppn}:node" hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
             echo "MPI Debug: Communication test completed"
 
             # Run IOR benchmark
@@ -827,19 +950,26 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
             ior_json_file="${IOR_OUTPUT_DIR}/ior_result_${runid}.json"
             ior_stdout_file="${IOR_OUTPUT_DIR}/ior_stdout_${runid}.log"
 
+            # Create directory for retry stats from IOR clients
+            retry_stats_dir="${STATS_OUTPUT_DIR}/retry_stats_run${runid}"
+            mkdir -p "${retry_stats_dir}"
+
             cmd_ior=(
               time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
-              "${cmd_mpirun_common[@]}"
+              "${cmd_mpirun_client[@]}"
               -np "$np"
               --bind-to none
               --map-by "ppr:${ppn}:node"
-              -x RUST_LOG=info
+              -x RUST_LOG="${RUST_LOG_C}"
               -x RUST_BACKTRACE
+              -x BENCHFS_RETRY_STATS_OUTPUT="${retry_stats_dir}/"
+              -x BENCHFS_EXPECTED_NODES="${server_np}"
               "${IOR_PREFIX}/src/ior"
               -vvv
               -a BENCHFS
               -t "$transfer_size"
               -b "$block_size"
+              -e
               $ior_flags
               --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
               --benchfs.datadir="${BENCHFS_DATA_DIR}"
@@ -861,6 +991,19 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
               echo "WARNING: IOR run $runid failed with exit code $ior_exit_code"
               echo "  Stderr log: ${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log"
               echo "  Continuing with next parameter combination..."
+            fi
+
+            # Merge client retry stats into a single CSV file
+            merged_retry_stats="${STATS_OUTPUT_DIR}/retry_stats_run${runid}.csv"
+            if [ -d "${retry_stats_dir}" ]; then
+              echo "Merging client retry stats into ${merged_retry_stats}..."
+              echo "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate" > "${merged_retry_stats}"
+              for csv_file in "${retry_stats_dir}"/*.csv; do
+                if [ -f "$csv_file" ]; then
+                  tail -n +2 "$csv_file" >> "${merged_retry_stats}"
+                fi
+              done
+              rm -rf "${retry_stats_dir}"
             fi
 
             runid=$((runid + 1))

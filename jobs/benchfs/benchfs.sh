@@ -14,6 +14,9 @@ TIMESTAMP="$(timestamp)"
 : ${TASKSET_CORES:=0,1}  # CPU cores to pin benchfsd_mpi to when TASKSET=1
 : ${ENABLE_NODE_DIAGNOSTICS:=0}  # Set to 1 to enable pre-benchmark node diagnostics
 : ${ENABLE_STATS:=0}     # Set to 1 to enable detailed timing statistics collection
+: ${SEPARATE:=0}         # Set to 1 to use separate nodes for server and client
+: ${SERVER_NODES:=}      # Number of server nodes (default: floor(NNODES/2))
+: ${CLIENT_NODES:=}      # Number of client nodes (default: NNODES - SERVER_NODES)
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -54,11 +57,11 @@ cd "${OUTPUT_DIR}"
 mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
-  # 2
+  2
   # 1 2 4 8
   # 4
   # 2 4 8 16
-  16
+  # 16
   # 32
   # 64
   # 100
@@ -131,6 +134,9 @@ for nnodes in "${nnodes_list[@]}"; do
         -v TASKSET_CORES="$TASKSET_CORES"
         -v ENABLE_NODE_DIAGNOSTICS="$ENABLE_NODE_DIAGNOSTICS"
         -v ENABLE_STATS="$ENABLE_STATS"
+        -v SEPARATE="$SEPARATE"
+        -v SERVER_NODES="${SERVER_NODES}"
+        -v CLIENT_NODES="${CLIENT_NODES}"
         # -v SEP_SCR=yes
         "${JOB_FILE}"
       )

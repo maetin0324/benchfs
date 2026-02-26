@@ -60,6 +60,10 @@ STATS_OUTPUT_DIR="${JOB_OUTPUT_DIR}/stats"
 # Node diagnostics configuration
 : ${ENABLE_NODE_DIAGNOSTICS:=0}
 : ${FIO_RUNTIME:=30}
+# Separate server/client node mode
+: ${SEPARATE:=0}
+: ${SERVER_NODES:=}
+: ${CLIENT_NODES:=}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -325,6 +329,7 @@ fi
 echo "RUST_LOG (server): ${RUST_LOG_S}"
 echo "RUST_LOG (client): ${RUST_LOG_C}"
 echo "TASKSET: ${TASKSET} (cores: ${TASKSET_CORES})"
+echo "SEPARATE: ${SEPARATE} (server_nodes: ${SERVER_NODES:-auto}, client_nodes: ${CLIENT_NODES:-auto})"
 echo "Node Diagnostics: ENABLE_NODE_DIAGNOSTICS=${ENABLE_NODE_DIAGNOSTICS:-0} (FIO_RUNTIME=${FIO_RUNTIME:-30}s)"
 echo ""
 echo "Checking binary:"
@@ -578,6 +583,9 @@ save_job_metadata() {
   "jobid": "$JOBID",
   "runid": ${runid},
   "nnodes": ${NNODES},
+  "separate": ${SEPARATE},
+  "server_nnodes": ${SERVER_NNODES},
+  "client_nnodes": ${CLIENT_NNODES},
   "server_ppn": ${server_ppn},
   "server_np": ${server_np},
   "client_ppn": ${ppn},
@@ -666,6 +674,86 @@ else
   )
 fi
 
+# ==============================================================================
+# Separate server/client node mode
+# ==============================================================================
+# When SEPARATE=1, server and client processes run on different physical nodes.
+# This eliminates resource contention (CPU, memory, NVMe I/O) between them.
+
+_replace_result=()
+replace_nqsii_hostfile() {
+  local new_hostfile=$1
+  _replace_result=()
+  local i=0
+  local found_hostfile=0
+  while [ $i -lt ${#nqsii_mpiopts_array[@]} ]; do
+    if [ "${nqsii_mpiopts_array[$i]}" = "-hostfile" ] || [ "${nqsii_mpiopts_array[$i]}" = "--hostfile" ]; then
+      _replace_result+=("${nqsii_mpiopts_array[$i]}" "$new_hostfile")
+      i=$((i + 2))
+      found_hostfile=1
+    else
+      _replace_result+=("${nqsii_mpiopts_array[$i]}")
+      i=$((i + 1))
+    fi
+  done
+  if [ $found_hostfile -eq 0 ]; then
+    _replace_result+=("--hostfile" "$new_hostfile")
+  fi
+}
+
+if [ "${SEPARATE}" -eq 1 ]; then
+  # Default: floor(NNODES/2) for server, remainder for client (client gets extra if odd)
+  : ${SERVER_NODES:=$((NNODES / 2))}
+  : ${CLIENT_NODES:=$((NNODES - SERVER_NODES))}
+
+  if [ $((SERVER_NODES + CLIENT_NODES)) -ne "$NNODES" ]; then
+    echo "ERROR: SERVER_NODES($SERVER_NODES) + CLIENT_NODES($CLIENT_NODES) != NNODES($NNODES)"
+    exit 1
+  fi
+  if [ "$SERVER_NODES" -lt 1 ] || [ "$CLIENT_NODES" -lt 1 ]; then
+    echo "ERROR: Both SERVER_NODES and CLIENT_NODES must be >= 1"
+    exit 1
+  fi
+
+  # Create separate hostfiles from PBS_NODEFILE
+  all_unique_nodes=($(sort -u "${PBS_NODEFILE}"))
+  SERVER_NODEFILE="${JOB_OUTPUT_DIR}/server_nodes.txt"
+  CLIENT_NODEFILE="${JOB_OUTPUT_DIR}/client_nodes.txt"
+
+  printf '%s\n' "${all_unique_nodes[@]:0:${SERVER_NODES}}" > "${SERVER_NODEFILE}"
+  printf '%s\n' "${all_unique_nodes[@]:${SERVER_NODES}:${CLIENT_NODES}}" > "${CLIENT_NODEFILE}"
+
+  # Build separate mpirun base commands with different hostfiles
+  replace_nqsii_hostfile "${SERVER_NODEFILE}"
+  nqsii_server_opts=("${_replace_result[@]}")
+  replace_nqsii_hostfile "${CLIENT_NODEFILE}"
+  nqsii_client_opts=("${_replace_result[@]}")
+
+  if [[ "${USE_UCX_PML}" -eq 1 ]]; then
+    cmd_mpirun_server=(mpirun "${nqsii_server_opts[@]}" --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_client=(mpirun "${nqsii_client_opts[@]}" --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+  else
+    cmd_mpirun_server=(mpirun "${nqsii_server_opts[@]}" --mca pml ob1 --mca btl tcp,vader,self --mca btl_openib_allow_ib 0 -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_client=(mpirun "${nqsii_client_opts[@]}" --mca pml ob1 --mca btl tcp,vader,self --mca btl_openib_allow_ib 0 -x PATH -x LD_LIBRARY_PATH)
+  fi
+
+  SERVER_NNODES=${SERVER_NODES}
+  CLIENT_NNODES=${CLIENT_NODES}
+
+  echo "=========================================="
+  echo "SEPARATE Mode Configuration"
+  echo "=========================================="
+  echo "  Total nodes: $NNODES"
+  echo "  Server nodes ($SERVER_NNODES): $(tr '\n' ' ' < "${SERVER_NODEFILE}")"
+  echo "  Client nodes ($CLIENT_NNODES): $(tr '\n' ' ' < "${CLIENT_NODEFILE}")"
+  echo "=========================================="
+else
+  cmd_mpirun_server=("${cmd_mpirun_common[@]}")
+  cmd_mpirun_client=("${cmd_mpirun_common[@]}")
+  SERVER_NNODES=${NNODES}
+  CLIENT_NNODES=${NNODES}
+fi
+
 # Kill any previous benchfsd instances
 cmd_mpirun_kill=(
   "${cmd_mpirun_common[@]}"
@@ -725,6 +813,9 @@ cat > "${JOB_OUTPUT_DIR}/parameters.json" <<EOF
 {
   "parameter_file": "$PARAM_FILE",
   "nnodes": ${NNODES},
+  "separate": ${SEPARATE},
+  "server_nnodes": ${SERVER_NNODES},
+  "client_nnodes": ${CLIENT_NNODES},
   "transfer_sizes": [$(printf '"%s",' "${transfer_size_list[@]}" | sed 's/,$//; s/,$//')],
   "block_sizes": [$(printf '"%s",' "${block_size_list[@]}" | sed 's/,$//; s/,$//')],
   "client_ppn_values": [$(printf '%s,' "${ppn_list[@]}" | sed 's/,$//; s/,$//')],
@@ -771,17 +862,17 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
   benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
 
   for server_ppn in "${server_ppn_list[@]}"; do
-    server_np=$((NNODES * server_ppn))
+    server_np=$((SERVER_NNODES * server_ppn))
 
     for ppn in "${ppn_list[@]}"; do
-      np=$((NNODES * ppn))
+      np=$((CLIENT_NNODES * ppn))
 
       for transfer_size in "${transfer_size_list[@]}"; do
         for block_size in "${block_size_list[@]}"; do
           for ior_flags in "${ior_flags_list[@]}"; do
             echo "=========================================="
             echo "Run ID: $runid"
-            echo "Nodes: $NNODES"
+            echo "Nodes: $NNODES (server: $SERVER_NNODES, client: $CLIENT_NNODES, separate: $SEPARATE)"
             echo "Server: PPN=$server_ppn, NP=$server_np"
             echo "Client: PPN=$ppn, NP=$np"
             echo "Transfer size: $transfer_size, Block size: $block_size"
@@ -872,13 +963,13 @@ EOF
             # Build benchfsd command with optional Perfetto tracing and stats output
             stats_file="${STATS_OUTPUT_DIR}/stats_run${runid}.csv"
             cmd_benchfsd=(
-              "${cmd_mpirun_common[@]}"
+              "${cmd_mpirun_server[@]}"
               -np "$server_np"
               --bind-to none
               -map-by "ppr:${server_ppn}:node"
               -x RUST_LOG="${RUST_LOG_S}"
               -x RUST_BACKTRACE
-              # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_common
+              # Note: PATH and LD_LIBRARY_PATH are already set in cmd_mpirun_server
               "${BENCHFSD_BINARY}"
               "${BENCHFS_REGISTRY_DIR}"
               "${config_file}"
@@ -945,7 +1036,7 @@ EOF
 
           # MPI Debug: Testing MPI communication before IOR
           echo "MPI Debug: Testing MPI communication before IOR"
-          "${cmd_mpirun_common[@]}" -np "$np" --map-by "ppr:${ppn}:node" hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
+          "${cmd_mpirun_client[@]}" -np "$np" --map-by "ppr:${ppn}:node" hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
           echo "MPI Debug: Communication test completed"
 
           # Run IOR benchmark
@@ -959,7 +1050,7 @@ EOF
 
           cmd_ior=(
             time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
-            "${cmd_mpirun_common[@]}"
+            "${cmd_mpirun_client[@]}"
             -np "$np"
             --bind-to none
             --map-by "ppr:${ppn}:node"
