@@ -28,6 +28,7 @@ TIMESTAMP="$(timestamp)"
 : ${TASKSET_CORES:=0,1}
 : ${ENABLE_NODE_DIAGNOSTICS:=0}
 : ${ENABLE_STATS:=0}
+: ${POSIX:=0}            # Set to 1 to use POSIX synchronous I/O instead of io_uring
 : ${SEPARATE:=0}         # Set to 1 to use separate nodes for server and client
 : ${SERVER_NODES:=}      # Number of server nodes (default: floor(NNODES/2))
 : ${CLIENT_NODES:=}      # Number of client nodes (default: NNODES - SERVER_NODES)
@@ -66,6 +67,7 @@ export TASKSET
 export TASKSET_CORES
 export ENABLE_NODE_DIAGNOSTICS
 export ENABLE_STATS
+export POSIX
 export SEPARATE
 export SERVER_NODES
 export CLIENT_NODES
@@ -96,7 +98,8 @@ mkdir -p "${BACKEND_DIR}"
 # On Sirius: select=1 gives 1 chunk (24 CPUs) with /scr scratch provisioning.
 # Client processes use --oversubscribe to exceed the 24-slot limit.
 nnodes_list=(
-  60
+  # 2 4 8 16 32
+  2
 )
 niter=1
 

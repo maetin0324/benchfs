@@ -542,6 +542,421 @@ impl ChunkStore for FileChunkStore {
     }
 }
 
+/// Page-aligned buffer for O_DIRECT I/O
+///
+/// O_DIRECT requires buffers to be aligned to the filesystem's block size (typically 4096).
+/// This struct uses `posix_memalign` to allocate properly aligned memory.
+struct AlignedBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedBuffer {
+    /// Allocate a new aligned buffer
+    ///
+    /// # Arguments
+    /// * `size` - Buffer size in bytes
+    /// * `alignment` - Required alignment (typically 4096 for O_DIRECT)
+    fn new(size: usize, alignment: usize) -> Self {
+        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        let ret = unsafe { libc::posix_memalign(&mut ptr, alignment, size) };
+        assert_eq!(ret, 0, "posix_memalign failed with error code {}", ret);
+        assert!(!ptr.is_null(), "posix_memalign returned null pointer");
+        Self {
+            ptr: ptr as *mut u8,
+            len: size,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::free(self.ptr as *mut libc::c_void);
+        }
+    }
+}
+
+/// Synchronous POSIX I/O chunk storage
+///
+/// Stores chunks using direct POSIX syscalls (open/pwrite/pread/close) with O_DIRECT.
+/// Uses the same sharded directory structure as `IOUringChunkStore` for fair comparison.
+///
+/// This backend is intended for benchmarking the overhead of io_uring vs synchronous syscalls
+/// while keeping all other factors (O_DIRECT, sharding, per-chunk open/close) identical.
+pub struct PosixChunkStore {
+    /// Base directory for chunk storage
+    base_dir: PathBuf,
+
+    /// Chunk size
+    chunk_size: usize,
+
+    /// Whether to use O_DIRECT
+    use_direct_io: bool,
+
+    /// Reusable aligned buffer (single-thread, so RefCell is fine)
+    aligned_buffer: RefCell<AlignedBuffer>,
+}
+
+impl PosixChunkStore {
+    /// Number of shard subdirectories (same as IOUringChunkStore)
+    const SHARD_COUNT: u64 = 16;
+
+    /// O_DIRECT alignment requirement
+    const ALIGNMENT: usize = 4096;
+
+    pub fn new<P: AsRef<Path>>(base_dir: P, use_direct_io: bool) -> ChunkStoreResult<Self> {
+        let base_dir = base_dir.as_ref().to_path_buf();
+
+        if !base_dir.exists() {
+            std::fs::create_dir_all(&base_dir)?;
+        }
+
+        let chunk_size = CHUNK_SIZE;
+        // Allocate aligned buffer rounded up to alignment boundary
+        let buf_size = (chunk_size + Self::ALIGNMENT - 1) & !(Self::ALIGNMENT - 1);
+        let aligned_buffer = RefCell::new(AlignedBuffer::new(buf_size, Self::ALIGNMENT));
+
+        tracing::info!(
+            "PosixChunkStore initialized (O_DIRECT={}, chunk_size={}, buf_size={})",
+            use_direct_io,
+            chunk_size,
+            buf_size,
+        );
+
+        Ok(Self {
+            base_dir,
+            chunk_size,
+            use_direct_io,
+            aligned_buffer,
+        })
+    }
+
+    fn hash_path(&self, path: &str) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        format!("{:x}", hasher.finish())
+    }
+
+    fn shard_dir(&self, chunk_index: u64) -> String {
+        format!("{:x}", chunk_index % Self::SHARD_COUNT)
+    }
+
+    fn chunk_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
+        let path_hash = self.hash_path(file_path);
+        let shard = self.shard_dir(chunk_index);
+        self.base_dir
+            .join(path_hash)
+            .join(shard)
+            .join(format!("{}", chunk_index))
+    }
+
+    fn ensure_chunk_dir(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<PathBuf> {
+        let path_hash = self.hash_path(file_path);
+        let shard = self.shard_dir(chunk_index);
+        let dir = self.base_dir.join(path_hash).join(shard);
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+        }
+        Ok(dir)
+    }
+
+    /// Write a chunk using synchronous POSIX I/O
+    #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "posix_write_chunk", skip(self, data), fields(path = file_path, chunk = chunk_index, offset, len = data.len()))]
+    pub async fn write_chunk(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize> {
+        let total_start = std::time::Instant::now();
+
+        if offset >= self.chunk_size as u64 {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+
+        // Ensure shard directory exists
+        self.ensure_chunk_dir(file_path, chunk_index)?;
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+        let c_path = std::ffi::CString::new(
+            chunk_file_path
+                .to_str()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        // Open
+        let open_start = std::time::Instant::now();
+        let mut flags = libc::O_WRONLY | libc::O_CREAT;
+        if self.use_direct_io {
+            flags |= libc::O_DIRECT;
+        }
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o644 as libc::mode_t) };
+        if fd < 0 {
+            return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+        }
+        let open_elapsed = open_start.elapsed();
+
+        // Prepare aligned buffer and write
+        let write_start = std::time::Instant::now();
+        let bytes_to_write = data.len().min(self.chunk_size - offset as usize);
+
+        let written = if self.use_direct_io {
+            // O_DIRECT: copy data into aligned buffer, round write size up to 512-byte boundary
+            let mut buf = self.aligned_buffer.borrow_mut();
+            let aligned_len = (bytes_to_write + 511) & !511;
+            let slice = buf.as_mut_slice();
+            // Zero the tail padding so we don't write garbage
+            slice[..aligned_len].fill(0);
+            slice[..bytes_to_write].copy_from_slice(&data[..bytes_to_write]);
+            let ret = unsafe {
+                libc::pwrite(fd, buf.as_slice().as_ptr() as *const libc::c_void, aligned_len, offset as libc::off_t)
+            };
+            if ret < 0 {
+                unsafe { libc::close(fd); }
+                return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+            }
+            // Truncate file to actual size if we wrote padding beyond data
+            let actual_end = offset as usize + bytes_to_write;
+            if aligned_len > bytes_to_write {
+                unsafe { libc::ftruncate(fd, actual_end as libc::off_t); }
+            }
+            bytes_to_write
+        } else {
+            let ret = unsafe {
+                libc::pwrite(fd, data.as_ptr() as *const libc::c_void, bytes_to_write, offset as libc::off_t)
+            };
+            if ret < 0 {
+                unsafe { libc::close(fd); }
+                return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+            }
+            ret as usize
+        };
+        let write_elapsed = write_start.elapsed();
+
+        // Close
+        let close_start = std::time::Instant::now();
+        unsafe { libc::close(fd); }
+        let close_elapsed = close_start.elapsed();
+
+        let total_elapsed = total_start.elapsed();
+
+        tracing::debug!(
+            op_type = "WRITE_CHUNK_POSIX",
+            chunk_index = chunk_index,
+            bytes_written = written,
+            open_us = open_elapsed.as_micros() as u64,
+            write_us = write_elapsed.as_micros() as u64,
+            close_us = close_elapsed.as_micros() as u64,
+            total_us = total_elapsed.as_micros() as u64,
+            "CHUNK_IO_TIMING"
+        );
+
+        Ok(written)
+    }
+
+    /// Read a chunk using synchronous POSIX I/O
+    #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "posix_read_chunk", skip(self), fields(path = file_path, chunk = chunk_index, offset, len = length))]
+    pub async fn read_chunk(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>> {
+        let total_start = std::time::Instant::now();
+
+        if offset >= self.chunk_size as u64 {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+        if !chunk_file_path.exists() {
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
+        }
+
+        let c_path = std::ffi::CString::new(
+            chunk_file_path
+                .to_str()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        // Open
+        let open_start = std::time::Instant::now();
+        let mut flags = libc::O_RDONLY;
+        if self.use_direct_io {
+            flags |= libc::O_DIRECT;
+        }
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+        }
+        let open_elapsed = open_start.elapsed();
+
+        // Read
+        let read_start = std::time::Instant::now();
+        let read_len = length as usize;
+
+        let data = if self.use_direct_io {
+            // O_DIRECT: read into aligned buffer, round up to 512-byte boundary
+            let mut buf = self.aligned_buffer.borrow_mut();
+            let aligned_len = (read_len + 511) & !511;
+            let ret = unsafe {
+                libc::pread(fd, buf.as_mut_slice().as_ptr() as *mut libc::c_void, aligned_len, offset as libc::off_t)
+            };
+            if ret < 0 {
+                unsafe { libc::close(fd); }
+                return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+            }
+            let bytes_read = (ret as usize).min(read_len);
+            buf.as_slice()[..bytes_read].to_vec()
+        } else {
+            let mut data = vec![0u8; read_len];
+            let ret = unsafe {
+                libc::pread(fd, data.as_mut_ptr() as *mut libc::c_void, read_len, offset as libc::off_t)
+            };
+            if ret < 0 {
+                unsafe { libc::close(fd); }
+                return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+            }
+            data.truncate(ret as usize);
+            data
+        };
+        let read_elapsed = read_start.elapsed();
+
+        // Close
+        let close_start = std::time::Instant::now();
+        unsafe { libc::close(fd); }
+        let close_elapsed = close_start.elapsed();
+
+        let total_elapsed = total_start.elapsed();
+
+        tracing::debug!(
+            op_type = "READ_CHUNK_POSIX",
+            chunk_index = chunk_index,
+            bytes_read = data.len(),
+            open_us = open_elapsed.as_micros() as u64,
+            read_us = read_elapsed.as_micros() as u64,
+            close_us = close_elapsed.as_micros() as u64,
+            total_us = total_elapsed.as_micros() as u64,
+            "CHUNK_IO_TIMING"
+        );
+
+        Ok(data)
+    }
+
+    /// Delete a chunk file
+    #[async_backtrace::framed]
+    pub async fn delete_chunk(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+
+        if !chunk_file_path.exists() {
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
+        }
+
+        std::fs::remove_file(&chunk_file_path)?;
+        Ok(())
+    }
+
+    /// Delete all chunks for a file (handles sharded directory structure)
+    #[async_backtrace::framed]
+    pub async fn delete_file_chunks(&self, file_path: &str) -> ChunkStoreResult<usize> {
+        let path_hash = self.hash_path(file_path);
+        let dir = self.base_dir.join(path_hash);
+
+        if !dir.exists() {
+            return Ok(0);
+        }
+
+        let mut deleted_count = 0;
+
+        for shard_entry in std::fs::read_dir(&dir)? {
+            let shard_entry = shard_entry?;
+            let shard_path = shard_entry.path();
+
+            if shard_path.is_dir() {
+                for chunk_entry in std::fs::read_dir(&shard_path)? {
+                    let chunk_entry = chunk_entry?;
+                    if chunk_entry.path().is_file() {
+                        std::fs::remove_file(chunk_entry.path())?;
+                        deleted_count += 1;
+                    }
+                }
+                std::fs::remove_dir(&shard_path)?;
+            } else if shard_path.is_file() {
+                std::fs::remove_file(&shard_path)?;
+                deleted_count += 1;
+            }
+        }
+
+        std::fs::remove_dir(&dir)?;
+
+        tracing::debug!("Deleted {} chunks for path {}", deleted_count, file_path);
+        Ok(deleted_count)
+    }
+
+    /// Check if a chunk exists
+    pub fn has_chunk(&self, file_path: &str, chunk_index: u64) -> bool {
+        self.chunk_path(file_path, chunk_index).exists()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ChunkStore for PosixChunkStore {
+    async fn write_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize> {
+        self.write_chunk(path, chunk_index, offset, data).await
+    }
+
+    async fn read_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>> {
+        self.read_chunk(path, chunk_index, offset, length).await
+    }
+
+    async fn delete_chunk(&self, path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
+        self.delete_chunk(path, chunk_index).await
+    }
+
+    async fn delete_file_chunks(&self, path: &str) -> ChunkStoreResult<usize> {
+        self.delete_file_chunks(path).await
+    }
+
+    fn has_chunk(&self, path: &str, chunk_index: u64) -> bool {
+        self.has_chunk(path, chunk_index)
+    }
+}
+
 /// IO_uring-based chunk storage
 ///
 /// Stores chunks in the local filesystem using io_uring for high-performance async I/O.

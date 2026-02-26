@@ -96,6 +96,7 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 : ${TASKSET_CORES:=0,1}
 : ${ENABLE_NODE_DIAGNOSTICS:=0}
 : ${ENABLE_STATS:=0}
+: ${POSIX:=0}
 : ${SEPARATE:=0}
 : ${SERVER_NODES:=}
 : ${CLIENT_NODES:=}
@@ -126,6 +127,7 @@ echo "RUST_LOG (server): ${RUST_LOG_S}"
 echo "RUST_LOG (client): ${RUST_LOG_C}"
 echo "TASKSET: ${TASKSET} (cores: ${TASKSET_CORES})"
 echo "ENABLE_STATS: ${ENABLE_STATS}"
+echo "POSIX: ${POSIX}"
 echo "SEPARATE: ${SEPARATE} (server_nodes: ${SERVER_NODES:-auto}, client_nodes: ${CLIENT_NODES:-auto})"
 echo "ENABLE_NODE_DIAGNOSTICS: ${ENABLE_NODE_DIAGNOSTICS}"
 echo ""
@@ -466,6 +468,16 @@ start_benchfsd() {
 
   # Create BenchFS config file
   config_file="${JOB_OUTPUT_DIR}/benchfs_${config_id}.toml"
+
+  # Determine storage backend settings for TOML config
+  if [ "${POSIX:-0}" -eq 1 ]; then
+    use_iouring_value="false"
+    storage_backend_line='storage_backend = "posix"'
+  else
+    use_iouring_value="true"
+    storage_backend_line=""
+  fi
+
   cat > "${config_file}" <<EOF
 [node]
 node_id = "node0"
@@ -474,7 +486,8 @@ log_level = "info"
 
 [storage]
 chunk_size = ${benchfs_chunk_size}
-use_iouring = true
+use_iouring = ${use_iouring_value}
+${storage_backend_line}
 max_storage_gb = 0
 
 [network]

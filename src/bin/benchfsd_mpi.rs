@@ -21,7 +21,7 @@ use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::{RpcServer, get_server_rpc_stats};
-use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore};
+use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore, PosixChunkStore};
 
 use pluvio_runtime::executor::{Runtime, SchedulingConfig};
 use pluvio_timer::TimerReactor;
@@ -329,75 +329,95 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         return Err(format!("Failed to create chunk store directory: {}", e).into());
     }
 
+    let effective_backend = config.storage.effective_backend().to_string();
     let (chunk_store, allocator): (
         Rc<dyn ChunkStore>,
         Rc<pluvio_uring::allocator::FixedBufferAllocator>,
-    ) = if config.storage.use_iouring {
-        tracing::info!("Using io_uring for storage backend");
+    ) = match effective_backend.as_str() {
+        "iouring" => {
+            tracing::info!("Using io_uring for storage backend");
 
-        // Create io_uring reactor
-        // Buffer size must match the chunk_size from config to support chunk-sized I/O operations
-        // Optimized parameters for high-throughput workloads:
-        // - queue_size: 512 buffers (reduced from 4096 to cut memory usage)
-        //   With 4 MiB chunks: 512 * 4 MiB = 2 GiB (was 16 GiB with 4096)
-        //   512 is still far above concurrent RPC limit (64), so no throughput loss
-        // - submit_depth: 128 for better batching and throughput
-        // - wait_submit_timeout/wait_complete_timeout: 1ms for low-latency reactor polling
-        let chunk_size = config.storage.chunk_size;
-        let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
-        let chunk_multiplier = (base_chunk_size / chunk_size).max(1);
-        // Reduced from 4096 to 512: cuts memory from 16 GiB to 2 GiB per process,
-        // reducing startup time from ~70s to ~10s while maintaining enough queue depth
-        let queue_size = (512 * chunk_multiplier as u32).min(512);
-        let submit_depth = (128 * chunk_multiplier as u32).min(512); // Cap at 512
+            // Create io_uring reactor
+            // Buffer size must match the chunk_size from config to support chunk-sized I/O operations
+            // Optimized parameters for high-throughput workloads:
+            // - queue_size: 512 buffers (reduced from 4096 to cut memory usage)
+            //   With 4 MiB chunks: 512 * 4 MiB = 2 GiB (was 16 GiB with 4096)
+            //   512 is still far above concurrent RPC limit (64), so no throughput loss
+            // - submit_depth: 128 for better batching and throughput
+            // - wait_submit_timeout/wait_complete_timeout: 1ms for low-latency reactor polling
+            let chunk_size = config.storage.chunk_size;
+            let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
+            let chunk_multiplier = (base_chunk_size / chunk_size).max(1);
+            // Reduced from 4096 to 512: cuts memory from 16 GiB to 2 GiB per process,
+            // reducing startup time from ~70s to ~10s while maintaining enough queue depth
+            let queue_size = (512 * chunk_multiplier as u32).min(512);
+            let submit_depth = (128 * chunk_multiplier as u32).min(512); // Cap at 512
 
-        tracing::info!(
-            "Configuring io_uring: buffer_size={} bytes ({} MiB), queue_size={}, submit_depth={}, memory={}GiB",
-            chunk_size,
-            chunk_size / (1024 * 1024),
-            queue_size,
-            submit_depth,
-            (queue_size as usize * chunk_size) / (1024 * 1024 * 1024)
-        );
-        let uring_reactor = IoUringReactor::builder()
-            .queue_size(queue_size)
-            .buffer_size(chunk_size)
-            .submit_depth(submit_depth)
-            .wait_submit_timeout(std::time::Duration::from_millis(1))
-            .wait_complete_timeout(std::time::Duration::from_millis(1))
-            .build();
+            tracing::info!(
+                "Configuring io_uring: buffer_size={} bytes ({} MiB), queue_size={}, submit_depth={}, memory={}GiB",
+                chunk_size,
+                chunk_size / (1024 * 1024),
+                queue_size,
+                submit_depth,
+                (queue_size as usize * chunk_size) / (1024 * 1024 * 1024)
+            );
+            let uring_reactor = IoUringReactor::builder()
+                .queue_size(queue_size)
+                .buffer_size(chunk_size)
+                .submit_depth(submit_depth)
+                .wait_submit_timeout(std::time::Duration::from_millis(1))
+                .wait_complete_timeout(std::time::Duration::from_millis(1))
+                .build();
 
-        let allocator = uring_reactor.allocator.clone();
-        let reactor_for_backend = uring_reactor.clone();
-        runtime.register_reactor("io_uring", uring_reactor);
+            let allocator = uring_reactor.allocator.clone();
+            let reactor_for_backend = uring_reactor.clone();
+            runtime.register_reactor("io_uring", uring_reactor);
 
-        // Create IOUringBackend and chunk store
-        // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
-        // that has the registered buffers (fixes SEGFAULT with 4+ nodes)
-        let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), reactor_for_backend));
-        // Increase LRU cache size to 32768 to reduce cache thrashing
-        // With 4 ppn × 4096 chunks = 16384 files per node, 8192 was causing ~50% miss rate
-        let chunk_store = Rc::new(IOUringChunkStore::with_capacity(
-            &chunk_store_dir,
-            io_backend.clone(),
-            32768, // Increased from default 8192 to handle large-scale benchmarks
-        )?);
-        (chunk_store, allocator)
-    } else {
-        tracing::info!("io_uring disabled - using file-based storage backend");
+            // Create IOUringBackend and chunk store
+            // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
+            // that has the registered buffers (fixes SEGFAULT with 4+ nodes)
+            let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), reactor_for_backend));
+            // Increase LRU cache size to 32768 to reduce cache thrashing
+            // With 4 ppn × 4096 chunks = 16384 files per node, 8192 was causing ~50% miss rate
+            let chunk_store = Rc::new(IOUringChunkStore::with_capacity(
+                &chunk_store_dir,
+                io_backend.clone(),
+                32768, // Increased from default 8192 to handle large-scale benchmarks
+            )?);
+            (chunk_store, allocator)
+        }
+        "posix" => {
+            tracing::info!("Using POSIX synchronous I/O for storage backend");
 
-        // Create a minimal io_uring reactor just for allocator
-        let uring_reactor = IoUringReactor::builder()
-            .queue_size(32)
-            .buffer_size(1 << 16) // 64 KiB - minimal size
-            .submit_depth(4)
-            .wait_submit_timeout(std::time::Duration::from_micros(10))
-            .wait_complete_timeout(std::time::Duration::from_micros(10))
-            .build();
+            // Create a minimal io_uring reactor just for allocator (needed by RPC layer)
+            let uring_reactor = IoUringReactor::builder()
+                .queue_size(32)
+                .buffer_size(1 << 16) // 64 KiB - minimal size
+                .submit_depth(4)
+                .wait_submit_timeout(std::time::Duration::from_micros(10))
+                .wait_complete_timeout(std::time::Duration::from_micros(10))
+                .build();
 
-        let allocator = uring_reactor.allocator.clone();
-        let chunk_store = Rc::new(FileChunkStore::new(&chunk_store_dir)?);
-        (chunk_store, allocator)
+            let allocator = uring_reactor.allocator.clone();
+            let chunk_store = Rc::new(PosixChunkStore::new(&chunk_store_dir, true)?);
+            (chunk_store, allocator)
+        }
+        _ => {
+            tracing::info!("Using file-based storage backend (backend={})", effective_backend);
+
+            // Create a minimal io_uring reactor just for allocator
+            let uring_reactor = IoUringReactor::builder()
+                .queue_size(32)
+                .buffer_size(1 << 16) // 64 KiB - minimal size
+                .submit_depth(4)
+                .wait_submit_timeout(std::time::Duration::from_micros(10))
+                .wait_complete_timeout(std::time::Duration::from_micros(10))
+                .build();
+
+            let allocator = uring_reactor.allocator.clone();
+            let chunk_store = Rc::new(FileChunkStore::new(&chunk_store_dir)?);
+            (chunk_store, allocator)
+        }
     };
 
     // Create RPC handler context

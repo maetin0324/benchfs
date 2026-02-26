@@ -130,9 +130,34 @@ pub struct StorageConfig {
     #[serde(default = "default_use_iouring")]
     pub use_iouring: bool,
 
+    /// Storage backend selection: "iouring" | "posix" | "file"
+    /// When set, this takes priority over use_iouring.
+    /// When not set, falls back to use_iouring flag for backward compatibility.
+    #[serde(default)]
+    pub storage_backend: Option<String>,
+
     /// Maximum storage size in GB (0 = unlimited)
     #[serde(default)]
     pub max_storage_gb: usize,
+}
+
+impl StorageConfig {
+    /// Get the effective storage backend name.
+    ///
+    /// If `storage_backend` is explicitly set, use it.
+    /// Otherwise, fall back to the `use_iouring` boolean for backward compatibility.
+    pub fn effective_backend(&self) -> &str {
+        match &self.storage_backend {
+            Some(b) => b.as_str(),
+            None => {
+                if self.use_iouring {
+                    "iouring"
+                } else {
+                    "file"
+                }
+            }
+        }
+    }
 }
 
 fn default_chunk_size() -> usize {
@@ -217,6 +242,7 @@ impl Default for ServerConfig {
             storage: StorageConfig {
                 chunk_size: default_chunk_size(),
                 use_iouring: default_use_iouring(),
+                storage_backend: None,
                 max_storage_gb: 0,
             },
             network: NetworkConfig {
