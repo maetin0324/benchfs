@@ -1236,7 +1236,7 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
                     );
                     (
                         ReadChunkResponseHeader::success(actual_bytes as u64),
-                        None,
+                        None::<Vec<u8>>,
                         Some((fixed_buffer, actual_bytes)),
                         buffer_acquire_us,
                         io_us,
@@ -1254,9 +1254,66 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
                     )
                 }
             }
+        } else if chunk_store_any.downcast_ref::<crate::storage::chunk_store::DummyChunkStore>().is_some() {
+            // DummyChunkStore fast path: no actual I/O needed, use FixedBuffer directly
+            tracing::trace!("Using DummyChunkStore fast path for ReadChunkById");
+
+            let buffer_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+            let fixed_buffer = ctx.allocator.acquire().await;
+            let buffer_acquire_us = buffer_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+            let read_len = (header.length as usize).min(fixed_buffer.len());
+
+            (
+                ReadChunkResponseHeader::success(read_len as u64),
+                None,
+                Some((fixed_buffer, read_len)),
+                buffer_acquire_us,
+                0u64,
+            )
+        } else if let Some(posix_store) = chunk_store_any.downcast_ref::<crate::storage::chunk_store::PosixChunkStore>() {
+            // PosixChunkStore path: read directly into FixedBuffer to avoid intermediate Vec allocation
+            tracing::trace!("Using PosixChunkStore path for ReadChunkById");
+
+            let buffer_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+            let mut fixed_buffer = ctx.allocator.acquire().await;
+            let buffer_acquire_us = buffer_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+            let read_len = (header.length as usize).min(fixed_buffer.len());
+
+            let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+            match posix_store
+                .read_chunk_into(&path, chunk_index, header.offset, header.length, &mut fixed_buffer.as_mut_slice()[..read_len])
+                .await
+            {
+                Ok(bytes_read) => {
+                    let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+                    tracing::trace!("Read {} bytes from PosixChunkStore into FixedBuffer", bytes_read);
+                    (
+                        ReadChunkResponseHeader::success(bytes_read as u64),
+                        None,
+                        Some((fixed_buffer, bytes_read)),
+                        buffer_acquire_us,
+                        io_us,
+                    )
+                }
+                Err(e) => {
+                    let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+                    tracing::error!("Failed to read chunk (PosixChunkStore): {:?}", e);
+                    (
+                        ReadChunkResponseHeader::error(-2),
+                        None,
+                        None,
+                        buffer_acquire_us,
+                        io_us,
+                    )
+                }
+            }
         } else {
-            // Fallback path
+            // Fallback path: use pooled FixedBuffer for reply to leverage UCX optimizations
             tracing::trace!("Using fallback path for ReadChunkById");
+
+            let buffer_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+            let mut fixed_buffer = ctx.allocator.acquire().await;
+            let buffer_acquire_us = buffer_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
             let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
             match ctx
@@ -1266,13 +1323,14 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
             {
                 Ok(data) => {
                     let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
-                    let bytes_read = data.len() as u64;
-                    tracing::trace!("Read {} bytes from storage", bytes_read);
+                    let read_len = data.len().min(fixed_buffer.len());
+                    fixed_buffer.as_mut_slice()[..read_len].copy_from_slice(&data[..read_len]);
+                    tracing::trace!("Read {} bytes from storage", read_len);
                     (
-                        ReadChunkResponseHeader::success(bytes_read),
-                        Some(data),
+                        ReadChunkResponseHeader::success(read_len as u64),
                         None,
-                        0u64,
+                        Some((fixed_buffer, read_len)),
+                        buffer_acquire_us,
                         io_us,
                     )
                 }
@@ -1283,7 +1341,7 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
                         ReadChunkResponseHeader::error(-2),
                         None,
                         None,
-                        0u64,
+                        buffer_acquire_us,
                         io_us,
                     )
                 }
@@ -1616,39 +1674,52 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
                 }
             }
         } else {
-            // Fallback path
+            // Fallback path: use pooled FixedBuffer to avoid malloc/free per RPC
             tracing::trace!("Using fallback path for WriteChunkById");
 
-            let mut data = vec![0u8; data_len];
+            let buffer_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+            let mut fixed_buffer = ctx.allocator.acquire().await;
+            let buffer_acquire_us = buffer_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
-            let recv_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
-            if let Err(e) = am_msg.recv_data_single(&mut data).await {
-                let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
-                tracing::error!("Failed to receive data: {:?}", e);
-                (WriteChunkResponseHeader::error(-5), 0u64, recv_us, 0u64)
+            if data_len > fixed_buffer.len() {
+                tracing::error!(
+                    "Data size {} exceeds registered buffer size {}",
+                    data_len,
+                    fixed_buffer.len()
+                );
+                (WriteChunkResponseHeader::error(-22), buffer_acquire_us, 0u64, 0u64)
             } else {
-                let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+                let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
 
-                let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
-                match ctx
-                    .chunk_store
-                    .write_chunk(&path, chunk_index, header.offset, &data)
-                    .await
-                {
-                    Ok(_bytes_written) => {
-                        let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
-                        tracing::trace!(
-                            "Wrote {} bytes to storage (path={}, chunk={})",
-                            data.len(),
-                            path,
-                            chunk_index
-                        );
-                        (WriteChunkResponseHeader::success(header.length), 0u64, recv_us, io_us)
-                    }
-                    Err(e) => {
-                        let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
-                        tracing::error!("Failed to write chunk: {:?}", e);
-                        (WriteChunkResponseHeader::error(-5), 0u64, recv_us, io_us)
+                let recv_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+                if let Err(e) = am_msg.recv_data_single(buffer_slice).await {
+                    let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+                    tracing::error!("Failed to receive data: {:?}", e);
+                    (WriteChunkResponseHeader::error(-5), buffer_acquire_us, recv_us, 0u64)
+                } else {
+                    let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+
+                    let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
+                    match ctx
+                        .chunk_store
+                        .write_chunk(&path, chunk_index, header.offset, buffer_slice)
+                        .await
+                    {
+                        Ok(_bytes_written) => {
+                            let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+                            tracing::trace!(
+                                "Wrote {} bytes to storage (path={}, chunk={})",
+                                data_len,
+                                path,
+                                chunk_index
+                            );
+                            (WriteChunkResponseHeader::success(header.length), buffer_acquire_us, recv_us, io_us)
+                        }
+                        Err(e) => {
+                            let io_us = io_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+                            tracing::error!("Failed to write chunk: {:?}", e);
+                            (WriteChunkResponseHeader::error(-5), buffer_acquire_us, recv_us, io_us)
+                        }
                     }
                 }
             }

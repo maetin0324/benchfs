@@ -29,6 +29,7 @@ TIMESTAMP="$(timestamp)"
 : ${ENABLE_NODE_DIAGNOSTICS:=0}
 : ${ENABLE_STATS:=0}
 : ${POSIX:=0}            # Set to 1 to use POSIX synchronous I/O instead of io_uring
+: ${DUMMY:=0}            # Set to 1 to use dummy (no-op) backend for RPC overhead measurement (overrides POSIX)
 : ${SEPARATE:=0}         # Set to 1 to use separate nodes for server and client
 : ${SERVER_NODES:=}      # Number of server nodes (default: floor(NNODES/2))
 : ${CLIENT_NODES:=}      # Number of client nodes (default: NNODES - SERVER_NODES)
@@ -68,6 +69,7 @@ export TASKSET_CORES
 export ENABLE_NODE_DIAGNOSTICS
 export ENABLE_STATS
 export POSIX
+export DUMMY
 export SEPARATE
 export SERVER_NODES
 export CLIENT_NODES
@@ -107,7 +109,7 @@ for nnodes in "${nnodes_list[@]}"; do
   for ((iter=0; iter<niter; iter++)); do
     cmd_qsub=(
       qsub
-      -q gold
+      -q debug
       -A NBB
       -l select="${nnodes}"
       -l walltime="${ELAPSTIM_REQ}"

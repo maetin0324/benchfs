@@ -542,6 +542,114 @@ impl ChunkStore for FileChunkStore {
     }
 }
 
+/// Dummy (no-op) chunk storage for RPC overhead measurement
+///
+/// Discards all writes and returns zero-filled buffers on read.
+/// No disk I/O is performed, allowing pure RPC layer throughput measurement.
+pub struct DummyChunkStore {
+    _chunk_size: usize,
+}
+
+impl DummyChunkStore {
+    pub fn new() -> Self {
+        let chunk_size = CHUNK_SIZE;
+        tracing::info!(
+            "DummyChunkStore initialized (no-op, chunk_size={})",
+            chunk_size,
+        );
+        Self { _chunk_size: chunk_size }
+    }
+
+    #[async_backtrace::framed]
+    pub async fn write_chunk(
+        &self,
+        _file_path: &str,
+        chunk_index: u64,
+        _offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize> {
+        let written = data.len();
+
+        tracing::debug!(
+            op_type = "WRITE_CHUNK_DUMMY",
+            chunk_index = chunk_index,
+            bytes_written = written,
+            total_us = 0u64,
+            "CHUNK_IO_TIMING"
+        );
+
+        Ok(written)
+    }
+
+    #[async_backtrace::framed]
+    pub async fn read_chunk(
+        &self,
+        _file_path: &str,
+        chunk_index: u64,
+        _offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>> {
+        let data = vec![0u8; length as usize];
+
+        tracing::debug!(
+            op_type = "READ_CHUNK_DUMMY",
+            chunk_index = chunk_index,
+            bytes_read = data.len(),
+            total_us = 0u64,
+            "CHUNK_IO_TIMING"
+        );
+
+        Ok(data)
+    }
+
+    pub async fn delete_chunk(&self, _file_path: &str, _chunk_index: u64) -> ChunkStoreResult<()> {
+        Ok(())
+    }
+
+    pub async fn delete_file_chunks(&self, _file_path: &str) -> ChunkStoreResult<usize> {
+        Ok(0)
+    }
+
+    pub fn has_chunk(&self, _file_path: &str, _chunk_index: u64) -> bool {
+        true
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ChunkStore for DummyChunkStore {
+    async fn write_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> ChunkStoreResult<usize> {
+        self.write_chunk(path, chunk_index, offset, data).await
+    }
+
+    async fn read_chunk(
+        &self,
+        path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+    ) -> ChunkStoreResult<Vec<u8>> {
+        self.read_chunk(path, chunk_index, offset, length).await
+    }
+
+    async fn delete_chunk(&self, path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
+        self.delete_chunk(path, chunk_index).await
+    }
+
+    async fn delete_file_chunks(&self, path: &str) -> ChunkStoreResult<usize> {
+        self.delete_file_chunks(path).await
+    }
+
+    fn has_chunk(&self, path: &str, chunk_index: u64) -> bool {
+        self.has_chunk(path, chunk_index)
+    }
+}
+
 /// Page-aligned buffer for O_DIRECT I/O
 ///
 /// O_DIRECT requires buffers to be aligned to the filesystem's block size (typically 4096).
@@ -861,6 +969,104 @@ impl PosixChunkStore {
         );
 
         Ok(data)
+    }
+
+    /// Read a chunk directly into a provided buffer, avoiding intermediate Vec allocation.
+    ///
+    /// Returns the number of bytes read.
+    #[async_backtrace::framed]
+    #[instrument(level = "trace", name = "posix_read_chunk_into", skip(self, buf), fields(path = file_path, chunk = chunk_index, offset, len = length))]
+    pub async fn read_chunk_into(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        length: u64,
+        buf: &mut [u8],
+    ) -> ChunkStoreResult<usize> {
+        let total_start = std::time::Instant::now();
+
+        if offset >= self.chunk_size as u64 {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+        if !chunk_file_path.exists() {
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
+        }
+
+        let c_path = std::ffi::CString::new(
+            chunk_file_path
+                .to_str()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        // Open
+        let open_start = std::time::Instant::now();
+        let mut flags = libc::O_RDONLY;
+        if self.use_direct_io {
+            flags |= libc::O_DIRECT;
+        }
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+        }
+        let open_elapsed = open_start.elapsed();
+
+        // Read
+        let read_start = std::time::Instant::now();
+        let read_len = (length as usize).min(buf.len());
+
+        let bytes_read = if self.use_direct_io {
+            // O_DIRECT: read into internal aligned buffer, then copy to destination
+            let mut aligned_buf = self.aligned_buffer.borrow_mut();
+            let aligned_len = (read_len + 511) & !511;
+            let ret = unsafe {
+                libc::pread(fd, aligned_buf.as_mut_slice().as_ptr() as *mut libc::c_void, aligned_len, offset as libc::off_t)
+            };
+            if ret < 0 {
+                unsafe { libc::close(fd); }
+                return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+            }
+            let actual = (ret as usize).min(read_len);
+            buf[..actual].copy_from_slice(&aligned_buf.as_slice()[..actual]);
+            actual
+        } else {
+            // Non-O_DIRECT: read directly into destination buffer
+            let ret = unsafe {
+                libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, read_len, offset as libc::off_t)
+            };
+            if ret < 0 {
+                unsafe { libc::close(fd); }
+                return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+            }
+            ret as usize
+        };
+        let read_elapsed = read_start.elapsed();
+
+        // Close
+        let close_start = std::time::Instant::now();
+        unsafe { libc::close(fd); }
+        let close_elapsed = close_start.elapsed();
+
+        let total_elapsed = total_start.elapsed();
+
+        tracing::debug!(
+            op_type = "READ_CHUNK_POSIX_INTO",
+            chunk_index = chunk_index,
+            bytes_read = bytes_read,
+            open_us = open_elapsed.as_micros() as u64,
+            read_us = read_elapsed.as_micros() as u64,
+            close_us = close_elapsed.as_micros() as u64,
+            total_us = total_elapsed.as_micros() as u64,
+            "CHUNK_IO_TIMING"
+        );
+
+        Ok(bytes_read)
     }
 
     /// Delete a chunk file

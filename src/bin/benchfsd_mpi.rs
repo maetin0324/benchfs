@@ -21,7 +21,7 @@ use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::{RpcServer, get_server_rpc_stats};
-use benchfs::storage::{ChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore, PosixChunkStore};
+use benchfs::storage::{ChunkStore, DummyChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore, PosixChunkStore};
 
 use pluvio_runtime::executor::{Runtime, SchedulingConfig};
 use pluvio_timer::TimerReactor;
@@ -386,13 +386,41 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
             )?);
             (chunk_store, allocator)
         }
+        "dummy" => {
+            tracing::info!("Using dummy (no-op) storage backend for RPC overhead measurement");
+
+            // io_uring reactor for allocator only (no actual I/O submission).
+            // buffer_size must match chunk_size so that RPC data transfers can
+            // send/receive a full chunk in a single round trip.
+            // queue_size=128: enough for peak RPC concurrency (96 clients) with headroom,
+            // while keeping memory usage at 128*4MiB=512MiB (vs 2GiB with 512).
+            // Unlike iouring backend, we don't need io_uring SQ depth, only buffer pool.
+            let chunk_size = config.storage.chunk_size;
+            let uring_reactor = IoUringReactor::builder()
+                .queue_size(128)
+                .buffer_size(chunk_size)
+                .submit_depth(4)
+                .wait_submit_timeout(std::time::Duration::from_micros(10))
+                .wait_complete_timeout(std::time::Duration::from_micros(10))
+                .build();
+
+            let allocator = uring_reactor.allocator.clone();
+            let chunk_store = Rc::new(DummyChunkStore::new());
+            (chunk_store, allocator)
+        }
         "posix" => {
             tracing::info!("Using POSIX synchronous I/O for storage backend");
 
-            // Create a minimal io_uring reactor just for allocator (needed by RPC layer)
+            // io_uring reactor for allocator only (no actual I/O submission).
+            // buffer_size must match chunk_size so that RPC data transfers can
+            // send/receive a full chunk in a single round trip.
+            // queue_size=128: enough for peak RPC concurrency (96 clients) with headroom,
+            // while keeping memory usage at 128*4MiB=512MiB (vs 2GiB with 512).
+            // Unlike iouring backend, we don't need io_uring SQ depth, only buffer pool.
+            let chunk_size = config.storage.chunk_size;
             let uring_reactor = IoUringReactor::builder()
-                .queue_size(32)
-                .buffer_size(1 << 16) // 64 KiB - minimal size
+                .queue_size(128)
+                .buffer_size(chunk_size)
                 .submit_depth(4)
                 .wait_submit_timeout(std::time::Duration::from_micros(10))
                 .wait_complete_timeout(std::time::Duration::from_micros(10))
@@ -405,10 +433,14 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
         _ => {
             tracing::info!("Using file-based storage backend (backend={})", effective_backend);
 
-            // Create a minimal io_uring reactor just for allocator
+            // io_uring reactor for allocator only.
+            // buffer_size must match chunk_size for RPC data transfers.
+            // queue_size=128: enough for peak RPC concurrency with headroom,
+            // while keeping memory usage at 128*4MiB=512MiB (vs 2GiB with 512).
+            let chunk_size = config.storage.chunk_size;
             let uring_reactor = IoUringReactor::builder()
-                .queue_size(32)
-                .buffer_size(1 << 16) // 64 KiB - minimal size
+                .queue_size(128)
+                .buffer_size(chunk_size)
                 .submit_depth(4)
                 .wait_submit_timeout(std::time::Duration::from_micros(10))
                 .wait_complete_timeout(std::time::Duration::from_micros(10))

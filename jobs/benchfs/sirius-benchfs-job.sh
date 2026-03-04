@@ -1,6 +1,6 @@
 #!/bin/bash
 #------- qsub option -----------
-#PBS -q gold
+#PBS -q gen
 #PBS -A NBB
 #------- Program execution -----------
 # NOTE: DO NOT use "set -e" or "set -u" or "set -o pipefail" here!
@@ -97,6 +97,7 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 : ${ENABLE_NODE_DIAGNOSTICS:=0}
 : ${ENABLE_STATS:=0}
 : ${POSIX:=0}
+: ${DUMMY:=0}
 : ${SEPARATE:=0}
 : ${SERVER_NODES:=}
 : ${CLIENT_NODES:=}
@@ -128,6 +129,7 @@ echo "RUST_LOG (client): ${RUST_LOG_C}"
 echo "TASKSET: ${TASKSET} (cores: ${TASKSET_CORES})"
 echo "ENABLE_STATS: ${ENABLE_STATS}"
 echo "POSIX: ${POSIX}"
+echo "DUMMY: ${DUMMY}"
 echo "SEPARATE: ${SEPARATE} (server_nodes: ${SERVER_NODES:-auto}, client_nodes: ${CLIENT_NODES:-auto})"
 echo "ENABLE_NODE_DIAGNOSTICS: ${ENABLE_NODE_DIAGNOSTICS}"
 echo ""
@@ -470,7 +472,11 @@ start_benchfsd() {
   config_file="${JOB_OUTPUT_DIR}/benchfs_${config_id}.toml"
 
   # Determine storage backend settings for TOML config
-  if [ "${POSIX:-0}" -eq 1 ]; then
+  # Priority: DUMMY=1 > POSIX=1 > default (iouring)
+  if [ "${DUMMY:-0}" -eq 1 ]; then
+    use_iouring_value="false"
+    storage_backend_line='storage_backend = "dummy"'
+  elif [ "${POSIX:-0}" -eq 1 ]; then
     use_iouring_value="false"
     storage_backend_line='storage_backend = "posix"'
   else
@@ -548,28 +554,62 @@ EOF2
   fi
 
   # Create per-rank data_dir wrapper to distribute server ranks across NVMe SSDs.
-  # Each MPI rank selects its own local NVMe based on OMPI_COMM_WORLD_LOCAL_RANK.
+  # NUMA-aware: each rank detects /scrN dirs on its own node and selects the closest SSD.
+  #
+  # Sirius topology (per physical node):
+  #   APU 0 (NUMA 0) → /scr0   APU 1 (NUMA 1) → /scr1
+  #   APU 2 (NUMA 2) → /scr2   APU 3 (NUMA 3) → /scr3
+  # PBS creates /scrN/${PBS_JOBID} only for allocated vnodes on each node.
   DATADIR_WRAPPER="${server_log_dir}/benchfsd_datadir_wrapper.sh"
   export BENCHFS_INNER_BINARY="${BENCHFSD_BINARY}"
   cat > "${DATADIR_WRAPPER}" <<'WRAPPER_EOF'
 #!/bin/bash
 LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK:-0}
-IFS=',' read -ra SCRATCH_DIRS <<< "${BENCHFS_SCRATCH_DIRS}"
-NUM_DIRS=${#SCRATCH_DIRS[@]}
-DIR_INDEX=$((LOCAL_RANK % NUM_DIRS))
-RANK_DATA_DIR="${SCRATCH_DIRS[$DIR_INDEX]}"
+
+# Detect NVMe scratch directories available on THIS node.
+# /scrN corresponds to APU N (NUMA node N) on Sirius.
+LOCAL_SCRATCH_DIRS=()
+LOCAL_NUMA_NODES=()
+for n in 0 1 2 3; do
+    if [ -d "/scr${n}/${PBS_JOBID}" ]; then
+        LOCAL_SCRATCH_DIRS+=("/scr${n}/${PBS_JOBID}")
+        LOCAL_NUMA_NODES+=("${n}")
+    fi
+done
+
+if [ ${#LOCAL_SCRATCH_DIRS[@]} -gt 0 ]; then
+    DIR_INDEX=$((LOCAL_RANK % ${#LOCAL_SCRATCH_DIRS[@]}))
+    RANK_DATA_DIR="${LOCAL_SCRATCH_DIRS[$DIR_INDEX]}"
+    RANK_NUMA="${LOCAL_NUMA_NODES[$DIR_INDEX]}"
+    echo "Rank ${LOCAL_RANK}: NUMA-aware data_dir=${RANK_DATA_DIR} (NUMA ${RANK_NUMA}, ${#LOCAL_SCRATCH_DIRS[@]} local SSDs: ${LOCAL_SCRATCH_DIRS[*]})"
+else
+    # Fallback: use passed scratch dirs (head node's detection)
+    IFS=',' read -ra SCRATCH_DIRS <<< "${BENCHFS_SCRATCH_DIRS}"
+    DIR_INDEX=$((LOCAL_RANK % ${#SCRATCH_DIRS[@]}))
+    RANK_DATA_DIR="${SCRATCH_DIRS[$DIR_INDEX]}"
+    RANK_NUMA=""
+    echo "Rank ${LOCAL_RANK}: fallback data_dir=${RANK_DATA_DIR} (no local /scrN/${PBS_JOBID} detected)"
+fi
 
 # Create rank-specific config with correct data_dir
 CONFIG_FILE="$2"
 RANK_CONFIG="${CONFIG_FILE%.toml}_rank${LOCAL_RANK}.toml"
 sed "s|^data_dir = .*|data_dir = \"${RANK_DATA_DIR}\"|" "${CONFIG_FILE}" > "${RANK_CONFIG}"
 
-echo "Rank ${LOCAL_RANK}: data_dir=${RANK_DATA_DIR}, config=${RANK_CONFIG}"
-exec "${BENCHFS_INNER_BINARY}" "$1" "${RANK_CONFIG}" "${@:3}"
+# Bind process to the NUMA node closest to the selected NVMe SSD.
+# This ensures CPU-memory-SSD affinity for optimal I/O throughput.
+if [ -n "${RANK_NUMA}" ] && command -v numactl >/dev/null 2>&1; then
+    echo "Rank ${LOCAL_RANK}: numactl --cpunodebind=${RANK_NUMA} --membind=${RANK_NUMA}, config=${RANK_CONFIG}"
+    exec numactl --cpunodebind="${RANK_NUMA}" --membind="${RANK_NUMA}" \
+        "${BENCHFS_INNER_BINARY}" "$1" "${RANK_CONFIG}" "${@:3}"
+else
+    echo "Rank ${LOCAL_RANK}: no NUMA binding (numactl not available or NUMA unknown), config=${RANK_CONFIG}"
+    exec "${BENCHFS_INNER_BINARY}" "$1" "${RANK_CONFIG}" "${@:3}"
+fi
 WRAPPER_EOF
   chmod +x "${DATADIR_WRAPPER}"
   BENCHFSD_BINARY="${DATADIR_WRAPPER}"
-  echo "Created per-rank data_dir wrapper: ${DATADIR_WRAPPER}"
+  echo "Created NUMA-aware per-rank data_dir wrapper: ${DATADIR_WRAPPER}"
 
   stats_file="${STATS_OUTPUT_DIR}/stats_server${config_id}.csv"
   cmd_benchfsd=(
@@ -579,6 +619,7 @@ WRAPPER_EOF
     --oversubscribe
     -x RUST_LOG="${RUST_LOG_S}"
     -x RUST_BACKTRACE
+    -x PBS_JOBID
     -x BENCHFS_SCRATCH_DIRS="${BENCHFS_SCRATCH_DIRS_CSV}"
     -x BENCHFS_INNER_BINARY
     "${BENCHFSD_BINARY}"

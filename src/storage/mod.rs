@@ -5,8 +5,8 @@ pub mod iouring;
 pub mod local;
 
 pub use chunk_store::{
-    ChunkKey, ChunkStore, ChunkStoreError, ChunkStoreResult, FileChunkStore, IOUringChunkStore,
-    InMemoryChunkStore, PosixChunkStore,
+    ChunkKey, ChunkStore, ChunkStoreError, ChunkStoreResult, DummyChunkStore, FileChunkStore,
+    IOUringChunkStore, InMemoryChunkStore, PosixChunkStore,
 };
 pub use error::{StorageError, StorageResult};
 pub use iouring::IOUringBackend;
