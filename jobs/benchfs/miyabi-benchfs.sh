@@ -17,6 +17,7 @@ TIMESTAMP="$(timestamp)"
 : ${SEPARATE:=0}         # Set to 1 to use separate nodes for server and client
 : ${SERVER_NODES:=}      # Number of server nodes (default: floor(NNODES/2))
 : ${CLIENT_NODES:=}      # Number of client nodes (default: NNODES - SERVER_NODES)
+: ${CHUNK_SIZE_MATCH_XFER:=0}  # Set to 1 to ignore chunk_size settings and use transfer_size as chunk_size
 : ${LABEL:=default}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
@@ -62,9 +63,10 @@ mkdir -p "${BACKEND_DIR}"
 
 nnodes_list=(
   # 1 2 4 8
-  # 4
+  # 2
   # 2 4 8 16
-  2 4 8 16 32
+  # 2 4 8 16 32
+  16
   # 32
   # 64
   # 128

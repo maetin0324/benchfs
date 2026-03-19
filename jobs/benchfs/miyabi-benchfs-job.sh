@@ -109,6 +109,7 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 : ${SEPARATE:=0}
 : ${SERVER_NODES:=}
 : ${CLIENT_NODES:=}
+: ${CHUNK_SIZE_MATCH_XFER:=0}
 
 # ==============================================================================
 # 1. トランスポート層設定（最優先）
@@ -906,22 +907,48 @@ EOF2
 runid=0
 server_config_id=0
 
+# When CHUNK_SIZE_MATCH_XFER=1, ignore benchfs_chunk_size_list and derive chunk_size from transfer_size
+if [ "${CHUNK_SIZE_MATCH_XFER}" -eq 1 ]; then
+  echo "CHUNK_SIZE_MATCH_XFER=1: chunk_size will be set to match transfer_size"
+  benchfs_chunk_size_list=("match_xfer")
+fi
+
+_active_benchfsd_chunk_size=""
+
 for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
-  # Convert chunk size string to bytes
-  benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
+  # Convert chunk size string to bytes (skip for match_xfer placeholder)
+  if [ "${CHUNK_SIZE_MATCH_XFER}" -ne 1 ]; then
+    benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
+  fi
 
   for server_ppn in "${server_ppn_list[@]}"; do
     server_np=$((SERVER_NNODES * server_ppn))
 
-    # Start benchfsd with current server configuration
-    stop_benchfsd
-    start_benchfsd "$server_config_id"
+    # Start benchfsd (unless CHUNK_SIZE_MATCH_XFER=1, in which case we start inside transfer_size loop)
+    if [ "${CHUNK_SIZE_MATCH_XFER}" -ne 1 ]; then
+      stop_benchfsd
+      start_benchfsd "$server_config_id"
+      _active_benchfsd_chunk_size="$benchfs_chunk_size"
+    fi
 
     # Run all IOR parameter combinations with this server configuration
     for ppn in "${ppn_list[@]}"; do
       np=$((CLIENT_NNODES * ppn))
 
       for transfer_size in "${transfer_size_list[@]}"; do
+        # Override chunk_size to match transfer_size when requested
+        if [ "${CHUNK_SIZE_MATCH_XFER}" -eq 1 ]; then
+          benchfs_chunk_size_str="$transfer_size"
+          benchfs_chunk_size=$(parse_size_to_bytes "$transfer_size")
+          # Restart benchfsd if chunk_size changed
+          if [ "$benchfs_chunk_size" != "$_active_benchfsd_chunk_size" ]; then
+            stop_benchfsd
+            start_benchfsd "$server_config_id"
+            _active_benchfsd_chunk_size="$benchfs_chunk_size"
+            server_config_id=$((server_config_id + 1))
+          fi
+        fi
+
         for block_size in "${block_size_list[@]}"; do
           for ior_flags in "${ior_flags_list[@]}"; do
             echo "=========================================="
@@ -934,8 +961,12 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
             echo "BenchFS chunk size: $benchfs_chunk_size_str ($benchfs_chunk_size bytes)"
             echo "=========================================="
 
-            # Clean data directory between IOR runs (but keep registry)
-            rm -rf "${BENCHFS_DATA_DIR}"/*
+            # Clean data directory on ALL nodes between IOR runs (but keep registry)
+            # The data dir is on node-local storage (/local/), so we must
+            # clean it via mpirun to reach every node.
+            echo "Cleaning data directory on all nodes: ${BENCHFS_DATA_DIR}"
+            "${cmd_mpirun_common[@]}" -np "$NNODES" --map-by ppr:1:node \
+              bash -c "rm -rf '${BENCHFS_DATA_DIR}'/* 2>/dev/null; echo \$(hostname): cleaned" || true
 
             # Create run_${runid} symlink in benchfsd_logs/ for extract script compatibility
             ln -sfn "server_${server_config_id}" "${BENCHFSD_LOG_BASE_DIR}/run_${runid}"
@@ -967,6 +998,7 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
               "${IOR_PREFIX}/src/ior"
               -vvv
               -a BENCHFS
+              -D 120
               -t "$transfer_size"
               -b "$block_size"
               -e

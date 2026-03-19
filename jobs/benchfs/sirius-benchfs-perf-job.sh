@@ -1,6 +1,6 @@
 #!/bin/bash
 #------- qsub option -----------
-#PBS -q gold
+#PBS -q mcrp
 #PBS -A NBB
 #------- Program execution -----------
 # NOTE: DO NOT use "set -e" — IOR/perf may fail and we still want to collect data
