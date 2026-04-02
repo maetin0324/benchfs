@@ -33,6 +33,7 @@ TIMESTAMP="$(timestamp)"
 : ${SEPARATE:=0}         # Set to 1 to use separate nodes for server and client
 : ${SERVER_NODES:=}      # Number of server nodes (default: floor(NNODES/2))
 : ${CLIENT_NODES:=}      # Number of client nodes (default: NNODES - SERVER_NODES)
+: ${CHUNK_SIZE_MATCH_XFER:=0}  # Set to 1 to ignore chunk_size settings and use transfer_size as chunk_size
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "$(this_directory)/../..")"
@@ -73,6 +74,7 @@ export DUMMY
 export SEPARATE
 export SERVER_NODES
 export CLIENT_NODES
+export CHUNK_SIZE_MATCH_XFER
 
 # Debug: Print paths
 echo "=========================================="
@@ -101,7 +103,8 @@ mkdir -p "${BACKEND_DIR}"
 # Client processes use --oversubscribe to exceed the 24-slot limit.
 nnodes_list=(
   # 2 4 8 16 32
-  2
+  16
+  # 2
 )
 niter=1
 
@@ -109,7 +112,7 @@ for nnodes in "${nnodes_list[@]}"; do
   for ((iter=0; iter<niter; iter++)); do
     cmd_qsub=(
       qsub
-      -q debug
+      -q mcrp
       -A NBB
       -l select="${nnodes}"
       -l walltime="${ELAPSTIM_REQ}"

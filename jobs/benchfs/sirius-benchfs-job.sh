@@ -101,12 +101,26 @@ PERFETTO_OUTPUT_DIR="${JOB_OUTPUT_DIR}/perfetto"
 : ${SEPARATE:=0}
 : ${SERVER_NODES:=}
 : ${CLIENT_NODES:=}
+: ${CHUNK_SIZE_MATCH_XFER:=0}
 
 # Set LD_LIBRARY_PATH for BenchFS shared library
 export LD_LIBRARY_PATH="${PROJECT_ROOT}/target/release:/home/NBB/rmaeda/.local/lib:${LD_LIBRARY_PATH:-}"
 
 echo "prepare the output directory: ${JOB_OUTPUT_DIR}"
 mkdir -p "${JOB_OUTPUT_DIR}"
+
+# Duplicate stdout/stderr to log files in JOB_OUTPUT_DIR.
+# PBS stdout capture can fail when cgroup resources are exhausted
+# ("setup of devices-cgroups failed"), losing all job output.
+# These log files are preserved regardless of PBS pipe status.
+exec > >(tee "${JOB_OUTPUT_DIR}/job_stdout.log") 2> >(tee "${JOB_OUTPUT_DIR}/job_stderr.log" >&2)
+
+# Create unique node list (PBS_NODEFILE may have duplicate entries for multi-vnode physical nodes)
+UNIQUE_HOSTFILE="${JOB_OUTPUT_DIR}/unique_nodes"
+sort -u "${PBS_NODEFILE}" > "${UNIQUE_HOSTFILE}"
+UNIQUE_NNODES=$(wc -l < "${UNIQUE_HOSTFILE}")
+echo "Unique physical nodes: ${UNIQUE_NNODES} (from ${NNODES} vnodes)"
+
 cp "$0" "${JOB_OUTPUT_DIR}"
 cp "${PBS_NODEFILE}" "${JOB_OUTPUT_DIR}"
 cp "${SCRIPT_DIR}/common.sh" "${JOB_OUTPUT_DIR}"
@@ -131,6 +145,7 @@ echo "ENABLE_STATS: ${ENABLE_STATS}"
 echo "POSIX: ${POSIX}"
 echo "DUMMY: ${DUMMY}"
 echo "SEPARATE: ${SEPARATE} (server_nodes: ${SERVER_NODES:-auto}, client_nodes: ${CLIENT_NODES:-auto})"
+echo "CHUNK_SIZE_MATCH_XFER: ${CHUNK_SIZE_MATCH_XFER}"
 echo "ENABLE_NODE_DIAGNOSTICS: ${ENABLE_NODE_DIAGNOSTICS}"
 echo ""
 echo "PBS_NODEFILE contents:"
@@ -251,10 +266,24 @@ else
   echo "WARNING: UCX PML not available – falling back to ob1/tcp configuration"
 fi
 
+# Build mpirun command for utility tasks (bash scripts, cleanup, etc.)
+# Uses simple TCP transport to avoid UCX/PMIX segfaults with non-MPI programs
+cmd_mpirun_util=(
+  mpirun
+  --mca routed direct
+  --mca plm_rsh_no_tree_spawn 1
+  --mca pml ob1
+  --mca btl tcp,sm,self
+)
+
 # OpenMPI 5.0.9 on Sirius: use UCX for point-to-point and one-sided
+# --mca routed direct: avoid DVM tree routing issues with multi-vnode PBS jobs
+# --mca plm_rsh_no_tree_spawn 1: linear process spawning (avoids tree-based launch failures)
 if [[ "${USE_UCX_PML}" -eq 1 ]]; then
   cmd_mpirun_common=(
     mpirun
+    --mca routed direct
+    --mca plm_rsh_no_tree_spawn 1
     --mca pml ucx
     --mca btl self
     --mca osc ucx
@@ -264,6 +293,8 @@ if [[ "${USE_UCX_PML}" -eq 1 ]]; then
 else
   cmd_mpirun_common=(
     mpirun
+    --mca routed direct
+    --mca plm_rsh_no_tree_spawn 1
     --mca pml ob1
     --mca btl tcp,sm,self
     -x PATH
@@ -301,11 +332,11 @@ if [ "${SEPARATE}" -eq 1 ]; then
 
   # Build separate mpirun commands with different hostfiles
   if [[ "${USE_UCX_PML}" -eq 1 ]]; then
-    cmd_mpirun_server=(mpirun --hostfile "${SERVER_NODEFILE}" --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
-    cmd_mpirun_client=(mpirun --hostfile "${CLIENT_NODEFILE}" --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_server=(mpirun --hostfile "${SERVER_NODEFILE}" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_client=(mpirun --hostfile "${CLIENT_NODEFILE}" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
   else
-    cmd_mpirun_server=(mpirun --hostfile "${SERVER_NODEFILE}" --mca pml ob1 --mca btl tcp,sm,self -x PATH -x LD_LIBRARY_PATH)
-    cmd_mpirun_client=(mpirun --hostfile "${CLIENT_NODEFILE}" --mca pml ob1 --mca btl tcp,sm,self -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_server=(mpirun --hostfile "${SERVER_NODEFILE}" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self -x PATH -x LD_LIBRARY_PATH)
+    cmd_mpirun_client=(mpirun --hostfile "${CLIENT_NODEFILE}" --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self -x PATH -x LD_LIBRARY_PATH)
   fi
 
   SERVER_NNODES=${SERVER_NODES}
@@ -459,11 +490,19 @@ stop_benchfsd() {
 start_benchfsd() {
   local config_id=$1
 
-  # Clean up registry and data directories
+  # Clean up registry and data directories on ALL nodes
   rm -rf "${BENCHFS_REGISTRY_DIR}"/*
-  for _scratch_dir in "${BENCHFS_ALL_SCRATCH_DIRS[@]}"; do
-    rm -rf "${_scratch_dir}"/* 2>/dev/null || true
-  done
+  "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$UNIQUE_NNODES" \
+    --bind-to none --oversubscribe \
+    -x PBS_JOBID \
+    bash -c '
+      for n in 0 1 2 3; do
+        d="/scr${n}/${PBS_JOBID}"
+        if [ -d "$d" ]; then
+          rm -rf "$d"/* 2>/dev/null
+        fi
+      done
+    ' 2>/dev/null || true
 
   server_log_dir="${BENCHFSD_LOG_BASE_DIR}/server_${config_id}"
   mkdir -p "${server_log_dir}"
@@ -592,8 +631,10 @@ else
 fi
 
 # Create rank-specific config with correct data_dir
+# Use WORLD_RANK (not LOCAL_RANK) to avoid config file collisions on shared filesystem
 CONFIG_FILE="$2"
-RANK_CONFIG="${CONFIG_FILE%.toml}_rank${LOCAL_RANK}.toml"
+WORLD_RANK=${OMPI_COMM_WORLD_RANK:-${LOCAL_RANK}}
+RANK_CONFIG="${CONFIG_FILE%.toml}_rank${WORLD_RANK}.toml"
 sed "s|^data_dir = .*|data_dir = \"${RANK_DATA_DIR}\"|" "${CONFIG_FILE}" > "${RANK_CONFIG}"
 
 # Bind process to the NUMA node closest to the selected NVMe SSD.
@@ -681,22 +722,48 @@ WRAPPER_EOF
 runid=0
 server_config_id=0
 
+# When CHUNK_SIZE_MATCH_XFER=1, ignore benchfs_chunk_size_list and derive chunk_size from transfer_size
+if [ "${CHUNK_SIZE_MATCH_XFER}" -eq 1 ]; then
+  echo "CHUNK_SIZE_MATCH_XFER=1: chunk_size will be set to match transfer_size"
+  benchfs_chunk_size_list=("match_xfer")
+fi
+
+_active_benchfsd_chunk_size=""
+
 for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
-  # Convert chunk size string to bytes
-  benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
+  # Convert chunk size string to bytes (skip for match_xfer placeholder)
+  if [ "${CHUNK_SIZE_MATCH_XFER}" -ne 1 ]; then
+    benchfs_chunk_size=$(parse_size_to_bytes "$benchfs_chunk_size_str")
+  fi
 
   for server_ppn in "${server_ppn_list[@]}"; do
     server_np=$((SERVER_NNODES * server_ppn))
 
-    # Start benchfsd with current server configuration
-    stop_benchfsd
-    start_benchfsd "$server_config_id"
+    # Start benchfsd (unless CHUNK_SIZE_MATCH_XFER=1, in which case we start inside transfer_size loop)
+    if [ "${CHUNK_SIZE_MATCH_XFER}" -ne 1 ]; then
+      stop_benchfsd
+      start_benchfsd "$server_config_id"
+      _active_benchfsd_chunk_size="$benchfs_chunk_size"
+    fi
 
     # Run all IOR parameter combinations with this server configuration
     for ppn in "${ppn_list[@]}"; do
       np=$((CLIENT_NNODES * ppn))
 
       for transfer_size in "${transfer_size_list[@]}"; do
+        # Override chunk_size to match transfer_size when requested
+        if [ "${CHUNK_SIZE_MATCH_XFER}" -eq 1 ]; then
+          benchfs_chunk_size_str="$transfer_size"
+          benchfs_chunk_size=$(parse_size_to_bytes "$transfer_size")
+          # Restart benchfsd if chunk_size changed
+          if [ "$benchfs_chunk_size" != "$_active_benchfsd_chunk_size" ]; then
+            stop_benchfsd
+            start_benchfsd "$server_config_id"
+            _active_benchfsd_chunk_size="$benchfs_chunk_size"
+            server_config_id=$((server_config_id + 1))
+          fi
+        fi
+
         for block_size in "${block_size_list[@]}"; do
           for ior_flags in "${ior_flags_list[@]}"; do
             echo "=========================================="
@@ -709,10 +776,11 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
             echo "BenchFS chunk size: $benchfs_chunk_size_str ($benchfs_chunk_size bytes)"
             echo "=========================================="
 
-            # Clean data directories between IOR runs (but keep registry)
-            for _scratch_dir in "${BENCHFS_ALL_SCRATCH_DIRS[@]}"; do
-              rm -rf "${_scratch_dir}"/* 2>/dev/null || true
-            done
+            # NOTE: No inter-run cleanup mpirun here.
+            # IOR removes its own test files (keepFile=0 default).
+            # Data dirs are cleaned in start_benchfsd() when the server restarts.
+            # Excessive mpirun invocations exhaust PBS cgroup resources
+            # ("setup of devices-cgroups failed") and cause job hangs.
 
             # Create run_${runid} symlink in benchfsd_logs/ for extract script compatibility
             # Extract scripts expect: benchfsd_logs/run_*/
@@ -732,11 +800,6 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
               IOSTAT_PID=""
               echo "WARNING: iostat not available, skipping disk utilization capture"
             fi
-
-            # MPI Debug: Testing MPI communication before IOR
-            echo "MPI Debug: Testing MPI communication before IOR"
-            "${cmd_mpirun_client[@]}" -np "$np" --bind-to none --oversubscribe hostname > "${IOR_OUTPUT_DIR}/mpi_test_${runid}.txt" 2>&1
-            echo "MPI Debug: Communication test completed"
 
             # Run IOR benchmark
             echo "Running IOR benchmark..."
@@ -759,6 +822,7 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
               -x BENCHFS_EXPECTED_NODES="${server_np}"
               "${IOR_PREFIX}/src/ior"
               -vvv
+              -D 120
               -a BENCHFS
               -t "$transfer_size"
               -b "$block_size"
