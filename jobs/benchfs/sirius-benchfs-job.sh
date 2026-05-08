@@ -811,7 +811,6 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
             mkdir -p "${retry_stats_dir}"
 
             cmd_ior=(
-              time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
               "${cmd_mpirun_client[@]}"
               -np "$np"
               --bind-to none
@@ -838,11 +837,25 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
 
             save_job_metadata
 
-            echo "${cmd_ior[@]}"
+            # Timeout: IOR uses -D 120 (120s per test phase).
+            # A full run (write + read + overhead) should complete within 600s.
+            # If it exceeds this, it's hung (e.g. MPI barrier deadlock from RPC timeouts).
+            IOR_TIMEOUT=600
+
+            echo "Running (timeout=${IOR_TIMEOUT}s): ${cmd_ior[*]}"
             ior_exit_code=0
-            "${cmd_ior[@]}" \
+            start_seconds=$SECONDS
+            timeout --signal=TERM --kill-after=30 "${IOR_TIMEOUT}" \
+              "${cmd_ior[@]}" \
               > "${ior_stdout_file}" \
               2> "${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log" || ior_exit_code=$?
+            elapsed_seconds=$((SECONDS - start_seconds))
+
+            # Save elapsed time as simple JSON (replaces time_json which is a bash
+            # function and cannot be called via timeout)
+            cat > "${JOB_OUTPUT_DIR}/time_${runid}.json" <<TIME_EOF
+{"ElapsedSeconds": ${elapsed_seconds}, "ExitCode": ${ior_exit_code}}
+TIME_EOF
 
             # Stop iostat capture
             if [ -n "${IOSTAT_PID:-}" ]; then
@@ -852,7 +865,10 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
               unset IOSTAT_PID
             fi
 
-            if [ "$ior_exit_code" -ne 0 ]; then
+            if [ "$ior_exit_code" -eq 124 ]; then
+              echo "WARNING: IOR run $runid killed by timeout after ${IOR_TIMEOUT}s (likely hung)"
+              echo "  Stderr log: ${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log"
+            elif [ "$ior_exit_code" -ne 0 ]; then
               echo "WARNING: IOR run $runid failed with exit code $ior_exit_code"
               echo "  Stderr log: ${IOR_OUTPUT_DIR}/ior_stderr_${runid}.log"
               echo "  Continuing with next parameter combination..."

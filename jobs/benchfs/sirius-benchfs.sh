@@ -115,7 +115,9 @@ for nnodes in "${nnodes_list[@]}"; do
       -q mcrp
       -A NBB
       -l select="${nnodes}"
+      -l place=exclhost
       -l walltime="${ELAPSTIM_REQ}"
+      -v SCRRAID=no
       -V
       "${JOB_FILE}"
     )

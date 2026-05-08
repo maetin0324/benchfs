@@ -110,9 +110,33 @@ echo "Unique physical nodes: ${UNIQUE_NNODES} (from ${NNODES} vnodes)"
 # Add locally installed CHFS binaries to PATH
 export PATH="$HOME/.local/bin:$HOME/.local/sbin:$PATH"
 
-# Save OpenMPI mpirun path before loading spack (spack may override PATH)
+# Save OpenMPI mpirun path and the clean environment BEFORE loading spack.
+# spack load pushes libfabric-2.4.0 into LD_LIBRARY_PATH which is ABI-incompatible
+# with OpenMPI 5.0.9's PRTE/orted and causes mpirun to SIGSEGV with
+# "PMIX_ERR_NOT_FOUND / NO PATH TO TARGET". We run mpirun with the original
+# LD_LIBRARY_PATH and only expose the spack env to chfsd/chlist/IOR explicitly.
 MPIRUN_CMD="$(which mpirun)"
 echo "OpenMPI mpirun: ${MPIRUN_CMD}"
+
+# Sanitize LD_LIBRARY_PATH / PATH: strip any spack paths that leaked in via
+# `qsub -V` (user's shell may already have `spack load` state). Without this,
+# ORIG_LD_LIBRARY_PATH contains libfabric-2.4.0 and mpirun/PRTE still segfaults.
+strip_spack_paths() {
+  local in="$1"
+  local IFS=:
+  local out=""
+  for p in $in; do
+    case "$p" in
+      */spack/*|*/.spack/*|*libfabric-2.4.0*) ;;
+      *) out="${out:+$out:}$p" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+ORIG_LD_LIBRARY_PATH="$(strip_spack_paths "${LD_LIBRARY_PATH:-}")"
+ORIG_PATH="$(strip_spack_paths "${PATH}")"
+echo "ORIG_PATH (sanitized): ${ORIG_PATH}"
+echo "ORIG_LD_LIBRARY_PATH (sanitized): ${ORIG_LD_LIBRARY_PATH}"
 
 # Load mochi-margo (CHFS dependency) via spack
 SPACK_SETUP="/work/NBB/rmaeda/spack/share/spack/setup-env.sh"
@@ -125,6 +149,12 @@ else
   echo "ERROR: Spack setup file not found at ${SPACK_SETUP}"
   exit 1
 fi
+
+# Capture the spack-loaded environment for CHFS binaries (chfsd, chlist, IOR).
+CHFS_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+CHFS_PATH="${PATH}"
+echo "ORIG_LD_LIBRARY_PATH: ${ORIG_LD_LIBRARY_PATH}"
+echo "CHFS_LD_LIBRARY_PATH: ${CHFS_LD_LIBRARY_PATH}"
 
 # Re-cleanup after spack load
 cleanup_exported_bash_functions
@@ -189,32 +219,39 @@ fi
 # Build mpirun common command for IOR
 # --mca routed direct: avoid DVM tree routing issues with multi-vnode PBS jobs
 # --mca plm_rsh_no_tree_spawn 1: linear process spawning
+# All mpirun invocations are prefixed with `env LD_LIBRARY_PATH=$ORIG_LD_LIBRARY_PATH`
+# so that OpenMPI/PRTE/orted load the system libfabric they were built with,
+# NOT the spack libfabric-2.4.0 (which causes PMIx segfaults).
+# Remote processes that need the spack env (chfsd, IOR) set LD_LIBRARY_PATH
+# themselves via the chfsd wrapper or via explicit -x LD_LIBRARY_PATH=... below.
+MPIRUN_ENV_PREFIX=(env "LD_LIBRARY_PATH=${ORIG_LD_LIBRARY_PATH}" "PATH=${ORIG_PATH}")
+
 if [[ "${USE_UCX_PML}" -eq 1 ]]; then
   cmd_mpirun_common=(
+    "${MPIRUN_ENV_PREFIX[@]}"
     "${MPIRUN_CMD}"
     --mca routed direct
     --mca plm_rsh_no_tree_spawn 1
     --mca pml ucx
     --mca btl self
     --mca osc ucx
-    -x PATH
-    -x LD_LIBRARY_PATH
   )
 else
   cmd_mpirun_common=(
+    "${MPIRUN_ENV_PREFIX[@]}"
     "${MPIRUN_CMD}"
     --mca routed direct
     --mca plm_rsh_no_tree_spawn 1
     --mca pml ob1
     --mca btl tcp,sm,self
-    -x PATH
-    -x LD_LIBRARY_PATH
   )
 fi
 
 # Build mpirun command for utility tasks (bash scripts, cleanup, etc.)
-# Uses simple TCP transport to avoid UCX/PMIX issues with non-MPI programs
+# Uses simple TCP transport to avoid UCX/PMIX issues with non-MPI programs.
+# Remote processes here are just bash; they don't need the spack env.
 cmd_mpirun_util=(
+  "${MPIRUN_ENV_PREFIX[@]}"
   "${MPIRUN_CMD}"
   --mca routed direct
   --mca plm_rsh_no_tree_spawn 1
@@ -226,149 +263,67 @@ cmd_mpirun_util=(
 cmd_mpirun_ssh=("${cmd_mpirun_util[@]}")
 
 # ==============================================================================
-# mpirun-based SSH replacement for chfsctl
+# chfsd-sirius wrapper (installed in $HOME/.local/sbin)
 # ==============================================================================
-# chfsctl uses ssh to launch chfsd on remote nodes.
-# On Sirius we provide a wrapper that uses mpirun instead.
+# The official Sirius chfsd wrapper handles /scrN selection, NUMA binding and
+# per-HCA IB device (mlx5_$i) assignment. We invoke it via
+#   chfsctl -wrapper chfsd-sirius -ssh <mpirun_ssh_wrapper> ...
+# chfsctl-side expansion: CHFSD = dirname($CHFSD)/chfsd-sirius, so it resolves
+# to $HOME/.local/sbin/chfsd-sirius (absolute path).
+# NOTE: pbs_tmrsh is NOT installed on Sirius (only the man page), so we still
+# need the mpirun-based SSH replacement for chfsctl to reach remote nodes.
+CHFSD_SIRIUS="$(dirname "$(command -v chfsd)")/chfsd-sirius"
+if [ ! -x "${CHFSD_SIRIUS}" ]; then
+  echo "ERROR: chfsd-sirius not found at ${CHFSD_SIRIUS}"
+  exit 1
+fi
+echo "chfsd-sirius wrapper: ${CHFSD_SIRIUS}"
 
+CHFSCTL="$(command -v chfsctl)"
+
+# IOR wrapper script: sets the spack-loaded env (mercury/margo/libfabric 2.4.0)
+# on each rank before execing IOR. mpirun itself runs with ORIG env to avoid
+# loading spack libfabric in OpenMPI's PRTE/orted (which segfaults).
+# This replaces the fragile `-x LD_LIBRARY_PATH=<very-long-spack-path>` which
+# hits PRTE argv/env handling issues.
+IOR_WRAPPER="${JOB_OUTPUT_DIR}/ior_wrapper.sh"
+cat > "${IOR_WRAPPER}" <<IOR_WRAPPER_EOF
+#!/bin/bash
+export LD_LIBRARY_PATH="${CHFS_LD_LIBRARY_PATH}"
+export PATH="${CHFS_PATH}"
+exec "${IOR_PREFIX}/src/ior" "\$@"
+IOR_WRAPPER_EOF
+chmod +x "${IOR_WRAPPER}"
+echo "Created IOR wrapper: ${IOR_WRAPPER}"
+
+# Create mpirun-based SSH replacement for chfsctl's -ssh option.
 MPIRUN_SSH_WRAPPER="${JOB_OUTPUT_DIR}/mpirun_ssh.sh"
 cat > "${MPIRUN_SSH_WRAPPER}" <<'SSHWRAPPER_EOF'
 #!/bin/bash
-# mpirun-based SSH replacement for chfsctl
-#
-# chfsctl calls this as:  ssh_cmd hostname command [args...]
-# ssh would run a remote shell, so we use "bash -c" to emulate it.
+# mpirun-based SSH replacement for chfsctl.
+# chfsctl calls this as: ssh_cmd hostname command [args...]
 HOST="$1"
 shift
 
-# Clean up ALL exported bash functions that break /bin/sh on remote nodes.
+# Clean up exported bash functions that break /bin/sh on remote nodes.
 while IFS= read -r _func; do
   _fname="${_func##* }"
   unset -f "$_fname" 2>/dev/null || true
 done < <(declare -Fx 2>/dev/null)
 export BASH_ENV=
-SSHWRAPPER_EOF
-# Append mpirun command (expand paths now, escape runtime variables)
-cat >> "${MPIRUN_SSH_WRAPPER}" <<SSHWRAPPER_EOF2
-# Build a single command string for bash -c (preserves env assignments and globs)
+
+# Join remaining args into a single command string for `bash -c`.
 _cmd=""
-for _arg in "\$@"; do
-  _cmd="\${_cmd:+\$_cmd }\$_arg"
+for _arg in "$@"; do
+  _cmd="${_cmd:+$_cmd }$_arg"
 done
-exec ${cmd_mpirun_ssh[@]} --host "\$HOST" -np 1 \
-  -x PBS_JOBID \
-  bash -c "\$_cmd"
+SSHWRAPPER_EOF
+# Append the mpirun invocation (expand paths at wrapper generation time).
+cat >> "${MPIRUN_SSH_WRAPPER}" <<SSHWRAPPER_EOF2
+exec ${cmd_mpirun_ssh[@]} --host "\$HOST" -np 1 -x PBS_JOBID bash -c "\$_cmd"
 SSHWRAPPER_EOF2
 chmod +x "${MPIRUN_SSH_WRAPPER}"
 echo "Created mpirun SSH wrapper: ${MPIRUN_SSH_WRAPPER}"
-
-# ==============================================================================
-# NUMA-aware chfsd wrapper
-# ==============================================================================
-# Each chfsd process detects the local /scrN on its node and uses the
-# NVMe SSD closest to its assigned NUMA node as the cache directory.
-# A file-based counter ensures multiple chfsd processes on the same
-# physical node get different /scrN directories.
-
-REAL_CHFSD="$(which chfsd 2>/dev/null || true)"
-echo "Real chfsd path: ${REAL_CHFSD:-not found}"
-
-if [ -z "${REAL_CHFSD}" ]; then
-  echo "ERROR: chfsd not found in PATH"
-  exit 1
-fi
-
-CHFSD_WRAPPER_DIR="${JOB_OUTPUT_DIR}/chfsd_wrapper"
-mkdir -p "${CHFSD_WRAPPER_DIR}"
-
-# Create the NUMA-aware chfsd wrapper
-# NOTE: Use double-quoted heredoc so REAL_CHFSD and TASKSET values are embedded.
-cat > "${CHFSD_WRAPPER_DIR}/chfsd" <<CHFSD_WRAPPER_EOF
-#!/bin/bash
-# NUMA-aware chfsd wrapper for Sirius
-# Detects local /scrN and binds chfsd to the corresponding NUMA node.
-
-REAL_CHFSD="${REAL_CHFSD}"
-TASKSET_ENABLED=${TASKSET}
-TASKSET_CORES_VAL="${TASKSET_CORES}"
-
-# Detect NVMe scratch directories on THIS node
-LOCAL_SCRATCH_DIRS=()
-LOCAL_NUMA_NODES=()
-for n in 0 1 2 3; do
-    if [ -d "/scr\${n}/\${PBS_JOBID}" ]; then
-        LOCAL_SCRATCH_DIRS+=("/scr\${n}/\${PBS_JOBID}")
-        LOCAL_NUMA_NODES+=("\${n}")
-    fi
-done
-
-SELECTED_DIR=""
-SELECTED_NUMA=""
-
-if [ \${#LOCAL_SCRATCH_DIRS[@]} -gt 0 ]; then
-    # Use atomic file-based counter to assign different /scrN
-    # to each chfsd process on the same node
-    COUNTER_FILE="/tmp/chfsd_numa_counter_\${PBS_JOBID}"
-    # flock + read/write for atomicity
-    RANK=\$(flock "\${COUNTER_FILE}" bash -c '
-        n=\$(cat "'\${COUNTER_FILE}'" 2>/dev/null || echo 0)
-        echo \$((n + 1)) > "'\${COUNTER_FILE}'"
-        echo \$n
-    ')
-    IDX=\$((RANK % \${#LOCAL_SCRATCH_DIRS[@]}))
-    SELECTED_DIR="\${LOCAL_SCRATCH_DIRS[\$IDX]}"
-    SELECTED_NUMA="\${LOCAL_NUMA_NODES[\$IDX]}"
-    echo "chfsd wrapper: rank=\${RANK}, NUMA \${SELECTED_NUMA}, cache=\${SELECTED_DIR}/chfs (from \${#LOCAL_SCRATCH_DIRS[@]} local SSDs)" >&2
-fi
-
-# Override the -c (cache dir) argument if we detected a local /scrN
-ARGS=()
-if [ -n "\${SELECTED_DIR}" ]; then
-    CACHE_DIR="\${SELECTED_DIR}/chfs"
-    mkdir -p "\${CACHE_DIR}"
-    SKIP_NEXT=0
-    for arg in "\$@"; do
-        if [ \${SKIP_NEXT} -eq 1 ]; then
-            ARGS+=("\${CACHE_DIR}")
-            SKIP_NEXT=0
-        elif [ "\$arg" = "-c" ]; then
-            ARGS+=("\$arg")
-            SKIP_NEXT=1
-        else
-            ARGS+=("\$arg")
-        fi
-    done
-else
-    ARGS=("\$@")
-fi
-
-# Launch chfsd with NUMA binding (and optional taskset)
-if [ -n "\${SELECTED_NUMA}" ] && command -v numactl >/dev/null 2>&1; then
-    if [ "\${TASKSET_ENABLED}" = "1" ]; then
-        echo "chfsd wrapper: numactl --cpunodebind=\${SELECTED_NUMA} --membind=\${SELECTED_NUMA} + taskset -c \${TASKSET_CORES_VAL}" >&2
-        exec numactl --cpunodebind="\${SELECTED_NUMA}" --membind="\${SELECTED_NUMA}" \\
-            taskset -c "\${TASKSET_CORES_VAL}" "\${REAL_CHFSD}" "\${ARGS[@]}"
-    else
-        echo "chfsd wrapper: numactl --cpunodebind=\${SELECTED_NUMA} --membind=\${SELECTED_NUMA}" >&2
-        exec numactl --cpunodebind="\${SELECTED_NUMA}" --membind="\${SELECTED_NUMA}" \\
-            "\${REAL_CHFSD}" "\${ARGS[@]}"
-    fi
-else
-    if [ "\${TASKSET_ENABLED}" = "1" ]; then
-        echo "chfsd wrapper: taskset -c \${TASKSET_CORES_VAL} (no NUMA binding)" >&2
-        exec taskset -c "\${TASKSET_CORES_VAL}" "\${REAL_CHFSD}" "\${ARGS[@]}"
-    else
-        echo "chfsd wrapper: no NUMA binding, no taskset" >&2
-        exec "\${REAL_CHFSD}" "\${ARGS[@]}"
-    fi
-fi
-CHFSD_WRAPPER_EOF
-chmod +x "${CHFSD_WRAPPER_DIR}/chfsd"
-echo "Created NUMA-aware chfsd wrapper: ${CHFSD_WRAPPER_DIR}/chfsd"
-
-# Prepend wrapper directory to PATH so chfsctl finds it first
-export PATH="${CHFSD_WRAPPER_DIR}:${PATH}"
-echo "Updated PATH to use NUMA-aware chfsd wrapper"
 
 # ==============================================================================
 # Parameter Loading
@@ -448,48 +403,30 @@ start_chfs_servers() {
 
   # Create hostfile from PBS_NODEFILE
   cp "${PBS_NODEFILE}" "${JOB_OUTPUT_DIR}/hostfile"
-
-  # Reset the NUMA counter on all nodes before starting chfsd
-  # This ensures counter starts at 0 for each start_chfs_servers call
-  # Use unique hostfile to run exactly one process per physical node
-  "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$UNIQUE_NNODES" \
-    --bind-to none --oversubscribe \
-    -x PBS_JOBID \
-    bash -c "rm -f /tmp/chfsd_numa_counter_\${PBS_JOBID} && echo \$(hostname): NUMA counter reset" || true
-
-  # Create scratch directories on all nodes
-  echo "Creating scratch directories on all nodes..."
-  "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$UNIQUE_NNODES" \
-    --bind-to none --oversubscribe \
-    -x PBS_JOBID \
-    bash -c '
-      for n in 0 1 2 3; do
-        d="/scr${n}/${PBS_JOBID}/chfs"
-        if [ -d "/scr${n}/${PBS_JOBID}" ]; then
-          mkdir -p "$d"
-          echo "$(hostname): created $d"
-        fi
-      done
-    ' || true
+  echo "[$(date +%T)] Invoking chfsctl start with chfsd-sirius wrapper..."
 
   # Start CHFS servers via chfsctl
   # Use -ssh to launch chfsd via mpirun instead of ssh
   # The NUMA-aware chfsd wrapper (in PATH) handles /scrN selection and NUMA binding
+  # Per CHFS author feedback:
+  # - Remove -b (backend dir causes flushing, hurts performance)
+  # - Remove -f (flush threads unnecessary without -b)
+  # - Add -O "-H 0 -T $NIOT" to disable heartbeat and set I/O thread count
+  local NIOT="${CHFS_NIOT:-1}"
   echo "Running chfsctl start..."
-  echo "chfsctl command: chfsctl -ssh ${MPIRUN_SSH_WRAPPER} -h ${JOB_OUTPUT_DIR}/hostfile -c ${CHFS_PRIMARY_SCRATCH}/chfs -b ${JOB_BACKEND_DIR} -s ${db_size} -p ${protocol} -M -f 2 -n 32 -L ${CHFS_LOG_DIR} start"
+  echo "chfsctl command: ${CHFSCTL} -wrapper chfsd-sirius -ssh ${MPIRUN_SSH_WRAPPER} -h ${JOB_OUTPUT_DIR}/hostfile -s ${db_size} -p ${protocol} -M -n 32 -L ${CHFS_LOG_DIR} -O \"-H 0 -T ${NIOT}\" start"
 
   local chfsctl_output
-  chfsctl_output=$(chfsctl \
+  chfsctl_output=$("${CHFSCTL}" \
+    -wrapper chfsd-sirius \
     -ssh "${MPIRUN_SSH_WRAPPER}" \
     -h "${JOB_OUTPUT_DIR}/hostfile" \
-    -c "${CHFS_PRIMARY_SCRATCH}/chfs" \
-    -b "${JOB_BACKEND_DIR}" \
     -s "${db_size}" \
     -p "${protocol}" \
     -M \
-    -f 2 \
     -n 32 \
     -L "${CHFS_LOG_DIR}" \
+    -O "-H 0 -T ${NIOT}" \
     -x PATH \
     -x LD_LIBRARY_PATH \
     -x PBS_JOBID \
@@ -541,10 +478,19 @@ start_chfs_servers() {
     cat "${CHFS_LOG_DIR}/chlist.log"
     return 1
   }
+  echo "=== chlist output ==="
   cat "${CHFS_LOG_DIR}/chlist.log"
 
   local server_count=$(wc -l < "${CHFS_LOG_DIR}/chlist.log")
   echo "CHFS servers ready: ${server_count} servers"
+
+  # Check chfsd status on each node via chfsctl status
+  echo "=== chfsctl status ==="
+  local status_hostfile="${CHFS_LOG_DIR}/status_hostfile"
+  uniq "${PBS_NODEFILE}" > "${status_hostfile}"
+  chfsctl -ssh pbs_tmrsh -h "${status_hostfile}" status \
+    > "${CHFS_LOG_DIR}/chfsctl_status.log" 2>&1 || true
+  cat "${CHFS_LOG_DIR}/chfsctl_status.log"
 
   return 0
 }
@@ -556,24 +502,11 @@ stop_chfs_servers() {
   echo "=========================================="
 
   # Stop servers
-  chfsctl \
+  "${CHFSCTL}" \
     -ssh "${MPIRUN_SSH_WRAPPER}" \
     -h "${JOB_OUTPUT_DIR}/hostfile" \
     -M \
     stop > "${CHFS_LOG_DIR}/chfsctl_stop.log" 2>"${CHFS_LOG_DIR}/chfsctl_stop_stderr.log" || true
-
-  # Clean up scratch directories and NUMA counter
-  chfsctl \
-    -ssh "${MPIRUN_SSH_WRAPPER}" \
-    -h "${JOB_OUTPUT_DIR}/hostfile" \
-    -c "${CHFS_PRIMARY_SCRATCH}/chfs" \
-    clean > "${CHFS_LOG_DIR}/chfsctl_clean.log" 2>"${CHFS_LOG_DIR}/chfsctl_clean_stderr.log" || true
-
-  # Clean up NUMA counters on all nodes
-  "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$UNIQUE_NNODES" \
-    --bind-to none --oversubscribe \
-    -x PBS_JOBID \
-    bash -c "rm -f /tmp/chfsd_numa_counter_\${PBS_JOBID}" 2>/dev/null || true
 
   echo "CHFS servers stopped"
 }
@@ -667,20 +600,19 @@ run_ior_benchmark() {
   echo "IOR Flags: ${ior_flags}"
   echo "=========================================="
 
-  # Build IOR command
+  # Build IOR command (without time_json wrapper - it's a bash function
+  # and cannot be called via timeout which spawns a new process)
   cmd_ior=(
-    time_json -o "${JOB_OUTPUT_DIR}/time_${runid}.json"
     "${cmd_mpirun_common[@]}"
     -np "$np"
     --bind-to none
     --oversubscribe
     -x CHFS_SERVER
     -x CHFS_CHUNK_SIZE="${effective_chunk_size}"
-    "${IOR_PREFIX}/src/ior"
+    "${IOR_WRAPPER}"
     -vvv
     -g
     -D 120
-    -O stoneWallingWearOut=1
     -a CHFS
     --chfs.chunk_size="${effective_chunk_size}"
     -t "$transfer_size"
@@ -691,15 +623,30 @@ run_ior_benchmark() {
     -O summaryFile="${ior_json}"
   )
 
-  echo "Running: ${cmd_ior[*]}"
-  local ior_exit_code=0
-  "${cmd_ior[@]}" > "${ior_stdout}" 2> "${ior_stderr}" || ior_exit_code=$?
+  # Timeout: IOR uses -D 120 (120s per test phase).
+  # A full run (write + read + overhead) should complete within 600s.
+  # If it exceeds this, it's hung (e.g. MPI barrier deadlock from CHFS timeouts).
+  local IOR_TIMEOUT=600
 
-  if [ "$ior_exit_code" -ne 0 ]; then
+  echo "Running (timeout=${IOR_TIMEOUT}s): ${cmd_ior[*]}"
+  local ior_exit_code=0
+  local start_seconds=$SECONDS
+  timeout --signal=TERM --kill-after=30 "${IOR_TIMEOUT}" \
+    "${cmd_ior[@]}" > "${ior_stdout}" 2> "${ior_stderr}" || ior_exit_code=$?
+  local elapsed_seconds=$((SECONDS - start_seconds))
+
+  # Save elapsed time as simple JSON (replaces time_json)
+  cat > "${JOB_OUTPUT_DIR}/time_${runid}.json" <<TIME_EOF
+{"ElapsedSeconds": ${elapsed_seconds}, "ExitCode": ${ior_exit_code}}
+TIME_EOF
+
+  if [ "$ior_exit_code" -eq 124 ]; then
+    echo "WARNING: IOR run $runid killed by timeout after ${IOR_TIMEOUT}s (likely hung)"
+    echo "  Stderr log: ${ior_stderr}"
+  elif [ "$ior_exit_code" -ne 0 ]; then
     echo "WARNING: IOR run $runid failed with exit code $ior_exit_code"
     echo "  Stderr log: ${ior_stderr}"
     echo "  Continuing with next parameter combination..."
-    cat "${ior_stderr}"
   fi
 
   # NOTE: Do NOT clean chfsd cache dirs while chfsd is running.
@@ -728,15 +675,28 @@ echo "=========================================="
 echo "Starting Benchmark Sweep"
 echo "=========================================="
 
-# Start CHFS servers
-if ! start_chfs_servers "${CHFS_PROTOCOL}" "${CHFS_DB_SIZE}"; then
-  echo "ERROR: Failed to start CHFS servers"
-  exit 1
-fi
-
 runid=0
+first_iter=1
 
+# Restart CHFS servers at the ppn boundary to prevent state accumulation.
+# chfsd's internal state (metadata DB, connections, buffers) degrades over many
+# IOR runs, causing escalating HG_TIMEOUT errors until servers become unresponsive.
 for ppn in "${ppn_list[@]}"; do
+
+  echo ""
+  echo "=========================================="
+  echo "(Re)starting CHFS servers for ppn=${ppn}"
+  echo "=========================================="
+  # Skip stop on the very first iteration; no servers / hostfile yet.
+  if [ "${first_iter}" -eq 0 ]; then
+    stop_chfs_servers
+  fi
+  first_iter=0
+  if ! start_chfs_servers "${CHFS_PROTOCOL}" "${CHFS_DB_SIZE}"; then
+    echo "ERROR: Failed to start CHFS servers"
+    exit 1
+  fi
+
   for transfer_size in "${transfer_size_list[@]}"; do
     for block_size in "${block_size_list[@]}"; do
       for ior_flags in "${ior_flags_list[@]}"; do
