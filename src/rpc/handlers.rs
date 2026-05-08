@@ -702,21 +702,33 @@ pub async fn handle_metadata_update(
         }
     };
 
-    // Update size if requested
+    // Update size if requested.
+    //
+    // Use extend (max) semantics rather than overwrite so concurrent writers to
+    // a shared file don't trample each other's metadata. Without this, the
+    // last-arriving close from a low-rank IOR client (whose local cache only
+    // saw its own offset range) could shrink the recorded size below what
+    // higher-rank clients had already written, and the read phase would see
+    // file_meta.size=0 / short reads.
+    //
+    // Truncate (e.g. on open with O_TRUNC) deliberately uses 0; treat 0 as a
+    // truncate intent and pass it through.
     if header.should_update_size() {
         let old_size = file_meta.size;
-        file_meta.size = header.new_size;
-        // chunk_count is calculated on demand via calculate_chunk_count()
+        let new_size = if header.new_size == 0 {
+            0
+        } else {
+            old_size.max(header.new_size)
+        };
+        file_meta.size = new_size;
 
         tracing::debug!(
-            "Updated file size: {} -> {} (path={})",
+            "Updated file size: {} -> {} (requested={}, path={})",
             old_size,
+            new_size,
             header.new_size,
             path
         );
-
-        // Note: In path-based KV design, chunk_locations are not tracked
-        // Chunks are identified directly by (path, chunk_index)
     }
 
     // Update mode if requested

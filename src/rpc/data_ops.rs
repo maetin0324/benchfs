@@ -305,7 +305,13 @@ impl<'a> AmRpc for ReadChunkRequest<'a> {
             // )
 
             match io_uring_store
-                .read_chunk_fixed(&path, header.chunk_index, header.offset, fixed_buffer)
+                .read_chunk_fixed(
+                    &path,
+                    header.chunk_index,
+                    header.offset,
+                    header.length,
+                    fixed_buffer,
+                )
                 .await
             {
                 Ok((bytes_read, fixed_buffer)) => {
@@ -1222,7 +1228,13 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
             // Step 2: io_uring READ operation timing (only when stats enabled)
             let io_start = if stats_enabled { Some(std::time::Instant::now()) } else { None };
             match io_uring_store
-                .read_chunk_fixed(&path, chunk_index, header.offset, fixed_buffer)
+                .read_chunk_fixed(
+                    &path,
+                    chunk_index,
+                    header.offset,
+                    header.length,
+                    fixed_buffer,
+                )
                 .await
             {
                 Ok((bytes_read, fixed_buffer)) => {

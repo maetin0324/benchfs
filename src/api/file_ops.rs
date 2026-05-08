@@ -1094,42 +1094,58 @@ impl BenchFS {
         use std::path::Path;
         let path_ref = Path::new(&handle.path);
 
-        // Sync metadata to remote server if this is a remote file
+        // Sync metadata to remote server if this is a remote file.
+        //
+        // The server tracks file_meta.size only via this close-time RPC (chunk
+        // writes don't extend file size). If this RPC drops, the server's
+        // size stays at 0 and the next read phase short-circuits at
+        // `offset >= file_meta.size` returning 0 bytes — IOR then prints
+        // "cannot read from file". 160 simultaneous closes at large transfer
+        // sizes can overwhelm the metadata server's 5s window, so we use a
+        // longer timeout and retry once.
         if handle.flags.write {
             let metadata_node = self.get_metadata_node(&handle.path);
             let is_local = self.is_local_metadata(&handle.path);
 
             if !is_local {
-                // Get final file metadata from local cache
                 if let Ok(file_meta) = self.metadata_manager.get_file_metadata(path_ref) {
-                    // Sync to remote metadata server
                     if let Some(pool) = &self.connection_pool {
-                        // Use timeout to prevent hanging on close
-                        let timeout_duration = Duration::from_secs(5);
-                        let mut timeout = Delay::new(timeout_duration).fuse();
+                        let timeout_duration = Duration::from_secs(30);
+                        let max_attempts = 3u32;
+                        let mut synced = false;
 
-                        // Try to connect with timeout
-                        let connect_future = pool.get_or_connect(&metadata_node).fuse();
-                        futures::pin_mut!(connect_future);
+                        for attempt in 1..=max_attempts {
+                            let mut timeout = Delay::new(timeout_duration).fuse();
+                            let connect_future = pool.get_or_connect(&metadata_node).fuse();
+                            futures::pin_mut!(connect_future);
 
-                        let client_result = futures::select! {
-                            result = connect_future => Some(result),
-                            _ = timeout => {
-                                tracing::warn!(
-                                    "Connection timeout for metadata sync on close: {} (timeout: {:?})",
-                                    handle.path,
-                                    timeout_duration
-                                );
-                                None
-                            }
-                        };
+                            let client_result = futures::select! {
+                                result = connect_future => Some(result),
+                                _ = timeout => {
+                                    tracing::warn!(
+                                        "Connection timeout for metadata sync on close: {} (attempt {}/{}, timeout: {:?})",
+                                        handle.path, attempt, max_attempts, timeout_duration
+                                    );
+                                    None
+                                }
+                            };
 
-                        if let Some(Ok(client)) = client_result {
+                            let client = match client_result {
+                                Some(Ok(c)) => c,
+                                Some(Err(e)) => {
+                                    tracing::warn!(
+                                        "Failed to connect for metadata sync on close: {} (attempt {}/{}): {:?}",
+                                        handle.path, attempt, max_attempts, e
+                                    );
+                                    continue;
+                                }
+                                None => continue,
+                            };
+
                             use crate::rpc::metadata_ops::MetadataUpdateRequest;
                             let request = MetadataUpdateRequest::new(handle.path.clone())
                                 .with_size(file_meta.size);
 
-                            // Also use timeout for RPC call
                             let mut rpc_timeout = Delay::new(timeout_duration).fuse();
                             let rpc_future = request.call(&*client).fuse();
                             futures::pin_mut!(rpc_future);
@@ -1138,9 +1154,8 @@ impl BenchFS {
                                 result = rpc_future => Some(result),
                                 _ = rpc_timeout => {
                                     tracing::warn!(
-                                        "Metadata sync RPC timeout on close: {} (timeout: {:?})",
-                                        handle.path,
-                                        timeout_duration
+                                        "Metadata sync RPC timeout on close: {} (attempt {}/{}, timeout: {:?})",
+                                        handle.path, attempt, max_attempts, timeout_duration
                                     );
                                     None
                                 }
@@ -1149,27 +1164,33 @@ impl BenchFS {
                             match rpc_result {
                                 Some(Ok(response)) if response.is_success() => {
                                     tracing::debug!(
-                                        "Synced metadata on close: {} (size: {})",
-                                        handle.path,
-                                        file_meta.size
+                                        "Synced metadata on close: {} (size: {}, attempt {}/{})",
+                                        handle.path, file_meta.size, attempt, max_attempts
                                     );
+                                    synced = true;
+                                    break;
                                 }
                                 Some(Ok(response)) => {
                                     tracing::warn!(
-                                        "Failed to sync metadata on close: {} (status: {})",
-                                        handle.path,
-                                        response.status
+                                        "Failed to sync metadata on close: {} (status: {}, attempt {}/{})",
+                                        handle.path, response.status, attempt, max_attempts
                                     );
                                 }
                                 Some(Err(e)) => {
-                                    tracing::warn!("Metadata sync RPC error on close: {:?}", e);
+                                    tracing::warn!(
+                                        "Metadata sync RPC error on close: {} (attempt {}/{}): {:?}",
+                                        handle.path, attempt, max_attempts, e
+                                    );
                                 }
-                                None => {
-                                    // Already logged timeout
-                                }
+                                None => {} // timeout already logged
                             }
-                        } else if let Some(Err(e)) = client_result {
-                            tracing::warn!("Failed to connect for metadata sync on close: {:?}", e);
+                        }
+
+                        if !synced {
+                            tracing::error!(
+                                "Metadata sync FAILED after {} attempts: {} (size {} not visible to subsequent reads)",
+                                max_attempts, handle.path, file_meta.size
+                            );
                         }
                     }
                 }

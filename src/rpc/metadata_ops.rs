@@ -956,10 +956,15 @@ impl AmRpc for MetadataUpdateRequest {
             }
         };
 
-        // Update size if requested
+        // Update size if requested. Use extend (max) semantics so concurrent
+        // writers to a shared file don't trample each other; treat 0 as a
+        // truncate intent (e.g. open with O_TRUNC) and pass through.
         if header.should_update_size() {
-            file_meta.size = header.new_size;
-            // chunk_count is calculated on demand via calculate_chunk_count()
+            file_meta.size = if header.new_size == 0 {
+                0
+            } else {
+                file_meta.size.max(header.new_size)
+            };
         }
 
         // Note: Mode update would be handled here if FileMetadata supported it

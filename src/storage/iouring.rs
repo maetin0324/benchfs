@@ -76,7 +76,13 @@ impl IOUringBackend {
     /// * `handle` - File handle
     /// * `offset` - Offset within the file
     /// * `fixed_buffer` - Pre-populated registered buffer
-    /// * `data_len` - Actual data length in the buffer
+    /// * `data_len` - Actual data length to write (must be <= fixed_buffer.len())
+    ///
+    /// # Notes
+    /// `data_len` is forwarded to the io_uring SQE so only that many bytes are
+    /// written. When the underlying file was opened with `O_DIRECT`, callers
+    /// must ensure `data_len` is a multiple of the device block size; otherwise
+    /// open the file in buffered mode.
     #[async_backtrace::framed]
     pub async fn write_fixed_direct(
         &self,
@@ -97,9 +103,11 @@ impl IOUringBackend {
         // Measure io_uring write_fixed operation time (only when stats enabled)
         let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
 
+        let write_len = data_len.min(fixed_buffer.len()) as u32;
+
         // Write data using write_fixed with registered buffer (zero-copy DMA)
         let (bytes_written_raw, _fixed_buffer) = dma_file
-            .write_fixed(fixed_buffer, offset)
+            .write_fixed(fixed_buffer, offset, write_len)
             .await
             .map_err(StorageError::IoError)?;
 
@@ -140,15 +148,22 @@ impl IOUringBackend {
     /// * `handle` - File handle
     /// * `offset` - Offset within the file
     /// * `fixed_buffer` - Pre-allocated registered buffer to read into
+    /// * `read_len` - Maximum number of bytes to read (capped at fixed_buffer.len())
     ///
     /// # Returns
     /// A tuple of (bytes_read, buffer) where buffer is the same FixedBuffer passed in
+    ///
+    /// # Notes
+    /// `read_len` is forwarded to the io_uring SQE. When the underlying file was
+    /// opened with `O_DIRECT`, callers must ensure `read_len` is a multiple of
+    /// the device block size; otherwise open the file in buffered mode.
     #[async_backtrace::framed]
     pub async fn read_fixed_direct(
         &self,
         handle: FileHandle,
         offset: u64,
         fixed_buffer: pluvio_uring::allocator::FixedBuffer,
+        read_len: usize,
     ) -> StorageResult<(usize, pluvio_uring::allocator::FixedBuffer)> {
         // Clone the DmaFile to avoid holding the borrow across await
         let dma_file = {
@@ -162,9 +177,11 @@ impl IOUringBackend {
         // Measure io_uring read_fixed operation time (only when stats enabled)
         let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
 
+        let read_len = read_len.min(fixed_buffer.len()) as u32;
+
         // Read data using read_fixed with registered buffer (zero-copy DMA)
         let (bytes_read_raw, fixed_buffer) = dma_file
-            .read_fixed(fixed_buffer, offset)
+            .read_fixed(fixed_buffer, offset, read_len)
             .await
             .map_err(StorageError::IoError)?;
 
@@ -258,7 +275,7 @@ impl StorageBackend for IOUringBackend {
         // Read data using read_fixed with registered buffer
         // New API returns (bytes_read, buffer)
         let (bytes_read, mut fixed_buffer) = dma_file
-            .read_fixed(fixed_buffer, offset)
+            .read_fixed(fixed_buffer, offset, read_size as u32)
             .await
             .map_err(StorageError::IoError)?;
 
@@ -308,7 +325,7 @@ impl StorageBackend for IOUringBackend {
         // Write data using write_fixed with registered buffer
         // New API returns (bytes_written, buffer)
         let (bytes_written_raw, _fixed_buffer) = dma_file
-            .write_fixed(fixed_buffer, offset)
+            .write_fixed(fixed_buffer, offset, write_size as u32)
             .await
             .map_err(StorageError::IoError)?;
 

@@ -1275,19 +1275,35 @@ impl IOUringChunkStore {
         Ok(dir)
     }
 
-    /// Open a chunk file for reading or writing
+    /// Block size that O_DIRECT requires the request length / offset to be a
+    /// multiple of. 4096 covers every NVMe device used on Sirius (512-byte and
+    /// 4K logical block sizes alike). When a request's len/offset is not a
+    /// multiple of this value, the file is opened buffered to avoid `EINVAL`.
+    const DIRECT_IO_ALIGN: u64 = 4096;
+
+    /// Whether `(offset, len)` satisfies O_DIRECT's alignment requirements.
     ///
-    /// This method opens files without caching - each operation gets a fresh file handle.
-    /// This allows different O_DIRECT settings for READ vs WRITE:
-    /// - WRITE: Uses O_DIRECT to bypass page cache, maximizing NVMe write buffer utilization
-    /// - READ: Does NOT use O_DIRECT, allowing OS page cache to be utilized for repeated reads
+    /// Note: buffer alignment is already guaranteed by `FixedBufferAllocator`
+    /// (page-aligned allocations). The remaining unknowns are the file offset
+    /// and request length, both of which the caller controls per request.
+    pub(crate) fn direct_io_aligned(offset: u64, len: u64) -> bool {
+        offset.is_multiple_of(Self::DIRECT_IO_ALIGN) && len.is_multiple_of(Self::DIRECT_IO_ALIGN)
+    }
+
+    /// Open a chunk file for reading or writing.
     ///
-    /// File handles are closed immediately after each operation.
+    /// `use_direct` controls whether the file is opened with `O_DIRECT`.
+    /// Pass `false` when the request's offset/len is not aligned to
+    /// [`DIRECT_IO_ALIGN`] — io_uring's `read_fixed` / `write_fixed` work fine
+    /// without `O_DIRECT`, but `O_DIRECT` itself rejects unaligned transfers.
+    ///
+    /// File handles are closed immediately after each operation; no caching.
     async fn open_chunk_file(
         &self,
         file_path: &str,
         chunk_index: u64,
         write: bool,
+        use_direct: bool,
     ) -> ChunkStoreResult<FileHandle> {
         let open_start = std::time::Instant::now();
 
@@ -1299,16 +1315,13 @@ impl IOUringChunkStore {
 
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
 
-        // O_DIRECT is used for both READ and WRITE operations.
-        // Past benchmarks showed no performance difference between buffered and direct I/O,
-        // so O_DIRECT is used consistently to bypass page cache and reduce memory pressure.
         let flags = OpenFlags {
-            read: !write,  // READ-only for read operations
-            write: write,  // WRITE-only for write operations
-            create: write, // Only create on write operations
+            read: !write,
+            write,
+            create: write,
             truncate: false,
             append: false,
-            direct: true,  // O_DIRECT for both READ and WRITE
+            direct: use_direct,
         };
 
         let open_syscall_start = std::time::Instant::now();
@@ -1320,6 +1333,7 @@ impl IOUringChunkStore {
         tracing::debug!(
             op_type = if write { "WRITE" } else { "READ" },
             chunk_index = chunk_index,
+            direct = use_direct,
             ensure_dir_us = ensure_dir_elapsed.as_micros() as u64,
             open_syscall_us = open_syscall_elapsed.as_micros() as u64,
             total_open_us = total_elapsed.as_micros() as u64,
@@ -1331,7 +1345,7 @@ impl IOUringChunkStore {
             chunk_file_path,
             handle,
             write,
-            write
+            use_direct
         );
 
         Ok(handle)
@@ -1351,12 +1365,16 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file with O_DIRECT for write
-        let handle = self.open_chunk_file(file_path, chunk_index, true).await?;
-
-        // Write data directly at the specified offset
-        // io_uring's pwrite handles sparse files efficiently - no need for read-modify-write
         let bytes_to_write = data.len().min(self.chunk_size - offset as usize);
+        // O_DIRECT only when both offset and request length are 4K-aligned;
+        // ior-hard's 47008-byte transfers fall back to buffered I/O.
+        let use_direct = Self::direct_io_aligned(offset, bytes_to_write as u64);
+
+        let handle = self
+            .open_chunk_file(file_path, chunk_index, true, use_direct)
+            .await?;
+
+        // io_uring's pwrite handles sparse files efficiently - no read-modify-write needed
         let result = self
             .backend
             .write(handle, offset, &data[..bytes_to_write])
@@ -1388,9 +1406,10 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file without O_DIRECT (uses page cache for better read performance)
-        // Note: Will fail with StorageError if file doesn't exist
-        let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
+        // Page cache typically wins for repeated reads — keep buffered.
+        let handle = self
+            .open_chunk_file(file_path, chunk_index, false, false)
+            .await?;
 
         // Read data
         let mut buffer = vec![0u8; length as usize];
@@ -1573,13 +1592,18 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file with O_DIRECT for write
+        let bytes_to_write = data_len.min(self.chunk_size - offset as usize);
+        // O_DIRECT only when both offset and request length are 4K-aligned;
+        // ior-hard's 47008-byte transfers fall back to buffered I/O.
+        let use_direct = Self::direct_io_aligned(offset, bytes_to_write as u64);
+
         let open_start = std::time::Instant::now();
-        let handle = self.open_chunk_file(file_path, chunk_index, true).await?;
+        let handle = self
+            .open_chunk_file(file_path, chunk_index, true, use_direct)
+            .await?;
         let open_elapsed = open_start.elapsed();
 
-        // Write data directly from registered buffer using DMA (zero-copy)
-        let bytes_to_write = data_len.min(self.chunk_size - offset as usize);
+        // Write data from registered buffer (zero-copy DMA when O_DIRECT).
         let write_start = std::time::Instant::now();
         let result = self
             .backend
@@ -1625,26 +1649,22 @@ impl IOUringChunkStore {
         self.backend.allocator()
     }
 
-    /// Read a chunk using a registered buffer (zero-copy DMA)
+    /// Read a chunk using a registered buffer (zero-copy DMA when aligned).
     ///
-    /// This method reads data directly from disk into a FixedBuffer without
-    /// an intermediate copy, maximizing read performance.
-    ///
-    /// # Arguments
-    /// * `file_path` - File path
-    /// * `chunk_index` - Chunk index
-    /// * `offset` - Offset within the chunk
-    /// * `fixed_buffer` - Pre-allocated registered buffer to read into
+    /// Reads up to `length` bytes from `offset` into `fixed_buffer`. The actual
+    /// transfer length passed to io_uring is `min(length, fixed_buffer.len())`
+    /// so the kernel only fills (and only reports) the requested range.
     ///
     /// # Returns
     /// A tuple of (bytes_read, buffer) where buffer is the FixedBuffer with data
     #[async_backtrace::framed]
-    #[instrument(level = "trace", name = "iouring_read_chunk_fixed", skip(self, fixed_buffer), fields(path = file_path, chunk = chunk_index, offset))]
+    #[instrument(level = "trace", name = "iouring_read_chunk_fixed", skip(self, fixed_buffer), fields(path = file_path, chunk = chunk_index, offset, len = length))]
     pub async fn read_chunk_fixed(
         &self,
         file_path: &str,
         chunk_index: u64,
         offset: u64,
+        length: u64,
         fixed_buffer: pluvio_uring::allocator::FixedBuffer,
     ) -> ChunkStoreResult<(usize, pluvio_uring::allocator::FixedBuffer)> {
         let total_start = std::time::Instant::now();
@@ -1653,17 +1673,21 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Open the chunk file without O_DIRECT (uses page cache for better read performance)
-        // Note: Will fail with StorageError if file doesn't exist
+        let read_len = (length as usize).min(fixed_buffer.len());
+        // Reads always go through the page cache: this is both the historical
+        // default and avoids any O_DIRECT alignment constraint for ior-hard.
+
         let open_start = std::time::Instant::now();
-        let handle = self.open_chunk_file(file_path, chunk_index, false).await?;
+        let handle = self
+            .open_chunk_file(file_path, chunk_index, false, false)
+            .await?;
         let open_elapsed = open_start.elapsed();
 
-        // Read data directly into registered buffer using DMA (zero-copy)
+        // Read data into registered buffer.
         let read_start = std::time::Instant::now();
         let result = self
             .backend
-            .read_fixed_direct(handle, offset, fixed_buffer)
+            .read_fixed_direct(handle, offset, fixed_buffer, read_len)
             .await;
         let read_elapsed = read_start.elapsed();
 

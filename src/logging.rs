@@ -111,27 +111,36 @@ where
     }
 }
 
-/// Initialize tracing with custom hostname formatter
+/// Initialize tracing with custom hostname formatter.
+///
+/// Idempotent: subsequent calls (e.g. when a long-running process re-initializes
+/// BenchFS through `benchfs_init` for io500's per-phase IOR runs) are no-ops.
+/// `tracing_subscriber::init()` calls `set_global_default()` which panics on
+/// the second call; that double-panicked unwind, then aborted the whole process.
 pub fn init_with_hostname(level: &str) {
+    use std::sync::Once;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
-    let fmt_layer = fmt::layer()
-        .event_format(HostnameFormatter::new())
-        .with_writer(std::io::stdout);
+        let fmt_layer = fmt::layer()
+            .event_format(HostnameFormatter::new())
+            .with_writer(std::io::stdout);
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer)
-        .init();
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .init();
 
-    let hostname_os = gethostname::gethostname();
-    let hostname = hostname_os.to_str().unwrap_or("unknown");
-    tracing::info!("Logging initialized on host: {}", hostname);
+        let hostname_os = gethostname::gethostname();
+        let hostname = hostname_os.to_str().unwrap_or("unknown");
+        tracing::info!("Logging initialized on host: {}", hostname);
+    });
 }
 
 /// Tracing guard for trace file output.
