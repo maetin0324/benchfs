@@ -7,7 +7,7 @@ use crate::metadata::MetadataManager;
 use crate::rpc::buffer_pool::{PathBufferLease, PathBufferPool};
 use crate::rpc::file_id::FileIdRegistry;
 use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
-use crate::storage::ChunkStore;
+use crate::storage::{ChunkStore, IOUringChunkStore};
 
 /// RPC Handler context
 ///
@@ -95,6 +95,14 @@ impl RpcHandlerContext {
     /// Check if shutdown has been requested
     pub fn should_shutdown(&self) -> bool {
         *self.shutdown_flag.borrow()
+    }
+
+    /// Borrow the chunk store as `&IOUringChunkStore` if that's the
+    /// concrete backend in use. Used by the CHFS POSIX-style metadata
+    /// handlers, which require the chunk-0 header / extension helpers
+    /// only present on `IOUringChunkStore`.
+    fn iouring_chunk_store(&self) -> Option<&IOUringChunkStore> {
+        self.chunk_store.as_any().downcast_ref::<IOUringChunkStore>()
     }
 
     pub fn acquire_path_buffer(&self) -> PathBufferLease {
@@ -422,17 +430,49 @@ pub async fn handle_metadata_lookup(
     use std::path::Path;
     let path_ref = Path::new(&path);
 
-    // Look up file metadata first
+    // Fast path: in-memory cache (populated by create/update and previous
+    // lookups). Skipping the disk hit here is critical at scale — at 640
+    // concurrent ranks each MetadataLookup that fell through to chunk-0
+    // open/read/close was enough to stall the WriteChunk pipeline. The
+    // cache is a write-through layer; the on-disk chunk-0 extension is
+    // still the durable source of truth for recovery.
     if let Ok(file_meta) = ctx.metadata_manager.get_file_metadata(path_ref) {
-        tracing::debug!(
-            "Found file: path={}, size={}",
+        tracing::trace!(
+            "MetadataLookup cache hit: path={}, size={}",
             file_meta.path,
             file_meta.size
         );
         return Ok((MetadataLookupResponseHeader::file(file_meta.size), am_msg));
     }
 
-    // Look up directory metadata (dummy in path-based KV design)
+    // Slow path: read from chunk-0 ext on disk, then populate the cache so
+    // subsequent lookups hit memory.
+    if let Some(iouring) = ctx.iouring_chunk_store() {
+        match iouring.read_chunk0_extension(&path).await {
+            Ok(Some(ext)) => {
+                tracing::debug!(
+                    "MetadataLookup chunk-0 ext hit: path={}, size={}",
+                    path,
+                    ext.logical_size
+                );
+                // Repopulate the in-memory cache for next time.
+                let _ = ctx.metadata_manager.store_file_metadata(
+                    crate::metadata::FileMetadata::new(path.clone(), ext.logical_size),
+                );
+                return Ok((
+                    MetadataLookupResponseHeader::file(ext.logical_size),
+                    am_msg,
+                ));
+            }
+            Ok(None) => { /* fall through to directory check */ }
+            Err(e) => {
+                tracing::warn!("chunk-0 stat failed for {}: {:?}", path, e);
+            }
+        }
+    }
+
+    // Directories are still in-memory; CHFS uses real POSIX directories,
+    // which is out of scope for this phase.
     if let Ok(dir_meta) = ctx.metadata_manager.get_dir_metadata(path_ref) {
         tracing::debug!("Found directory: path={}", dir_meta.path);
         return Ok((MetadataLookupResponseHeader::directory(), am_msg));
@@ -490,21 +530,37 @@ pub async fn handle_metadata_create_file(
         header.mode
     );
 
-    // Create file metadata (no inode in path-based KV design)
-    use crate::metadata::FileMetadata;
-    let file_meta = FileMetadata::new(path.clone(), header.size);
-
-    // Store file metadata
-    match ctx.metadata_manager.store_file_metadata(file_meta) {
-        Ok(()) => {
-            tracing::debug!("Created file metadata: path={}", path);
-            Ok((MetadataCreateFileResponseHeader::success(0), am_msg)) // Dummy inode
+    // CHFS POSIX-style write-through: persist on chunk-0 (durable) first,
+    // then update the in-memory cache so subsequent lookups skip the disk.
+    if let Some(iouring) = ctx.iouring_chunk_store() {
+        if let Err(e) = iouring
+            .write_chunk0_extension(
+                &path,
+                crate::storage::BenchfsChunk0Extension::with_size(header.size),
+            )
+            .await
+        {
+            tracing::error!("Failed to write chunk-0 extension for {}: {:?}", path, e);
+            return Ok((MetadataCreateFileResponseHeader::error(-5), am_msg)); // EIO
         }
-        Err(e) => {
-            tracing::error!("Failed to store file metadata: {:?}", e);
-            Ok((MetadataCreateFileResponseHeader::error(-5), am_msg)) // EIO
-        }
+    } else {
+        tracing::error!("MetadataCreate: no IOUringChunkStore backend available");
+        return Ok((MetadataCreateFileResponseHeader::error(-5), am_msg)); // EIO
     }
+
+    // Populate in-memory cache. Duplicate creates are benign; just refresh
+    // the cached size to whatever the latest write produced.
+    let cache_entry = crate::metadata::FileMetadata::new(path.clone(), header.size);
+    if ctx
+        .metadata_manager
+        .update_file_metadata(cache_entry.clone())
+        .is_err()
+    {
+        let _ = ctx.metadata_manager.store_file_metadata(cache_entry);
+    }
+
+    tracing::debug!("Created file (chunk-0 backed): path={}", path);
+    Ok((MetadataCreateFileResponseHeader::success(0), am_msg)) // Dummy inode
 }
 
 /// Handle MetadataCreateDir RPC request
@@ -620,26 +676,32 @@ pub async fn handle_metadata_delete(
     let path_ref = Path::new(&path);
 
     // Delete based on entry type
-    let result = if header.entry_type == 1 {
-        // Delete file
-        ctx.metadata_manager.remove_file_metadata(path_ref)
+    if header.entry_type == 1 {
+        // For files, deleting the chunk-0 (and other chunk) files removes
+        // both data and metadata in one shot — CHFS POSIX-style.
+        if let Some(iouring) = ctx.iouring_chunk_store() {
+            if let Err(e) = iouring.delete_file_chunks(&path).await {
+                tracing::warn!("delete_file_chunks failed for {}: {:?}", path, e);
+            }
+        }
+        // Invalidate the in-memory cache.
+        let _ = ctx.metadata_manager.remove_file_metadata(path_ref);
+        tracing::debug!("Deleted file (chunk-0 backed): path={}", path);
+        Ok((MetadataDeleteResponseHeader::success(), am_msg))
     } else if header.entry_type == 2 {
-        // Delete directory
-        ctx.metadata_manager.remove_dir_metadata(path_ref)
+        match ctx.metadata_manager.remove_dir_metadata(path_ref) {
+            Ok(()) => {
+                tracing::debug!("Deleted directory metadata: path={}", path);
+                Ok((MetadataDeleteResponseHeader::success(), am_msg))
+            }
+            Err(e) => {
+                tracing::error!("Failed to delete directory metadata: {:?}", e);
+                Ok((MetadataDeleteResponseHeader::error(-2), am_msg)) // ENOENT
+            }
+        }
     } else {
         tracing::error!("Invalid entry_type: {}", header.entry_type);
-        return Ok((MetadataDeleteResponseHeader::error(-22), am_msg)); // EINVAL
-    };
-
-    match result {
-        Ok(()) => {
-            tracing::debug!("Deleted metadata: path={}", path);
-            Ok((MetadataDeleteResponseHeader::success(), am_msg))
-        }
-        Err(e) => {
-            tracing::error!("Failed to delete metadata: {:?}", e);
-            Ok((MetadataDeleteResponseHeader::error(-2), am_msg)) // ENOENT
-        }
+        Ok((MetadataDeleteResponseHeader::error(-22), am_msg)) // EINVAL
     }
 }
 
@@ -690,22 +752,10 @@ pub async fn handle_metadata_update(
         header.update_mask
     );
 
-    use std::path::Path;
-    let path_ref = Path::new(&path);
-
-    // Get current file metadata
-    let mut file_meta = match ctx.metadata_manager.get_file_metadata(path_ref) {
-        Ok(meta) => meta,
-        Err(_) => {
-            tracing::debug!("File not found: {}", path);
-            return Ok((MetadataUpdateResponseHeader::error(-2), am_msg)); // ENOENT
-        }
-    };
-
-    // Update size if requested.
+    // Update size on chunk-0's BenchFS extension, max-extend semantics.
     //
-    // Use extend (max) semantics rather than overwrite so concurrent writers to
-    // a shared file don't trample each other's metadata. Without this, the
+    // Use extend (max) rather than overwrite so concurrent writers to a
+    // shared file don't trample each other's metadata. Without this, the
     // last-arriving close from a low-rank IOR client (whose local cache only
     // saw its own offset range) could shrink the recorded size below what
     // higher-rank clients had already written, and the read phase would see
@@ -714,42 +764,47 @@ pub async fn handle_metadata_update(
     // Truncate (e.g. on open with O_TRUNC) deliberately uses 0; treat 0 as a
     // truncate intent and pass it through.
     if header.should_update_size() {
-        let old_size = file_meta.size;
-        let new_size = if header.new_size == 0 {
-            0
+        let updated = if let Some(iouring) = ctx.iouring_chunk_store() {
+            match iouring.update_logical_size(&path, header.new_size).await {
+                Ok(updated) => {
+                    tracing::debug!(
+                        "Updated chunk-0 logical_size -> {} (requested={}, path={})",
+                        updated,
+                        header.new_size,
+                        path
+                    );
+                    updated
+                }
+                Err(e) => {
+                    tracing::error!("Failed to update chunk-0 logical_size: {:?}", e);
+                    return Ok((MetadataUpdateResponseHeader::error(-5), am_msg)); // EIO
+                }
+            }
         } else {
-            old_size.max(header.new_size)
+            tracing::error!("MetadataUpdate: no IOUringChunkStore backend available");
+            return Ok((MetadataUpdateResponseHeader::error(-5), am_msg)); // EIO
         };
-        file_meta.size = new_size;
 
-        tracing::debug!(
-            "Updated file size: {} -> {} (requested={}, path={})",
-            old_size,
-            new_size,
-            header.new_size,
-            path
-        );
+        // Refresh the in-memory cache so future MetadataLookup hits don't
+        // need to re-read the chunk-0 extension.
+        let cache_entry = crate::metadata::FileMetadata::new(path.clone(), updated);
+        if ctx
+            .metadata_manager
+            .update_file_metadata(cache_entry.clone())
+            .is_err()
+        {
+            let _ = ctx.metadata_manager.store_file_metadata(cache_entry);
+        }
     }
 
-    // Update mode if requested
-    // Note: BenchFS doesn't currently use mode field in FileMetadata,
-    // so we just log it for now
     if header.should_update_mode() {
         tracing::debug!("Updated file mode: {:#o} (path={})", header.new_mode, path);
-        // In the future, store mode in FileMetadata
+        // BenchFS doesn't currently persist mode; CHFS records it via POSIX
+        // file mode bits, which would require chmod() at the chunk file
+        // level — out of scope for this phase.
     }
 
-    // Store updated metadata
-    match ctx.metadata_manager.update_file_metadata(file_meta) {
-        Ok(()) => {
-            tracing::debug!("Successfully updated metadata: path={}", path);
-            Ok((MetadataUpdateResponseHeader::success(), am_msg))
-        }
-        Err(e) => {
-            tracing::error!("Failed to update metadata: {:?}", e);
-            Ok((MetadataUpdateResponseHeader::error(-5), am_msg)) // EIO
-        }
-    }
+    Ok((MetadataUpdateResponseHeader::success(), am_msg))
 }
 
 #[cfg(test)]

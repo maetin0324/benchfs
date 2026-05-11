@@ -17,11 +17,22 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE:-$0}" )" &> /dev/null && pwd )"
 source "${SCRIPT_DIR}/../benchfs/common.sh"
 TIMESTAMP="$(timestamp)"
 
-: ${ELAPSTIM_REQ:="01:30:00"}      # 90 minutes
+# Default workflow is single-run with the empirical best ior-easy config
+# (transfer=4m block=4g ppn=4 fpp=TRUE chunk=4m). Set SKIP_SWEEP=0 to fall
+# back to the original 24-config sweep + final-best workflow.
+: ${SKIP_SWEEP:=1}
+: ${ELAPSTIM_REQ:="00:30:00"}      # 30 minutes (single-run mode); raise to 01:30:00 for SKIP_SWEEP=0
 : ${RUST_LOG_S:=warn}
 : ${RUST_LOG_C:=warn}
-: ${SWEEP_STONEWALL:=30}           # seconds per ior-easy phase during sweep
+: ${SWEEP_STONEWALL:=30}           # seconds per ior-easy phase during sweep (only used when SKIP_SWEEP=0)
 : ${FINAL_STONEWALL:=60}           # seconds per phase for final ior-hard run
+
+# Empirically-best ior-easy config (passed through to job script).
+: ${BEST_TRANSFER:=4m}
+: ${BEST_BLOCK:=4g}
+: ${BEST_PPN:=4}
+: ${BEST_FPP:=TRUE}
+: ${BEST_CHUNK_BYTES:=4194304}
 
 JOB_FILE="$(remove_ext "$(this_file)")-job.sh"
 PROJECT_ROOT="$(to_fullpath "${SCRIPT_DIR}/../..")"
@@ -29,7 +40,14 @@ BACKEND_DIR="$PROJECT_ROOT/backend/io500"
 BENCHFS_PREFIX="${PROJECT_ROOT}/target/release"
 IO500_DIR="${PROJECT_ROOT}/ior_integration/io500"
 
-LABEL="${LABEL:-ior_easy_sweep}"
+if [ "${SKIP_SWEEP}" = "1" ]; then
+  LABEL="${LABEL:-single_${BEST_TRANSFER}_b${BEST_BLOCK}_p${BEST_PPN}_fpp${BEST_FPP}}"
+else
+  LABEL="${LABEL:-ior_easy_sweep}"
+fi
+
+# Allow override of select=N for small reproductions on a single node
+: ${SELECT_NODES:=40}
 OUTPUT_DIR="$PROJECT_ROOT/results/io500/${TIMESTAMP}-sirius-${LABEL}"
 
 export JOB_FILE
@@ -44,6 +62,19 @@ export RUST_LOG_S
 export RUST_LOG_C
 export SWEEP_STONEWALL
 export FINAL_STONEWALL
+export SKIP_SWEEP
+export SKIP_MDTEST_HARD
+export FORCE_UCX_TCP
+export IO500_FINAL_HARD
+export IO500_FINAL_MDTEST
+export IO500_ASAN_LIB
+export IO500_ASAN_OPTIONS
+export IO500_MALLOC_CHECK
+export BEST_TRANSFER
+export BEST_BLOCK
+export BEST_PPN
+export BEST_FPP
+export BEST_CHUNK_BYTES
 
 echo "=========================================="
 echo "IO500 Job Submission (Sirius)"
@@ -65,7 +96,7 @@ mkdir -p "${BACKEND_DIR}"
 
 # 10 physical nodes × 4 chunks/node = 40 PBS chunks (vnodes).
 # qsub `select=N` is in chunks; exclhost requires N to be a multiple of 4.
-nnodes_list=(40)
+nnodes_list=("${SELECT_NODES}")
 niter=1
 
 for nnodes in "${nnodes_list[@]}"; do

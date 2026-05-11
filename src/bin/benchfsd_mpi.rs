@@ -339,19 +339,26 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
 
             // Create io_uring reactor
             // Buffer size must match the chunk_size from config to support chunk-sized I/O operations
-            // Optimized parameters for high-throughput workloads:
-            // - queue_size: 512 buffers (reduced from 4096 to cut memory usage)
-            //   With 4 MiB chunks: 512 * 4 MiB = 2 GiB (was 16 GiB with 4096)
-            //   512 is still far above concurrent RPC limit (64), so no throughput loss
-            // - submit_depth: 128 for better batching and throughput
-            // - wait_submit_timeout/wait_complete_timeout: 1ms for low-latency reactor polling
+            //
+            // At ppn=16 × 10 nodes = 640 clients hitting 40 server vnodes, each server
+            // sees up to 16 clients × 64 in-flight per client (MAX_CONCURRENT_CHUNK_RPCS)
+            // = 1024 concurrent WriteChunk RPCs. queue_size=512 was the cap that exhausted
+            // and caused 30s WriteChunk timeouts during io500 ior-easy.
+            // Override via BENCHFS_IOURING_QUEUE_SIZE / BENCHFS_IOURING_SUBMIT_DEPTH.
             let chunk_size = config.storage.chunk_size;
             let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
-            let chunk_multiplier = (base_chunk_size / chunk_size).max(1);
-            // Reduced from 4096 to 512: cuts memory from 16 GiB to 2 GiB per process,
-            // reducing startup time from ~70s to ~10s while maintaining enough queue depth
-            let queue_size = (512 * chunk_multiplier as u32).min(512);
-            let submit_depth = (128 * chunk_multiplier as u32).min(512); // Cap at 512
+            let chunk_multiplier = (base_chunk_size / chunk_size).max(1) as u32;
+            let queue_size = std::env::var("BENCHFS_IOURING_QUEUE_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(2048)
+                .saturating_mul(chunk_multiplier);
+            let submit_depth = std::env::var("BENCHFS_IOURING_SUBMIT_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(512)
+                .saturating_mul(chunk_multiplier)
+                .min(queue_size);
 
             tracing::info!(
                 "Configuring io_uring: buffer_size={} bytes ({} MiB), queue_size={}, submit_depth={}, memory={}GiB",

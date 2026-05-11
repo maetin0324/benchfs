@@ -208,6 +208,21 @@ impl BenchFS {
         self.node_id.clone()
     }
 
+    /// CHFS POSIX-style chunk routing key.
+    ///
+    /// Chunk 0 uses the bare path (matching the metadata routing key) so
+    /// the chunk-0 file always lives on the metadata-owner node and the
+    /// metadata RPC handler can stat / write its CHFS-style header
+    /// directly. Chunks 1+ append `/<index>` to spread data across nodes
+    /// independently of metadata placement.
+    fn chunk_routing_key(file_path: &str, chunk_index: u64) -> String {
+        if chunk_index == 0 {
+            file_path.to_string()
+        } else {
+            format!("{}/{}", file_path, chunk_index)
+        }
+    }
+
     /// Get file metadata with automatic caching for distributed mode
     ///
     /// This helper function tries to get metadata locally first.
@@ -672,8 +687,8 @@ impl BenchFS {
                         // NOTE: Chunk cache disabled for read operations to ensure consistency
                         // in distributed environments where other nodes may modify the same data.
 
-                        // Calculate target node for this chunk
-                        let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                        // Calculate target node for this chunk (chunk-0 colocates with metadata).
+                        let chunk_key = BenchFS::chunk_routing_key(&file_path, chunk_index);
                         let target_node = fs.get_chunk_node(&chunk_key);
                         let self_node_id = fs.metadata_manager.self_node_id().to_string();
                         let is_local = target_node == self_node_id;
@@ -924,7 +939,7 @@ impl BenchFS {
                 let chunk_data = data[data_offset..data_offset + data_len].to_vec();
 
                 let file_path = file_meta.path.clone();
-                let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                let chunk_key = BenchFS::chunk_routing_key(&file_path, chunk_index);
                 let target_node = self.get_chunk_node(&chunk_key);
                 let is_local = target_node == self.metadata_manager.self_node_id();
 
@@ -1392,7 +1407,7 @@ impl BenchFS {
                 spawn_with_name(
                     async move {
                         let fs = unsafe { &*fs_ptr };
-                        let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                        let chunk_key = BenchFS::chunk_routing_key(&file_path, chunk_index);
                         let target_node = fs.get_chunk_node(&chunk_key);
                         let is_local = target_node == self_node_id;
 

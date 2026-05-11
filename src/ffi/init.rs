@@ -636,15 +636,22 @@ pub extern "C" fn benchfs_init(
             }
         }
 
-        // Create BenchFS client instance with distributed metadata
-        // Client mode does NOT need io_uring or local chunk store - all I/O goes via RPC
-        // In MPI mode: node_0 is the metadata server, all nodes are data servers
-        // Use the nodes discovered earlier during connection setup
-        let metadata_nodes = vec!["node_0".to_string()];
-        let data_nodes = discovered_nodes; // Reuse nodes discovered earlier
+        // Create BenchFS client instance with distributed metadata.
+        //
+        // Distribute metadata across ALL discovered server nodes via the same
+        // consistent-hash ring used for chunks. Earlier this list was hardcoded
+        // to ["node_0"], which forced every Lookup/Create/Update RPC from every
+        // client onto a single server. At ~640 clients × 40 servers (10 phys
+        // nodes × ppn=16) the server-side AM queue saturated and triggered
+        // EndpointTimeout cascades, capping aggregate read at ~30 GiB/s. With
+        // metadata sharded over the full ring, per-server metadata load drops
+        // by 1/N and the bottleneck moves back to the data path.
+        let metadata_nodes = discovered_nodes.clone();
+        let data_nodes = discovered_nodes;
 
         tracing::info!(
-            "Creating BenchFS client with {} data nodes for distributed storage (no local io_uring)",
+            "Creating BenchFS client with {} metadata + {} data nodes (consistent-hash sharded)",
+            metadata_nodes.len(),
             data_nodes.len()
         );
 

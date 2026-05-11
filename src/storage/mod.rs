@@ -1,6 +1,7 @@
 // ストレージ層モジュール
 pub mod chunk_store;
 pub mod error;
+pub mod inode;
 pub mod iouring;
 pub mod local;
 
@@ -9,6 +10,7 @@ pub use chunk_store::{
     IOUringChunkStore, InMemoryChunkStore, PosixChunkStore,
 };
 pub use error::{StorageError, StorageResult};
+pub use inode::{BenchfsChunk0Extension, PosixMetadataHeader, EXT_OFFSET, MSIZE};
 pub use iouring::IOUringBackend;
 pub use local::LocalFileSystem;
 

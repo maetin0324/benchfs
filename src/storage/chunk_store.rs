@@ -5,6 +5,8 @@ use std::rc::Rc;
 
 use tracing::instrument;
 
+use super::inode::{BenchfsChunk0Extension, PosixMetadataHeader, EXT_OFFSET, MSIZE};
+use zerocopy::IntoBytes;
 use super::{FileHandle, IOUringBackend, OpenFlags, StorageBackend};
 use crate::metadata::CHUNK_SIZE;
 
@@ -30,6 +32,11 @@ pub trait ChunkStore: std::any::Any {
     async fn delete_chunk(&self, path: &str, chunk_index: u64) -> ChunkStoreResult<()>;
     async fn delete_file_chunks(&self, path: &str) -> ChunkStoreResult<usize>;
     fn has_chunk(&self, path: &str, chunk_index: u64) -> bool;
+
+    /// Reflection escape hatch for callers that need backend-specific
+    /// methods (e.g. CHFS POSIX-style chunk-0 metadata helpers on
+    /// `IOUringChunkStore`). Default implementations are not provided.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Chunk storage error types
@@ -304,6 +311,10 @@ impl ChunkStore for InMemoryChunkStore {
     fn has_chunk(&self, path: &str, chunk_index: u64) -> bool {
         self.has_chunk(path, chunk_index)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// File-based chunk storage
@@ -540,6 +551,10 @@ impl ChunkStore for FileChunkStore {
     fn has_chunk(&self, path: &str, chunk_index: u64) -> bool {
         self.has_chunk(path, chunk_index)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Dummy (no-op) chunk storage for RPC overhead measurement
@@ -647,6 +662,10 @@ impl ChunkStore for DummyChunkStore {
 
     fn has_chunk(&self, path: &str, chunk_index: u64) -> bool {
         self.has_chunk(path, chunk_index)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -1161,6 +1180,10 @@ impl ChunkStore for PosixChunkStore {
     fn has_chunk(&self, path: &str, chunk_index: u64) -> bool {
         self.has_chunk(path, chunk_index)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// IO_uring-based chunk storage
@@ -1187,6 +1210,12 @@ pub struct IOUringChunkStore {
 
     /// IO_uring backend for async file operations
     backend: Rc<IOUringBackend>,
+
+    /// Set of chunks whose CHFS-style header has been written in this
+    /// process lifetime. Used to skip the existence stat on subsequent
+    /// writes to the same chunk. Best-effort: a missing entry just
+    /// triggers a redundant stat, never a missed header write.
+    header_initialized: RefCell<std::collections::HashSet<ChunkKey>>,
 }
 
 impl IOUringChunkStore {
@@ -1217,6 +1246,7 @@ impl IOUringChunkStore {
             base_dir,
             chunk_size: CHUNK_SIZE,
             backend,
+            header_initialized: RefCell::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1279,7 +1309,238 @@ impl IOUringChunkStore {
     /// multiple of. 4096 covers every NVMe device used on Sirius (512-byte and
     /// 4K logical block sizes alike). When a request's len/offset is not a
     /// multiple of this value, the file is opened buffered to avoid `EINVAL`.
+    ///
+    /// Note: chunk data starts at file offset `MSIZE` (also 4096), so a
+    /// chunk-relative aligned offset/len stays aligned at the file level.
     const DIRECT_IO_ALIGN: u64 = 4096;
+
+    /// Ensure the CHFS POSIX-style metadata header (chunk_size / msize / flags)
+    /// has been written at offset 0 of this chunk's file. This is a no-op if
+    /// the header was already written in this process or persisted to disk
+    /// (size >= MSIZE). Mirrors CHFS's `set_metadata` / `fs_open` create path
+    /// (chfs/chfsd/fs_posix.c).
+    async fn ensure_chunk_header(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+    ) -> ChunkStoreResult<()> {
+        let key = ChunkKey::new(file_path.to_string(), chunk_index);
+        if self.header_initialized.borrow().contains(&key) {
+            return Ok(());
+        }
+
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+
+        // Persisted-on-disk fast path: a previous process (or run) may have
+        // already initialized the header.
+        let already_persisted = matches!(
+            std::fs::metadata(&chunk_file_path),
+            Ok(m) if m.len() >= MSIZE,
+        );
+        if already_persisted {
+            self.header_initialized.borrow_mut().insert(key);
+            return Ok(());
+        }
+
+        self.ensure_chunk_dir(file_path, chunk_index)?;
+
+        let header = PosixMetadataHeader::new(self.chunk_size as u64, 0);
+        let header_buf = header.as_msize_buffer();
+
+        // Buffered open + a single MSIZE-byte write at offset 0. We don't
+        // use O_DIRECT here because the buffer (Vec<u8>) is not guaranteed
+        // page-aligned; the data path (which uses registered buffers from
+        // FixedBufferAllocator) keeps O_DIRECT.
+        let flags = OpenFlags {
+            read: false,
+            write: true,
+            create: true,
+            truncate: false,
+            append: false,
+            direct: false,
+        };
+        let handle = self.backend.open(&chunk_file_path, flags).await?;
+        let result = self.backend.write(handle, 0, &header_buf).await;
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after header init: {:?}", e);
+        }
+        result?;
+
+        self.header_initialized.borrow_mut().insert(key);
+
+        tracing::trace!(
+            "Wrote POSIX metadata header for chunk (path={}, chunk_index={})",
+            file_path,
+            chunk_index
+        );
+
+        Ok(())
+    }
+
+    /// Stat a chunk: returns (data_size_in_bytes, decoded header) where
+    /// `data_size_in_bytes = sb.st_size - MSIZE` (CHFS semantics).
+    /// Returns `ChunkNotFound` if the chunk file does not exist or is
+    /// shorter than MSIZE (i.e., header not yet written).
+    pub async fn stat_chunk(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+    ) -> ChunkStoreResult<(u64, PosixMetadataHeader)> {
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+
+        let st = match self.backend.stat(&chunk_file_path).await {
+            Ok(s) => s,
+            Err(super::StorageError::NotFound(_)) => {
+                return Err(ChunkStoreError::ChunkNotFound {
+                    path: file_path.to_string(),
+                    chunk_index,
+                });
+            }
+            Err(e) => return Err(ChunkStoreError::StorageError(e)),
+        };
+
+        if st.size < MSIZE {
+            return Err(ChunkStoreError::ChunkNotFound {
+                path: file_path.to_string(),
+                chunk_index,
+            });
+        }
+
+        let flags = OpenFlags {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+            append: false,
+            direct: false,
+        };
+        let handle = self.backend.open(&chunk_file_path, flags).await?;
+        let mut buf = vec![0u8; std::mem::size_of::<PosixMetadataHeader>()];
+        let read_res = self.backend.read(handle, 0, &mut buf).await;
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after stat: {:?}", e);
+        }
+        let n = read_res?;
+        if n != buf.len() {
+            return Err(ChunkStoreError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "short read of chunk header: got {} of {} bytes",
+                    n,
+                    buf.len()
+                ),
+            )));
+        }
+
+        let header = PosixMetadataHeader::from_bytes_validated(&buf).ok_or_else(|| {
+            ChunkStoreError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk header msize mismatch (expected MSIZE)",
+            ))
+        })?;
+
+        let data_size = st.size - MSIZE;
+        Ok((data_size, header))
+    }
+
+    /// Read the BenchFS-specific chunk-0 extension (logical file size etc.).
+    /// Only meaningful for `chunk_index == 0`; callers must not use this for
+    /// non-zero chunks. Returns `None` if the chunk file does not exist or
+    /// is shorter than the header + extension region.
+    pub async fn read_chunk0_extension(
+        &self,
+        file_path: &str,
+    ) -> ChunkStoreResult<Option<BenchfsChunk0Extension>> {
+        let chunk_file_path = self.chunk_path(file_path, 0);
+        if !chunk_file_path.exists() {
+            return Ok(None);
+        }
+
+        let flags = OpenFlags {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+            append: false,
+            direct: false,
+        };
+        let handle = self.backend.open(&chunk_file_path, flags).await?;
+        let mut buf = vec![0u8; std::mem::size_of::<BenchfsChunk0Extension>()];
+        let read_res = self.backend.read(handle, EXT_OFFSET, &mut buf).await;
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after ext read: {:?}", e);
+        }
+        let n = read_res?;
+        if n != buf.len() {
+            return Ok(None);
+        }
+        Ok(BenchfsChunk0Extension::from_bytes_validated(&buf))
+    }
+
+    /// Write the BenchFS-specific chunk-0 extension. Ensures the chunk-0
+    /// header exists first so the file is at least MSIZE bytes long. Used
+    /// by metadata RPC handlers to persist `logical_size` updates.
+    pub async fn write_chunk0_extension(
+        &self,
+        file_path: &str,
+        ext: BenchfsChunk0Extension,
+    ) -> ChunkStoreResult<()> {
+        // Make sure the CHFS struct metadata header exists (allocates the
+        // MSIZE-byte reserved region) before we touch its bytes 16..32.
+        self.ensure_chunk_header(file_path, 0).await?;
+
+        let chunk_file_path = self.chunk_path(file_path, 0);
+        let flags = OpenFlags {
+            read: false,
+            write: true,
+            create: false,
+            truncate: false,
+            append: false,
+            direct: false,
+        };
+        let handle = self.backend.open(&chunk_file_path, flags).await?;
+        let result = self
+            .backend
+            .write(handle, EXT_OFFSET, ext.as_bytes())
+            .await;
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after ext write: {:?}", e);
+        }
+        result?;
+        Ok(())
+    }
+
+    /// Convenience: persist a logical file size in chunk-0's BenchFS extension
+    /// using max-extend semantics (matches `MetadataUpdate` behavior). Pass
+    /// `new_size = 0` to force a truncate to zero.
+    pub async fn update_logical_size(
+        &self,
+        file_path: &str,
+        new_size: u64,
+    ) -> ChunkStoreResult<u64> {
+        let current = self
+            .read_chunk0_extension(file_path)
+            .await?
+            .unwrap_or_else(BenchfsChunk0Extension::zero);
+        let updated = if new_size == 0 {
+            0
+        } else {
+            current.logical_size.max(new_size)
+        };
+        self.write_chunk0_extension(file_path, BenchfsChunk0Extension::with_size(updated))
+            .await?;
+        Ok(updated)
+    }
+
+    /// Read the persisted logical file size for `file_path`. Returns 0 if
+    /// chunk-0 doesn't exist (file not yet created) or has no extension yet.
+    pub async fn read_logical_size(&self, file_path: &str) -> ChunkStoreResult<u64> {
+        Ok(self
+            .read_chunk0_extension(file_path)
+            .await?
+            .map(|e| e.logical_size)
+            .unwrap_or(0))
+    }
 
     /// Whether `(offset, len)` satisfies O_DIRECT's alignment requirements.
     ///
@@ -1370,14 +1631,19 @@ impl IOUringChunkStore {
         // ior-hard's 47008-byte transfers fall back to buffered I/O.
         let use_direct = Self::direct_io_aligned(offset, bytes_to_write as u64);
 
+        // Ensure the CHFS POSIX-style header exists at offset 0 before any
+        // chunk data is written. Header is initialized at most once per chunk.
+        self.ensure_chunk_header(file_path, chunk_index).await?;
+
         let handle = self
             .open_chunk_file(file_path, chunk_index, true, use_direct)
             .await?;
 
-        // io_uring's pwrite handles sparse files efficiently - no read-modify-write needed
+        // io_uring's pwrite handles sparse files efficiently - no read-modify-write needed.
+        // Data lives at file offset MSIZE + chunk_offset (CHFS POSIX layout).
         let result = self
             .backend
-            .write(handle, offset, &data[..bytes_to_write])
+            .write(handle, MSIZE + offset, &data[..bytes_to_write])
             .await;
 
         // Close the file handle immediately (no caching)
@@ -1406,14 +1672,17 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
 
-        // Page cache typically wins for repeated reads — keep buffered.
+        // O_DIRECT for aligned chunks — historical default that the prior
+        // 144 GiB/s read benchmark relied on. Drop O_DIRECT only when the
+        // request can't satisfy O_DIRECT alignment (ior-hard with 47008 B).
+        let use_direct = Self::direct_io_aligned(offset, length);
         let handle = self
-            .open_chunk_file(file_path, chunk_index, false, false)
+            .open_chunk_file(file_path, chunk_index, false, use_direct)
             .await?;
 
-        // Read data
+        // Read data from file offset MSIZE + chunk_offset (CHFS POSIX layout).
         let mut buffer = vec![0u8; length as usize];
-        let result = self.backend.read(handle, offset, &mut buffer).await;
+        let result = self.backend.read(handle, MSIZE + offset, &mut buffer).await;
 
         // Close the file handle immediately (no caching)
         if let Err(e) = self.backend.close(handle).await {
@@ -1489,6 +1758,11 @@ impl IOUringChunkStore {
         // Delete using io_uring backend
         self.backend.unlink(&chunk_file_path).await?;
 
+        // Drop header-initialized memo so a subsequent re-create writes the header.
+        self.header_initialized
+            .borrow_mut()
+            .remove(&ChunkKey::new(file_path.to_string(), chunk_index));
+
         tracing::debug!(
             "Deleted chunk (path={}, chunk_index={})",
             file_path,
@@ -1537,6 +1811,11 @@ impl IOUringChunkStore {
 
         // Remove the path_hash directory
         self.backend.rmdir(&dir).await?;
+
+        // Purge any header-initialized entries for this path.
+        self.header_initialized
+            .borrow_mut()
+            .retain(|k| k.path != file_path);
 
         tracing::debug!("Deleted {} chunks for path {}", deleted_count, file_path);
 
@@ -1597,6 +1876,10 @@ impl IOUringChunkStore {
         // ior-hard's 47008-byte transfers fall back to buffered I/O.
         let use_direct = Self::direct_io_aligned(offset, bytes_to_write as u64);
 
+        // Ensure CHFS POSIX-style header is written before the first data
+        // write to this chunk. No-op for subsequent writes (HashSet memo).
+        self.ensure_chunk_header(file_path, chunk_index).await?;
+
         let open_start = std::time::Instant::now();
         let handle = self
             .open_chunk_file(file_path, chunk_index, true, use_direct)
@@ -1604,10 +1887,11 @@ impl IOUringChunkStore {
         let open_elapsed = open_start.elapsed();
 
         // Write data from registered buffer (zero-copy DMA when O_DIRECT).
+        // Data lives at file offset MSIZE + chunk_offset (CHFS POSIX layout).
         let write_start = std::time::Instant::now();
         let result = self
             .backend
-            .write_fixed_direct(handle, offset, fixed_buffer, bytes_to_write)
+            .write_fixed_direct(handle, MSIZE + offset, fixed_buffer, bytes_to_write)
             .await;
         let write_elapsed = write_start.elapsed();
 
@@ -1674,20 +1958,22 @@ impl IOUringChunkStore {
         }
 
         let read_len = (length as usize).min(fixed_buffer.len());
-        // Reads always go through the page cache: this is both the historical
-        // default and avoids any O_DIRECT alignment constraint for ior-hard.
+        // O_DIRECT for aligned chunks — historical default the prior 144 GiB/s
+        // read benchmark relied on. Drop O_DIRECT only for ior-hard's
+        // non-4K-aligned 47008 B transfers (offset/len misaligned).
+        let use_direct = Self::direct_io_aligned(offset, read_len as u64);
 
         let open_start = std::time::Instant::now();
         let handle = self
-            .open_chunk_file(file_path, chunk_index, false, false)
+            .open_chunk_file(file_path, chunk_index, false, use_direct)
             .await?;
         let open_elapsed = open_start.elapsed();
 
-        // Read data into registered buffer.
+        // Read data into registered buffer (CHFS POSIX layout: data at MSIZE+offset).
         let read_start = std::time::Instant::now();
         let result = self
             .backend
-            .read_fixed_direct(handle, offset, fixed_buffer, read_len)
+            .read_fixed_direct(handle, MSIZE + offset, fixed_buffer, read_len)
             .await;
         let read_elapsed = read_start.elapsed();
 
@@ -1757,6 +2043,10 @@ impl ChunkStore for IOUringChunkStore {
 
     fn has_chunk(&self, path: &str, chunk_index: u64) -> bool {
         self.has_chunk(path, chunk_index)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

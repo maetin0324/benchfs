@@ -57,6 +57,20 @@ SUMMARY_CSV="${JOB_OUTPUT_DIR}/sweep_summary.csv"
 : ${SWEEP_STONEWALL:=30}
 : ${FINAL_STONEWALL:=60}
 
+# Run mode selector. Default ("0") skips the parameter sweep and runs io500
+# once with the empirically-best ior-easy configuration; the final ior-hard /
+# mdtest phases run as usual. Set SKIP_SWEEP=0 to fall back to the legacy
+# 24-config sweep + final-best workflow.
+: ${SKIP_SWEEP:=1}
+
+# Empirically-best ior-easy parameters (from prior 10-physical-node Sirius
+# sweeps with 40 vnodes). Override per-invocation via env if needed.
+: ${BEST_TRANSFER:=4m}
+: ${BEST_BLOCK:=4g}
+: ${BEST_PPN:=4}
+: ${BEST_FPP:=TRUE}
+: ${BEST_CHUNK_BYTES:=4194304}
+
 # BenchFS scratch dir detection (one /scrN per vnode, up to 4 per physical node).
 detect_all_scratch_dirs() {
   BENCHFS_ALL_SCRATCH_DIRS=()
@@ -129,8 +143,41 @@ export OMPI_MCA_mpi_yield_when_idle=1
 export OMPI_MCA_btl_base_warn_component_unused=0
 export RUST_BACKTRACE=full
 
+# BenchFS tuning for high-concurrency io500 ior-easy:
+# - BENCHFS_RPC_TIMEOUT=120s (was default 30s; stonewall transitions push
+#   server response time past 30s briefly, causing spurious timeouts).
+# - BENCHFS_IOURING_QUEUE_SIZE=2048 (server-side FixedBuffer pool; 512 was
+#   getting exhausted with 16 clients/server × 64 in-flight = 1024).
+# - BENCHFS_IOURING_SUBMIT_DEPTH=512 (was 128).
+: ${BENCHFS_RPC_TIMEOUT:=120}
+: ${BENCHFS_IOURING_QUEUE_SIZE:=2048}
+: ${BENCHFS_IOURING_SUBMIT_DEPTH:=512}
+export BENCHFS_RPC_TIMEOUT
+export BENCHFS_IOURING_QUEUE_SIZE
+export BENCHFS_IOURING_SUBMIT_DEPTH
+
 cmd_mpirun_util=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self)
 cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+
+# Optional UCX-only TCP fallback for debugging cross-node RDMA-related bugs.
+# Set FORCE_UCX_TCP=1 to force BenchFS's internal UCX context to TCP/SHM
+# only (no RDMA, no memory pinning). Switches OpenMPI itself off UCX (uses
+# ob1+tcp BTL for MPI coordination) so the UCX_TLS restriction doesn't
+# break OpenMPI's own bring-up.
+if [ "${FORCE_UCX_TCP:-0}" = "1" ]; then
+  echo "FORCE_UCX_TCP=1: BenchFS UCX = TCP-only; OpenMPI = ob1+tcp BTL, hcoll off"
+  export UCX_TLS=tcp,self,sm
+  export UCX_RCACHE_ENABLE=n
+  export UCX_MEMTYPE_CACHE=n
+  cmd_mpirun_common=(
+    mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1
+    --mca pml ob1 --mca btl tcp,self,sm
+    --mca coll '^hcoll'
+    --mca osc '^ucx'
+    -x PATH -x LD_LIBRARY_PATH
+    -x UCX_TLS -x UCX_RCACHE_ENABLE -x UCX_MEMTYPE_CACHE
+  )
+fi
 
 # ==============================================================================
 # benchfsd lifecycle (adapted from sirius-benchfs-job.sh)
@@ -278,6 +325,9 @@ WRAPPER_EOF
     -x PBS_JOBID
     -x BENCHFS_SCRATCH_DIRS="${BENCHFS_SCRATCH_DIRS_CSV}"
     -x BENCHFS_INNER_BINARY
+    -x BENCHFS_RPC_TIMEOUT
+    -x BENCHFS_IOURING_QUEUE_SIZE
+    -x BENCHFS_IOURING_SUBMIT_DEPTH
     "${datadir_wrapper}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -313,6 +363,23 @@ write_ini() {
   local file_per_proc="$7"  # TRUE/FALSE
   local enable_hard="$8"    # 1 or 0
   local chunk_bytes_arg="$9"
+  local enable_mdtest="${10:-0}"  # 1 or 0; 0 keeps the legacy IOR-only behavior
+
+  local mdtest_run="FALSE"
+  if [ "${enable_mdtest}" = "1" ]; then
+    mdtest_run="TRUE"
+  fi
+  local hard_run="FALSE"
+  if [ "${enable_hard}" = "1" ]; then
+    hard_run="TRUE"
+  fi
+  # mdtest-hard is currently unstable (client-side heap corruption with
+  # 100k+ tiny file creates per phase). Keep mdtest-easy on and gate the
+  # hard variant separately so the easy phases still produce results.
+  local mdtest_hard_run="FALSE"
+  if [ "${enable_mdtest}" = "1" ] && [ "${SKIP_MDTEST_HARD:-1}" != "1" ]; then
+    mdtest_hard_run="TRUE"
+  fi
 
   # The api line also carries BENCHFS-specific aiori options
   # (registry/datadir/chunk-size) — io500 splits api on whitespace and feeds
@@ -351,43 +418,43 @@ run = TRUE
 [mdtest-easy]
 API =
 n = 1
-run = FALSE
+run = ${mdtest_run}
 
 [mdtest-easy-write]
-run = FALSE
+run = ${mdtest_run}
 
 [find-easy]
-run = FALSE
+run = ${mdtest_run}
 
 [ior-hard]
 API =
 segmentCount = 100000
 collective =
-run = $([ "$enable_hard" = "1" ] && echo TRUE || echo FALSE)
+run = ${hard_run}
 
 [ior-hard-write]
-run = $([ "$enable_hard" = "1" ] && echo TRUE || echo FALSE)
+run = ${hard_run}
 
 [mdtest-hard]
-run = FALSE
+run = ${mdtest_hard_run}
 [mdtest-hard-write]
-run = FALSE
+run = ${mdtest_hard_run}
 [find]
-run = FALSE
+run = ${mdtest_hard_run}
 [ior-easy-read]
 run = TRUE
 [mdtest-easy-stat]
-run = FALSE
+run = ${mdtest_run}
 [ior-hard-read]
-run = $([ "$enable_hard" = "1" ] && echo TRUE || echo FALSE)
+run = ${hard_run}
 [mdtest-hard-stat]
-run = FALSE
+run = ${mdtest_hard_run}
 [mdtest-easy-delete]
-run = FALSE
+run = ${mdtest_run}
 [mdtest-hard-read]
-run = FALSE
+run = ${mdtest_hard_run}
 [mdtest-hard-delete]
-run = FALSE
+run = ${mdtest_hard_run}
 [ior-rnd4K-easy-read]
 run = FALSE
 EOF
@@ -400,6 +467,27 @@ run_io500() {
   local out_dir="$2"
   local np="$3"
   mkdir -p "${out_dir}"
+  # Optional heap UB diagnostics. Two modes:
+  #   IO500_ASAN_LIB=<libasan.so> — full AddressSanitizer (often fails to
+  #     init on UCX/MPI hosts because ASAN's shadow remap collides with
+  #     pinned-memory regions; if you see DEADLYSIGNAL during init, fall
+  #     back to the malloc-check mode below).
+  #   IO500_MALLOC_CHECK=1 — glibc MALLOC_CHECK_=3 + MALLOC_PERTURB_=85
+  #     (cheap, no recompile, aborts with a backtrace at the first heap
+  #     UB; freed memory is filled with 0x55 to surface UAF reads early).
+  local asan_args=()
+  if [ -n "${IO500_ASAN_LIB:-}" ] && [ -f "${IO500_ASAN_LIB}" ]; then
+    asan_args=(
+      -x LD_PRELOAD="${IO500_ASAN_LIB}"
+      -x ASAN_OPTIONS="${IO500_ASAN_OPTIONS:-halt_on_error=1:abort_on_error=1:detect_leaks=0:print_stacktrace=1:malloc_context_size=30:disable_coredump=0:unmap_shadow_on_exit=1}"
+    )
+  elif [ "${IO500_MALLOC_CHECK:-0}" = "1" ]; then
+    asan_args=(
+      -x MALLOC_CHECK_=3
+      -x MALLOC_PERTURB_=85
+      -x LIBC_FATAL_STDERR_=1
+    )
+  fi
   local cmd=(
     "${cmd_mpirun_common[@]}"
     -np "$np"
@@ -408,11 +496,18 @@ run_io500() {
     -x RUST_LOG="${RUST_LOG_C}"
     -x RUST_BACKTRACE
     -x BENCHFS_EXPECTED_NODES="${VNODES}"
+    -x BENCHFS_RPC_TIMEOUT
+    "${asan_args[@]}"
     "${IO500_DIR}/io500"
     "${ini}"
   )
   echo "Running: ${cmd[*]}"
-  local timeout_s=$(( SWEEP_STONEWALL > 0 ? SWEEP_STONEWALL * 6 + 600 : 1200 ))
+  # Pick the stonewall that's actually in play for this invocation: final runs
+  # use FINAL_STONEWALL, sweep runs use SWEEP_STONEWALL. The previous formula
+  # (SWEEP_STONEWALL*6+600) capped the final run at 780s and killed io500
+  # mid-ior-easy-write when FINAL_STONEWALL=120 and multiple phases were enabled.
+  local stonewall_for_timeout="${IO500_STONEWALL_FOR_TIMEOUT:-${SWEEP_STONEWALL}}"
+  local timeout_s=$(( stonewall_for_timeout > 0 ? stonewall_for_timeout * 8 + 600 : 1800 ))
   timeout --signal=TERM --kill-after=30 "${timeout_s}" \
     "${cmd[@]}" > "${out_dir}/io500_stdout.log" 2> "${out_dir}/io500_stderr.log" || true
 }
@@ -452,6 +547,21 @@ best_ppn=""
 best_fpp=""
 best_chunk_bytes=""
 
+if [ "${SKIP_SWEEP}" = "1" ]; then
+  echo ""
+  echo "=========================================="
+  echo "SKIP_SWEEP=1: using empirical best config:"
+  echo "  transfer=${BEST_TRANSFER} block=${BEST_BLOCK} ppn=${BEST_PPN}"
+  echo "  fpp=${BEST_FPP} chunk_bytes=${BEST_CHUNK_BYTES}"
+  echo "=========================================="
+  best_transfer="${BEST_TRANSFER}"
+  best_block="${BEST_BLOCK}"
+  best_ppn="${BEST_PPN}"
+  best_fpp="${BEST_FPP}"
+  best_chunk_bytes="${BEST_CHUNK_BYTES}"
+  best_label="empirical_best"
+  best_score="-"
+else
 for transfer_size in "${transfer_size_list[@]}"; do
   chunk_bytes=$(parse_size_to_bytes "${transfer_size}")
 
@@ -527,6 +637,7 @@ echo "Sweep complete: ${runid} runs"
 echo "Best ior-easy avg: ${best_score} GiB/s"
 echo "  transfer_size=${best_transfer} block_size=${best_block} ppn=${best_ppn} fpp=${best_fpp} chunk_bytes=${best_chunk_bytes}"
 echo "=========================================="
+fi  # end SKIP_SWEEP=0 branch
 
 cat > "${JOB_OUTPUT_DIR}/best_config.json" <<EOF
 {
@@ -556,11 +667,16 @@ if [ -n "${best_transfer}" ]; then
   result_dir="${FINAL_DIR}/io500_result"
   mkdir -p "${result_dir}"
 
+  # IO500_FINAL_HARD / IO500_FINAL_MDTEST let callers disable ior-hard /
+  # mdtest for ior-easy-focused tuning runs (1=enable, 0=disable).
+  local final_hard="${IO500_FINAL_HARD:-1}"
+  local final_mdtest="${IO500_FINAL_MDTEST:-1}"
   write_ini "${ini}" "${data_dir}" "${result_dir}" \
-    "${FINAL_STONEWALL}" "${best_transfer}" "${best_block}" "${best_fpp}" "1" "${best_chunk_bytes}"
+    "${FINAL_STONEWALL}" "${best_transfer}" "${best_block}" "${best_fpp}" "${final_hard}" "${best_chunk_bytes}" "${final_mdtest}"
 
   current_run_label="final"
-  run_io500 "${ini}" "${FINAL_DIR}" "${np}"
+  IO500_STONEWALL_FOR_TIMEOUT="${FINAL_STONEWALL}" \
+    run_io500 "${ini}" "${FINAL_DIR}" "${np}"
 
   echo ""
   echo "Final scores:"
