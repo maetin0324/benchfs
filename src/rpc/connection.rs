@@ -187,7 +187,7 @@ impl ConnectionPool {
                     "locusta: peer not yet connected, running add_peer handshake"
                 );
                 transport
-                    .add_peer(&peer_node_id, std::time::Duration::from_secs(30))
+                    .add_peer(&peer_node_id, std::time::Duration::from_secs(120))
                     .map_err(|e| {
                         RpcError::ConnectionError(format!(
                             "locusta add_peer({node_id}) failed: {e:?}"
