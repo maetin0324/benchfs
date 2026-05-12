@@ -136,11 +136,19 @@ pub struct LocustaConfig {
     pub exchange_timeout_secs: u64,
     /// Number of pluvio FixedBuffer slots for the server-side RDMA pool.
     /// 0 disables the pool (Put/Get server handlers will not be usable).
-    /// Phase 2.1 default: 4 slots × 4 MiB each.
+    /// Phase 2.1 default: 4 slots × 4 MiB each. Ignored when
+    /// `external_server_allocator` is `Some`.
     pub server_buf_slots: usize,
     /// Per-slot size for the server-side buffer pool. Set ≥ the largest
-    /// expected chunk (4 MiB for BenchFS).
+    /// expected chunk (4 MiB for BenchFS). Ignored when
+    /// `external_server_allocator` is `Some`.
     pub server_buf_size: usize,
+    /// Phase 2.4 production wiring: if `Some`, locusta registers this
+    /// caller-owned `FixedBufferAllocator` with the server PD instead
+    /// of allocating a separate pool. Lets the chunk store and the
+    /// locusta server share one set of pinned buffers, enabling
+    /// zero-copy `network ↔ io_uring`.
+    pub external_server_allocator: Option<Rc<FixedBufferAllocator>>,
 }
 
 impl Default for LocustaConfig {
@@ -157,6 +165,7 @@ impl Default for LocustaConfig {
             exchange_timeout_secs: 120,
             server_buf_slots: 4,
             server_buf_size: 4 * 1024 * 1024,
+            external_server_allocator: None,
         }
     }
 }
@@ -416,23 +425,28 @@ impl LocustaTransport {
             cfg.cq_size,
         )?);
 
-        // ------ Server-side RDMA buffer pool (Phase 2.1) ------
+        // ------ Server-side RDMA buffer pool ------
         //
-        // Allocates pluvio FixedBuffers without io_uring registration, then
-        // registers them with the server's PD. The same pluvio handle type
-        // can later be threaded through io_uring once the chunk-store
-        // integration (Phase 2.2) lands.
-        let (server_buffer_allocator, server_buffer_mrs) = if cfg.server_buf_slots > 0 {
-            let pd = &server.rdma.as_ref().unwrap().pd;
-            let alloc = FixedBufferAllocator::new_without_uring(
-                cfg.server_buf_slots,
-                cfg.server_buf_size,
-            );
-            let mrs = register_with_pd(&alloc, pd)?;
-            (Some(alloc), mrs)
-        } else {
-            (None, Vec::new())
-        };
+        // Phase 2.4 prefers an externally-supplied allocator (which is
+        // already io_uring-registered by the chunk store). Otherwise
+        // fall back to a freshly-allocated standalone pool — used by
+        // the demo binary which has no real chunk_store.
+        let (server_buffer_allocator, server_buffer_mrs) =
+            if let Some(alloc) = cfg.external_server_allocator.clone() {
+                let pd = &server.rdma.as_ref().unwrap().pd;
+                let mrs = register_with_pd(&alloc, pd)?;
+                (Some(alloc), mrs)
+            } else if cfg.server_buf_slots > 0 {
+                let pd = &server.rdma.as_ref().unwrap().pd;
+                let alloc = FixedBufferAllocator::new_without_uring(
+                    cfg.server_buf_slots,
+                    cfg.server_buf_size,
+                );
+                let mrs = register_with_pd(&alloc, pd)?;
+                (Some(alloc), mrs)
+            } else {
+                (None, Vec::new())
+            };
 
         let qp_config = mlx5::qp::RcQpConfig {
             max_send_wr: 1024,
