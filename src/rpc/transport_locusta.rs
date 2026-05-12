@@ -638,17 +638,31 @@ impl LocustaTransport {
                 candidates_relay.insert(peer.to_string());
             }
         }
-        let known: std::collections::HashSet<&NodeId> = known_peers.iter().collect();
         let mut added = Vec::new();
+        let candidates_count =
+            candidates_server.intersection(&candidates_relay).count();
+        if candidates_count > 0 {
+            tracing::debug!(
+                "try_accept_pending_peers: {} server-side, {} relay-side, {} intersect; known={}",
+                candidates_server.len(),
+                candidates_relay.len(),
+                candidates_count,
+                known_peers.len()
+            );
+        }
         for peer in candidates_server.intersection(&candidates_relay) {
             if peer == &local_node_id {
                 continue;
             }
-            if known.contains(&peer.to_string()) {
+            if known_peers.iter().any(|k| k == peer) {
                 continue;
             }
             // Both publications exist — handshake should be quick. Use
             // the supplied timeout as a sanity cap.
+            tracing::info!(
+                "try_accept_pending_peers: handshaking new peer {}",
+                peer
+            );
             self.add_peer(peer, per_peer_timeout)?;
             added.push(peer.clone());
         }

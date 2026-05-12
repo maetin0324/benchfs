@@ -671,18 +671,32 @@ fn run_server(
                     tracing::info!("Starting locusta client_accept loop");
                     let scan_interval = std::time::Duration::from_millis(100);
                     let per_peer_timeout = std::time::Duration::from_secs(10);
+                    let mut iter: u64 = 0;
                     loop {
+                        iter = iter.wrapping_add(1);
                         match accept_transport.try_accept_pending_peers(per_peer_timeout) {
                             Ok(added) if !added.is_empty() => {
                                 tracing::info!(
-                                    "locusta accepted {} new client peer(s): {:?}",
+                                    "locusta accepted {} new client peer(s) on iter {}: {:?}",
                                     added.len(),
+                                    iter,
                                     added
                                 );
                             }
-                            Ok(_) => {}
+                            Ok(_) => {
+                                if iter == 1 || iter % 50 == 0 {
+                                    tracing::info!(
+                                        "locusta accept loop heartbeat iter={} (no new peers)",
+                                        iter
+                                    );
+                                }
+                            }
                             Err(e) => {
-                                tracing::warn!("try_accept_pending_peers error: {:?}", e);
+                                tracing::warn!(
+                                    "try_accept_pending_peers error on iter {}: {:?}",
+                                    iter,
+                                    e
+                                );
                             }
                         }
                         futures_timer::Delay::new(scan_interval).await;
