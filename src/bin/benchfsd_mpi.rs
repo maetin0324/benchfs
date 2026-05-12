@@ -673,7 +673,12 @@ fn run_server(
                                 iter
                             );
                         }
-                        futures_timer::Delay::new(
+                        // pluvio_timer (runtime-integrated, single
+                        // TimerReactor) instead of futures_timer
+                        // (thread-per-Delay) — the dispatch loop's
+                        // hot rate broke futures_timer after ~100k
+                        // iterations in jobs 17038/17040.
+                        pluvio_timer::sleep(
                             std::time::Duration::from_micros(100),
                         )
                         .await;
@@ -720,7 +725,7 @@ fn run_server(
                                 );
                             }
                         }
-                        futures_timer::Delay::new(scan_interval).await;
+                        pluvio_timer::sleep(scan_interval).await;
                     }
                 },
                 "locusta_client_accept".to_string(),
