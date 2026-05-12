@@ -7,3 +7,6 @@
 [submodule "ior_integration/io500"]
 	path = ior_integration/io500
 	url = https://github.com/maetin0324/io500.git
+[submodule "lib/locusta"]
+	path = lib/locusta
+	url = https://github.com/maetin0324/locusta.git
