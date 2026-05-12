@@ -36,7 +36,9 @@ use clap::{Parser, ValueEnum};
 use zerocopy::{FromBytes, IntoBytes};
 
 use benchfs::rpc::data_ops::{WriteChunkByIdRequest, WriteChunkResponseHeader};
+use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::locusta_call::LocustaCallable;
+use benchfs::rpc::locusta_server::LocustaServerDispatch;
 use benchfs::rpc::metadata_ops::{
     MetadataLookupRequest, MetadataLookupRequestHeader, MetadataLookupResponseHeader,
 };
@@ -109,6 +111,11 @@ enum Mode {
     /// Phase 2.2b: production `WriteChunkByIdRequest::call_locusta(...)`
     /// — exercises the AmRpc `Put` dispatch via `LocustaCallable`.
     AmrpcPut,
+    /// Phase 2.4: same wire as `Amrpc` on the client, but the server
+    /// runs the production [`LocustaServerDispatch`] backed by a real
+    /// `RpcHandlerContext`. Validates the full server-side dispatch
+    /// path (rpc_id lookup, handler invocation, reply consumer).
+    Dispatch,
 }
 
 fn main() {
@@ -151,10 +158,40 @@ fn main() {
 fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
     use benchfs::rpc::locusta_buffer::RegisteredFixedBuffer;
 
+    // For Mode::Dispatch only — build a real LocustaServerDispatch backed
+    // by a minimal RpcHandlerContext, pre-populating one file entry so
+    // the lookup hits.
+    let dispatch_setup = if mode == Mode::Dispatch {
+        use benchfs::metadata::FileMetadata;
+        let ctx = std::rc::Rc::new(RpcHandlerContext::new_bench());
+        ctx.metadata_manager
+            .store_file_metadata(FileMetadata::new("/test/file.bin".to_string(), 1024 * 1024))
+            .expect("seed file metadata");
+        let mut dispatch = LocustaServerDispatch::new(ctx);
+        dispatch.register::<MetadataLookupRequest>();
+        Some(dispatch)
+    } else {
+        None
+    };
+
     let deadline = Instant::now() + Duration::from_secs(serve_secs);
     let mut reqs = 0u64;
     let mut polls = 0u64;
     while Instant::now() < deadline {
+        if let Some(dispatch) = dispatch_setup.as_ref() {
+            // Mode::Dispatch — production polling path. `poll_once` ticks
+            // the locusta state machines and runs every ready request
+            // through the registered handler.
+            dispatch.poll_once(transport);
+            reqs = reqs.saturating_add(1); // dispatcher doesn't count; rough estimate
+            polls += 1;
+            if polls % 1_000_000 == 0 {
+                eprintln!("[server] polls={polls} (dispatch mode)");
+            }
+            std::thread::yield_now();
+            continue;
+        }
+
         let mut inner = transport.inner.borrow_mut();
         inner.daemon.poll_client_requests();
         inner.daemon.process_pending_dma_writes();
@@ -179,6 +216,9 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
                         // header bytes followed by the path. The only
                         // difference is the client-side marshalling path.
                         Mode::Metadata | Mode::Amrpc => serve_metadata_lookup(body),
+                        Mode::Dispatch => {
+                            unreachable!("Dispatch handled by LocustaServerDispatch path");
+                        }
                         Mode::Put | Mode::Get | Mode::AmrpcPut => {
                             eprintln!("[server] unexpected RoundtripEager in {mode:?} mode");
                             vec![0u8; 8]
@@ -325,14 +365,14 @@ fn run_client(
             buf.extend_from_slice(path.as_bytes());
             buf
         }
-        // Amrpc/AmrpcPut modes construct the request struct itself; small_req unused.
-        Mode::Amrpc | Mode::AmrpcPut => Vec::new(),
+        // Amrpc/AmrpcPut/Dispatch modes construct the request struct itself; small_req unused.
+        Mode::Amrpc | Mode::AmrpcPut | Mode::Dispatch => Vec::new(),
         Mode::Put | Mode::Get => vec![0u8; 8], // tiny header for DMA modes
     };
 
     // Pre-build the AmRpc request once so the latency loop only measures
     // the wire round-trip, not allocation overhead.
-    let amrpc_req = if mode == Mode::Amrpc {
+    let amrpc_req = if matches!(mode, Mode::Amrpc | Mode::Dispatch) {
         Some(MetadataLookupRequest::new(path.to_string()))
     } else {
         None
@@ -396,7 +436,7 @@ fn run_client(
                     }
                 }
             }
-            Mode::Amrpc => {
+            Mode::Amrpc | Mode::Dispatch => {
                 // Exercise the production code path: LocustaCallable
                 // blanket impl on AmRpc serializes header+request_data,
                 // dispatches via call_type, and deserializes the response.
@@ -474,7 +514,7 @@ fn run_client(
             Ok(resp) => {
                 if i == 0 {
                     match mode {
-                        Mode::Metadata | Mode::Amrpc => {
+                        Mode::Metadata | Mode::Amrpc | Mode::Dispatch => {
                             let bytes = &resp.header_bytes;
                             let sz = std::mem::size_of::<MetadataLookupResponseHeader>();
                             if bytes.len() >= sz {
