@@ -252,6 +252,21 @@ export OMPI_MCA_mpi_show_handle_leaks=0
 
 export RUST_BACKTRACE=full
 
+# BenchFS tuning for high-concurrency runs (matches sirius-io500-job.sh).
+# Without these, direct IOR at ppn=16+ hits the same WriteChunk timeout cascade
+# the io500 job had: server buffer pool exhausts at 16 clients/server × 64
+# in-flight, and 30s default RPC timeout fires.
+: ${BENCHFS_RPC_TIMEOUT:=120}
+: ${BENCHFS_IOURING_QUEUE_SIZE:=2048}
+: ${BENCHFS_IOURING_SUBMIT_DEPTH:=512}
+: ${BENCHFS_IOURING_SUBMIT_TIMEOUT_US:=1000}
+: ${BENCHFS_IOURING_COMPLETE_TIMEOUT_US:=1000}
+export BENCHFS_RPC_TIMEOUT
+export BENCHFS_IOURING_QUEUE_SIZE
+export BENCHFS_IOURING_SUBMIT_DEPTH
+export BENCHFS_IOURING_SUBMIT_TIMEOUT_US
+export BENCHFS_IOURING_COMPLETE_TIMEOUT_US
+
 # MCA pml detection
 supports_ucx_pml() {
   command -v ompi_info >/dev/null 2>&1 || return 1
@@ -289,6 +304,20 @@ if [[ "${USE_UCX_PML}" -eq 1 ]]; then
     --mca osc ucx
     -x PATH
     -x LD_LIBRARY_PATH
+    -x BENCHFS_RPC_TIMEOUT
+    -x BENCHFS_IOURING_QUEUE_SIZE
+    -x BENCHFS_IOURING_SUBMIT_DEPTH
+    -x BENCHFS_IOURING_SUBMIT_TIMEOUT_US
+    -x BENCHFS_IOURING_COMPLETE_TIMEOUT_US
+    -x ENABLE_STATS
+    -x UCX_LOG_LEVEL
+    -x UCX_LOG_FILE
+    -x UCX_LOG_PRINT_ENABLE
+    -x UCX_RNDV_SCHEME
+    -x UCX_RNDV_THRESH
+    -x UCX_TLS
+    -x UCX_NET_DEVICES
+    -x UCX_MAX_RNDV_RAILS
   )
 else
   cmd_mpirun_common=(
@@ -299,6 +328,20 @@ else
     --mca btl tcp,sm,self
     -x PATH
     -x LD_LIBRARY_PATH
+    -x BENCHFS_RPC_TIMEOUT
+    -x BENCHFS_IOURING_QUEUE_SIZE
+    -x BENCHFS_IOURING_SUBMIT_DEPTH
+    -x BENCHFS_IOURING_SUBMIT_TIMEOUT_US
+    -x BENCHFS_IOURING_COMPLETE_TIMEOUT_US
+    -x ENABLE_STATS
+    -x UCX_LOG_LEVEL
+    -x UCX_LOG_FILE
+    -x UCX_LOG_PRINT_ENABLE
+    -x UCX_RNDV_SCHEME
+    -x UCX_RNDV_THRESH
+    -x UCX_TLS
+    -x UCX_NET_DEVICES
+    -x UCX_MAX_RNDV_RAILS
   )
 fi
 
@@ -810,6 +853,22 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
             retry_stats_dir="${STATS_OUTPUT_DIR}/retry_stats_run${runid}"
             mkdir -p "${retry_stats_dir}"
 
+            # Resolve overridable IOR flags. Empty string = explicitly disable.
+            if [ "${IOR_TASK_OFFSET+set}" = "set" ]; then
+              # shellcheck disable=SC2206  # intentional word-splitting
+              ior_task_offset_args=( ${IOR_TASK_OFFSET} )
+            else
+              ior_task_offset_args=( -Q 1 )
+            fi
+            if [ "${IOR_WEAROUT+set}" = "set" ]; then
+              # shellcheck disable=SC2206
+              ior_wearout_args=( ${IOR_WEAROUT} )
+            else
+              ior_wearout_args=( -O stoneWallingWearOut=1 )
+            fi
+            echo "IOR task_offset args: ${ior_task_offset_args[*]:-<none>}"
+            echo "IOR wearout args: ${ior_wearout_args[*]:-<none>}"
+
             cmd_ior=(
               "${cmd_mpirun_client[@]}"
               -np "$np"
@@ -826,6 +885,20 @@ for benchfs_chunk_size_str in "${benchfs_chunk_size_list[@]}"; do
               -t "$transfer_size"
               -b "$block_size"
               -e
+              # `-Q 1` task-per-node-offset spreads each node's ranks across
+              # distant file offsets so the per-server WriteChunk fan-out stays
+              # within the UCX worker's reply-handling capacity (vanilla's
+              # rank-stride pattern triggers a UCX-layer freeze around the
+              # stonewall MPI sync point — see project_ior_hang_root_cause memo).
+              # `stoneWallingWearOut=1` keeps every rank writing past the
+              # stonewall deadline until the fastest rank's progress is
+              # matched, which avoids the abrupt MPI_Allreduce sync that
+              # blocks client-side UCX progress for ranks still expecting an
+              # in-flight WriteChunk reply.
+              # Override via env IOR_TASK_OFFSET / IOR_WEAROUT (set to "" to
+              # disable; defaults are applied before the array is built).
+              "${ior_task_offset_args[@]}"
+              "${ior_wearout_args[@]}"
               $ior_flags
               --benchfs.registry="${BENCHFS_REGISTRY_DIR}"
               --benchfs.datadir="${BENCHFS_DATA_DIR}"

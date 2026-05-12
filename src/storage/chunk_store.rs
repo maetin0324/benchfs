@@ -1631,19 +1631,22 @@ impl IOUringChunkStore {
         // ior-hard's 47008-byte transfers fall back to buffered I/O.
         let use_direct = Self::direct_io_aligned(offset, bytes_to_write as u64);
 
-        // Ensure the CHFS POSIX-style header exists at offset 0 before any
-        // chunk data is written. Header is initialized at most once per chunk.
-        self.ensure_chunk_header(file_path, chunk_index).await?;
-
+        // RESTORE 5/9 layout: data lives at file offset 0 (no MSIZE shift) and
+        // no per-write CHFS POSIX header. This removes the per-chunk
+        // `ensure_chunk_header` + sync `std::fs::metadata` that was added
+        // by commit 38a82e9 and showed up as the WriteChunk regression at
+        // ppn=16 / b=16g shared. The CHFS POSIX metadata helpers
+        // (`write_chunk0_extension`, `stat_chunk`) are unaffected — they
+        // still write at offset 0 (the metadata server's own writes), but
+        // the bulk-data path no longer pays the header overhead and stays
+        // raw-data-at-offset-0 like the 5/9 baseline (106 GiB/s).
         let handle = self
             .open_chunk_file(file_path, chunk_index, true, use_direct)
             .await?;
 
-        // io_uring's pwrite handles sparse files efficiently - no read-modify-write needed.
-        // Data lives at file offset MSIZE + chunk_offset (CHFS POSIX layout).
         let result = self
             .backend
-            .write(handle, MSIZE + offset, &data[..bytes_to_write])
+            .write(handle, offset, &data[..bytes_to_write])
             .await;
 
         // Close the file handle immediately (no caching)
@@ -1680,9 +1683,9 @@ impl IOUringChunkStore {
             .open_chunk_file(file_path, chunk_index, false, use_direct)
             .await?;
 
-        // Read data from file offset MSIZE + chunk_offset (CHFS POSIX layout).
+        // 5/9 raw layout: data at file offset 0.
         let mut buffer = vec![0u8; length as usize];
-        let result = self.backend.read(handle, MSIZE + offset, &mut buffer).await;
+        let result = self.backend.read(handle, offset, &mut buffer).await;
 
         // Close the file handle immediately (no caching)
         if let Err(e) = self.backend.close(handle).await {
@@ -1876,10 +1879,7 @@ impl IOUringChunkStore {
         // ior-hard's 47008-byte transfers fall back to buffered I/O.
         let use_direct = Self::direct_io_aligned(offset, bytes_to_write as u64);
 
-        // Ensure CHFS POSIX-style header is written before the first data
-        // write to this chunk. No-op for subsequent writes (HashSet memo).
-        self.ensure_chunk_header(file_path, chunk_index).await?;
-
+        // Restored 5/9 layout (see write_chunk above).
         let open_start = std::time::Instant::now();
         let handle = self
             .open_chunk_file(file_path, chunk_index, true, use_direct)
@@ -1887,11 +1887,11 @@ impl IOUringChunkStore {
         let open_elapsed = open_start.elapsed();
 
         // Write data from registered buffer (zero-copy DMA when O_DIRECT).
-        // Data lives at file offset MSIZE + chunk_offset (CHFS POSIX layout).
+        // 5/9 raw layout: data at file offset 0.
         let write_start = std::time::Instant::now();
         let result = self
             .backend
-            .write_fixed_direct(handle, MSIZE + offset, fixed_buffer, bytes_to_write)
+            .write_fixed_direct(handle, offset, fixed_buffer, bytes_to_write)
             .await;
         let write_elapsed = write_start.elapsed();
 
@@ -1969,11 +1969,11 @@ impl IOUringChunkStore {
             .await?;
         let open_elapsed = open_start.elapsed();
 
-        // Read data into registered buffer (CHFS POSIX layout: data at MSIZE+offset).
+        // 5/9 raw layout: data at file offset 0.
         let read_start = std::time::Instant::now();
         let result = self
             .backend
-            .read_fixed_direct(handle, MSIZE + offset, fixed_buffer, read_len)
+            .read_fixed_direct(handle, offset, fixed_buffer, read_len)
             .await;
         let read_elapsed = read_start.elapsed();
 

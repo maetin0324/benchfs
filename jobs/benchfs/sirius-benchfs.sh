@@ -111,11 +111,19 @@ niter=1
 
 for nnodes in "${nnodes_list[@]}"; do
   for ((iter=0; iter<niter; iter++)); do
+    # PBS_SELECT_SPEC env override pins the job to specific hosts.
+    # Example: PBS_SELECT_SPEC="4:host=a02+4:host=a06+4:host=a07+..."
+    # avoids the a14-a23 bad nodes (project_sirius_bad_nodes memo).
+    if [ -n "${PBS_SELECT_SPEC:-}" ]; then
+      select_spec="${PBS_SELECT_SPEC}"
+    else
+      select_spec="${nnodes}"
+    fi
     cmd_qsub=(
       qsub
       -q mcrp
       -A NBB
-      -l select="${nnodes}"
+      -l select="${select_spec}"
       -l place=exclhost
       -l walltime="${ELAPSTIM_REQ}"
       -v SCRRAID=no

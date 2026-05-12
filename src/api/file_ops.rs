@@ -688,7 +688,7 @@ impl BenchFS {
                         // in distributed environments where other nodes may modify the same data.
 
                         // Calculate target node for this chunk (chunk-0 colocates with metadata).
-                        let chunk_key = BenchFS::chunk_routing_key(&file_path, chunk_index);
+                        let chunk_key = format!("{}/{}", &file_path, chunk_index);
                         let target_node = fs.get_chunk_node(&chunk_key);
                         let self_node_id = fs.metadata_manager.self_node_id().to_string();
                         let is_local = target_node == self_node_id;
@@ -939,7 +939,7 @@ impl BenchFS {
                 let chunk_data = data[data_offset..data_offset + data_len].to_vec();
 
                 let file_path = file_meta.path.clone();
-                let chunk_key = BenchFS::chunk_routing_key(&file_path, chunk_index);
+                let chunk_key = format!("{}/{}", &file_path, chunk_index);
                 let target_node = self.get_chunk_node(&chunk_key);
                 let is_local = target_node == self.metadata_manager.self_node_id();
 
@@ -1407,7 +1407,7 @@ impl BenchFS {
                 spawn_with_name(
                     async move {
                         let fs = unsafe { &*fs_ptr };
-                        let chunk_key = BenchFS::chunk_routing_key(&file_path, chunk_index);
+                        let chunk_key = format!("{}/{}", &file_path, chunk_index);
                         let target_node = fs.get_chunk_node(&chunk_key);
                         let is_local = target_node == self_node_id;
 

@@ -331,6 +331,14 @@ pub extern "C" fn benchfs_init(
     };
     crate::logging::init_with_hostname("info");
 
+    // Honor ENABLE_STATS env var on the client (FFI) side so that
+    // RPC_CLIENT_TIMING and other stats-gated paths emit data.
+    // The server binary (benchfsd_mpi) sets this directly; the FFI
+    // client must read it from env (mpirun -x ENABLE_STATS).
+    if std::env::var("ENABLE_STATS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        crate::stats::set_stats_enabled(true);
+    }
+
     // Validate pointers
     if node_id.is_null() || registry_dir.is_null() {
         set_error_message("node_id and registry_dir must not be null");
@@ -636,21 +644,47 @@ pub extern "C" fn benchfs_init(
             }
         }
 
-        // Create BenchFS client instance with distributed metadata.
-        //
-        // Distribute metadata across ALL discovered server nodes via the same
-        // consistent-hash ring used for chunks. Earlier this list was hardcoded
-        // to ["node_0"], which forced every Lookup/Create/Update RPC from every
-        // client onto a single server. At ~640 clients × 40 servers (10 phys
-        // nodes × ppn=16) the server-side AM queue saturated and triggered
-        // EndpointTimeout cascades, capping aggregate read at ~30 GiB/s. With
-        // metadata sharded over the full ring, per-server metadata load drops
-        // by 1/N and the bottleneck moves back to the data path.
-        let metadata_nodes = discovered_nodes.clone();
+        // Pre-warm UCX endpoints to every data node so the first write to each
+        // server pays only the steady-state RPC cost (~10 ms RTT) instead of
+        // first-connect cold-start (~1 s observed in job 16578). At 576 clients
+        // × 36 servers, the lazy-connect burst eats the first 30-50 sec of any
+        // shared-file write phase. Toggle with BENCHFS_PREWARM_CONNECTIONS=0 to
+        // measure the unprewarmed baseline.
+        let prewarm = std::env::var("BENCHFS_PREWARM_CONNECTIONS")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if prewarm && discovered_nodes.len() > 1 {
+            tracing::info!(
+                "Pre-warming UCX endpoints to all {} data nodes",
+                discovered_nodes.len()
+            );
+            let pool_for_prewarm = connection_pool.clone();
+            let nodes_for_prewarm = discovered_nodes.clone();
+            let prewarm_start = std::time::Instant::now();
+            let _ = block_on_with_name("prewarm_connections", async move {
+                for node in nodes_for_prewarm.iter() {
+                    if let Err(e) = pool_for_prewarm.get_or_connect(node).await {
+                        tracing::warn!("Pre-warm: failed to connect to {}: {:?}", node, e);
+                    }
+                }
+                Ok::<(), crate::rpc::RpcError>(())
+            });
+            tracing::info!(
+                "Pre-warm complete in {} ms",
+                prewarm_start.elapsed().as_millis()
+            );
+        }
+
+        // BISECT: restore 5/9 (fbb36a0) behavior where metadata is pinned to
+        // node_0. The 5/11 change to consistent-hash sharding correlated with
+        // a regression at ppn=16 b=16g shared (vanilla -w -r now hangs while
+        // the 5/9 baseline got 106 GiB/s on the same hardware). Try the
+        // hardcoded variant to confirm the cause.
+        let metadata_nodes = vec!["node_0".to_string()];
         let data_nodes = discovered_nodes;
 
         tracing::info!(
-            "Creating BenchFS client with {} metadata + {} data nodes (consistent-hash sharded)",
+            "Creating BenchFS client with {} metadata + {} data nodes (metadata pinned to node_0)",
             metadata_nodes.len(),
             data_nodes.len()
         );

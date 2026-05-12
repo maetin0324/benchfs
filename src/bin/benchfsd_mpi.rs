@@ -360,20 +360,37 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                 .saturating_mul(chunk_multiplier)
                 .min(queue_size);
 
+            // Pluvio's io_uring reactor reports `Stopped` when SQ is below
+            // submit_depth and these timeouts haven't elapsed, which means
+            // SQEs can sit in the in-memory submission queue for up to
+            // `wait_submit_timeout` before being flushed via `io_uring_enter`.
+            // At low/medium load this caps server-side write concurrency.
+            // Default kept at 1 ms for safety; override via env to probe.
+            let submit_timeout_us = std::env::var("BENCHFS_IOURING_SUBMIT_TIMEOUT_US")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1000);
+            let complete_timeout_us = std::env::var("BENCHFS_IOURING_COMPLETE_TIMEOUT_US")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1000);
+
             tracing::info!(
-                "Configuring io_uring: buffer_size={} bytes ({} MiB), queue_size={}, submit_depth={}, memory={}GiB",
+                "Configuring io_uring: buffer_size={} bytes ({} MiB), queue_size={}, submit_depth={}, submit_timeout_us={}, complete_timeout_us={}, memory={}GiB",
                 chunk_size,
                 chunk_size / (1024 * 1024),
                 queue_size,
                 submit_depth,
+                submit_timeout_us,
+                complete_timeout_us,
                 (queue_size as usize * chunk_size) / (1024 * 1024 * 1024)
             );
             let uring_reactor = IoUringReactor::builder()
                 .queue_size(queue_size)
                 .buffer_size(chunk_size)
                 .submit_depth(submit_depth)
-                .wait_submit_timeout(std::time::Duration::from_millis(1))
-                .wait_complete_timeout(std::time::Duration::from_millis(1))
+                .wait_submit_timeout(std::time::Duration::from_micros(submit_timeout_us))
+                .wait_complete_timeout(std::time::Duration::from_micros(complete_timeout_us))
                 .build();
 
             let allocator = uring_reactor.allocator.clone();

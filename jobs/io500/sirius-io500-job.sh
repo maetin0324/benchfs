@@ -669,8 +669,9 @@ if [ -n "${best_transfer}" ]; then
 
   # IO500_FINAL_HARD / IO500_FINAL_MDTEST let callers disable ior-hard /
   # mdtest for ior-easy-focused tuning runs (1=enable, 0=disable).
-  local final_hard="${IO500_FINAL_HARD:-1}"
-  local final_mdtest="${IO500_FINAL_MDTEST:-1}"
+  # Use plain assignment (not `local`) — this block is not inside a function.
+  final_hard="${IO500_FINAL_HARD:-1}"
+  final_mdtest="${IO500_FINAL_MDTEST:-1}"
   write_ini "${ini}" "${data_dir}" "${result_dir}" \
     "${FINAL_STONEWALL}" "${best_transfer}" "${best_block}" "${best_fpp}" "${final_hard}" "${best_chunk_bytes}" "${final_mdtest}"
 

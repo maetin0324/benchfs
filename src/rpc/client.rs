@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pluvio_timer::{timeout, TimeoutError};
 use tracing::instrument;
 
 use crate::rpc::{AmRpc, Connection, RpcError};
+use crate::stats::is_stats_enabled;
 
 // ============================================================================
 // Global retry statistics counters
@@ -321,6 +322,9 @@ impl RpcClient {
     /// Internal: Execute a single RPC attempt without retry
     #[async_backtrace::framed]
     async fn execute_once<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
+        let stats_enabled = is_stats_enabled();
+        let exec_start = if stats_enabled { Some(Instant::now()) } else { None };
+
         let timeout_duration = get_rpc_timeout();
         let rpc_id = T::rpc_id();
         let reply_stream_id = T::reply_stream_id();
@@ -338,12 +342,14 @@ impl RpcClient {
             timeout_duration.as_secs()
         );
 
+        let stream_start = exec_start.map(|_| Instant::now());
         let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
                 "Failed to create reply AM stream: {:?}",
                 e.to_string()
             ))
         })?;
+        let stream_us = stream_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
         tracing::trace!("Created reply stream: stream_id={}", reply_stream_id);
 
@@ -371,6 +377,7 @@ impl RpcClient {
             proto,
         );
 
+        let send_start = exec_start.map(|_| Instant::now());
         match timeout(timeout_duration, Box::pin(send_future)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -393,6 +400,7 @@ impl RpcClient {
                 return Err(RpcError::Timeout);
             }
         }
+        let send_us = send_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
         tracing::debug!(
             "Waiting for reply on stream_id={}, rpc_id={}, timeout_secs={}",
@@ -402,6 +410,7 @@ impl RpcClient {
         );
 
         // Wait for reply with timeout
+        let wait_start = exec_start.map(|_| Instant::now());
         let wait_future = reply_stream.wait_msg();
         let mut msg = match timeout(timeout_duration, Box::pin(wait_future)).await {
             Ok(Some(msg)) => msg,
@@ -423,6 +432,7 @@ impl RpcClient {
                 return Err(RpcError::Timeout);
             }
         };
+        let wait_us = wait_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
 
         tracing::debug!(
             "Received reply message: rpc_id={}, reply_stream_id={}",
@@ -431,6 +441,7 @@ impl RpcClient {
         );
 
         // Deserialize the response header
+        let recv_start = exec_start.map(|_| Instant::now());
         let response_header = msg
             .header()
             .get(..std::mem::size_of::<T::ResponseHeader>())
@@ -463,6 +474,22 @@ impl RpcClient {
                     return Err(RpcError::Timeout);
                 }
             }
+        }
+
+        let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+
+        if let Some(start) = exec_start {
+            let total_us = start.elapsed().as_micros() as u64;
+            tracing::debug!(
+                target: "rpc_client_timing",
+                rpc_id = rpc_id,
+                stream_us = stream_us,
+                send_us = send_us,
+                wait_us = wait_us,
+                recv_us = recv_us,
+                total_us = total_us,
+                "RPC_CLIENT_TIMING"
+            );
         }
 
         // Note: The caller should check the status field in the response header
