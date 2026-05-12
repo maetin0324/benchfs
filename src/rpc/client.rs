@@ -179,6 +179,18 @@ fn get_retry_config() -> RetryConfig {
     }
 }
 
+/// Optional locusta backend attached to an `RpcClient`.
+///
+/// When set, `execute<T>` short-circuits the UCX path and forwards to
+/// `T::call_locusta(peer, transport)` via the `LocustaCallable` blanket
+/// impl. This lets every existing `AmRpc::call(&*client)` call site
+/// transparently use locusta when `BENCHFS_TRANSPORT=locusta`.
+#[cfg(feature = "transport-locusta")]
+pub struct LocustaBackend {
+    pub transport: std::rc::Rc<crate::rpc::transport_locusta::LocustaTransport>,
+    pub peer_node_id: String,
+}
+
 /// RPC client for making RPC calls
 ///
 /// The client executes RPCs by taking any type that implements the `RpcCall` trait.
@@ -189,6 +201,13 @@ pub struct RpcClient {
     reply_stream_id: RefCell<Option<u16>>,
     /// Client's own WorkerAddress for direct response
     worker_address: Vec<u8>,
+    /// When `Some`, `execute<T>` dispatches via locusta instead of UCX.
+    /// Set by `RpcClient::new_locusta` or via
+    /// `ConnectionPool::new_locusta`. The `conn` field is then unused
+    /// (kept around to preserve binary layout; a fresh dummy worker is
+    /// supplied at construction time).
+    #[cfg(feature = "transport-locusta")]
+    locusta: Option<LocustaBackend>,
 }
 
 impl RpcClient {
@@ -216,7 +235,40 @@ impl RpcClient {
             conn,
             reply_stream_id: RefCell::new(None),
             worker_address,
+            #[cfg(feature = "transport-locusta")]
+            locusta: None,
         }
+    }
+
+    /// Construct an `RpcClient` that routes every `execute<T>` through
+    /// locusta. The `conn` is still required by the struct layout —
+    /// pass a fresh, never-used UCX `Connection` (the caller is
+    /// expected to have a dummy worker handy).
+    #[cfg(feature = "transport-locusta")]
+    pub fn new_locusta(
+        conn: Connection,
+        transport: std::rc::Rc<crate::rpc::transport_locusta::LocustaTransport>,
+        peer_node_id: String,
+    ) -> Self {
+        Self {
+            conn,
+            reply_stream_id: RefCell::new(None),
+            worker_address: Vec::new(),
+            locusta: Some(LocustaBackend {
+                transport,
+                peer_node_id,
+            }),
+        }
+    }
+
+    /// Whether this client is locusta-backed.
+    #[cfg(feature = "transport-locusta")]
+    pub fn is_locusta(&self) -> bool {
+        self.locusta.is_some()
+    }
+    #[cfg(not(feature = "transport-locusta"))]
+    pub fn is_locusta(&self) -> bool {
+        false
     }
 
     /// Get the client's WorkerAddress
@@ -271,6 +323,18 @@ impl RpcClient {
     #[instrument(level = "trace", name = "rpc_call", skip(self, request), fields(rpc_id = T::rpc_id()))]
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         increment_request_count();
+
+        // Locusta fast path: skip the UCX retry/timeout machinery —
+        // locusta uses RC QPs (reliable delivery) so transient retries
+        // are unnecessary, and the call_locusta blanket impl handles
+        // serialization + dispatch in-place.
+        #[cfg(feature = "transport-locusta")]
+        if let Some(backend) = &self.locusta {
+            use crate::rpc::locusta_call::LocustaCallable;
+            return request
+                .call_locusta(&backend.peer_node_id, &backend.transport)
+                .await;
+        }
 
         let retry_config = get_retry_config();
         let mut attempt = 0u32;
@@ -514,6 +578,27 @@ impl RpcClient {
     #[async_backtrace::framed]
     pub async fn execute_no_reply<T: AmRpc>(&self, request: &T) -> Result<(), RpcError> {
         increment_request_count();
+
+        // Locusta fast path — fire-and-forget via `send_oneway`. Build
+        // the same vectored small_req as `call_locusta` would, but
+        // discard the reply.
+        #[cfg(feature = "transport-locusta")]
+        if let Some(backend) = &self.locusta {
+            use crate::rpc::transport::RpcTransport;
+            use std::io::IoSlice;
+            use zerocopy::IntoBytes;
+            let header_bytes = request.request_header().as_bytes();
+            let data = request.request_data();
+            let mut parts: Vec<IoSlice<'_>> = Vec::with_capacity(1 + data.len());
+            parts.push(IoSlice::new(header_bytes));
+            for s in data {
+                parts.push(IoSlice::new(s));
+            }
+            return backend
+                .transport
+                .send_oneway(&backend.peer_node_id, T::rpc_id(), &parts)
+                .await;
+        }
 
         let retry_config = get_retry_config();
         let mut attempt = 0u32;
