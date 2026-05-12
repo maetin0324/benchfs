@@ -1941,15 +1941,37 @@ impl IOUringChunkStore {
             return Err(ChunkStoreError::InvalidOffset(offset));
         }
         let use_direct = Self::direct_io_aligned(offset, len as u64);
+        let open_start = std::time::Instant::now();
         let handle = self
             .open_chunk_file(file_path, chunk_index, true, use_direct)
             .await?;
+        let open_us = open_start.elapsed().as_micros() as u64;
+        let write_start = std::time::Instant::now();
         let result = self
             .backend
             .write_via_registered(handle, offset, ptr, len, buf_index)
             .await;
+        let write_us = write_start.elapsed().as_micros() as u64;
+        let close_start = std::time::Instant::now();
         if let Err(e) = self.backend.close(handle).await {
             tracing::warn!("Failed to close chunk file after write_via_registered: {:?}", e);
+        }
+        let close_us = close_start.elapsed().as_micros() as u64;
+        if crate::stats::is_stats_enabled() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(1000) {
+                tracing::info!(
+                    target: "rpc_handler_timing",
+                    kind = "write_chunk_via_registered",
+                    n = n,
+                    open_us = open_us,
+                    write_us = write_us,
+                    close_us = close_us,
+                    "WRITE_CHUNK_TIMING"
+                );
+            }
         }
         Ok(result.map_err(|e| ChunkStoreError::IoError(std::io::Error::other(format!("{e:?}"))))?)
     }
