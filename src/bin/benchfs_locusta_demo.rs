@@ -44,7 +44,7 @@ use benchfs::rpc::metadata_ops::{
 };
 use benchfs::rpc::transport::RpcTransport;
 use benchfs::rpc::transport_locusta::{
-    drain_server_requests, extract_rpc_id, LocustaConfig, LocustaTransport,
+    LocustaConfig, LocustaTransport, drain_server_requests, extract_rpc_id,
 };
 
 /// RpcId used by BenchFS for `MetadataLookup`. Mirrors
@@ -257,8 +257,8 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
                 rrrpc::server::Request::RoundtripEager(h) => {
                     // All locusta send_* paths prepend a 2-byte rpc_id.
                     // Strip it before dispatching to the per-RPC body parser.
-                    let (_rpc_id, body) = extract_rpc_id(h.small_req())
-                        .expect("small_req missing rpc_id prefix");
+                    let (_rpc_id, body) =
+                        extract_rpc_id(h.small_req()).expect("small_req missing rpc_id prefix");
                     let reply = match mode {
                         Mode::Raw => vec![0u8; 8],
                         // Both Metadata and Amrpc send the same wire format —
@@ -308,8 +308,7 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
                             // WriteChunkResponseHeader. `RdmaBuffer::len`
                             // is a trait method, so use the explicit path.
                             use rrrpc::server::RdmaBuffer;
-                            let resp =
-                                WriteChunkResponseHeader::success(h.buffer().len() as u64);
+                            let resp = WriteChunkResponseHeader::success(h.buffer().len() as u64);
                             resp.as_bytes().to_vec()
                         }
                         _ => vec![0u8; 8],
@@ -476,8 +475,7 @@ fn run_client(
         let result: Result<_, _> = match mode {
             Mode::Raw | Mode::Metadata => {
                 let parts = [IoSlice::new(&small_req)];
-                let mut fut =
-                    Box::pin(transport.send_eager(&peer_id, RPC_METADATA_LOOKUP, &parts));
+                let mut fut = Box::pin(transport.send_eager(&peer_id, RPC_METADATA_LOOKUP, &parts));
                 loop {
                     match Pin::as_mut(&mut fut).poll(&mut cx) {
                         Poll::Ready(r) => break r,
@@ -567,10 +565,9 @@ fn run_client(
                             let bytes = &resp.header_bytes;
                             let sz = std::mem::size_of::<MetadataLookupResponseHeader>();
                             if bytes.len() >= sz {
-                                let rh = MetadataLookupResponseHeader::read_from_bytes(
-                                    &bytes[..sz],
-                                )
-                                .expect("decode");
+                                let rh =
+                                    MetadataLookupResponseHeader::read_from_bytes(&bytes[..sz])
+                                        .expect("decode");
                                 println!(
                                     "[client] first response ({:?}): entry_type={} status={} size={}",
                                     mode, rh.entry_type, rh.status, rh.size
@@ -590,9 +587,8 @@ fn run_client(
                             let bytes = &resp.header_bytes;
                             let sz = std::mem::size_of::<WriteChunkResponseHeader>();
                             if bytes.len() >= sz {
-                                let rh =
-                                    WriteChunkResponseHeader::read_from_bytes(&bytes[..sz])
-                                        .expect("decode");
+                                let rh = WriteChunkResponseHeader::read_from_bytes(&bytes[..sz])
+                                    .expect("decode");
                                 println!(
                                     "[client] first AmrpcPut response: bytes_written={} status={}",
                                     rh.bytes_written, rh.status

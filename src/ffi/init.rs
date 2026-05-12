@@ -170,11 +170,7 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
                 }
             } else {
                 // No expected_nodes set - return as soon as we find any nodes
-                tracing::info!(
-                    "Discovered {} data nodes: {:?}",
-                    node_ids.len(),
-                    node_ids
-                );
+                tracing::info!("Discovered {} data nodes: {:?}", node_ids.len(), node_ids);
                 return Ok(node_ids);
             }
         }
@@ -335,7 +331,10 @@ pub extern "C" fn benchfs_init(
     // RPC_CLIENT_TIMING and other stats-gated paths emit data.
     // The server binary (benchfsd_mpi) sets this directly; the FFI
     // client must read it from env (mpirun -x ENABLE_STATS).
-    if std::env::var("ENABLE_STATS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+    if std::env::var("ENABLE_STATS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
         crate::stats::set_stats_enabled(true);
     }
 
@@ -419,8 +418,11 @@ pub extern "C" fn benchfs_init(
         tracing::info!("Starting IoUringReactor initialization...");
         let start = std::time::Instant::now();
 
-        tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
-            chunk_size, chunk_size / (1024 * 1024));
+        tracing::info!(
+            "Configuring io_uring with buffer_size={} bytes ({} MiB)",
+            chunk_size,
+            chunk_size / (1024 * 1024)
+        );
         let uring_reactor = IoUringReactor::builder()
             .queue_size(32) // Reduced to prevent kernel resource contention
             .buffer_size(chunk_size) // Match chunk_size from config
@@ -589,9 +591,7 @@ pub extern "C" fn benchfs_init(
             .unwrap_or(false);
         #[cfg(not(feature = "transport-locusta"))]
         if use_locusta {
-            set_error_message(
-                "BENCHFS_TRANSPORT=locusta requires the transport-locusta feature",
-            );
+            set_error_message("BENCHFS_TRANSPORT=locusta requires the transport-locusta feature");
             return std::ptr::null_mut();
         }
         #[cfg(feature = "transport-locusta")]
@@ -622,10 +622,7 @@ pub extern "C" fn benchfs_init(
                         Some(Rc::new(t))
                     }
                     Err(e) => {
-                        set_error_message(&format!(
-                            "Failed to init LocustaTransport: {:?}",
-                            e
-                        ));
+                        set_error_message(&format!("Failed to init LocustaTransport: {:?}", e));
                         return std::ptr::null_mut();
                     }
                 }
@@ -639,11 +636,7 @@ pub extern "C" fn benchfs_init(
             #[cfg(feature = "transport-locusta")]
             {
                 if let Some(transport) = locusta_transport {
-                    match ConnectionPool::new_locusta(
-                        worker.clone(),
-                        registry_dir_str,
-                        transport,
-                    ) {
+                    match ConnectionPool::new_locusta(worker.clone(), registry_dir_str, transport) {
                         Ok(pool) => Rc::new(pool),
                         Err(e) => {
                             set_error_message(&format!(
@@ -671,10 +664,7 @@ pub extern "C" fn benchfs_init(
                 match ConnectionPool::new(worker, registry_dir_str) {
                     Ok(pool) => Rc::new(pool),
                     Err(e) => {
-                        set_error_message(&format!(
-                            "Failed to create connection pool: {:?}",
-                            e
-                        ));
+                        set_error_message(&format!("Failed to create connection pool: {:?}", e));
                         return std::ptr::null_mut();
                     }
                 }

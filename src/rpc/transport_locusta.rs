@@ -12,7 +12,7 @@
 
 #![cfg(feature = "transport-locusta")]
 
-use std::alloc::{alloc, Layout};
+use std::alloc::{Layout, alloc};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -28,7 +28,7 @@ use rrrpc::rdma_util::RecvBufferPool;
 use rrrpc::relay::client::{Client, Response, ResponseFuture};
 use rrrpc::relay::daemon::{Channel, RdmaContext, RelayConfig, RelayDaemon};
 use rrrpc::relay::jiffy::JiffyQueue;
-use rrrpc::relay::shm::{init_channel_header, ChannelHeader, ChannelState, ShmLayout};
+use rrrpc::relay::shm::{ChannelHeader, ChannelState, ShmLayout, init_channel_header};
 use rrrpc::relay::spsc::FastForwardRing;
 use rrrpc::server::{Request, ServerConfig, ServerContext, ServerRdmaContext};
 use rrrpc::wire::{CompletionSlot, QpExchangeInfo, RequestSlot};
@@ -36,9 +36,9 @@ use rrrpc::wire::{CompletionSlot, QpExchangeInfo, RequestSlot};
 use mlx5::pd::MemoryRegion;
 use pluvio_uring::allocator::FixedBufferAllocator;
 
-use crate::rpc::locusta_buffer::{register_with_pd, RegisteredFixedBuffer};
-use crate::rpc::transport::{NodeId, RpcResponse, RpcTransport};
 use crate::rpc::RpcError;
+use crate::rpc::locusta_buffer::{RegisteredFixedBuffer, register_with_pd};
+use crate::rpc::transport::{NodeId, RpcResponse, RpcTransport};
 
 const QP_INFO_SIZE: usize = std::mem::size_of::<QpExchangeInfo>();
 const _: () = assert!(QP_INFO_SIZE == 64);
@@ -106,11 +106,7 @@ impl LocustaInner {
     /// symmetric — whichever side runs first writes its files and
     /// spin-reads for the other side; whichever side runs second sees
     /// the files immediately and returns quickly.
-    fn add_peer_blocking(
-        &mut self,
-        peer: &str,
-        deadline: Instant,
-    ) -> Result<u16, RpcError> {
+    fn add_peer_blocking(&mut self, peer: &str, deadline: Instant) -> Result<u16, RpcError> {
         if let Some(&existing) = self.node_to_dest.get(peer) {
             return Ok(existing);
         }
@@ -125,10 +121,7 @@ impl LocustaInner {
             })?;
         let server_out = server_qp_path(&self.registry_dir, &self.local_node_id, peer);
         write_qp_info(&server_out, &server_local).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "write_qp_info({}): {e}",
-                server_out.display()
-            ))
+            RpcError::ConnectionError(format!("write_qp_info({}): {e}", server_out.display()))
         })?;
 
         // Relay side: prepare destination for the remote server
@@ -136,16 +129,11 @@ impl LocustaInner {
             .daemon
             .prepare_destination(dest_id, 64 * 1024, 64 * 1024, &self.qp_config)
             .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "daemon.prepare_destination({dest_id}): {e:?}"
-                ))
+                RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
             })?;
         let relay_out = relay_qp_path(&self.registry_dir, &self.local_node_id, peer);
         write_qp_info(&relay_out, &relay_local).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "write_qp_info({}): {e}",
-                relay_out.display()
-            ))
+            RpcError::ConnectionError(format!("write_qp_info({}): {e}", relay_out.display()))
         })?;
 
         // Wait for peer's published info and finalize connections.
@@ -162,9 +150,7 @@ impl LocustaInner {
         self.daemon
             .connect_destination(dest_id, &peer_server_info)
             .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "daemon.connect_destination({dest_id}): {e:?}"
-                ))
+                RpcError::ConnectionError(format!("daemon.connect_destination({dest_id}): {e:?}"))
             })?;
 
         self.node_to_dest.insert(peer.to_string(), dest_id);
@@ -263,9 +249,8 @@ impl Default for LocustaConfig {
 }
 
 fn open_mlx5_device() -> Result<mlx5::device::Context, RpcError> {
-    let device_list = mlx5::device::DeviceList::list().map_err(|e| {
-        RpcError::ConnectionError(format!("mlx5::device::DeviceList::list: {e:?}"))
-    })?;
+    let device_list = mlx5::device::DeviceList::list()
+        .map_err(|e| RpcError::ConnectionError(format!("mlx5::device::DeviceList::list: {e:?}")))?;
     for device in device_list.iter() {
         if let Ok(ctx) = device.open() {
             return Ok(ctx);
@@ -389,11 +374,7 @@ fn try_read_qp_info(path: &Path) -> Option<QpExchangeInfo> {
     }
     let mut info = std::mem::MaybeUninit::<QpExchangeInfo>::uninit();
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            info.as_mut_ptr() as *mut u8,
-            QP_INFO_SIZE,
-        );
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), info.as_mut_ptr() as *mut u8, QP_INFO_SIZE);
         Some(info.assume_init())
     }
 }
@@ -414,11 +395,15 @@ fn read_qp_info_when_ready(path: &Path, deadline: Instant) -> Result<QpExchangeI
 }
 
 fn server_qp_path(registry: &Path, server_node: &str, client_node: &str) -> PathBuf {
-    registry.join(format!("server_{server_node}_to_relay_{client_node}.qpinfo"))
+    registry.join(format!(
+        "server_{server_node}_to_relay_{client_node}.qpinfo"
+    ))
 }
 
 fn relay_qp_path(registry: &Path, client_node: &str, server_node: &str) -> PathBuf {
-    registry.join(format!("relay_{client_node}_to_server_{server_node}.qpinfo"))
+    registry.join(format!(
+        "relay_{client_node}_to_server_{server_node}.qpinfo"
+    ))
 }
 
 impl LocustaTransport {
@@ -437,10 +422,7 @@ impl LocustaTransport {
     /// use `dest_id = index` to identify the remote peer.
     pub fn init(cfg: &LocustaConfig) -> Result<Self, RpcError> {
         fs::create_dir_all(&cfg.registry_dir).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "mkdir {}: {e}",
-                cfg.registry_dir.display()
-            ))
+            RpcError::ConnectionError(format!("mkdir {}: {e}", cfg.registry_dir.display()))
         })?;
         let ctx = open_mlx5_device()?;
 
@@ -478,9 +460,7 @@ impl LocustaTransport {
                 pd.register(
                     arena_base,
                     layout.dma_arena_len,
-                    AccessFlags::LOCAL_WRITE
-                        | AccessFlags::REMOTE_WRITE
-                        | AccessFlags::REMOTE_READ,
+                    AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
                 )
             }
             .map_err(|e| RpcError::ConnectionError(format!("arena MR register: {e:?}")))?
@@ -529,22 +509,21 @@ impl LocustaTransport {
         // already io_uring-registered by the chunk store). Otherwise
         // fall back to a freshly-allocated standalone pool — used by
         // the demo binary which has no real chunk_store.
-        let (server_buffer_allocator, server_buffer_mrs) =
-            if let Some(alloc) = cfg.external_server_allocator.clone() {
-                let pd = &server.rdma.as_ref().unwrap().pd;
-                let mrs = register_with_pd(&alloc, pd)?;
-                (Some(alloc), mrs)
-            } else if cfg.server_buf_slots > 0 {
-                let pd = &server.rdma.as_ref().unwrap().pd;
-                let alloc = FixedBufferAllocator::new_without_uring(
-                    cfg.server_buf_slots,
-                    cfg.server_buf_size,
-                );
-                let mrs = register_with_pd(&alloc, pd)?;
-                (Some(alloc), mrs)
-            } else {
-                (None, Vec::new())
-            };
+        let (server_buffer_allocator, server_buffer_mrs) = if let Some(alloc) =
+            cfg.external_server_allocator.clone()
+        {
+            let pd = &server.rdma.as_ref().unwrap().pd;
+            let mrs = register_with_pd(&alloc, pd)?;
+            (Some(alloc), mrs)
+        } else if cfg.server_buf_slots > 0 {
+            let pd = &server.rdma.as_ref().unwrap().pd;
+            let alloc =
+                FixedBufferAllocator::new_without_uring(cfg.server_buf_slots, cfg.server_buf_size);
+            let mrs = register_with_pd(&alloc, pd)?;
+            (Some(alloc), mrs)
+        } else {
+            (None, Vec::new())
+        };
 
         let qp_config = RcQpConfig {
             max_send_wr: 1024,
@@ -600,11 +579,7 @@ impl LocustaTransport {
     /// This is the building block that lets BenchFS dynamically accept
     /// connections from late-joining clients (the FFI / IOR path) that
     /// were not known at `init` time.
-    pub fn add_peer(
-        &self,
-        peer: &NodeId,
-        timeout: Duration,
-    ) -> Result<u16, RpcError> {
+    pub fn add_peer(&self, peer: &NodeId, timeout: Duration) -> Result<u16, RpcError> {
         let deadline = Instant::now() + timeout;
         let mut inner = self.inner.borrow_mut();
         inner.add_peer_blocking(peer, deadline)
@@ -647,10 +622,7 @@ impl LocustaTransport {
         let mut candidates_relay: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let dir_iter = fs::read_dir(&registry_dir).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "read_dir({}): {e}",
-                registry_dir.display()
-            ))
+            RpcError::ConnectionError(format!("read_dir({}): {e}", registry_dir.display()))
         })?;
         for entry in dir_iter.flatten() {
             let Ok(name) = entry.file_name().into_string() else {
@@ -784,7 +756,9 @@ fn stage_small_req<'b>(
     inner.small_req_scratch.clear();
     let total: usize = LOCUSTA_RPC_ID_PREFIX_LEN + parts.iter().map(|p| p.len()).sum::<usize>();
     inner.small_req_scratch.reserve(total);
-    inner.small_req_scratch.extend_from_slice(&rpc_id.to_le_bytes());
+    inner
+        .small_req_scratch
+        .extend_from_slice(&rpc_id.to_le_bytes());
     for slice in parts {
         inner.small_req_scratch.extend_from_slice(slice);
     }
@@ -813,9 +787,9 @@ impl RpcTransport for LocustaTransport {
                     unsafe { std::slice::from_raw_parts(small_req_ptr, small_req_len) };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
-                    let fut = batch.call_eager(dest_id, small_req_slice).map_err(|e| {
-                        RpcError::TransportError(format!("call_eager: {e:?}"))
-                    })?;
+                    let fut = batch
+                        .call_eager(dest_id, small_req_slice)
+                        .map_err(|e| RpcError::TransportError(format!("call_eager: {e:?}")))?;
                     let id = fut.req_id();
                     (id, fut)
                 };
@@ -865,9 +839,8 @@ impl RpcTransport for LocustaTransport {
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
                 let small_req = stage_small_req(&mut inner, rpc_id, parts);
-                let small_req_slice = unsafe {
-                    std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
-                };
+                let small_req_slice =
+                    unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
                     let fut = batch
@@ -918,9 +891,8 @@ impl RpcTransport for LocustaTransport {
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
                 let small_req = stage_small_req(&mut inner, rpc_id, parts);
-                let small_req_slice = unsafe {
-                    std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
-                };
+                let small_req_slice =
+                    unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
                     let fut = batch
@@ -977,9 +949,7 @@ impl RpcTransport for LocustaTransport {
             inner
                 .client
                 .send_oneway_eager(dest_id, small_req_slice)
-                .map_err(|e| {
-                RpcError::TransportError(format!("send_oneway_eager: {e:?}"))
-            })?;
+                .map_err(|e| RpcError::TransportError(format!("send_oneway_eager: {e:?}")))?;
             Ok(())
         }
     }

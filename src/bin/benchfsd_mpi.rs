@@ -16,12 +16,14 @@
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
-use benchfs::logging::{init_with_chrome, init_with_perfetto, TraceGuard};
+use benchfs::logging::{TraceGuard, init_with_chrome, init_with_perfetto};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::{RpcServer, get_server_rpc_stats};
-use benchfs::storage::{ChunkStore, DummyChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore, PosixChunkStore};
+use benchfs::storage::{
+    ChunkStore, DummyChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore, PosixChunkStore,
+};
 
 use pluvio_runtime::executor::{Runtime, SchedulingConfig};
 use pluvio_timer::TimerReactor;
@@ -81,7 +83,10 @@ fn init_locusta_runtime(
         cfg.registry_dir.display()
     );
     let transport = Rc::new(LocustaTransport::init(&cfg)?);
-    tracing::info!("LocustaTransport connected to {} peers", cfg.peer_node_ids.len());
+    tracing::info!(
+        "LocustaTransport connected to {} peers",
+        cfg.peer_node_ids.len()
+    );
 
     // Register every supported RPC's `LocustaServerHandler`.
     let mut dispatch = LocustaServerDispatch::new(handler_context);
@@ -157,7 +162,9 @@ fn main() {
     let mut positional_args: Vec<&String> = Vec::new();
 
     // Set BENCHFS_RPC_TIMEOUT to 3 second for MPI environment
-    unsafe { std::env::set_var("BENCHFS_RPC_TIMEOUT", "3"); }
+    unsafe {
+        std::env::set_var("BENCHFS_RPC_TIMEOUT", "3");
+    }
 
     let mut i = 1;
     while i < args.len() {
@@ -220,14 +227,22 @@ fn main() {
                 "Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file] [options]",
                 args[0]
             );
-            eprintln!("  registry_dir:            Shared directory for service discovery (required)");
-            eprintln!("  config_file:             Configuration file (optional, default: benchfs.toml)");
+            eprintln!(
+                "  registry_dir:            Shared directory for service discovery (required)"
+            );
+            eprintln!(
+                "  config_file:             Configuration file (optional, default: benchfs.toml)"
+            );
             eprintln!("  --trace-output <path>:   Enable Perfetto tracing (optional)");
             eprintln!("                           Each rank creates <path>_rank<N>.json");
             eprintln!("  --stats-output <path>:   Enable CSV stats output (optional)");
             eprintln!("                           Each rank creates <path>_rank<N>.csv");
-            eprintln!("  --enable-stats:          Enable detailed timing statistics collection (optional)");
-            eprintln!("                           Adds overhead, use only for performance analysis");
+            eprintln!(
+                "  --enable-stats:          Enable detailed timing statistics collection (optional)"
+            );
+            eprintln!(
+                "                           Adds overhead, use only for performance analysis"
+            );
         }
         std::process::exit(1);
     }
@@ -315,7 +330,6 @@ fn main() {
         tracing::info!("Stats output enabled: {}", stats_path.display());
     }
 
-
     // Synchronize all ranks before starting servers
     world.barrier();
 
@@ -332,7 +346,10 @@ fn main() {
     tracing::info!("Rank {}: BenchFS server stopped", mpi_rank);
 }
 
-fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_server(
+    state: Rc<ServerState>,
+    enable_perfetto_tracks: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = &state.config;
     let node_id = state.node_id();
     let registry_dir = state
@@ -343,8 +360,8 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
     // Create pluvio runtime with optional Perfetto task tracking
     // Tuned for high-throughput I/O: larger batch size and more frequent reactor polling
     let scheduling_config = SchedulingConfig {
-        task_batch_size: 64,          // Increased from 16 for better throughput
-        reactor_poll_interval: 2,     // Reduced from 8 for lower io_uring latency
+        task_batch_size: 64,      // Increased from 16 for better throughput
+        reactor_poll_interval: 2, // Reduced from 8 for lower io_uring latency
         enable_perfetto_tracks,
         ..Default::default()
     };
@@ -517,7 +534,10 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
             (chunk_store, allocator)
         }
         _ => {
-            tracing::info!("Using file-based storage backend (backend={})", effective_backend);
+            tracing::info!(
+                "Using file-based storage backend (backend={})",
+                effective_backend
+            );
 
             // io_uring reactor for allocator only.
             // buffer_size must match chunk_size for RPC data transfers.
@@ -624,7 +644,8 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                 async move {
                     tracing::info!(
                         "Starting LocustaServerDispatch poll loop ({} handlers registered)",
-                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>()
+                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>(
+                        )
                     );
                     loop {
                         dispatch.poll_once_spawn(&transport);
@@ -657,10 +678,7 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                tracing::warn!(
-                                    "try_accept_pending_peers error: {:?}",
-                                    e
-                                );
+                                tracing::warn!("try_accept_pending_peers error: {:?}", e);
                             }
                         }
                         futures_timer::Delay::new(scan_interval).await;
@@ -849,7 +867,11 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                             );
                         }
                         Err(e) => {
-                            tracing::error!("Failed to create stats file {}: {}", path.display(), e);
+                            tracing::error!(
+                                "Failed to create stats file {}: {}",
+                                path.display(),
+                                e
+                            );
                         }
                     }
                 }
@@ -1000,10 +1022,7 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> 
             Some(guard)
         } else if enable_chrome {
             let guard = init_with_chrome(level, trace_path);
-            tracing::info!(
-                "Chrome tracing enabled, output: {}",
-                trace_path.display()
-            );
+            tracing::info!("Chrome tracing enabled, output: {}", trace_path.display());
             Some(guard)
         } else {
             // Trace output path given but no format enabled - default to Perfetto

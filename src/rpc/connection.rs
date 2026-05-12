@@ -190,10 +190,7 @@ impl ConnectionPool {
                         ))
                     })?;
             }
-            let client = Rc::new(RpcClient::new_locusta(
-                Rc::clone(transport),
-                peer_node_id,
-            ));
+            let client = Rc::new(RpcClient::new_locusta(Rc::clone(transport), peer_node_id));
             self.connections
                 .borrow_mut()
                 .insert(node_id.to_string(), client.clone());
