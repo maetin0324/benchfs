@@ -419,49 +419,70 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                 let offset = header.offset;
                 let length = header.length;
 
-                let data = match ctx
-                    .chunk_store
-                    .read_chunk(&path, chunk_index, offset, length)
-                    .await
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("[locusta_handlers] ReadChunkById store failed: {e:?}");
-                        // Drop the handle → client gets error response.
+                // Zero-copy path: read directly into an RDMA-registered
+                // FixedBuffer via io_uring fixed buffer read, then hand
+                // that same buffer to the locusta handle for RDMA send.
+                // The old path read into a Vec<u8>, allocated a separate
+                // FixedBuffer, and memcpy'd 4 MiB between them — that
+                // memcpy was the dominant read-path overhead (job 17048
+                // showed 5.78 GiB/s read vs 11.04 GiB/s write at the
+                // same chunk size, with dispatch latency ruled out).
+                let alloc = Rc::clone(&ctx.allocator);
+                let fb = match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(&alloc) {
+                    Some(fb) => fb,
+                    None => {
+                        eprintln!("[locusta_handlers] ReadChunkById: server allocator empty");
                         drop(h);
                         return;
                     }
                 };
-                if nth < 5 {
-                    tracing::info!(
-                        "[locusta_handlers] ReadChunkById #{nth}: chunk_store returned {} bytes",
-                        data.len()
-                    );
-                }
 
-                // Allocate a server-side RDMA-registered buffer and stage
-                // the read data into it. The handle's `reply()` will
-                // RDMA-write that buffer to the client's recv area.
-                let alloc = Rc::clone(&ctx.allocator);
-                let mut fb =
-                    match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(&alloc) {
-                        Some(fb) => fb,
-                        None => {
-                            eprintln!("[locusta_handlers] ReadChunkById: server allocator empty");
-                            drop(h);
-                            return;
+                let io_store = ctx.chunk_store.as_any().downcast_ref::<crate::storage::IOUringChunkStore>();
+                let (n, fb) = match io_store {
+                    Some(store) => {
+                        match store
+                            .read_chunk_fixed(&path, chunk_index, offset, length, fb)
+                            .await
+                        {
+                            Ok((n, fb)) => (n, fb),
+                            Err(e) => {
+                                eprintln!("[locusta_handlers] ReadChunkById store_fixed failed: {e:?}");
+                                drop(h);
+                                return;
+                            }
                         }
-                    };
-                let n = data.len().min(fb.len()).min(h.dma_len() as usize);
-                fb.as_mut_slice()[..n].copy_from_slice(&data[..n]);
-                let buf = RegisteredFixedBuffer::from_fixed_buffer(fb);
-                let resp = ReadChunkResponseHeader::success(n as u64);
+                    }
+                    None => {
+                        // Fallback for non-io_uring chunk stores (tests):
+                        // do the old read-into-Vec + copy path.
+                        let data = match ctx
+                            .chunk_store
+                            .read_chunk(&path, chunk_index, offset, length)
+                            .await
+                        {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!("[locusta_handlers] ReadChunkById store failed: {e:?}");
+                                drop(h);
+                                return;
+                            }
+                        };
+                        let mut fb = fb;
+                        let n = data.len().min(fb.len()).min(h.dma_len() as usize);
+                        fb.as_mut_slice()[..n].copy_from_slice(&data[..n]);
+                        (n, fb)
+                    }
+                };
+
+                let n = n.min(h.dma_len() as usize);
                 if nth < 5 {
                     tracing::info!(
-                        "[locusta_handlers] ReadChunkById #{nth}: about to h.reply(n={n}, dma_len={})",
+                        "[locusta_handlers] ReadChunkById #{nth}: read_chunk_fixed returned {n} bytes (dma_len={})",
                         h.dma_len()
                     );
                 }
+                let buf = RegisteredFixedBuffer::from_fixed_buffer(fb);
+                let resp = ReadChunkResponseHeader::success(n as u64);
                 h.reply(buf, resp.as_bytes().to_vec());
                 if nth < 5 {
                     tracing::info!("[locusta_handlers] ReadChunkById #{nth}: h.reply returned");
