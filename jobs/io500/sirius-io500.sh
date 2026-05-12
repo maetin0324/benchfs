@@ -106,7 +106,7 @@ for nnodes in "${nnodes_list[@]}"; do
       -q mcrp
       -A NBB
       -l select="${nnodes}:ncpus=96:mem=496gb:ngpus=4"
-      -l place=exclhost
+      -l place="${PBS_PLACE:-pack:exclhost}"
       -l walltime="${ELAPSTIM_REQ}"
       -v SCRRAID=no
       -V
