@@ -42,8 +42,23 @@ echo ""
 
 # Build BenchFS library
 echo -e "${YELLOW}Building BenchFS library...${NC}"
-cargo build --release --features mpi-support
-cargo build --release --lib
+# BENCHFS_FEATURES lets the caller add features at install time.
+# Example: BENCHFS_FEATURES=transport-locusta bash install.sh
+EXTRA_FEATURES="${BENCHFS_FEATURES:-}"
+SERVER_FEATURES="mpi-support"
+LIB_FEATURES=""
+if [ -n "$EXTRA_FEATURES" ]; then
+    SERVER_FEATURES="${SERVER_FEATURES},${EXTRA_FEATURES}"
+    LIB_FEATURES="${EXTRA_FEATURES}"
+fi
+echo "  cargo build --features ${SERVER_FEATURES}   (server binaries)"
+cargo build --release --features "$SERVER_FEATURES"
+if [ -n "$LIB_FEATURES" ]; then
+    echo "  cargo build --lib --features ${LIB_FEATURES}"
+    cargo build --release --lib --features "$LIB_FEATURES"
+else
+    cargo build --release --lib
+fi
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Failed to build BenchFS library${NC}"
