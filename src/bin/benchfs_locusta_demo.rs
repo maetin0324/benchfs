@@ -34,8 +34,9 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use zerocopy::{FromBytes, IntoBytes};
 
+use benchfs::rpc::locusta_call::LocustaCallable;
 use benchfs::rpc::metadata_ops::{
-    MetadataLookupRequestHeader, MetadataLookupResponseHeader,
+    MetadataLookupRequest, MetadataLookupRequestHeader, MetadataLookupResponseHeader,
 };
 use benchfs::rpc::transport::RpcTransport;
 use benchfs::rpc::transport_locusta::{
@@ -88,8 +89,13 @@ enum Mode {
     /// Phase 1b: opaque 32B eager payload + 8B reply.
     Raw,
     /// Phase 1c: real BenchFS `MetadataLookupRequestHeader` + path eager
-    /// round-trip.
+    /// round-trip (manual marshalling via `transport.send_eager`).
     Metadata,
+    /// Phase 2.2: same wire RPC as `Metadata`, but driven through the
+    /// `LocustaCallable::call_locusta` blanket impl — i.e. invokes
+    /// `MetadataLookupRequest::call_locusta(...)` exactly as production
+    /// BenchFS code would once the RPC layer is wired up.
+    Amrpc,
     /// Phase 2.1: `RoundtripPut` — client DMA-writes `--payload-bytes` of
     /// data into a server-side `SharedRdmaBuffer`; server replies with an
     /// 8B ack.
@@ -160,7 +166,10 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
                 rrrpc::server::Request::RoundtripEager(h) => {
                     let reply = match mode {
                         Mode::Raw => vec![0u8; 8],
-                        Mode::Metadata => serve_metadata_lookup(h.small_req()),
+                        // Both Metadata and Amrpc send the same wire format —
+                        // header bytes followed by the path. The only
+                        // difference is the client-side marshalling path.
+                        Mode::Metadata | Mode::Amrpc => serve_metadata_lookup(h.small_req()),
                         Mode::Put | Mode::Get => {
                             eprintln!("[server] unexpected RoundtripEager in {mode:?} mode");
                             vec![0u8; 8]
@@ -293,7 +302,17 @@ fn run_client(
             buf.extend_from_slice(path.as_bytes());
             buf
         }
+        // Amrpc mode constructs the request struct itself; small_req unused.
+        Mode::Amrpc => Vec::new(),
         Mode::Put | Mode::Get => vec![0u8; 8], // tiny header for DMA modes
+    };
+
+    // Pre-build the AmRpc request once so the latency loop only measures
+    // the wire round-trip, not allocation overhead.
+    let amrpc_req = if mode == Mode::Amrpc {
+        Some(MetadataLookupRequest::new(path.to_string()))
+    } else {
+        None
     };
 
     // For Put we pre-fill a payload with a recognizable pattern so the
@@ -346,6 +365,26 @@ fn run_client(
                     }
                 }
             }
+            Mode::Amrpc => {
+                // Exercise the production code path: LocustaCallable
+                // blanket impl on AmRpc serializes header+request_data,
+                // dispatches via call_type, and deserializes the response.
+                let req = amrpc_req.as_ref().expect("amrpc_req built");
+                let mut fut = Box::pin(req.call_locusta(&peer_id, transport));
+                let hdr_result = loop {
+                    match Pin::as_mut(&mut fut).poll(&mut cx) {
+                        Poll::Ready(r) => break r,
+                        Poll::Pending => std::thread::yield_now(),
+                    }
+                };
+                // Adapt to RpcResponse so the surrounding loop shape stays
+                // uniform with other modes — we only care that the wire
+                // round-trip succeeded and the response decoded.
+                hdr_result.map(|hdr| benchfs::rpc::transport::RpcResponse {
+                    header_bytes: hdr.as_bytes().to_vec(),
+                    data_len: 0,
+                })
+            }
             Mode::Put => {
                 let mut fut = Box::pin(transport.send_put(
                     &peer_id,
@@ -381,7 +420,7 @@ fn run_client(
             Ok(resp) => {
                 if i == 0 {
                     match mode {
-                        Mode::Metadata => {
+                        Mode::Metadata | Mode::Amrpc => {
                             let bytes = &resp.header_bytes;
                             let sz = std::mem::size_of::<MetadataLookupResponseHeader>();
                             if bytes.len() >= sz {
@@ -390,8 +429,8 @@ fn run_client(
                                 )
                                 .expect("decode");
                                 println!(
-                                    "[client] first response: entry_type={} status={} size={}",
-                                    rh.entry_type, rh.status, rh.size
+                                    "[client] first response ({:?}): entry_type={} status={} size={}",
+                                    mode, rh.entry_type, rh.status, rh.size
                                 );
                             }
                         }

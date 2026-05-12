@@ -21,6 +21,8 @@ pub mod transport;
 #[cfg(feature = "transport-locusta")]
 pub mod locusta_buffer;
 #[cfg(feature = "transport-locusta")]
+pub mod locusta_call;
+#[cfg(feature = "transport-locusta")]
 pub mod transport_locusta;
 
 /// RPC ID type for identifying different RPC operations
