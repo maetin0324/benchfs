@@ -833,13 +833,13 @@ fn run_server(
                     ));
                 }
 
-                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                pluvio_timer::sleep(std::time::Duration::from_millis(100)).await;
             }
 
             tracing::info!("RPC handlers ready, now registering node address");
 
             // Small delay to ensure AM streams are fully established
-            futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
+            pluvio_timer::sleep(std::time::Duration::from_millis(200)).await;
 
             // Register this node's worker address
             if let Err(e) = pool_clone.register_self(&node_id_clone) {
@@ -909,7 +909,7 @@ fn run_server(
                     );
                 }
 
-                futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
+                pluvio_timer::sleep(std::time::Duration::from_millis(500)).await;
             }
 
             Ok::<(), std::io::Error>(())
@@ -1016,7 +1016,7 @@ fn run_server(
                         break;
                     }
                     // Yield to allow other tasks to run
-                    futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                    pluvio_timer::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
                 // ========== Graceful Shutdown Sequence ==========
