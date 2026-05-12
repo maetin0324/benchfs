@@ -578,8 +578,6 @@ fn run_server(
 
     #[cfg(feature = "transport-locusta")]
     let locusta_state = if use_locusta {
-        use benchfs::rpc::locusta_server::LocustaServerDispatch;
-        use benchfs::rpc::transport_locusta::LocustaTransport;
         let s = init_locusta_runtime(
             &node_id,
             state.mpi_rank,
@@ -587,29 +585,11 @@ fn run_server(
             registry_dir,
             handler_context.clone(),
         )?;
-        // Reactor that does *both* tick + dispatch. Folding it into a
-        // single reactor means we don't need a hot polling task that
-        // floods the executor's task channel — the reactor runs once
-        // per executor iteration alongside timer / io_uring.
-        struct LocustaDispatchReactor {
-            transport: Rc<LocustaTransport>,
-            dispatch: Rc<LocustaServerDispatch>,
-        }
-        impl pluvio_runtime::reactor::Reactor for LocustaDispatchReactor {
-            fn poll(&self) {
-                self.dispatch.poll_once_spawn(&self.transport);
-            }
-            fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
-                pluvio_runtime::reactor::ReactorStatus::Running
-            }
-        }
-        runtime.register_reactor(
-            "locusta",
-            Rc::new(LocustaDispatchReactor {
-                transport: Rc::clone(&s.transport),
-                dispatch: Rc::clone(&s.dispatch),
-            }),
-        );
+        // Lightweight Reactor: just tick locusta's state machines each
+        // executor iteration. Dispatch (drain ready + spawn handlers)
+        // happens on a separate task below — keeping them separate
+        // avoids hot-loop starvation of timer-woken tasks.
+        runtime.register_reactor("locusta", Rc::clone(&s.transport));
         Some(s)
     } else {
         None
@@ -664,8 +644,37 @@ fn run_server(
         *handler_ready_clone.borrow_mut() = true;
         #[cfg(feature = "transport-locusta")]
         {
-            tracing::info!(
-                "LocustaDispatchReactor registered — server dispatch runs every executor iteration"
+            // Dispatch task: drains ready locusta requests and spawns
+            // handler futures. Uses futures_timer::Delay(100µs) between
+            // iterations — short enough to keep latency low, long
+            // enough to avoid starving timer-woken tasks (10x the
+            // 1µs that caused issues; futures_timer's thread-based
+            // implementation handles this rate fine).
+            let dispatch = Rc::clone(&locusta_state.as_ref().unwrap().dispatch);
+            let transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    tracing::info!(
+                        "Starting LocustaServerDispatch drain task ({} handlers registered)",
+                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>()
+                    );
+                    let mut iter: u64 = 0;
+                    loop {
+                        dispatch.drain_and_spawn(&transport);
+                        iter = iter.wrapping_add(1);
+                        if iter == 1 || iter % 100_000 == 0 {
+                            tracing::info!(
+                                "locusta dispatch drain heartbeat iter={}",
+                                iter
+                            );
+                        }
+                        futures_timer::Delay::new(
+                            std::time::Duration::from_micros(100),
+                        )
+                        .await;
+                    }
+                },
+                "locusta_dispatch_drain".to_string(),
             );
 
             // Accept loop: scan the registry directory for late-joining

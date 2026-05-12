@@ -30,12 +30,10 @@ use std::rc::Rc;
 
 use rrrpc::server::Request;
 
+use crate::rpc::AmRpc;
 use crate::rpc::handlers::RpcHandlerContext;
 use crate::rpc::locusta_buffer::RegisteredFixedBuffer;
-use crate::rpc::transport_locusta::{
-    drain_server_requests, extract_rpc_id, LocustaTransport,
-};
-use crate::rpc::AmRpc;
+use crate::rpc::transport_locusta::{LocustaTransport, drain_server_requests, extract_rpc_id};
 
 /// Server-side handler for a single AmRpc type, dispatched by locusta.
 ///
@@ -135,6 +133,18 @@ impl LocustaServerDispatch {
     pub fn poll_once_spawn(&self, transport: &LocustaTransport) {
         let mut inner = transport.inner.borrow_mut();
         inner.tick();
+        drain_server_requests(&mut *inner, |req| {
+            if let Some(fut) = self.dispatch(req) {
+                pluvio_runtime::executor::spawn(fut);
+            }
+        });
+    }
+
+    /// Drain-only variant for use when a separate Reactor handles
+    /// `inner.tick()`. Skips the redundant tick so per-iteration cost
+    /// is just the drain + spawn loop.
+    pub fn drain_and_spawn(&self, transport: &LocustaTransport) {
+        let mut inner = transport.inner.borrow_mut();
         drain_server_requests(&mut *inner, |req| {
             if let Some(fut) = self.dispatch(req) {
                 pluvio_runtime::executor::spawn(fut);
