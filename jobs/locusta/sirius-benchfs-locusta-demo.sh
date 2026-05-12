@@ -1,10 +1,22 @@
 #!/bin/bash
 #PBS -q mcrp
 #PBS -A NBB
-# Submit with: qsub -l select=4:host=a01+4:host=a14 -l place=exclhost -l walltime=00:10:00 -V sirius-benchfs-locusta-demo.sh
 #
-# Phase 1b validation: drive LocustaTransport (from src/rpc/transport_locusta.rs)
-# via the benchfs_locusta_demo binary on 2 nodes.
+# Cross-node validation of LocustaTransport via mpirun.
+#
+# Sirius's sshd refuses connections originating from PBS-allocated TCP source
+# ports between different a-nodes — so we use `mpirun --map-by ppr:1:node` to
+# launch one process per host. The launched processes auto-pick their role
+# from `OMPI_COMM_WORLD_RANK` (rank 0 = server, rank 1 = client).
+#
+# Knobs (env vars):
+#   PINGS=N            number of round-trip pings (default 1000)
+#   SERVE_SECS=N       how long the server stays up (default 120)
+#   MODE=...           raw | metadata | amrpc | amrpc-put | put | get | dispatch
+#                      (default metadata)
+#   LOOKUP_PATH=...    path string for metadata-style modes
+#                      (default /test/file.bin)
+#   PAYLOAD_BYTES=N    DMA size for put/get modes (default 4 MiB)
 
 set -e
 hostname
@@ -13,18 +25,21 @@ mapfile -t HOSTS < <(sort -u "$PBS_NODEFILE")
 echo "unique hosts (${#HOSTS[@]}):"
 printf '  %s\n' "${HOSTS[@]}"
 
-SERVER_HOST="${HOSTS[0]}"
-if [ "${#HOSTS[@]}" -ge 2 ]; then
-    CLIENT_HOST="${HOSTS[1]}"
-else
-    CLIENT_HOST="${HOSTS[0]}"
-    echo "NOTE: only 1 host available — running server + client on same host (loopback)"
+if [ "${#HOSTS[@]}" -lt 1 ]; then
+    echo "ERROR: PBS_NODEFILE empty"
+    exit 1
 fi
-echo "SERVER: $SERVER_HOST"
-echo "CLIENT: $CLIENT_HOST"
+
+source /etc/profile.d/modules.sh 2>/dev/null
+module purge 2>/dev/null
+module load openmpi/5.0.9/gcc11.5.0
+echo "openmpi: $(which mpirun)"
 
 DEMO_BIN=/work/NBB/rmaeda/workspace/rust/benchfs/target/release/benchfs_locusta_demo
-ls -la "$DEMO_BIN" || { echo "ERROR: demo binary missing — build with: cargo build --release --bin benchfs_locusta_demo --features transport-locusta"; exit 1; }
+ls -la "$DEMO_BIN" || {
+    echo "ERROR: demo binary missing — build with: cargo build --release --bin benchfs_locusta_demo --features transport-locusta"
+    exit 1
+}
 
 REGISTRY=/work/NBB/rmaeda/workspace/rust/benchfs/results/locusta/demo-$(date +%Y%m%d-%H%M%S)-${PBS_JOBID%.pbs}/registry
 mkdir -p "$REGISTRY"
@@ -32,59 +47,64 @@ echo "REGISTRY: $REGISTRY"
 
 PINGS=${PINGS:-1000}
 SERVE_SECS=${SERVE_SECS:-120}
-MODE=${MODE:-metadata}            # raw | metadata
+MODE=${MODE:-metadata}
 LOOKUP_PATH=${LOOKUP_PATH:-/test/file.bin}
+PAYLOAD_BYTES=${PAYLOAD_BYTES:-4194304}
 
-# Helper: run a command either via ssh (different host) or directly (same host as the
-# script). For single-host (loopback) jobs we skip ssh entirely — Sirius sshd refuses
-# connections from PBS-allocated TCP source ports, and even when it works, `hostname -s`
-# vs the FQDN in `$PBS_NODEFILE` can mismatch and force a needless ssh round-trip.
-LOOPBACK=0
-if [ "$SERVER_HOST" = "$CLIENT_HOST" ]; then
-    LOOPBACK=1
+# Build per-rank wrapper. mpirun dispatches it to each rank; the wrapper
+# looks at OMPI_COMM_WORLD_RANK and execs `benchfs_locusta_demo` with the
+# right role + arg set. We avoid heredoc / quoting hell by writing to a
+# tmp file in $REGISTRY.
+WRAPPER="$REGISTRY/launch_demo.sh"
+cat > "$WRAPPER" <<EOF
+#!/bin/bash
+set -e
+exec >> "$REGISTRY/rank\${OMPI_COMM_WORLD_RANK}.log" 2>&1
+echo "[rank=\$OMPI_COMM_WORLD_RANK host=\$(hostname -s)] starting"
+case "\$OMPI_COMM_WORLD_RANK" in
+    0)
+        "$DEMO_BIN" --role server --local server_node --peer client_node \\
+            --registry-dir "$REGISTRY" --serve-secs $SERVE_SECS --mode $MODE
+        ;;
+    1)
+        # Give the server a moment to publish its QP info.
+        sleep 2
+        "$DEMO_BIN" --role client --local client_node --peer server_node \\
+            --registry-dir "$REGISTRY" --pings $PINGS --mode $MODE \\
+            --path $LOOKUP_PATH --payload-bytes $PAYLOAD_BYTES
+        ;;
+    *)
+        echo "[rank=\$OMPI_COMM_WORLD_RANK] unexpected rank; exiting"
+        exit 1
+        ;;
+esac
+EOF
+chmod +x "$WRAPPER"
+
+# `--map-by ppr:1:node` places exactly 1 process per host. With select=2
+# we get rank 0 on HOSTS[0] and rank 1 on HOSTS[1]. With select=1 (the
+# loopback case) we'd only get 1 process — skip and fall back below.
+if [ "${#HOSTS[@]}" -ge 2 ]; then
+    HOSTLIST=$(printf "%s," "${HOSTS[@]:0:2}")
+    HOSTLIST="${HOSTLIST%,}"
+    echo "mpirun -np 2 --host $HOSTLIST ..."
+    mpirun -np 2 --host "$HOSTLIST" --map-by ppr:1:node --bind-to none \
+        -x BENCHFS_TRANSPORT \
+        -x RUST_BACKTRACE \
+        "$WRAPPER" || echo "mpirun exit=$?"
+else
+    # 1-host loopback — just run both directly under bash.
+    echo "single-host loopback (no mpirun)"
+    OMPI_COMM_WORLD_RANK=0 bash "$WRAPPER" &
+    SERVER_PID=$!
+    sleep 2
+    OMPI_COMM_WORLD_RANK=1 bash "$WRAPPER" || echo "client exit=$?"
+    wait $SERVER_PID || true
 fi
-THIS_HOST_SHORT="$(hostname -s)"
-THIS_HOST_FQDN="$(hostname -f 2>/dev/null || echo "$THIS_HOST_SHORT")"
-run_on() {
-    local target="$1"; shift
-    if [ "$LOOPBACK" -eq 1 ] \
-       || [ "$target" = "$THIS_HOST_SHORT" ] \
-       || [ "$target" = "$THIS_HOST_FQDN" ] \
-       || [ "$target" = "$(hostname)" ]; then
-        bash -lc "$@"
-    else
-        ssh -o StrictHostKeyChecking=no "$target" bash -lc "$@"
-    fi
-}
-
-# Launch server in background on SERVER_HOST
-run_on "$SERVER_HOST" "
-    cd /work/NBB/rmaeda/workspace/rust/benchfs &&
-    $DEMO_BIN --role server --local server_node --peer client_node \
-      --registry-dir $REGISTRY --serve-secs $SERVE_SECS --mode $MODE \
-      2>&1 | sed 's/^/SRV: /'
-" > $REGISTRY/server.log 2>&1 &
-SERVER_PID=$!
-echo "server pid: $SERVER_PID"
-
-sleep 2  # let server prepare QP info
-
-# Run client in foreground on CLIENT_HOST
-run_on "$CLIENT_HOST" "
-    cd /work/NBB/rmaeda/workspace/rust/benchfs &&
-    $DEMO_BIN --role client --local client_node --peer server_node \
-      --registry-dir $REGISTRY --pings $PINGS --mode $MODE --path $LOOKUP_PATH \
-      2>&1 | sed 's/^/CLI: /'
-" > $REGISTRY/client.log 2>&1
-CLIENT_EXIT=$?
-echo "client exit: $CLIENT_EXIT"
-
-sleep 1
-wait $SERVER_PID || true
 
 echo ""
-echo "===Server log==="
-cat $REGISTRY/server.log
+echo "===rank0 (server) log==="
+cat "$REGISTRY/rank0.log" 2>/dev/null | head -60
 echo ""
-echo "===Client log==="
-cat $REGISTRY/client.log
+echo "===rank1 (client) log==="
+cat "$REGISTRY/rank1.log" 2>/dev/null
