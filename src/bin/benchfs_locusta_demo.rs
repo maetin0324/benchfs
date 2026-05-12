@@ -42,7 +42,7 @@ use benchfs::rpc::metadata_ops::{
 };
 use benchfs::rpc::transport::RpcTransport;
 use benchfs::rpc::transport_locusta::{
-    drain_server_requests, LocustaConfig, LocustaTransport,
+    drain_server_requests, extract_rpc_id, LocustaConfig, LocustaTransport,
 };
 
 /// RpcId used by BenchFS for `MetadataLookup`. Mirrors
@@ -169,12 +169,16 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
         drain_server_requests(&mut *inner, |req| {
             match req {
                 rrrpc::server::Request::RoundtripEager(h) => {
+                    // All locusta send_* paths prepend a 2-byte rpc_id.
+                    // Strip it before dispatching to the per-RPC body parser.
+                    let (_rpc_id, body) = extract_rpc_id(h.small_req())
+                        .expect("small_req missing rpc_id prefix");
                     let reply = match mode {
                         Mode::Raw => vec![0u8; 8],
                         // Both Metadata and Amrpc send the same wire format —
                         // header bytes followed by the path. The only
                         // difference is the client-side marshalling path.
-                        Mode::Metadata | Mode::Amrpc => serve_metadata_lookup(h.small_req()),
+                        Mode::Metadata | Mode::Amrpc => serve_metadata_lookup(body),
                         Mode::Put | Mode::Get | Mode::AmrpcPut => {
                             eprintln!("[server] unexpected RoundtripEager in {mode:?} mode");
                             vec![0u8; 8]

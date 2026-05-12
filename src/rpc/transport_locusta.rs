@@ -572,8 +572,11 @@ impl std::future::Future for WaitForResponse {
 }
 
 /// Helper for the server side of the loop: drain incoming requests and
-/// invoke a user-provided handler. Phase 2 will replace this with the
-/// AmRpc dispatch table.
+/// invoke a user-provided handler. The 2-byte `rpc_id` prefix encoded by
+/// [`stage_small_req`] is **not** stripped — handlers reading
+/// `h.small_req()` will see `[rpc_id_lo, rpc_id_hi, ...body]`. Use
+/// [`extract_rpc_id`] (or the higher-level `LocustaServerDispatch`) to
+/// decode it.
 pub fn drain_server_requests<F>(inner: &mut LocustaInner, mut handler: F)
 where
     F: FnMut(Request<RegisteredFixedBuffer>),
@@ -586,13 +589,41 @@ where
     inner.server.flush_all();
 }
 
-/// Flatten `parts` into `inner.small_req_scratch`, clearing the previous
-/// contents first. Returns the slice view of the populated bytes — borrows
-/// `inner` for the duration of the immediate caller's expression.
-fn stage_small_req<'b>(inner: &'b mut LocustaInner, parts: &[std::io::IoSlice<'_>]) -> &'b [u8] {
+/// Size of the BenchFS-level `rpc_id` prefix that
+/// [`LocustaTransport::send_*`] prepends to every locusta `small_req`.
+/// Server-side dispatchers strip this before handing the body to the
+/// RPC's parser.
+pub const LOCUSTA_RPC_ID_PREFIX_LEN: usize = 2;
+
+/// Decode the 2-byte little-endian `rpc_id` prefix from a `small_req`.
+/// Returns `(rpc_id, body_slice)` where `body_slice = small_req[2..]`.
+///
+/// Returns `None` if `small_req` is shorter than 2 bytes (malformed).
+pub fn extract_rpc_id(small_req: &[u8]) -> Option<(u16, &[u8])> {
+    if small_req.len() < LOCUSTA_RPC_ID_PREFIX_LEN {
+        return None;
+    }
+    let rpc_id = u16::from_le_bytes([small_req[0], small_req[1]]);
+    Some((rpc_id, &small_req[LOCUSTA_RPC_ID_PREFIX_LEN..]))
+}
+
+/// Flatten `parts` into `inner.small_req_scratch`, prepended by a
+/// 2-byte little-endian `rpc_id`. Returns the slice view of the
+/// populated bytes — borrows `inner` for the duration of the immediate
+/// caller's expression.
+///
+/// Every locusta send path goes through this so the wire format is
+/// uniform: server-side handlers can always read `small_req[0..2]` as
+/// the rpc_id and dispatch accordingly.
+fn stage_small_req<'b>(
+    inner: &'b mut LocustaInner,
+    rpc_id: u16,
+    parts: &[std::io::IoSlice<'_>],
+) -> &'b [u8] {
     inner.small_req_scratch.clear();
-    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let total: usize = LOCUSTA_RPC_ID_PREFIX_LEN + parts.iter().map(|p| p.len()).sum::<usize>();
     inner.small_req_scratch.reserve(total);
+    inner.small_req_scratch.extend_from_slice(&rpc_id.to_le_bytes());
     for slice in parts {
         inner.small_req_scratch.extend_from_slice(slice);
     }
@@ -603,14 +634,14 @@ impl RpcTransport for LocustaTransport {
     fn send_eager<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
             let dest_id = self.lookup_dest(dest)?;
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
-                let small_req = stage_small_req(&mut inner, parts);
+                let small_req = stage_small_req(&mut inner, rpc_id, parts);
                 // Re-borrow trick: stage_small_req keeps the borrow on the
                 // scratch field; submitting needs a separate mutable borrow
                 // on `client`. Both fields are disjoint members of inner so
@@ -649,7 +680,7 @@ impl RpcTransport for LocustaTransport {
     fn send_put<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
         payload: &'a [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
@@ -672,7 +703,7 @@ impl RpcTransport for LocustaTransport {
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
-                let small_req = stage_small_req(&mut inner, parts);
+                let small_req = stage_small_req(&mut inner, rpc_id, parts);
                 let small_req_slice = unsafe {
                     std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
                 };
@@ -707,7 +738,7 @@ impl RpcTransport for LocustaTransport {
     fn send_get<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
         recv: &'a mut [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
@@ -725,7 +756,7 @@ impl RpcTransport for LocustaTransport {
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
-                let small_req = stage_small_req(&mut inner, parts);
+                let small_req = stage_small_req(&mut inner, rpc_id, parts);
                 let small_req_slice = unsafe {
                     std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
                 };
@@ -773,13 +804,13 @@ impl RpcTransport for LocustaTransport {
     fn send_oneway<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<(), RpcError>> + 'a {
         async move {
             let dest_id = self.lookup_dest(dest)?;
             let mut inner = self.inner.borrow_mut();
-            let small_req = stage_small_req(&mut inner, parts);
+            let small_req = stage_small_req(&mut inner, rpc_id, parts);
             let small_req_slice =
                 unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
             inner
