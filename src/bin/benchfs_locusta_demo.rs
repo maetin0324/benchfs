@@ -28,6 +28,7 @@
 
 #![cfg(feature = "transport-locusta")]
 
+use std::io::IoSlice;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -356,8 +357,9 @@ fn run_client(
         let t0 = Instant::now();
         let result: Result<_, _> = match mode {
             Mode::Raw | Mode::Metadata => {
+                let parts = [IoSlice::new(&small_req)];
                 let mut fut =
-                    Box::pin(transport.send_eager(&peer_id, RPC_METADATA_LOOKUP, &small_req));
+                    Box::pin(transport.send_eager(&peer_id, RPC_METADATA_LOOKUP, &parts));
                 loop {
                     match Pin::as_mut(&mut fut).poll(&mut cx) {
                         Poll::Ready(r) => break r,
@@ -386,10 +388,11 @@ fn run_client(
                 })
             }
             Mode::Put => {
+                let parts = [IoSlice::new(&small_req)];
                 let mut fut = Box::pin(transport.send_put(
                     &peer_id,
                     RPC_METADATA_LOOKUP,
-                    &small_req,
+                    &parts,
                     &put_payload,
                 ));
                 loop {
@@ -400,10 +403,11 @@ fn run_client(
                 }
             }
             Mode::Get => {
+                let parts = [IoSlice::new(&small_req)];
                 let mut fut = Box::pin(transport.send_get(
                     &peer_id,
                     RPC_METADATA_LOOKUP,
-                    &small_req,
+                    &parts,
                     &mut get_recv,
                 ));
                 loop {

@@ -19,6 +19,8 @@
 
 #![cfg(feature = "transport-locusta")]
 
+use std::io::IoSlice;
+
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::rpc::transport::RpcTransport;
@@ -32,25 +34,38 @@ pub trait LocustaCallable: AmRpc {
     ///
     /// `peer` is the locusta `NodeId` of the target server, as registered
     /// via `LocustaConfig::peer_node_ids` at transport-init time.
+    ///
+    /// Hot path is zero-allocation: the request_header bytes and the
+    /// `request_data()` IoSlices are passed through to the transport as
+    /// a small `IoSlice` stack array, which the transport flattens into
+    /// its reusable scratch buffer.
     async fn call_locusta(
         &self,
         peer: &str,
         transport: &LocustaTransport,
     ) -> Result<Self::ResponseHeader, RpcError> {
-        let header_bytes = self.request_header().as_bytes().to_vec();
+        let header_bytes = self.request_header().as_bytes();
+        let data = self.request_data();
 
-        // For eager paths the wire format BenchFS uses is `header bytes ||
-        // request_data IoSlices` — same convention as the demo binary.
-        let mut small_req = header_bytes;
-        for slice in self.request_data() {
-            small_req.extend_from_slice(slice);
-        }
+        // Build a stack-allocated IoSlice array large enough for the
+        // common case (header + ≤4 data slices). Most BenchFS RPCs have
+        // 0 or 1 data slice, so this is overprovisioned but cheap.
+        let parts_storage: [IoSlice<'_>; 8] = std::array::from_fn(|i| {
+            if i == 0 {
+                IoSlice::new(header_bytes)
+            } else if i - 1 < data.len() {
+                IoSlice::new(&data[i - 1])
+            } else {
+                IoSlice::new(&[])
+            }
+        });
+        let parts = &parts_storage[..1 + data.len().min(7)];
 
+        let peer_id = peer.to_string();
         match self.call_type() {
             AmRpcCallType::None => {
-                let peer_id = peer.to_string();
                 let resp = transport
-                    .send_eager(&peer_id, Self::rpc_id(), &small_req)
+                    .send_eager(&peer_id, Self::rpc_id(), parts)
                     .await?;
                 Self::ResponseHeader::read_from_bytes(
                     &resp.header_bytes[..std::mem::size_of::<Self::ResponseHeader>()],

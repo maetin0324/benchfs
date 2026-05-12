@@ -61,39 +61,46 @@ impl RpcResponse {
 /// a single-threaded async runtime that runs futures on the local thread.
 /// Implementations may hold `Rc<RefCell<...>>` state without `Send` bounds.
 pub trait RpcTransport {
-    /// Send a small request and wait for a small response.
+    /// Send a small request (vectored) and wait for a small response.
+    ///
+    /// `parts` are concatenated into the wire `small_req`. Splitting the
+    /// header and the trailing path/data into separate slices lets
+    /// callers like [`crate::rpc::locusta_call::LocustaCallable`] skip
+    /// the per-call `Vec` allocation that a `&[u8]` API would force.
     fn send_eager<'a>(
         &'a self,
         dest: &'a NodeId,
         rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a;
 
-    /// Send a small request followed by a DMA-written bulk payload.
-    /// Returns when the server has acked the small response.
+    /// Send a small vectored request followed by a DMA-written bulk
+    /// payload. Returns when the server has acked the small response.
     fn send_put<'a>(
         &'a self,
         dest: &'a NodeId,
         rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
         payload: &'a [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a;
 
-    /// Send a small request and receive a DMA-read bulk response into `recv`.
-    /// `RpcResponse::data_len` reports the number of bytes written to `recv`.
+    /// Send a small vectored request and receive a DMA-read bulk
+    /// response into `recv`. `RpcResponse::data_len` reports the number
+    /// of bytes written to `recv`.
     fn send_get<'a>(
         &'a self,
         dest: &'a NodeId,
         rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
         recv: &'a mut [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a;
 
-    /// Fire-and-forget: send a small request without waiting for a reply.
+    /// Fire-and-forget: send a small vectored request without waiting
+    /// for a reply.
     fn send_oneway<'a>(
         &'a self,
         dest: &'a NodeId,
         rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<(), RpcError>> + 'a;
 }

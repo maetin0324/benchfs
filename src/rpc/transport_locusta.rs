@@ -63,6 +63,12 @@ pub struct LocustaInner {
     pub channel_base_ptr: *mut u8,
     pub channel_layout_total: usize,
     pub inflight: HashMap<u64, ResponseFuture>,
+    /// Reused scratch buffer for vectored `send_eager`/`send_put`/`send_get`
+    /// requests — locusta's `batch.call_*` API only accepts a contiguous
+    /// `&[u8]`, so we have to flatten `IoSlice`s here. Allocating once and
+    /// re-using avoids the per-RPC `Vec` churn that hurt the `LocustaCallable`
+    /// path.
+    pub small_req_scratch: Vec<u8>,
 }
 
 impl LocustaInner {
@@ -512,6 +518,9 @@ impl LocustaTransport {
             channel_base_ptr: shm_base,
             channel_layout_total: layout.total_size,
             inflight: HashMap::new(),
+            // Pre-size for typical metadata header + path (≤256B). Will
+            // grow once if larger inputs arrive.
+            small_req_scratch: Vec::with_capacity(256),
         };
         Ok(Self {
             inner: Rc::new(RefCell::new(inner)),
@@ -577,20 +586,42 @@ where
     inner.server.flush_all();
 }
 
+/// Flatten `parts` into `inner.small_req_scratch`, clearing the previous
+/// contents first. Returns the slice view of the populated bytes — borrows
+/// `inner` for the duration of the immediate caller's expression.
+fn stage_small_req<'b>(inner: &'b mut LocustaInner, parts: &[std::io::IoSlice<'_>]) -> &'b [u8] {
+    inner.small_req_scratch.clear();
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    inner.small_req_scratch.reserve(total);
+    for slice in parts {
+        inner.small_req_scratch.extend_from_slice(slice);
+    }
+    &inner.small_req_scratch
+}
+
 impl RpcTransport for LocustaTransport {
     fn send_eager<'a>(
         &'a self,
         dest: &'a NodeId,
         _rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
             let dest_id = self.lookup_dest(dest)?;
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
+                let small_req = stage_small_req(&mut inner, parts);
+                // Re-borrow trick: stage_small_req keeps the borrow on the
+                // scratch field; submitting needs a separate mutable borrow
+                // on `client`. Both fields are disjoint members of inner so
+                // we can split them via the raw `*mut LocustaInner`.
+                let small_req_ptr = small_req.as_ptr();
+                let small_req_len = small_req.len();
+                let small_req_slice =
+                    unsafe { std::slice::from_raw_parts(small_req_ptr, small_req_len) };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
-                    let fut = batch.call_eager(dest_id, header).map_err(|e| {
+                    let fut = batch.call_eager(dest_id, small_req_slice).map_err(|e| {
                         RpcError::TransportError(format!("call_eager: {e:?}"))
                     })?;
                     let id = fut.req_id();
@@ -619,7 +650,7 @@ impl RpcTransport for LocustaTransport {
         &'a self,
         dest: &'a NodeId,
         _rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
         payload: &'a [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
@@ -641,10 +672,14 @@ impl RpcTransport for LocustaTransport {
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
+                let small_req = stage_small_req(&mut inner, parts);
+                let small_req_slice = unsafe {
+                    std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
+                };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
                     let fut = batch
-                        .call_put(dest_id, header, &dma_buf)
+                        .call_put(dest_id, small_req_slice, &dma_buf)
                         .map_err(|e| RpcError::TransportError(format!("call_put: {e:?}")))?;
                     let id = fut.req_id();
                     (id, fut)
@@ -673,7 +708,7 @@ impl RpcTransport for LocustaTransport {
         &'a self,
         dest: &'a NodeId,
         _rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
         recv: &'a mut [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
@@ -690,10 +725,14 @@ impl RpcTransport for LocustaTransport {
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
+                let small_req = stage_small_req(&mut inner, parts);
+                let small_req_slice = unsafe {
+                    std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
+                };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
                     let fut = batch
-                        .call_get(dest_id, header, &dma_buf)
+                        .call_get(dest_id, small_req_slice, &dma_buf)
                         .map_err(|e| RpcError::TransportError(format!("call_get: {e:?}")))?;
                     let id = fut.req_id();
                     (id, fut)
@@ -735,12 +774,18 @@ impl RpcTransport for LocustaTransport {
         &'a self,
         dest: &'a NodeId,
         _rpc_id: u16,
-        header: &'a [u8],
+        parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<(), RpcError>> + 'a {
         async move {
             let dest_id = self.lookup_dest(dest)?;
             let mut inner = self.inner.borrow_mut();
-            inner.client.send_oneway_eager(dest_id, header).map_err(|e| {
+            let small_req = stage_small_req(&mut inner, parts);
+            let small_req_slice =
+                unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
+            inner
+                .client
+                .send_oneway_eager(dest_id, small_req_slice)
+                .map_err(|e| {
                 RpcError::TransportError(format!("send_oneway_eager: {e:?}"))
             })?;
             Ok(())
