@@ -580,12 +580,104 @@ pub extern "C" fn benchfs_init(
 
         ucx_reactor.register_worker(worker.clone());
 
-        // Create connection pool
-        let connection_pool = match ConnectionPool::new(worker, registry_dir_str) {
-            Ok(pool) => Rc::new(pool),
-            Err(e) => {
-                set_error_message(&format!("Failed to create connection pool: {:?}", e));
-                return std::ptr::null_mut();
+        // BENCHFS_TRANSPORT=locusta: build a locusta-backed connection pool
+        // with no static peers. Every `get_or_connect(node)` will lazy-run
+        // `LocustaTransport::add_peer(node, 30s)` before returning a
+        // locusta-backed RpcClient. Falls through to UCX otherwise.
+        let use_locusta = std::env::var("BENCHFS_TRANSPORT")
+            .map(|v| v.eq_ignore_ascii_case("locusta"))
+            .unwrap_or(false);
+        #[cfg(not(feature = "transport-locusta"))]
+        if use_locusta {
+            set_error_message(
+                "BENCHFS_TRANSPORT=locusta requires the transport-locusta feature",
+            );
+            return std::ptr::null_mut();
+        }
+        #[cfg(feature = "transport-locusta")]
+        let locusta_transport: Option<Rc<crate::rpc::transport_locusta::LocustaTransport>> =
+            if use_locusta {
+                use crate::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
+                use std::path::PathBuf;
+                let cfg = LocustaConfig {
+                    registry_dir: PathBuf::from(registry_dir_str).join("locusta_qp"),
+                    local_node_id: node_id_str.to_string(),
+                    peer_node_ids: Vec::new(),
+                    ..LocustaConfig::default()
+                };
+                if let Err(e) = std::fs::create_dir_all(&cfg.registry_dir) {
+                    set_error_message(&format!(
+                        "Failed to create locusta registry dir {}: {}",
+                        cfg.registry_dir.display(),
+                        e
+                    ));
+                    return std::ptr::null_mut();
+                }
+                match LocustaTransport::init(&cfg) {
+                    Ok(t) => {
+                        tracing::info!(
+                            "FFI client: LocustaTransport ready, registry={}",
+                            cfg.registry_dir.display()
+                        );
+                        Some(Rc::new(t))
+                    }
+                    Err(e) => {
+                        set_error_message(&format!(
+                            "Failed to init LocustaTransport: {:?}",
+                            e
+                        ));
+                        return std::ptr::null_mut();
+                    }
+                }
+            } else {
+                None
+            };
+
+        // Create connection pool. Locusta path skips UCX endpoint setup
+        // entirely and short-circuits inside ConnectionPool::get_or_connect.
+        let connection_pool = {
+            #[cfg(feature = "transport-locusta")]
+            {
+                if let Some(transport) = locusta_transport {
+                    match ConnectionPool::new_locusta(
+                        worker.clone(),
+                        registry_dir_str,
+                        transport,
+                    ) {
+                        Ok(pool) => Rc::new(pool),
+                        Err(e) => {
+                            set_error_message(&format!(
+                                "Failed to create locusta connection pool: {:?}",
+                                e
+                            ));
+                            return std::ptr::null_mut();
+                        }
+                    }
+                } else {
+                    match ConnectionPool::new(worker, registry_dir_str) {
+                        Ok(pool) => Rc::new(pool),
+                        Err(e) => {
+                            set_error_message(&format!(
+                                "Failed to create connection pool: {:?}",
+                                e
+                            ));
+                            return std::ptr::null_mut();
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "transport-locusta"))]
+            {
+                match ConnectionPool::new(worker, registry_dir_str) {
+                    Ok(pool) => Rc::new(pool),
+                    Err(e) => {
+                        set_error_message(&format!(
+                            "Failed to create connection pool: {:?}",
+                            e
+                        ));
+                        return std::ptr::null_mut();
+                    }
+                }
             }
         };
 
