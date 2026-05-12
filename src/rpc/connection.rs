@@ -267,7 +267,9 @@ impl ConnectionPool {
         node_id: &str,
         timeout_secs: u64,
     ) -> Result<Rc<RpcClient>, RpcError> {
-        // Wait for address to be available
+        // Wait for address to be available. For locusta the registry
+        // file content is just a sentinel — we don't unpack it, but the
+        // wait still has value as a "server is up" signal.
         let worker_address_bytes = self.registry.wait_for(node_id, timeout_secs).await?;
 
         // Check if connection already exists
@@ -277,6 +279,14 @@ impl ConnectionPool {
                 tracing::debug!("Reusing existing connection to {}", node_id);
                 return Ok(client.clone());
             }
+        }
+
+        // Locusta path: never touch the .addr bytes. `get_or_connect`
+        // already runs the QP handshake via `LocustaTransport::add_peer`
+        // for any peer not yet present.
+        #[cfg(feature = "transport-locusta")]
+        if self.locusta_transport.is_some() {
+            return self.get_or_connect(node_id).await;
         }
 
         // Store address bytes in cache to ensure the memory remains valid
