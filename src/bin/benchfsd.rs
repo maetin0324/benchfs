@@ -11,7 +11,7 @@
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
-use benchfs::logging::{init_with_chrome, init_with_perfetto, TraceGuard};
+use benchfs::logging::{TraceGuard, init_with_chrome, init_with_perfetto};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
@@ -72,7 +72,9 @@ fn main() {
             }
         } else if args[i] == "--help" || args[i] == "-h" {
             eprintln!("Usage: {} [config_file] [--trace-output <path>]", args[0]);
-            eprintln!("  config_file:            Configuration file (optional, default: benchfs.toml)");
+            eprintln!(
+                "  config_file:            Configuration file (optional, default: benchfs.toml)"
+            );
             eprintln!("  --trace-output <path>:  Enable Perfetto tracing (optional)");
             std::process::exit(0);
         } else {
@@ -124,7 +126,10 @@ fn main() {
     tracing::info!("BenchFS server stopped");
 }
 
-fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_server(
+    state: Rc<ServerState>,
+    enable_perfetto_tracks: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = &state.config;
 
     // Create pluvio runtime with optional Perfetto task tracking
@@ -187,7 +192,10 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
 
     // Create IOUringBackend for chunk storage
     // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
-    let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), uring_reactor.clone()));
+    let io_backend = Rc::new(IOUringBackend::new(
+        allocator.clone(),
+        uring_reactor.clone(),
+    ));
 
     // Create chunk store with io_uring backend
     let chunk_store_dir = config.node.data_dir.join("chunks");
@@ -330,10 +338,7 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>) -> Option<TraceGua
             Some(guard)
         } else if enable_chrome {
             let guard = init_with_chrome(level, trace_path);
-            tracing::info!(
-                "Chrome tracing enabled, output: {}",
-                trace_path.display()
-            );
+            tracing::info!("Chrome tracing enabled, output: {}", trace_path.display());
             Some(guard)
         } else {
             // Trace output path given but no format enabled - default to Perfetto

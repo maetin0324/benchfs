@@ -5,10 +5,10 @@ use std::rc::Rc;
 
 use tracing::instrument;
 
-use super::inode::{BenchfsChunk0Extension, PosixMetadataHeader, EXT_OFFSET, MSIZE};
-use zerocopy::IntoBytes;
+use super::inode::{BenchfsChunk0Extension, EXT_OFFSET, MSIZE, PosixMetadataHeader};
 use super::{FileHandle, IOUringBackend, OpenFlags, StorageBackend};
 use crate::metadata::CHUNK_SIZE;
+use zerocopy::IntoBytes;
 
 /// Chunk store trait for different storage backends
 ///
@@ -230,7 +230,12 @@ impl InMemoryChunkStore {
 
     /// Delete all chunks for a file
     #[async_backtrace::framed]
-    #[instrument(level = "trace", name = "inmemory_delete_file_chunks", skip(self), fields(path))]
+    #[instrument(
+        level = "trace",
+        name = "inmemory_delete_file_chunks",
+        skip(self),
+        fields(path)
+    )]
     pub async fn delete_file_chunks(&self, path: &str) -> ChunkStoreResult<usize> {
         let mut chunks = self.chunks.borrow_mut();
         let mut deleted_count = 0;
@@ -572,7 +577,9 @@ impl DummyChunkStore {
             "DummyChunkStore initialized (no-op, chunk_size={})",
             chunk_size,
         );
-        Self { _chunk_size: chunk_size }
+        Self {
+            _chunk_size: chunk_size,
+        }
     }
 
     #[async_backtrace::framed]
@@ -818,11 +825,9 @@ impl PosixChunkStore {
         // Ensure shard directory exists
         self.ensure_chunk_dir(file_path, chunk_index)?;
         let chunk_file_path = self.chunk_path(file_path, chunk_index);
-        let c_path = std::ffi::CString::new(
-            chunk_file_path
-                .to_str()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?,
-        )
+        let c_path = std::ffi::CString::new(chunk_file_path.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")
+        })?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         // Open
@@ -850,24 +855,40 @@ impl PosixChunkStore {
             slice[..aligned_len].fill(0);
             slice[..bytes_to_write].copy_from_slice(&data[..bytes_to_write]);
             let ret = unsafe {
-                libc::pwrite(fd, buf.as_slice().as_ptr() as *const libc::c_void, aligned_len, offset as libc::off_t)
+                libc::pwrite(
+                    fd,
+                    buf.as_slice().as_ptr() as *const libc::c_void,
+                    aligned_len,
+                    offset as libc::off_t,
+                )
             };
             if ret < 0 {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
             }
             // Truncate file to actual size if we wrote padding beyond data
             let actual_end = offset as usize + bytes_to_write;
             if aligned_len > bytes_to_write {
-                unsafe { libc::ftruncate(fd, actual_end as libc::off_t); }
+                unsafe {
+                    libc::ftruncate(fd, actual_end as libc::off_t);
+                }
             }
             bytes_to_write
         } else {
             let ret = unsafe {
-                libc::pwrite(fd, data.as_ptr() as *const libc::c_void, bytes_to_write, offset as libc::off_t)
+                libc::pwrite(
+                    fd,
+                    data.as_ptr() as *const libc::c_void,
+                    bytes_to_write,
+                    offset as libc::off_t,
+                )
             };
             if ret < 0 {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
             }
             ret as usize
@@ -876,7 +897,9 @@ impl PosixChunkStore {
 
         // Close
         let close_start = std::time::Instant::now();
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         let close_elapsed = close_start.elapsed();
 
         let total_elapsed = total_start.elapsed();
@@ -919,11 +942,9 @@ impl PosixChunkStore {
             });
         }
 
-        let c_path = std::ffi::CString::new(
-            chunk_file_path
-                .to_str()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?,
-        )
+        let c_path = std::ffi::CString::new(chunk_file_path.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")
+        })?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         // Open
@@ -947,10 +968,17 @@ impl PosixChunkStore {
             let mut buf = self.aligned_buffer.borrow_mut();
             let aligned_len = (read_len + 511) & !511;
             let ret = unsafe {
-                libc::pread(fd, buf.as_mut_slice().as_ptr() as *mut libc::c_void, aligned_len, offset as libc::off_t)
+                libc::pread(
+                    fd,
+                    buf.as_mut_slice().as_ptr() as *mut libc::c_void,
+                    aligned_len,
+                    offset as libc::off_t,
+                )
             };
             if ret < 0 {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
             }
             let bytes_read = (ret as usize).min(read_len);
@@ -958,10 +986,17 @@ impl PosixChunkStore {
         } else {
             let mut data = vec![0u8; read_len];
             let ret = unsafe {
-                libc::pread(fd, data.as_mut_ptr() as *mut libc::c_void, read_len, offset as libc::off_t)
+                libc::pread(
+                    fd,
+                    data.as_mut_ptr() as *mut libc::c_void,
+                    read_len,
+                    offset as libc::off_t,
+                )
             };
             if ret < 0 {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
             }
             data.truncate(ret as usize);
@@ -971,7 +1006,9 @@ impl PosixChunkStore {
 
         // Close
         let close_start = std::time::Instant::now();
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         let close_elapsed = close_start.elapsed();
 
         let total_elapsed = total_start.elapsed();
@@ -1017,11 +1054,9 @@ impl PosixChunkStore {
             });
         }
 
-        let c_path = std::ffi::CString::new(
-            chunk_file_path
-                .to_str()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?,
-        )
+        let c_path = std::ffi::CString::new(chunk_file_path.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path")
+        })?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         // Open
@@ -1045,10 +1080,17 @@ impl PosixChunkStore {
             let mut aligned_buf = self.aligned_buffer.borrow_mut();
             let aligned_len = (read_len + 511) & !511;
             let ret = unsafe {
-                libc::pread(fd, aligned_buf.as_mut_slice().as_ptr() as *mut libc::c_void, aligned_len, offset as libc::off_t)
+                libc::pread(
+                    fd,
+                    aligned_buf.as_mut_slice().as_ptr() as *mut libc::c_void,
+                    aligned_len,
+                    offset as libc::off_t,
+                )
             };
             if ret < 0 {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
             }
             let actual = (ret as usize).min(read_len);
@@ -1057,10 +1099,17 @@ impl PosixChunkStore {
         } else {
             // Non-O_DIRECT: read directly into destination buffer
             let ret = unsafe {
-                libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, read_len, offset as libc::off_t)
+                libc::pread(
+                    fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    read_len,
+                    offset as libc::off_t,
+                )
             };
             if ret < 0 {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
             }
             ret as usize
@@ -1069,7 +1118,9 @@ impl PosixChunkStore {
 
         // Close
         let close_start = std::time::Instant::now();
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         let close_elapsed = close_start.elapsed();
 
         let total_elapsed = total_start.elapsed();
@@ -1319,11 +1370,7 @@ impl IOUringChunkStore {
     /// the header was already written in this process or persisted to disk
     /// (size >= MSIZE). Mirrors CHFS's `set_metadata` / `fs_open` create path
     /// (chfs/chfsd/fs_posix.c).
-    async fn ensure_chunk_header(
-        &self,
-        file_path: &str,
-        chunk_index: u64,
-    ) -> ChunkStoreResult<()> {
+    async fn ensure_chunk_header(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<()> {
         let key = ChunkKey::new(file_path.to_string(), chunk_index);
         if self.header_initialized.borrow().contains(&key) {
             return Ok(());
@@ -1499,10 +1546,7 @@ impl IOUringChunkStore {
             direct: false,
         };
         let handle = self.backend.open(&chunk_file_path, flags).await?;
-        let result = self
-            .backend
-            .write(handle, EXT_OFFSET, ext.as_bytes())
-            .await;
+        let result = self.backend.write(handle, EXT_OFFSET, ext.as_bytes()).await;
         if let Err(e) = self.backend.close(handle).await {
             tracing::warn!("Failed to close chunk file after ext write: {:?}", e);
         }

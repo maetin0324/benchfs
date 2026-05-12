@@ -7,28 +7,28 @@
 //!   Server: benchfs_perf server --registry-dir /shared/path --data-dir /local/data
 //!   Client: benchfs_perf client --registry-dir /shared/path --server-node server
 
-use benchfs::logging::{init_with_perfetto, PerfettoGuard};
+use benchfs::logging::{PerfettoGuard, init_with_perfetto};
 use benchfs::metadata::MetadataManager;
+use benchfs::rpc::AmRpc;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
 use benchfs::rpc::file_id::FileId;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
-use benchfs::rpc::AmRpc;
 use benchfs::storage::{IOUringBackend, IOUringChunkStore};
 
 use clap::{Parser, Subcommand};
 use pluvio_runtime::executor::Runtime;
 use pluvio_timer::TimerReactor;
-use pluvio_ucx::reactor::UCXReactor;
 use pluvio_ucx::Context as UcxContext;
+use pluvio_ucx::reactor::UCXReactor;
 use pluvio_uring::reactor::IoUringReactor;
 use tracing::instrument;
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// BenchFS Performance Analysis Tool
@@ -174,15 +174,37 @@ impl BenchmarkStats {
     fn print_report(&self, name: &str) {
         println!("\n===== {} Results =====", name);
         println!("Operations:   {}", self.latencies.len());
-        println!("Total bytes:  {} bytes ({:.2} MB)", self.total_bytes, self.total_bytes as f64 / 1024.0 / 1024.0);
-        println!("Total time:   {:.3} ms", self.total_time.as_secs_f64() * 1000.0);
+        println!(
+            "Total bytes:  {} bytes ({:.2} MB)",
+            self.total_bytes,
+            self.total_bytes as f64 / 1024.0 / 1024.0
+        );
+        println!(
+            "Total time:   {:.3} ms",
+            self.total_time.as_secs_f64() * 1000.0
+        );
         println!("Throughput:   {:.2} MB/s", self.throughput_mbps());
         println!("IOPS:         {:.2}", self.iops());
-        println!("Latency (min):  {:.3} us", self.min_latency().as_secs_f64() * 1_000_000.0);
-        println!("Latency (avg):  {:.3} us", self.avg_latency().as_secs_f64() * 1_000_000.0);
-        println!("Latency (p50):  {:.3} us", self.p50_latency().as_secs_f64() * 1_000_000.0);
-        println!("Latency (p99):  {:.3} us", self.p99_latency().as_secs_f64() * 1_000_000.0);
-        println!("Latency (max):  {:.3} us", self.max_latency().as_secs_f64() * 1_000_000.0);
+        println!(
+            "Latency (min):  {:.3} us",
+            self.min_latency().as_secs_f64() * 1_000_000.0
+        );
+        println!(
+            "Latency (avg):  {:.3} us",
+            self.avg_latency().as_secs_f64() * 1_000_000.0
+        );
+        println!(
+            "Latency (p50):  {:.3} us",
+            self.p50_latency().as_secs_f64() * 1_000_000.0
+        );
+        println!(
+            "Latency (p99):  {:.3} us",
+            self.p99_latency().as_secs_f64() * 1_000_000.0
+        );
+        println!(
+            "Latency (max):  {:.3} us",
+            self.max_latency().as_secs_f64() * 1_000_000.0
+        );
     }
 }
 
@@ -309,7 +331,10 @@ fn run_server(
     let metadata_manager = Rc::new(MetadataManager::new(node_id.to_string()));
 
     // Create IOUringBackend for chunk storage
-    let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), uring_reactor.clone()));
+    let io_backend = Rc::new(IOUringBackend::new(
+        allocator.clone(),
+        uring_reactor.clone(),
+    ));
 
     // Create chunk store
     let chunk_store_dir = data_dir.join("chunks");
@@ -356,7 +381,7 @@ fn run_server(
                     }
                     pluvio_timer::sleep(Duration::from_millis(1000)).await;
                 }
-                
+
                 Ok::<(), std::io::Error>(())
             },
             "perf_server".to_string(),
@@ -482,7 +507,11 @@ async fn run_benchmark(
     }
 
     // Write benchmark
-    tracing::info!("Running write benchmark ({} iterations, {} bytes each)...", iterations, block_size);
+    tracing::info!(
+        "Running write benchmark ({} iterations, {} bytes each)...",
+        iterations,
+        block_size
+    );
     let mut write_stats = BenchmarkStats::new();
     let write_start = Instant::now();
 
@@ -502,7 +531,11 @@ async fn run_benchmark(
         if response.is_success() {
             write_stats.record(latency, response.bytes_written);
         } else {
-            tracing::warn!("Write failed for chunk {}: status={}", chunk_index, response.status);
+            tracing::warn!(
+                "Write failed for chunk {}: status={}",
+                chunk_index,
+                response.status
+            );
         }
 
         if (i + 1) % 100 == 0 {
@@ -514,7 +547,11 @@ async fn run_benchmark(
     write_stats.print_report("Write Benchmark");
 
     // Read benchmark
-    tracing::info!("Running read benchmark ({} iterations, {} bytes each)...", iterations, block_size);
+    tracing::info!(
+        "Running read benchmark ({} iterations, {} bytes each)...",
+        iterations,
+        block_size
+    );
     let mut read_stats = BenchmarkStats::new();
     let read_start = Instant::now();
 
@@ -524,12 +561,8 @@ async fn run_benchmark(
 
         // Use FileId-based RPC for compact headers (32 bytes vs 288 bytes)
         let file_id = FileId::new(&test_path, chunk_index);
-        let read_req = ReadChunkByIdRequest::from_file_id(
-            file_id,
-            0,
-            block_size as u64,
-            &mut read_buffer,
-        );
+        let read_req =
+            ReadChunkByIdRequest::from_file_id(file_id, 0, block_size as u64, &mut read_buffer);
         let response = read_req
             .call(&client)
             .await
@@ -540,7 +573,11 @@ async fn run_benchmark(
         if response.is_success() {
             read_stats.record(latency, response.bytes_read);
         } else {
-            tracing::warn!("Read failed for chunk {}: status={}", chunk_index, response.status);
+            tracing::warn!(
+                "Read failed for chunk {}: status={}",
+                chunk_index,
+                response.status
+            );
         }
 
         if (i + 1) % 100 == 0 {

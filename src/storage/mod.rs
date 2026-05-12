@@ -10,7 +10,7 @@ pub use chunk_store::{
     IOUringChunkStore, InMemoryChunkStore, PosixChunkStore,
 };
 pub use error::{StorageError, StorageResult};
-pub use inode::{BenchfsChunk0Extension, PosixMetadataHeader, EXT_OFFSET, MSIZE};
+pub use inode::{BenchfsChunk0Extension, EXT_OFFSET, MSIZE, PosixMetadataHeader};
 pub use iouring::IOUringBackend;
 pub use local::LocalFileSystem;
 

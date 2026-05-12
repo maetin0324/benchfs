@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pluvio_timer::{timeout, TimeoutError};
+use pluvio_timer::{TimeoutError, timeout};
 use tracing::instrument;
 
 use crate::rpc::{AmRpc, Connection, RpcError};
@@ -89,7 +89,10 @@ pub fn write_retry_stats_to_csv(path: &str, node_id: &str) -> std::io::Result<()
     }
 
     let mut file = File::create(path)?;
-    writeln!(file, "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate")?;
+    writeln!(
+        file,
+        "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate"
+    )?;
     writeln!(
         file,
         "{},{},{},{},{},{:.4}",
@@ -362,7 +365,7 @@ impl RpcClient {
                     );
                     pluvio_timer::sleep(delay).await;
                     delay = Duration::from_secs_f64(
-                        delay.as_secs_f64() * retry_config.backoff_multiplier
+                        delay.as_secs_f64() * retry_config.backoff_multiplier,
                     );
                 }
                 Err(e) => {
@@ -386,7 +389,11 @@ impl RpcClient {
     #[async_backtrace::framed]
     async fn execute_once<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         let stats_enabled = is_stats_enabled();
-        let exec_start = if stats_enabled { Some(Instant::now()) } else { None };
+        let exec_start = if stats_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         let timeout_duration = get_rpc_timeout();
         let rpc_id = T::rpc_id();
@@ -406,13 +413,21 @@ impl RpcClient {
         );
 
         let stream_start = exec_start.map(|_| Instant::now());
-        let reply_stream = self.conn.as_ref().unwrap().worker.am_stream(reply_stream_id).map_err(|e| {
-            RpcError::TransportError(format!(
-                "Failed to create reply AM stream: {:?}",
-                e.to_string()
-            ))
-        })?;
-        let stream_us = stream_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let reply_stream = self
+            .conn
+            .as_ref()
+            .unwrap()
+            .worker
+            .am_stream(reply_stream_id)
+            .map_err(|e| {
+                RpcError::TransportError(format!(
+                    "Failed to create reply AM stream: {:?}",
+                    e.to_string()
+                ))
+            })?;
+        let stream_us = stream_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         tracing::trace!("Created reply stream: stream_id={}", reply_stream_id);
 
@@ -463,7 +478,9 @@ impl RpcClient {
                 return Err(RpcError::Timeout);
             }
         }
-        let send_us = send_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let send_us = send_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         tracing::debug!(
             "Waiting for reply on stream_id={}, rpc_id={}, timeout_secs={}",
@@ -495,7 +512,9 @@ impl RpcClient {
                 return Err(RpcError::Timeout);
             }
         };
-        let wait_us = wait_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let wait_us = wait_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         tracing::debug!(
             "Received reply message: rpc_id={}, reply_stream_id={}",
@@ -539,7 +558,9 @@ impl RpcClient {
             }
         }
 
-        let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let recv_us = recv_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         if let Some(start) = exec_start {
             let total_us = start.elapsed().as_micros() as u64;
@@ -626,7 +647,7 @@ impl RpcClient {
                     );
                     pluvio_timer::sleep(delay).await;
                     delay = Duration::from_secs_f64(
-                        delay.as_secs_f64() * retry_config.backoff_multiplier
+                        delay.as_secs_f64() * retry_config.backoff_multiplier,
                     );
                 }
                 Err(e) => {

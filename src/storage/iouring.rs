@@ -101,7 +101,11 @@ impl IOUringBackend {
         };
 
         // Measure io_uring write_fixed operation time (only when stats enabled)
-        let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
+        let start = if is_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let write_len = data_len.min(fixed_buffer.len()) as u32;
 
@@ -175,7 +179,11 @@ impl IOUringBackend {
         };
 
         // Measure io_uring read_fixed operation time (only when stats enabled)
-        let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
+        let start = if is_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let read_len = read_len.min(fixed_buffer.len()) as u32;
 
@@ -225,9 +233,10 @@ impl StorageBackend for IOUringBackend {
         let mode = 0o644u32;
 
         // Async file open via io_uring OpenAt
-        let dma_file = DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
-            .await
-            .map_err(|e| Self::map_io_error(e, path))?;
+        let dma_file =
+            DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
+                .await
+                .map_err(|e| Self::map_io_error(e, path))?;
 
         let dma_file = Rc::new(dma_file);
         let fd = self.allocate_fd();
@@ -363,9 +372,10 @@ impl StorageBackend for IOUringBackend {
         let linux_flags = libc::O_WRONLY | libc::O_CREAT;
 
         // Async file create via io_uring OpenAt
-        let dma_file = DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
-            .await
-            .map_err(|e| Self::map_io_error(e, path))?;
+        let dma_file =
+            DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
+                .await
+                .map_err(|e| Self::map_io_error(e, path))?;
 
         let dma_file = Rc::new(dma_file);
         let fd = self.allocate_fd();
@@ -592,9 +602,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("new_file.txt");
 
-        runtime
-            .clone()
-            .run_with_name_and_runtime("iouring_backend_test_create_write", async move {
+        runtime.clone().run_with_name_and_runtime(
+            "iouring_backend_test_create_write",
+            async move {
                 let backend = IOUringBackend::new(allocator, reactor);
 
                 // ファイルを作成
@@ -611,6 +621,7 @@ mod tests {
 
                 // ファイルが存在することを確認
                 assert!(test_file.exists());
-            });
+            },
+        );
     }
 }

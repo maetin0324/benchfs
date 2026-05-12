@@ -62,12 +62,13 @@ pub trait LocustaCallable: AmRpc {
         let parts = &parts_storage[..1 + data.len().min(7)];
 
         let peer_id = peer.to_string();
-        let decode = |resp: crate::rpc::transport::RpcResponse| -> Result<Self::ResponseHeader, RpcError> {
-            Self::ResponseHeader::read_from_bytes(
-                &resp.header_bytes[..std::mem::size_of::<Self::ResponseHeader>()],
-            )
-            .map_err(|_| RpcError::InvalidHeader)
-        };
+        let decode =
+            |resp: crate::rpc::transport::RpcResponse| -> Result<Self::ResponseHeader, RpcError> {
+                Self::ResponseHeader::read_from_bytes(
+                    &resp.header_bytes[..std::mem::size_of::<Self::ResponseHeader>()],
+                )
+                .map_err(|_| RpcError::InvalidHeader)
+            };
 
         match self.call_type() {
             AmRpcCallType::None => {

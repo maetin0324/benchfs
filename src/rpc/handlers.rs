@@ -102,7 +102,9 @@ impl RpcHandlerContext {
     /// handlers, which require the chunk-0 header / extension helpers
     /// only present on `IOUringChunkStore`.
     fn iouring_chunk_store(&self) -> Option<&IOUringChunkStore> {
-        self.chunk_store.as_any().downcast_ref::<IOUringChunkStore>()
+        self.chunk_store
+            .as_any()
+            .downcast_ref::<IOUringChunkStore>()
     }
 
     pub fn acquire_path_buffer(&self) -> PathBufferLease {
@@ -456,13 +458,13 @@ pub async fn handle_metadata_lookup(
                     ext.logical_size
                 );
                 // Repopulate the in-memory cache for next time.
-                let _ = ctx.metadata_manager.store_file_metadata(
-                    crate::metadata::FileMetadata::new(path.clone(), ext.logical_size),
-                );
-                return Ok((
-                    MetadataLookupResponseHeader::file(ext.logical_size),
-                    am_msg,
-                ));
+                let _ =
+                    ctx.metadata_manager
+                        .store_file_metadata(crate::metadata::FileMetadata::new(
+                            path.clone(),
+                            ext.logical_size,
+                        ));
+                return Ok((MetadataLookupResponseHeader::file(ext.logical_size), am_msg));
             }
             Ok(None) => { /* fall through to directory check */ }
             Err(e) => {

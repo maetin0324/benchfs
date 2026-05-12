@@ -14,16 +14,16 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::field::{Field, Visit};
-use tracing::{span, Event, Id, Subscriber};
+use tracing::{Event, Id, Subscriber, span};
+use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
 
 // Re-export track ID functions from pluvio_runtime for convenience
 pub use pluvio_runtime::track::{
-    acquire_track_id, get_current_track_id, release_track_id, set_current_track_id, tracked,
-    TrackedFuture,
+    TrackedFuture, acquire_track_id, get_current_track_id, release_track_id, set_current_track_id,
+    tracked,
 };
 
 #[path = "perfetto_protos.rs"]
@@ -42,9 +42,7 @@ thread_local! {
 
 /// Convert a track ID to a unique track UUID.
 fn track_id_to_uuid(track_id: u64) -> u64 {
-    BASE_TRACK_UUID.with(|base| {
-        base.wrapping_add(track_id.wrapping_mul(0x9E3779B97F4A7C15))
-    })
+    BASE_TRACK_UUID.with(|base| base.wrapping_add(track_id.wrapping_mul(0x9E3779B97F4A7C15)))
 }
 
 /// Convert a track ID to a unique sequence ID (32-bit for Perfetto protocol).
@@ -144,9 +142,9 @@ impl<W: PerfettoWriter> TaskPerfettoLayer<W> {
         let mut track_desc = idl::TrackDescriptor::default();
         track_desc.uuid = Some(track_uuid);
         track_desc.parent_uuid = Some(self.process_track_uuid);
-        track_desc.static_or_dynamic_name = Some(
-            idl::track_descriptor::StaticOrDynamicName::Name(track_name.to_string())
-        );
+        track_desc.static_or_dynamic_name = Some(idl::track_descriptor::StaticOrDynamicName::Name(
+            track_name.to_string(),
+        ));
         track_desc.thread = Some(thread);
 
         let mut packet = idl::TracePacket::default();
@@ -193,7 +191,7 @@ impl<W: PerfettoWriter> TaskPerfettoLayer<W> {
             source_location.file_name = Some(file.to_owned());
             source_location.line_number = Some(line);
             event.source_location_field = Some(
-                idl::track_event::SourceLocationField::SourceLocation(source_location)
+                idl::track_event::SourceLocationField::SourceLocation(source_location),
             );
         }
         event
@@ -202,7 +200,7 @@ impl<W: PerfettoWriter> TaskPerfettoLayer<W> {
 
 /// Data stored with each span to associate it with a track.
 struct SpanData {
-    track_id: u64,     // Store track_id to derive sequence_id in on_close()
+    track_id: u64, // Store track_id to derive sequence_id in on_close()
     track_uuid: u64,
     trace: idl::Trace,
 }
@@ -216,64 +214,86 @@ struct DebugAnnotations {
 impl Visit for DebugAnnotations {
     fn record_bool(&mut self, field: &Field, value: bool) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
         annotation.value = Some(idl::debug_annotation::Value::BoolValue(value));
         self.annotations.push(annotation);
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
         annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
         self.annotations.push(annotation);
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
         annotation.value = Some(idl::debug_annotation::Value::DoubleValue(value));
         self.annotations.push(annotation);
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
         annotation.value = Some(idl::debug_annotation::Value::IntValue(value));
         self.annotations.push(annotation);
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
         annotation.value = Some(idl::debug_annotation::Value::IntValue(value as i64));
         self.annotations.push(annotation);
     }
 
     fn record_i128(&mut self, field: &Field, value: i128) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
         annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
         self.annotations.push(annotation);
     }
 
     fn record_u128(&mut self, field: &Field, value: u128) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
         annotation.value = Some(idl::debug_annotation::Value::StringValue(value.to_string()));
         self.annotations.push(annotation);
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
-        annotation.value = Some(idl::debug_annotation::Value::StringValue(format!("{value:?}")));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
+            "{value:?}"
+        )));
         self.annotations.push(annotation);
     }
 
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
         let mut annotation = idl::DebugAnnotation::default();
-        annotation.name_field = Some(idl::debug_annotation::NameField::Name(field.name().to_string()));
-        annotation.value = Some(idl::debug_annotation::Value::StringValue(format!("{value}")));
+        annotation.name_field = Some(idl::debug_annotation::NameField::Name(
+            field.name().to_string(),
+        ));
+        annotation.value = Some(idl::debug_annotation::Value::StringValue(format!(
+            "{value}"
+        )));
         self.annotations.push(annotation);
     }
 }
@@ -344,7 +364,9 @@ where
                 if let Some(idl::trace_packet::Data::TrackEvent(event)) = &mut packet.data {
                     let mut debug_annotations = DebugAnnotations::default();
                     values.record(&mut debug_annotations);
-                    event.debug_annotations.append(&mut debug_annotations.annotations);
+                    event
+                        .debug_annotations
+                        .append(&mut debug_annotations.annotations);
                 }
             }
         }

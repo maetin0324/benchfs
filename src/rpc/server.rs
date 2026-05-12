@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pluvio_ucx::{Worker, async_ucx::ucp::WorkerAddress, am::AmStream};
+use pluvio_ucx::{Worker, am::AmStream, async_ucx::ucp::WorkerAddress};
 use tracing::instrument;
 
 use crate::rpc::handlers::RpcHandlerContext;

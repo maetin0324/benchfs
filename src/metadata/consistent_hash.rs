@@ -67,11 +67,7 @@ impl ConsistentHashRing {
 
         self.nodes.push(node_id.clone());
 
-        tracing::debug!(
-            "Added node {} (total nodes: {})",
-            node_id,
-            self.nodes.len()
-        );
+        tracing::debug!("Added node {} (total nodes: {})", node_id, self.nodes.len());
     }
 
     /// ノードをリングから削除

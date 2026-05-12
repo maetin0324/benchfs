@@ -7,11 +7,11 @@
 //! delete, etc.) and verifies that the filesystem behaves correctly.
 
 use proptest::prelude::*;
-use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
+use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Maximum file size for testing (1MB)
@@ -648,7 +648,14 @@ impl StateMachineTest for BenchFSStateMachineTest {
 
         // Verify result matches expected state
         match (&transition, result) {
-            (Transition::ReadFile { path, offset, length }, TransitionResult::ReadData(data)) => {
+            (
+                Transition::ReadFile {
+                    path,
+                    offset,
+                    length,
+                },
+                TransitionResult::ReadData(data),
+            ) => {
                 if let Some(expected_contents) = ref_state.files.get(path) {
                     let expected_end = (*offset as usize + *length).min(expected_contents.len());
                     let expected_start = (*offset as usize).min(expected_contents.len());
