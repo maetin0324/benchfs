@@ -765,6 +765,24 @@ fn stage_small_req<'b>(
     &inner.small_req_scratch
 }
 
+/// Register `LocustaTransport` as a pluvio reactor: each runtime tick
+/// will call `inner.tick()`. This makes the runtime see locusta as
+/// "making progress" so the 1M-iteration stuck watchdog doesn't fire
+/// while a long DMA RPC is in flight, and removes the need for
+/// `WaitForResponse` to busy-poll inline.
+impl pluvio_runtime::reactor::Reactor for LocustaTransport {
+    fn poll(&self) {
+        // try_borrow_mut so we don't panic if a future is currently
+        // holding the inner borrow (it will tick on its own anyway).
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.tick();
+        }
+    }
+    fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
+        pluvio_runtime::reactor::ReactorStatus::Running
+    }
+}
+
 impl RpcTransport for LocustaTransport {
     fn send_eager<'a>(
         &'a self,

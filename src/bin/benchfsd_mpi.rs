@@ -578,13 +578,17 @@ fn run_server(
 
     #[cfg(feature = "transport-locusta")]
     let locusta_state = if use_locusta {
-        Some(init_locusta_runtime(
+        let s = init_locusta_runtime(
             &node_id,
             state.mpi_rank,
             state.mpi_size,
             registry_dir,
             handler_context.clone(),
-        )?)
+        )?;
+        // Register locusta as a reactor so the runtime's stuck watchdog
+        // doesn't fire while DMA RPCs are in flight.
+        runtime.register_reactor("locusta", Rc::clone(&s.transport));
+        Some(s)
     } else {
         None
     };

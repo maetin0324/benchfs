@@ -619,7 +619,13 @@ pub extern "C" fn benchfs_init(
                             "FFI client: LocustaTransport ready, registry={}",
                             cfg.registry_dir.display()
                         );
-                        Some(Rc::new(t))
+                        let transport = Rc::new(t);
+                        // Register locusta as a reactor so each runtime
+                        // tick drives the state machines. Without this
+                        // pluvio's 1M-iteration stuck watchdog fires
+                        // while a long write RPC is in flight.
+                        runtime.register_reactor("locusta", Rc::clone(&transport));
+                        Some(transport)
                     }
                     Err(e) => {
                         set_error_message(&format!("Failed to init LocustaTransport: {:?}", e));
