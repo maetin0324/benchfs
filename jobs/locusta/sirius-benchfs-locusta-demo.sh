@@ -36,13 +36,21 @@ MODE=${MODE:-metadata}            # raw | metadata
 LOOKUP_PATH=${LOOKUP_PATH:-/test/file.bin}
 
 # Helper: run a command either via ssh (different host) or directly (same host as the
-# script). PBS allocates this script onto the first chunk's host, so an ssh into that
-# same host can be replaced by a direct invocation, which avoids sshd loopback
-# rejection (Sirius sshd refuses connections from PBS-allocated TCP source ports).
-THIS_HOST="$(hostname -s)"
+# script). For single-host (loopback) jobs we skip ssh entirely — Sirius sshd refuses
+# connections from PBS-allocated TCP source ports, and even when it works, `hostname -s`
+# vs the FQDN in `$PBS_NODEFILE` can mismatch and force a needless ssh round-trip.
+LOOPBACK=0
+if [ "$SERVER_HOST" = "$CLIENT_HOST" ]; then
+    LOOPBACK=1
+fi
+THIS_HOST_SHORT="$(hostname -s)"
+THIS_HOST_FQDN="$(hostname -f 2>/dev/null || echo "$THIS_HOST_SHORT")"
 run_on() {
     local target="$1"; shift
-    if [ "$target" = "$THIS_HOST" ]; then
+    if [ "$LOOPBACK" -eq 1 ] \
+       || [ "$target" = "$THIS_HOST_SHORT" ] \
+       || [ "$target" = "$THIS_HOST_FQDN" ] \
+       || [ "$target" = "$(hostname)" ]; then
         bash -lc "$@"
     else
         ssh -o StrictHostKeyChecking=no "$target" bash -lc "$@"

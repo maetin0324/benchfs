@@ -24,6 +24,8 @@
 #![cfg(feature = "transport-locusta")]
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 
 use rrrpc::server::Request;
@@ -37,33 +39,35 @@ use crate::rpc::AmRpc;
 
 /// Server-side handler for a single AmRpc type, dispatched by locusta.
 ///
-/// Implementations parse the rpc-specific header from `body` (the
-/// `small_req` after the rpc_id prefix has been stripped), execute the
-/// business logic against `ctx`, and call the appropriate consumer on
-/// the `req` handle.
+/// Async because chunk RPCs need to interact with the io_uring-backed
+/// `ChunkStore`. Sync RPCs (metadata) implement this trivially with
+/// `async fn` that contains no `.await`.
 ///
-/// The trait is intentionally generic over the `AmRpc` type so the
-/// dispatcher can pick up `Self::rpc_id()` automatically when the
-/// caller does `dispatch.register::<MyRequest>()`.
+/// Parameters are owned (not borrowed) so the returned future is
+/// `'static` — needed to spawn it on `pluvio_runtime::executor`.
+#[allow(async_fn_in_trait)]
 pub trait LocustaServerHandler: AmRpc {
-    /// Run the request to completion. The handler is consumed (must
-    /// call `req.reply()` / `req.grant()` etc. or let it drop, which
-    /// produces an error response).
-    fn handle_locusta(ctx: &Rc<RpcHandlerContext>, body: &[u8], req: Request<RegisteredFixedBuffer>);
+    async fn handle_locusta(
+        ctx: Rc<RpcHandlerContext>,
+        body: Vec<u8>,
+        req: Request<RegisteredFixedBuffer>,
+    );
 }
 
-/// Boxed handler function pointer used by the registry.
-type DynHandler =
-    Box<dyn Fn(&Rc<RpcHandlerContext>, &[u8], Request<RegisteredFixedBuffer>)>;
+/// Boxed handler launcher: takes ownership of (ctx, body, req) and
+/// returns a `'static` future that drives the handler to completion.
+type DynLauncher = Box<
+    dyn Fn(
+        Rc<RpcHandlerContext>,
+        Vec<u8>,
+        Request<RegisteredFixedBuffer>,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'static>>,
+>;
 
 /// Per-process router from `rpc_id` to its [`LocustaServerHandler`].
-///
-/// Created once at startup, registered with every RPC type the server
-/// understands, then `poll_once` is called repeatedly inside the
-/// server's main loop.
 pub struct LocustaServerDispatch {
     ctx: Rc<RpcHandlerContext>,
-    handlers: HashMap<u16, DynHandler>,
+    handlers: HashMap<u16, DynLauncher>,
 }
 
 impl LocustaServerDispatch {
@@ -80,7 +84,7 @@ impl LocustaServerDispatch {
         let rpc_id = H::rpc_id();
         let prev = self.handlers.insert(
             rpc_id,
-            Box::new(|ctx, body, req| H::handle_locusta(ctx, body, req)),
+            Box::new(|ctx, body, req| Box::pin(H::handle_locusta(ctx, body, req))),
         );
         assert!(
             prev.is_none(),
@@ -88,10 +92,14 @@ impl LocustaServerDispatch {
         );
     }
 
-    /// Dispatch a single `Request` based on the rpc_id prefix in its
-    /// `small_req`. Variants without a small_req body (none exist in
-    /// the current rrrpc enum) would need special handling.
-    pub fn dispatch(&self, req: Request<RegisteredFixedBuffer>) {
+    /// Look up the handler for a request and return the handler's
+    /// future. Returns `None` if the request is malformed or no
+    /// handler is registered (in the latter case, `req` is dropped,
+    /// which sends an error response for roundtrip variants).
+    pub fn dispatch(
+        &self,
+        req: Request<RegisteredFixedBuffer>,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let small_req: &[u8] = match &req {
             Request::OnewayEager(h) => h.small_req(),
             Request::RoundtripEager(h) => h.small_req(),
@@ -107,34 +115,72 @@ impl LocustaServerDispatch {
                     "[locusta_server] dropping request with malformed small_req ({} bytes)",
                     small_req.len()
                 );
-                return;
+                return None;
             }
         };
-        // `body` borrows from the handle inside `req`; we need to drop
-        // that borrow before moving `req` into the handler. Reborrow as
-        // an owned `Vec` for now (typical metadata bodies are ≤256B —
-        // the copy is cheap). A future revision can re-use the
-        // small_req_scratch pattern from the client side if this
-        // shows up in profiles.
         let body_owned = body.to_vec();
         match self.handlers.get(&rpc_id) {
-            Some(handler) => handler(&self.ctx, &body_owned, req),
+            Some(launcher) => Some(launcher(Rc::clone(&self.ctx), body_owned, req)),
             None => {
                 eprintln!("[locusta_server] no handler registered for rpc_id={rpc_id}");
-                // `req` drops here — for roundtrip variants this sends
-                // an error response back to the client; for oneway
-                // variants it auto-acks.
                 drop(req);
+                None
             }
         }
     }
 
-    /// Drain all currently-ready requests through the dispatcher.
-    /// Caller is responsible for ticking the locusta polling state
-    /// machines first via [`LocustaInner::tick`].
-    pub fn poll_once(&self, transport: &LocustaTransport) {
+    /// Drain ready requests and spawn each handler onto the
+    /// currently-active `pluvio_runtime` executor. Caller must have
+    /// `set_runtime` already configured on this thread.
+    pub fn poll_once_spawn(&self, transport: &LocustaTransport) {
         let mut inner = transport.inner.borrow_mut();
         inner.tick();
-        drain_server_requests(&mut *inner, |req| self.dispatch(req));
+        drain_server_requests(&mut *inner, |req| {
+            if let Some(fut) = self.dispatch(req) {
+                pluvio_runtime::executor::spawn(fut);
+            }
+        });
+    }
+
+    /// Drain ready requests and drive each handler to completion
+    /// inline via a tiny busy-poll loop. Suitable for the demo binary
+    /// (no pluvio_runtime running) when handlers are effectively
+    /// sync — i.e. metadata RPCs whose async future is just a
+    /// `Ready(())` wrapper. Calling this with an actually-async
+    /// handler that blocks on I/O will hang the polling thread.
+    pub fn poll_once_inline(&self, transport: &LocustaTransport) {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker: Waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+
+        let mut inner = transport.inner.borrow_mut();
+        inner.tick();
+        let mut pending: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
+        drain_server_requests(&mut *inner, |req| {
+            if let Some(fut) = self.dispatch(req) {
+                pending.push(fut);
+            }
+        });
+        // Need to drop the borrow before polling — handlers may take
+        // the transport's borrow (e.g. for re-acquiring buffers).
+        drop(inner);
+        for mut fut in pending {
+            loop {
+                match Pin::as_mut(&mut fut).poll(&mut cx) {
+                    Poll::Ready(()) => break,
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            }
+        }
+    }
+
+    /// Backwards-compat wrapper. Equivalent to [`Self::poll_once_inline`].
+    pub fn poll_once(&self, transport: &LocustaTransport) {
+        self.poll_once_inline(transport);
     }
 }

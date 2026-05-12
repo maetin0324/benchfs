@@ -76,12 +76,12 @@ fn take_path<'b>(rest: &'b [u8], path_len: usize) -> Option<&'b str> {
 }
 
 impl LocustaServerHandler for MetadataLookupRequest {
-    fn handle_locusta(
-        ctx: &Rc<RpcHandlerContext>,
-        body: &[u8],
+    async fn handle_locusta(
+        ctx: Rc<RpcHandlerContext>,
+        body: Vec<u8>,
         req: Request<RegisteredFixedBuffer>,
     ) {
-        let (header, rest) = match split_header::<MetadataLookupRequestHeader>(body) {
+        let (header, rest) = match split_header::<MetadataLookupRequestHeader>(&body) {
             Some(pair) => pair,
             None => {
                 reply_eager(
@@ -117,12 +117,12 @@ impl LocustaServerHandler for MetadataLookupRequest {
 }
 
 impl LocustaServerHandler for MetadataCreateFileRequest {
-    fn handle_locusta(
-        ctx: &Rc<RpcHandlerContext>,
-        body: &[u8],
+    async fn handle_locusta(
+        ctx: Rc<RpcHandlerContext>,
+        body: Vec<u8>,
         req: Request<RegisteredFixedBuffer>,
     ) {
-        let (header, rest) = match split_header::<MetadataCreateFileRequestHeader>(body) {
+        let (header, rest) = match split_header::<MetadataCreateFileRequestHeader>(&body) {
             Some(pair) => pair,
             None => {
                 reply_eager(
@@ -159,12 +159,12 @@ impl LocustaServerHandler for MetadataCreateFileRequest {
 }
 
 impl LocustaServerHandler for MetadataCreateDirRequest {
-    fn handle_locusta(
-        ctx: &Rc<RpcHandlerContext>,
-        body: &[u8],
+    async fn handle_locusta(
+        ctx: Rc<RpcHandlerContext>,
+        body: Vec<u8>,
         req: Request<RegisteredFixedBuffer>,
     ) {
-        let (header, rest) = match split_header::<MetadataCreateDirRequestHeader>(body) {
+        let (header, rest) = match split_header::<MetadataCreateDirRequestHeader>(&body) {
             Some(pair) => pair,
             None => {
                 reply_eager(
@@ -202,12 +202,12 @@ impl LocustaServerHandler for MetadataCreateDirRequest {
 }
 
 impl LocustaServerHandler for MetadataDeleteRequest {
-    fn handle_locusta(
-        ctx: &Rc<RpcHandlerContext>,
-        body: &[u8],
+    async fn handle_locusta(
+        ctx: Rc<RpcHandlerContext>,
+        body: Vec<u8>,
         req: Request<RegisteredFixedBuffer>,
     ) {
-        let (header, rest) = match split_header::<MetadataDeleteRequestHeader>(body) {
+        let (header, rest) = match split_header::<MetadataDeleteRequestHeader>(&body) {
             Some(pair) => pair,
             None => {
                 reply_eager(
@@ -244,12 +244,12 @@ impl LocustaServerHandler for MetadataDeleteRequest {
 }
 
 impl LocustaServerHandler for MetadataUpdateRequest {
-    fn handle_locusta(
-        ctx: &Rc<RpcHandlerContext>,
-        body: &[u8],
+    async fn handle_locusta(
+        ctx: Rc<RpcHandlerContext>,
+        body: Vec<u8>,
         req: Request<RegisteredFixedBuffer>,
     ) {
-        let (header, rest) = match split_header::<MetadataUpdateRequestHeader>(body) {
+        let (header, rest) = match split_header::<MetadataUpdateRequestHeader>(&body) {
             Some(pair) => pair,
             None => {
                 reply_eager(
