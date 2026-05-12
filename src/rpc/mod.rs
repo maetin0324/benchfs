@@ -17,6 +17,11 @@ pub mod handlers;
 pub mod helpers;
 pub mod metadata_ops;
 pub mod server;
+pub mod transport;
+#[cfg(feature = "transport-locusta")]
+pub mod locusta_buffer;
+#[cfg(feature = "transport-locusta")]
+pub mod transport_locusta;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;

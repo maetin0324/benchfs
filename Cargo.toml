@@ -14,6 +14,11 @@ pluvio_uring = { path = "lib/pluvio/pluvio_uring" }
 pluvio_timer = { path = "lib/pluvio/pluvio_timer" }
 pluvio_ucx = { path = "lib/pluvio/pluvio_ucx" }
 
+# Locusta RPC backend (ibverbs/mlx5 direct). Behind transport-locusta feature
+# so that the default build path is unaffected during Phase 1 prototyping.
+rrrpc = { path = "lib/locusta/rrrpc", optional = true }
+mlx5  = { path = "lib/locusta/mlx5",  optional = true }
+
 # Serialization
 zerocopy = { version = "0.8.27", features = ["std", "derive"] }
 
@@ -74,6 +79,12 @@ proptest-state-machine = "0.3"
 default = []
 mpi-support = ["mpi"]
 
+# Enable the locusta (rrrpc / mlx5 DevX) transport backend.
+# When enabled, `src/rpc/transport_locusta.rs` is compiled and exposes
+# `LocustaTransport`. The runtime backend is selected at startup
+# (env var `BENCHFS_TRANSPORT=locusta` or programmatic config).
+transport-locusta = ["dep:rrrpc", "dep:mlx5"]
+
 # Debug profile with full debug symbols for perf profiling
 [profile.dev]
 debug = 2                  # Full debug info (DWARF)
@@ -106,6 +117,11 @@ required-features = ["mpi-support"]
 [[bin]]
 name = "benchfs_perf"
 path = "src/bin/benchfs_perf.rs"
+
+[[bin]]
+name = "benchfs_locusta_demo"
+path = "src/bin/benchfs_locusta_demo.rs"
+required-features = ["transport-locusta"]
 
 # Benchmark configuration - currently disabled as benches/small.rs does not exist
 # [[bench]]
