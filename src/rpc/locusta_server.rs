@@ -130,14 +130,21 @@ impl LocustaServerDispatch {
     /// Drain ready requests and spawn each handler onto the
     /// currently-active `pluvio_runtime` executor. Caller must have
     /// `set_runtime` already configured on this thread.
-    pub fn poll_once_spawn(&self, transport: &LocustaTransport) {
+    ///
+    /// Returns the number of requests drained (and spawned). The
+    /// driver loop uses this to choose between busy-yielding (when
+    /// hot) and a short sleep (when idle).
+    pub fn poll_once_spawn(&self, transport: &LocustaTransport) -> usize {
         let mut inner = transport.inner.borrow_mut();
         inner.tick();
+        let mut count = 0usize;
         drain_server_requests(&mut *inner, |req| {
             if let Some(fut) = self.dispatch(req) {
                 pluvio_runtime::executor::spawn(fut);
+                count += 1;
             }
         });
+        count
     }
 
     /// Drain-only variant for use when a separate Reactor handles

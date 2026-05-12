@@ -39,6 +39,33 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// One-shot yield future: returns Pending once (registering its waker as
+/// already-ready so the executor re-polls it on the next iteration), then
+/// resolves. Lets a hot poll loop give other tasks a slot without going
+/// through a timer.
+#[cfg(feature = "transport-locusta")]
+#[derive(Default)]
+struct YieldOnce {
+    yielded: bool,
+}
+
+#[cfg(feature = "transport-locusta")]
+impl std::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.yielded {
+            std::task::Poll::Ready(())
+        } else {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+}
+
 #[cfg(feature = "transport-locusta")]
 struct LocustaRuntimeState {
     transport: Rc<benchfs::rpc::transport_locusta::LocustaTransport>,
@@ -660,28 +687,57 @@ fn run_server(
                         "Starting LocustaServerDispatch drain task ({} handlers registered)",
                         std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>()
                     );
+                    // Adaptive backoff so the dispatch loop doesn't impose
+                    // a hard 100us latency floor on every RPC. When work was
+                    // drained, busy-yield to come back fast (the executor
+                    // gives other tasks one round between yields). When
+                    // idle for a few iterations, fall back to a short
+                    // sleep so this task doesn't starve other work.
+                    //
+                    // Tuning knobs:
+                    //   BENCHFS_LOCUSTA_DISPATCH_SLEEP_US — idle sleep (default 20us)
+                    //   BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD — empty polls
+                    //     before sleeping (default 16)
+                    let idle_sleep_us: u64 = std::env::var(
+                        "BENCHFS_LOCUSTA_DISPATCH_SLEEP_US",
+                    )
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(20);
+                    let idle_threshold: u32 = std::env::var(
+                        "BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD",
+                    )
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
                     let mut iter: u64 = 0;
+                    let mut empty_polls: u32 = 0;
                     loop {
-                        // `poll_once_spawn` ticks locusta state machines
-                        // AND drains ready requests. No separate Reactor
-                        // is needed (see commit removing tick-reactor).
-                        dispatch.poll_once_spawn(&transport);
+                        let drained = dispatch.poll_once_spawn(&transport);
                         iter = iter.wrapping_add(1);
-                        if iter == 1 || iter % 100_000 == 0 {
+                        if iter == 1 || iter % 1_000_000 == 0 {
                             tracing::info!(
-                                "locusta dispatch drain heartbeat iter={}",
-                                iter
+                                "locusta dispatch drain heartbeat iter={} (idle_threshold={}, idle_sleep_us={})",
+                                iter, idle_threshold, idle_sleep_us
                             );
                         }
-                        // pluvio_timer (runtime-integrated, single
-                        // TimerReactor) instead of futures_timer
-                        // (thread-per-Delay) — the dispatch loop's
-                        // hot rate broke futures_timer after ~100k
-                        // iterations in jobs 17038/17040.
-                        pluvio_timer::sleep(
-                            std::time::Duration::from_micros(100),
-                        )
-                        .await;
+                        if drained > 0 {
+                            empty_polls = 0;
+                            // Hot path — yield once so other tasks
+                            // (handlers, accept loop) get a slot, then
+                            // re-poll immediately.
+                            YieldOnce::default().await;
+                        } else {
+                            empty_polls = empty_polls.saturating_add(1);
+                            if empty_polls < idle_threshold {
+                                YieldOnce::default().await;
+                            } else {
+                                pluvio_timer::sleep(
+                                    std::time::Duration::from_micros(idle_sleep_us),
+                                )
+                                .await;
+                            }
+                        }
                     }
                 },
                 "locusta_dispatch_drain".to_string(),
