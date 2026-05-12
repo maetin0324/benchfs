@@ -156,6 +156,13 @@ export BENCHFS_RPC_TIMEOUT
 export BENCHFS_IOURING_QUEUE_SIZE
 export BENCHFS_IOURING_SUBMIT_DEPTH
 
+# Locusta server dispatch tuning. Defaults match the conservative
+# values baked into benchfsd_mpi; override here for sweep runs.
+: ${BENCHFS_LOCUSTA_DISPATCH_SLEEP_US:=20}
+: ${BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD:=16}
+export BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+export BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
+
 cmd_mpirun_util=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self)
 cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
 
@@ -328,6 +335,9 @@ WRAPPER_EOF
     -x BENCHFS_RPC_TIMEOUT
     -x BENCHFS_IOURING_QUEUE_SIZE
     -x BENCHFS_IOURING_SUBMIT_DEPTH
+    -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+    -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
+    -x BENCHFS_TRANSPORT
     "${datadir_wrapper}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -496,6 +506,9 @@ run_io500() {
     -x RUST_LOG="${RUST_LOG_C}"
     -x RUST_BACKTRACE
     -x BENCHFS_EXPECTED_NODES="${VNODES}"
+    -x BENCHFS_TRANSPORT
+    -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+    -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
     -x BENCHFS_RPC_TIMEOUT
     "${asan_args[@]}"
     "${IO500_DIR}/io500"
