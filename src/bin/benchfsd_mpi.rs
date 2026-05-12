@@ -666,7 +666,7 @@ fn run_server(
                     }
                 }
             }
-            pluvio_runtime::spawn_polling_with_name(
+            pluvio_runtime::spawn_with_name(
                 async move {
                     tracing::info!(
                         "Starting LocustaServerDispatch poll loop ({} handlers registered)",
