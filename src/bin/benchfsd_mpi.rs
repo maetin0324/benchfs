@@ -37,6 +37,68 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "transport-locusta")]
+struct LocustaRuntimeState {
+    transport: Rc<benchfs::rpc::transport_locusta::LocustaTransport>,
+    dispatch: Rc<benchfs::rpc::locusta_server::LocustaServerDispatch>,
+}
+
+#[cfg(feature = "transport-locusta")]
+fn init_locusta_runtime(
+    node_id: &str,
+    mpi_rank: i32,
+    mpi_size: i32,
+    registry_dir: &str,
+    handler_context: Rc<RpcHandlerContext>,
+) -> Result<LocustaRuntimeState, Box<dyn std::error::Error>> {
+    use benchfs::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
+    use benchfs::rpc::locusta_server::LocustaServerDispatch;
+    use benchfs::rpc::metadata_ops::{
+        MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
+        MetadataLookupRequest, MetadataUpdateRequest,
+    };
+    use benchfs::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
+
+    // Peer list: every other MPI rank gets a `node_<rank>` id. The
+    // locusta file-based QP exchange is symmetric so all ranks build
+    // the same view.
+    let peer_node_ids: Vec<String> = (0..mpi_size)
+        .filter(|&r| r != mpi_rank)
+        .map(|r| format!("node_{}", r))
+        .collect();
+
+    let cfg = LocustaConfig {
+        registry_dir: PathBuf::from(registry_dir).join("locusta_qp"),
+        local_node_id: node_id.to_string(),
+        peer_node_ids,
+        external_server_allocator: Some(Rc::clone(&handler_context.allocator)),
+        ..LocustaConfig::default()
+    };
+    std::fs::create_dir_all(&cfg.registry_dir)?;
+    tracing::info!(
+        "Initializing LocustaTransport (peers={}, registry={})",
+        cfg.peer_node_ids.len(),
+        cfg.registry_dir.display()
+    );
+    let transport = Rc::new(LocustaTransport::init(&cfg)?);
+    tracing::info!("LocustaTransport connected to {} peers", cfg.peer_node_ids.len());
+
+    // Register every supported RPC's `LocustaServerHandler`.
+    let mut dispatch = LocustaServerDispatch::new(handler_context);
+    dispatch.register::<MetadataLookupRequest>();
+    dispatch.register::<MetadataCreateFileRequest>();
+    dispatch.register::<MetadataCreateDirRequest>();
+    dispatch.register::<MetadataDeleteRequest>();
+    dispatch.register::<MetadataUpdateRequest>();
+    dispatch.register::<WriteChunkByIdRequest<'_>>();
+    dispatch.register::<ReadChunkByIdRequest<'_>>();
+
+    Ok(LocustaRuntimeState {
+        transport,
+        dispatch: Rc::new(dispatch),
+    })
+}
+
 /// Server state
 struct ServerState {
     config: ServerConfig,
@@ -484,10 +546,55 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
     ));
 
     // Create RPC server
-    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
+    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));
+
+    // BENCHFS_TRANSPORT=locusta swaps the connection pool for a
+    // locusta-backed one *and* fires up the server-side dispatch loop.
+    // All other state (chunk store, metadata manager, RpcHandlerContext)
+    // is reused as-is — the only difference is the wire mechanism.
+    let use_locusta = std::env::var("BENCHFS_TRANSPORT")
+        .map(|v| v.eq_ignore_ascii_case("locusta"))
+        .unwrap_or(false);
+
+    #[cfg(feature = "transport-locusta")]
+    let locusta_state = if use_locusta {
+        Some(init_locusta_runtime(
+            &node_id,
+            state.mpi_rank,
+            state.mpi_size,
+            registry_dir,
+            handler_context.clone(),
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "transport-locusta"))]
+    let locusta_state: Option<()> = if use_locusta {
+        return Err("BENCHFS_TRANSPORT=locusta requires --features transport-locusta".into());
+    } else {
+        None
+    };
 
     // Create connection pool for inter-node communication
-    let connection_pool = Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?);
+    let connection_pool = {
+        #[cfg(feature = "transport-locusta")]
+        {
+            if let Some(state_locusta) = &locusta_state {
+                Rc::new(ConnectionPool::new_locusta(
+                    worker.clone(),
+                    registry_dir,
+                    Rc::clone(&state_locusta.transport),
+                )?)
+            } else {
+                Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?)
+            }
+        }
+        #[cfg(not(feature = "transport-locusta"))]
+        {
+            let _ = &locusta_state;
+            Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?)
+        }
+    };
 
     // Registration will be done after runtime starts (moved to async task below)
 
@@ -498,21 +605,54 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
     let handler_ready = std::rc::Rc::new(std::cell::RefCell::new(false));
     let handler_ready_clone = handler_ready.clone();
 
-    pluvio_runtime::spawn_with_name(
-        async move {
-            tracing::info!("Registering RPC handlers...");
-            match server_clone.register_all_handlers().await {
-                Ok(_) => {
-                    tracing::info!("RPC handlers registered successfully");
-                    *handler_ready_clone.borrow_mut() = true;
+    #[cfg(feature = "transport-locusta")]
+    let locusta_ready_flag = locusta_state.is_some();
+    #[cfg(not(feature = "transport-locusta"))]
+    let locusta_ready_flag = false;
+
+    if locusta_ready_flag {
+        // Locusta path: server-side dispatch is wired the moment
+        // `LocustaServerDispatch::new` returned. The UCX handler
+        // registration would crash (no UCX endpoint setup), so skip it
+        // entirely.
+        *handler_ready_clone.borrow_mut() = true;
+        #[cfg(feature = "transport-locusta")]
+        {
+            let dispatch = Rc::clone(&locusta_state.as_ref().unwrap().dispatch);
+            let transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    tracing::info!(
+                        "Starting LocustaServerDispatch poll loop ({} handlers registered)",
+                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>()
+                    );
+                    loop {
+                        dispatch.poll_once_spawn(&transport);
+                        // Yield briefly so other tasks (chunk-store
+                        // io_uring callbacks, etc.) get a turn.
+                        futures_timer::Delay::new(std::time::Duration::from_micros(1)).await;
+                    }
+                },
+                "locusta_dispatch_poll".to_string(),
+            );
+        }
+    } else {
+        pluvio_runtime::spawn_with_name(
+            async move {
+                tracing::info!("Registering RPC handlers...");
+                match server_clone.register_all_handlers().await {
+                    Ok(_) => {
+                        tracing::info!("RPC handlers registered successfully");
+                        *handler_ready_clone.borrow_mut() = true;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to register RPC handlers: {:?}", e);
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to register RPC handlers: {:?}", e);
-                }
-            }
-        },
-        "rpc_handler_registration".to_string(),
-    );
+            },
+            "rpc_handler_registration".to_string(),
+        );
+    }
 
     // Spawn node registration task (must run after RPC handlers are ready)
     let pool_clone = connection_pool.clone();
