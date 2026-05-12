@@ -578,6 +578,8 @@ fn run_server(
 
     #[cfg(feature = "transport-locusta")]
     let locusta_state = if use_locusta {
+        use benchfs::rpc::locusta_server::LocustaServerDispatch;
+        use benchfs::rpc::transport_locusta::LocustaTransport;
         let s = init_locusta_runtime(
             &node_id,
             state.mpi_rank,
@@ -585,9 +587,29 @@ fn run_server(
             registry_dir,
             handler_context.clone(),
         )?;
-        // Register locusta as a reactor so the runtime's stuck watchdog
-        // doesn't fire while DMA RPCs are in flight.
-        runtime.register_reactor("locusta", Rc::clone(&s.transport));
+        // Reactor that does *both* tick + dispatch. Folding it into a
+        // single reactor means we don't need a hot polling task that
+        // floods the executor's task channel — the reactor runs once
+        // per executor iteration alongside timer / io_uring.
+        struct LocustaDispatchReactor {
+            transport: Rc<LocustaTransport>,
+            dispatch: Rc<LocustaServerDispatch>,
+        }
+        impl pluvio_runtime::reactor::Reactor for LocustaDispatchReactor {
+            fn poll(&self) {
+                self.dispatch.poll_once_spawn(&self.transport);
+            }
+            fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
+                pluvio_runtime::reactor::ReactorStatus::Running
+            }
+        }
+        runtime.register_reactor(
+            "locusta",
+            Rc::new(LocustaDispatchReactor {
+                transport: Rc::clone(&s.transport),
+                dispatch: Rc::clone(&s.dispatch),
+            }),
+        );
         Some(s)
     } else {
         None
@@ -642,51 +664,8 @@ fn run_server(
         *handler_ready_clone.borrow_mut() = true;
         #[cfg(feature = "transport-locusta")]
         {
-            let dispatch = Rc::clone(&locusta_state.as_ref().unwrap().dispatch);
-            let transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
-            // YieldOnce: a tiny future that completes after one
-            // executor turn. Lighter than `futures_timer::Delay`, which
-            // creates a new background thread per instance and can
-            // starve the rest of the runtime when called every loop iter.
-            struct YieldOnce {
-                yielded: bool,
-            }
-            impl std::future::Future for YieldOnce {
-                type Output = ();
-                fn poll(
-                    mut self: std::pin::Pin<&mut Self>,
-                    cx: &mut std::task::Context<'_>,
-                ) -> std::task::Poll<()> {
-                    if self.yielded {
-                        std::task::Poll::Ready(())
-                    } else {
-                        self.yielded = true;
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                }
-            }
-            pluvio_runtime::spawn_with_name(
-                async move {
-                    tracing::info!(
-                        "Starting LocustaServerDispatch poll loop ({} handlers registered)",
-                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>(
-                        )
-                    );
-                    let mut iter: u64 = 0;
-                    loop {
-                        dispatch.poll_once_spawn(&transport);
-                        iter = iter.wrapping_add(1);
-                        if iter == 1 || iter % 1_000_000 == 0 {
-                            tracing::info!(
-                                "locusta dispatch poll heartbeat iter={}",
-                                iter
-                            );
-                        }
-                        YieldOnce { yielded: false }.await;
-                    }
-                },
-                "locusta_dispatch_poll".to_string(),
+            tracing::info!(
+                "LocustaDispatchReactor registered — server dispatch runs every executor iteration"
             );
 
             // Accept loop: scan the registry directory for late-joining
