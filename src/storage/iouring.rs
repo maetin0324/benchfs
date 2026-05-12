@@ -215,6 +215,76 @@ impl IOUringBackend {
 
         Ok((bytes_read, fixed_buffer))
     }
+
+    /// Write to file directly from an externally-owned registered buffer.
+    ///
+    /// Lets the locusta RPC server submit `WriteFixed` against the RDMA
+    /// landing buffer in-place, instead of forcing `IOUringBackend::write`'s
+    /// `acquire().await + 4 MiB memcpy` path (job 17061 timing identified
+    /// this as ~0.4 ms/chunk on the WRITE_READY handler hot path).
+    ///
+    /// # Safety
+    /// `ptr` must point inside a buffer registered with this backend's
+    /// allocator (i.e. acquired from `self.allocator`), and `buf_index` must
+    /// be that buffer's slot index. The memory must remain valid until the
+    /// returned future resolves.
+    #[async_backtrace::framed]
+    pub async fn write_via_registered(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        ptr: *const u8,
+        len: u32,
+        buf_index: u16,
+    ) -> StorageResult<usize> {
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
+        let bytes_written = dma_file
+            .write_fixed_raw(offset, ptr, len, buf_index)
+            .await
+            .map_err(StorageError::IoError)?;
+        if bytes_written < 0 {
+            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                -bytes_written,
+            )));
+        }
+        Ok(bytes_written as usize)
+    }
+
+    /// Read from file directly into an externally-owned registered buffer.
+    /// See [`write_via_registered`] for safety constraints.
+    #[async_backtrace::framed]
+    pub async fn read_via_registered(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        ptr: *mut u8,
+        len: u32,
+        buf_index: u16,
+    ) -> StorageResult<usize> {
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
+        let bytes_read = dma_file
+            .read_fixed_raw(offset, ptr, len, buf_index)
+            .await
+            .map_err(StorageError::IoError)?;
+        if bytes_read < 0 {
+            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                -bytes_read,
+            )));
+        }
+        Ok(bytes_read as usize)
+    }
 }
 
 // Default implementation removed - allocator must be provided

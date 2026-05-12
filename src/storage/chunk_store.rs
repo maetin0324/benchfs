@@ -1902,6 +1902,69 @@ impl IOUringChunkStore {
     /// * `offset` - Offset within the chunk
     /// * `fixed_buffer` - Pre-populated registered buffer
     /// * `data_len` - Actual data length in the buffer
+    /// Zero-copy write where the buffer is owned elsewhere (e.g. the
+    /// locusta RoundtripPut grant). The caller must guarantee the
+    /// pointed-to memory was acquired from this store's allocator and stays
+    /// valid until the returned future resolves.
+    ///
+    /// # Safety
+    /// See [`IOUringBackend::write_via_registered`].
+    #[async_backtrace::framed]
+    pub async fn write_chunk_via_registered(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        ptr: *const u8,
+        len: u32,
+        buf_index: u16,
+    ) -> ChunkStoreResult<usize> {
+        if offset >= self.chunk_size as u64 {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+        let use_direct = Self::direct_io_aligned(offset, len as u64);
+        let handle = self
+            .open_chunk_file(file_path, chunk_index, true, use_direct)
+            .await?;
+        let result = self
+            .backend
+            .write_via_registered(handle, offset, ptr, len, buf_index)
+            .await;
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after write_via_registered: {:?}", e);
+        }
+        Ok(result.map_err(|e| ChunkStoreError::IoError(std::io::Error::other(format!("{e:?}"))))?)
+    }
+
+    /// Zero-copy read into an externally-owned registered buffer.
+    /// See [`write_chunk_via_registered`] for safety constraints.
+    #[async_backtrace::framed]
+    pub async fn read_chunk_via_registered(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        ptr: *mut u8,
+        len: u32,
+        buf_index: u16,
+    ) -> ChunkStoreResult<usize> {
+        if offset >= self.chunk_size as u64 {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+        let use_direct = Self::direct_io_aligned(offset, len as u64);
+        let handle = self
+            .open_chunk_file(file_path, chunk_index, false, use_direct)
+            .await?;
+        let result = self
+            .backend
+            .read_via_registered(handle, offset, ptr, len, buf_index)
+            .await;
+        if let Err(e) = self.backend.close(handle).await {
+            tracing::warn!("Failed to close chunk file after read_via_registered: {:?}", e);
+        }
+        Ok(result.map_err(|e| ChunkStoreError::IoError(std::io::Error::other(format!("{e:?}"))))?)
+    }
+
     #[async_backtrace::framed]
     #[instrument(level = "trace", name = "iouring_write_chunk_fixed", skip(self, fixed_buffer), fields(path = file_path, chunk = chunk_index, offset, len = data_len))]
     pub async fn write_chunk_fixed(

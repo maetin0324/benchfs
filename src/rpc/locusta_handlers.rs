@@ -331,6 +331,7 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
 
         match req {
             Request::PutGrant(h) => {
+                let grant_start = std::time::Instant::now();
                 // Phase 1: allocate a server-side RDMA-registered buffer
                 // big enough for the client's incoming DMA write.
                 // `try_acquire` has receiver `&Rc<Self>` so we use UFCS
@@ -344,6 +345,7 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                         return;
                     }
                 };
+                let alloc_us = grant_start.elapsed().as_micros() as u64;
                 if (fb.len() as u32) < h.dma_len() {
                     eprintln!(
                         "[locusta_handlers] WriteChunkById buffer too small ({} < {})",
@@ -355,30 +357,84 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                     return;
                 }
                 h.grant(RegisteredFixedBuffer::from_fixed_buffer(fb));
+                if crate::stats::is_stats_enabled() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n.is_multiple_of(1000) {
+                        tracing::info!(
+                            target: "rpc_handler_timing",
+                            kind = "write_grant",
+                            n = n,
+                            alloc_us = alloc_us,
+                            "WRITE_GRANT_TIMING"
+                        );
+                    }
+                }
             }
             Request::RoundtripPutReady(h) => {
+                let ready_start = std::time::Instant::now();
                 // Phase 2: client's RDMA write has landed in the granted
-                // buffer. Surface it as a `&[u8]` and forward to the
-                // chunk store.
+                // buffer. The buffer is RDMA-registered AND was acquired
+                // from the same io_uring allocator the chunk store uses,
+                // so we can submit `WriteFixed` against it in place and
+                // avoid the 4 MiB memcpy in `IOUringBackend::write`
+                // (job 17061 timing).
                 let path = resolve_chunk_path(&ctx, header.path_hash());
                 let chunk_index = header.chunk_id() as u64;
                 let offset = header.offset;
                 let data_len = header.length as usize;
                 let buf = h.buffer();
-                let slice: &[u8] =
-                    unsafe { std::slice::from_raw_parts(buf.as_ptr(), data_len.min(buf.len())) };
-                let resp = match ctx
-                    .chunk_store
-                    .write_chunk(&path, chunk_index, offset, slice)
-                    .await
-                {
-                    Ok(bytes) => WriteChunkResponseHeader::success(bytes as u64),
-                    Err(e) => {
-                        eprintln!("[locusta_handlers] WriteChunkById store failed: {e:?}");
-                        WriteChunkResponseHeader::error(-5) // EIO
+                let ptr = buf.as_ptr();
+                let len = data_len.min(buf.len()) as u32;
+                let buf_index = buf.buf_index();
+                let io_start = std::time::Instant::now();
+                let io_store = ctx.chunk_store.as_any().downcast_ref::<crate::storage::IOUringChunkStore>();
+                let resp = match io_store {
+                    Some(store) => {
+                        match store
+                            .write_chunk_via_registered(&path, chunk_index, offset, ptr, len, buf_index)
+                            .await
+                        {
+                            Ok(bytes) => WriteChunkResponseHeader::success(bytes as u64),
+                            Err(e) => {
+                                eprintln!("[locusta_handlers] WriteChunkById via_registered failed: {e:?}");
+                                WriteChunkResponseHeader::error(-5)
+                            }
+                        }
+                    }
+                    None => {
+                        let slice: &[u8] = unsafe {
+                            std::slice::from_raw_parts(ptr, len as usize)
+                        };
+                        match ctx.chunk_store.write_chunk(&path, chunk_index, offset, slice).await {
+                            Ok(bytes) => WriteChunkResponseHeader::success(bytes as u64),
+                            Err(e) => {
+                                eprintln!("[locusta_handlers] WriteChunkById store failed: {e:?}");
+                                WriteChunkResponseHeader::error(-5)
+                            }
+                        }
                     }
                 };
+                let io_us = io_start.elapsed().as_micros() as u64;
                 h.reply(resp.as_bytes().to_vec());
+                let total_us = ready_start.elapsed().as_micros() as u64;
+                if crate::stats::is_stats_enabled() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n.is_multiple_of(1000) {
+                        tracing::info!(
+                            target: "rpc_handler_timing",
+                            kind = "write_ready",
+                            n = n,
+                            io_us = io_us,
+                            total_us = total_us,
+                            data_len = data_len,
+                            "WRITE_READY_TIMING"
+                        );
+                    }
+                }
             }
             other => {
                 eprintln!(
