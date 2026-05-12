@@ -105,13 +105,17 @@ impl ConnectionPool {
     /// * `node_id` - Unique identifier for this node
     pub fn register_self(&self, node_id: &str) -> Result<(), RpcError> {
         // Locusta backend exchanges QP info via its own file registry —
-        // there is no UCX worker address to publish.
+        // there is no UCX worker address to publish. Still publish an
+        // empty `<node_id>.addr` sentinel so the rest of BenchFS (the
+        // `Waiting for N nodes to register` polling loop and the FFI
+        // client's `discover_data_nodes`) sees this node as up.
         #[cfg(feature = "transport-locusta")]
         if self.locusta_transport.is_some() {
             tracing::info!(
                 node_id = node_id,
-                "skipping UCX register_self (locusta backend handles its own QP exchange)"
+                "locusta backend: writing empty .addr sentinel for discovery"
             );
+            self.registry.register(node_id, b"locusta")?;
             return Ok(());
         }
         let address = self.worker.address().map_err(|e| {
