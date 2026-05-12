@@ -503,10 +503,16 @@ run_io500() {
   )
   echo "Running: ${cmd[*]}"
   # Pick the stonewall that's actually in play for this invocation: final runs
-  # use FINAL_STONEWALL, sweep runs use SWEEP_STONEWALL. The previous formula
-  # (SWEEP_STONEWALL*6+600) capped the final run at 780s and killed io500
-  # mid-ior-easy-write when FINAL_STONEWALL=120 and multiple phases were enabled.
-  local stonewall_for_timeout="${IO500_STONEWALL_FOR_TIMEOUT:-${SWEEP_STONEWALL}}"
+  # use FINAL_STONEWALL, sweep runs use SWEEP_STONEWALL. Caller can override
+  # via IO500_STONEWALL_FOR_TIMEOUT. Default for the final run is
+  # FINAL_STONEWALL so all enabled phases get a budget proportional to their
+  # actual stonewall (job 17043 was killed at 14 min mid-find-easy because
+  # this fell back to SWEEP_STONEWALL=30 → timeout=840s).
+  local default_stonewall="${SWEEP_STONEWALL}"
+  if [ "${out_dir}" = "${FINAL_DIR}" ]; then
+    default_stonewall="${FINAL_STONEWALL}"
+  fi
+  local stonewall_for_timeout="${IO500_STONEWALL_FOR_TIMEOUT:-${default_stonewall}}"
   local timeout_s=$(( stonewall_for_timeout > 0 ? stonewall_for_timeout * 8 + 600 : 1800 ))
   timeout --signal=TERM --kill-after=30 "${timeout_s}" \
     "${cmd[@]}" > "${out_dir}/io500_stdout.log" 2> "${out_dir}/io500_stderr.log" || true

@@ -387,6 +387,28 @@ pub extern "C" fn benchfs_init(
         data_dir_str
     );
 
+    // io500 calls benchfs_init/finalize once per phase (ior-easy, mdtest-easy,
+    // ...). Under BENCHFS_TRANSPORT=locusta, tearing down the locusta
+    // transport between phases leaves the server side with stale dest_id→QP
+    // mappings; the next phase's RPCs hit dead QPs and trigger CQE
+    // syndrome=21 (TRANSPORT_RETRY_EXC_ERR) after the ~30s retry budget
+    // exhausts (job 17042). Make the FFI idempotent for locusta clients:
+    // if TLS already holds a BenchFS instance, hand out a fresh Box
+    // wrapping a clone of the existing Rc and skip the full re-init.
+    let use_locusta_client = is_server == 0
+        && std::env::var("BENCHFS_TRANSPORT")
+            .map(|v| v.eq_ignore_ascii_case("locusta"))
+            .unwrap_or(false);
+    if use_locusta_client {
+        if let Some(existing) = super::runtime::get_benchfs_ctx_rc() {
+            tracing::info!(
+                "benchfs_init: reusing existing locusta client context (idempotent re-init)"
+            );
+            let boxed = Box::new(existing);
+            return Box::into_raw(boxed) as *mut benchfs_context_t;
+        }
+    }
+
     // Create BenchFS instance based on mode
     let benchfs = if is_server != 0 {
         // ===== SERVER MODE =====
@@ -900,10 +922,29 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
         }
     }
 
-    // Convert back to Rc<BenchFS> and drop it
-    // This will automatically trigger Drop implementations for all components
+    // Locusta clients: io500 calls benchfs_init/finalize per phase. We
+    // keep TLS state alive across phases so the locusta server-side
+    // dest_id→QP mapping stays valid (see benchfs_init for context).
+    // Only drop the Box wrapper that C owns; the underlying Rc is
+    // still held by the TLS BENCHFS_CTX and will be dropped on
+    // process exit.
+    let use_locusta_client = std::env::var("BENCHFS_TRANSPORT")
+        .map(|v| v.eq_ignore_ascii_case("locusta"))
+        .unwrap_or(false)
+        && super::runtime::get_benchfs_ctx_rc().is_some();
+
+    // Convert back to Rc<BenchFS> and drop one Rc clone. Other Rc
+    // clones (TLS, ConnectionPool, etc.) keep the instance alive on
+    // the locusta path.
     unsafe {
         let _ = Box::from_raw(ctx as *mut Rc<BenchFS>);
+    }
+
+    if use_locusta_client {
+        tracing::info!(
+            "benchfs_finalize: locusta client — preserving TLS state for next phase"
+        );
+        return;
     }
 
     // Clean up thread-local storage
