@@ -339,9 +339,7 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                 let fb = match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(&alloc) {
                     Some(fb) => fb,
                     None => {
-                        eprintln!(
-                            "[locusta_handlers] WriteChunkById PutGrant: allocator empty"
-                        );
+                        eprintln!("[locusta_handlers] WriteChunkById PutGrant: allocator empty");
                         drop(h);
                         return;
                     }
@@ -367,9 +365,8 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                 let offset = header.offset;
                 let data_len = header.length as usize;
                 let buf = h.buffer();
-                let slice: &[u8] = unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr(), data_len.min(buf.len()))
-                };
+                let slice: &[u8] =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr(), data_len.min(buf.len())) };
                 let resp = match ctx
                     .chunk_store
                     .write_chunk(&path, chunk_index, offset, slice)
@@ -377,9 +374,7 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                 {
                     Ok(bytes) => WriteChunkResponseHeader::success(bytes as u64),
                     Err(e) => {
-                        eprintln!(
-                            "[locusta_handlers] WriteChunkById store failed: {e:?}"
-                        );
+                        eprintln!("[locusta_handlers] WriteChunkById store failed: {e:?}");
                         WriteChunkResponseHeader::error(-5) // EIO
                     }
                 };
@@ -402,6 +397,13 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
         body: Vec<u8>,
         req: Request<RegisteredFixedBuffer>,
     ) {
+        // Static debug counter to confirm reads are reaching the handler.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static READ_HANDLER_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+        let nth = READ_HANDLER_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+        if nth < 5 || nth.is_multiple_of(10000) {
+            tracing::info!("[locusta_handlers] ReadChunkById handler invocation #{nth}");
+        }
         let (header, _) = match split_header::<ReadChunkByIdRequestHeader>(&body) {
             Some(pair) => pair,
             None => {
@@ -424,36 +426,46 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                 {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!(
-                            "[locusta_handlers] ReadChunkById store failed: {e:?}"
-                        );
+                        eprintln!("[locusta_handlers] ReadChunkById store failed: {e:?}");
                         // Drop the handle → client gets error response.
                         drop(h);
                         return;
                     }
                 };
+                if nth < 5 {
+                    tracing::info!(
+                        "[locusta_handlers] ReadChunkById #{nth}: chunk_store returned {} bytes",
+                        data.len()
+                    );
+                }
 
                 // Allocate a server-side RDMA-registered buffer and stage
                 // the read data into it. The handle's `reply()` will
                 // RDMA-write that buffer to the client's recv area.
                 let alloc = Rc::clone(&ctx.allocator);
-                let mut fb = match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(
-                    &alloc,
-                ) {
-                    Some(fb) => fb,
-                    None => {
-                        eprintln!(
-                            "[locusta_handlers] ReadChunkById: server allocator empty"
-                        );
-                        drop(h);
-                        return;
-                    }
-                };
+                let mut fb =
+                    match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(&alloc) {
+                        Some(fb) => fb,
+                        None => {
+                            eprintln!("[locusta_handlers] ReadChunkById: server allocator empty");
+                            drop(h);
+                            return;
+                        }
+                    };
                 let n = data.len().min(fb.len()).min(h.dma_len() as usize);
                 fb.as_mut_slice()[..n].copy_from_slice(&data[..n]);
                 let buf = RegisteredFixedBuffer::from_fixed_buffer(fb);
                 let resp = ReadChunkResponseHeader::success(n as u64);
+                if nth < 5 {
+                    tracing::info!(
+                        "[locusta_handlers] ReadChunkById #{nth}: about to h.reply(n={n}, dma_len={})",
+                        h.dma_len()
+                    );
+                }
                 h.reply(buf, resp.as_bytes().to_vec());
+                if nth < 5 {
+                    tracing::info!("[locusta_handlers] ReadChunkById #{nth}: h.reply returned");
+                }
             }
             other => {
                 eprintln!(
