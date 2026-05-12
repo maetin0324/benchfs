@@ -428,7 +428,7 @@ run = ${mdtest_run}
 
 [ior-hard]
 API =
-segmentCount = 100000
+segmentCount = ${IO500_IOR_HARD_SEGMENTS:-20000}
 collective =
 run = ${hard_run}
 
