@@ -80,6 +80,12 @@ struct Args {
     /// (client) DMA payload size for put/get modes (default 4 MiB).
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     payload_bytes: usize,
+    /// Skip the static QP exchange at init time — both sides start with
+    /// an empty peer list. Server uses `try_accept_pending_peers`; the
+    /// client calls `add_peer` explicitly before issuing RPCs. Exercises
+    /// the late-join handshake path used by FFI/IOR clients in Phase 3.
+    #[arg(long, default_value_t = false)]
+    dynamic: bool,
 }
 
 #[derive(Copy, Clone, ValueEnum, Debug, PartialEq, Eq)]
@@ -131,16 +137,44 @@ fn main() {
     let cfg = LocustaConfig {
         registry_dir: args.registry_dir.clone(),
         local_node_id: args.local.clone(),
-        peer_node_ids: vec![args.peer.clone()],
+        peer_node_ids: if args.dynamic {
+            Vec::new()
+        } else {
+            vec![args.peer.clone()]
+        },
         ..LocustaConfig::default()
     };
 
     let transport = LocustaTransport::init(&cfg).expect("LocustaTransport::init");
     println!(
-        "[{:?}] connected — node_to_dest={:?}",
+        "[{:?}] init done (dynamic={}) — node_to_dest={:?}",
         args.role,
+        args.dynamic,
         transport.inner.borrow().node_to_dest
     );
+
+    // Dynamic path: client explicitly adds the peer after init; server
+    // discovers it via the registry-scan accept loop driven inside
+    // `run_server` below.
+    if args.dynamic {
+        match args.role {
+            Role::Client => {
+                let t0 = Instant::now();
+                transport
+                    .add_peer(&args.peer, Duration::from_secs(30))
+                    .expect("dynamic add_peer");
+                println!(
+                    "[Client] dynamic add_peer({}) handshake took {:?}",
+                    args.peer,
+                    t0.elapsed()
+                );
+            }
+            Role::Server => {
+                // Server's accept loop is launched inside `run_server` so
+                // it runs interleaved with the request poll loop.
+            }
+        }
+    }
 
     match args.role {
         Role::Server => run_server(&transport, args.serve_secs, args.mode),
@@ -177,7 +211,22 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
     let deadline = Instant::now() + Duration::from_secs(serve_secs);
     let mut reqs = 0u64;
     let mut polls = 0u64;
+    let mut next_accept_at = Instant::now();
     while Instant::now() < deadline {
+        // Periodic registry scan — picks up dynamically-joining clients.
+        // Cheap when nothing new is present (a single readdir).
+        if Instant::now() >= next_accept_at {
+            match transport.try_accept_pending_peers(Duration::from_secs(10)) {
+                Ok(added) if !added.is_empty() => {
+                    println!("[server] try_accept_pending_peers added: {:?}", added);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[server] try_accept_pending_peers error: {:?}", e);
+                }
+            }
+            next_accept_at = Instant::now() + Duration::from_millis(100);
+        }
         if let Some(dispatch) = dispatch_setup.as_ref() {
             // Mode::Dispatch — production polling path. `poll_once` ticks
             // the locusta state machines and runs every ready request

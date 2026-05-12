@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mlx5::pd::AccessFlags;
+use mlx5::qp::RcQpConfig;
 use rrrpc::arena::DmaArena;
 use rrrpc::rdma_util::RecvBufferPool;
 use rrrpc::relay::client::{Client, Response, ResponseFuture};
@@ -29,7 +30,7 @@ use rrrpc::relay::daemon::{Channel, RdmaContext, RelayConfig, RelayDaemon};
 use rrrpc::relay::jiffy::JiffyQueue;
 use rrrpc::relay::shm::{init_channel_header, ChannelHeader, ChannelState, ShmLayout};
 use rrrpc::relay::spsc::FastForwardRing;
-use rrrpc::server::{RdmaBuffer, Request, ServerConfig, ServerContext, ServerRdmaContext};
+use rrrpc::server::{Request, ServerConfig, ServerContext, ServerRdmaContext};
 use rrrpc::wire::{CompletionSlot, QpExchangeInfo, RequestSlot};
 
 use mlx5::pd::MemoryRegion;
@@ -69,6 +70,18 @@ pub struct LocustaInner {
     /// re-using avoids the per-RPC `Vec` churn that hurt the `LocustaCallable`
     /// path.
     pub small_req_scratch: Vec<u8>,
+    /// Filesystem directory used for QP info exchange (same value passed
+    /// in `LocustaConfig`). Cached so `add_peer` can find / write files
+    /// after `init`.
+    pub registry_dir: PathBuf,
+    /// Local node id (same value passed in `LocustaConfig`).
+    pub local_node_id: NodeId,
+    /// QP config reused for every new peer.
+    pub qp_config: RcQpConfig,
+    /// Next dest_id to hand out from `add_peer`. Starts at
+    /// `cfg.peer_node_ids.len()` after `init` and increments with each
+    /// successful dynamic add.
+    pub next_dest_id: u16,
 }
 
 impl LocustaInner {
@@ -81,6 +94,85 @@ impl LocustaInner {
         self.daemon.poll_server_completions();
         self.client.poll();
         self.server.poll();
+    }
+
+    /// Run the full 4-step QP handshake against `peer` and register the
+    /// resulting dest_id under `peer` in `node_to_dest`. Blocks the
+    /// calling thread (with 50ms sleeps) until both of the peer's QP
+    /// info files appear, or `deadline` is reached.
+    ///
+    /// Used by `LocustaTransport::init` for each pre-configured peer
+    /// and by `LocustaTransport::add_peer` at runtime. The protocol is
+    /// symmetric — whichever side runs first writes its files and
+    /// spin-reads for the other side; whichever side runs second sees
+    /// the files immediately and returns quickly.
+    fn add_peer_blocking(
+        &mut self,
+        peer: &str,
+        deadline: Instant,
+    ) -> Result<u16, RpcError> {
+        if let Some(&existing) = self.node_to_dest.get(peer) {
+            return Ok(existing);
+        }
+        let dest_id = self.next_dest_id;
+
+        // Server side: prepare peer for the remote relay
+        let server_local = self
+            .server
+            .prepare_peer(dest_id, 64 * 1024, 64 * 1024, 512, 4096, &self.qp_config)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
+            })?;
+        let server_out = server_qp_path(&self.registry_dir, &self.local_node_id, peer);
+        write_qp_info(&server_out, &server_local).map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "write_qp_info({}): {e}",
+                server_out.display()
+            ))
+        })?;
+
+        // Relay side: prepare destination for the remote server
+        let relay_local = self
+            .daemon
+            .prepare_destination(dest_id, 64 * 1024, 64 * 1024, &self.qp_config)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "daemon.prepare_destination({dest_id}): {e:?}"
+                ))
+            })?;
+        let relay_out = relay_qp_path(&self.registry_dir, &self.local_node_id, peer);
+        write_qp_info(&relay_out, &relay_local).map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "write_qp_info({}): {e}",
+                relay_out.display()
+            ))
+        })?;
+
+        // Wait for peer's published info and finalize connections.
+        let peer_relay_path = relay_qp_path(&self.registry_dir, peer, &self.local_node_id);
+        let peer_relay_info = read_qp_info_when_ready(&peer_relay_path, deadline)?;
+        self.server
+            .connect_peer(dest_id, &peer_relay_info)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("server.connect_peer({dest_id}): {e:?}"))
+            })?;
+
+        let peer_server_path = server_qp_path(&self.registry_dir, peer, &self.local_node_id);
+        let peer_server_info = read_qp_info_when_ready(&peer_server_path, deadline)?;
+        self.daemon
+            .connect_destination(dest_id, &peer_server_info)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "daemon.connect_destination({dest_id}): {e:?}"
+                ))
+            })?;
+
+        self.node_to_dest.insert(peer.to_string(), dest_id);
+        self.next_dest_id = self
+            .next_dest_id
+            .checked_add(1)
+            .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
+        Ok(dest_id)
     }
 
     /// Returns true once the response for `completion_id` is ready.
@@ -290,20 +382,26 @@ fn write_qp_info(path: &Path, info: &QpExchangeInfo) -> std::io::Result<()> {
     Ok(())
 }
 
+fn try_read_qp_info(path: &Path) -> Option<QpExchangeInfo> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() != QP_INFO_SIZE {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<QpExchangeInfo>::uninit();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            info.as_mut_ptr() as *mut u8,
+            QP_INFO_SIZE,
+        );
+        Some(info.assume_init())
+    }
+}
+
 fn read_qp_info_when_ready(path: &Path, deadline: Instant) -> Result<QpExchangeInfo, RpcError> {
     loop {
-        if let Ok(bytes) = fs::read(path) {
-            if bytes.len() == QP_INFO_SIZE {
-                let mut info = std::mem::MaybeUninit::<QpExchangeInfo>::uninit();
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        info.as_mut_ptr() as *mut u8,
-                        QP_INFO_SIZE,
-                    );
-                    return Ok(info.assume_init());
-                }
-            }
+        if let Some(info) = try_read_qp_info(path) {
+            return Ok(info);
         }
         if Instant::now() > deadline {
             return Err(RpcError::ConnectionError(format!(
@@ -448,69 +546,10 @@ impl LocustaTransport {
                 (None, Vec::new())
             };
 
-        let qp_config = mlx5::qp::RcQpConfig {
+        let qp_config = RcQpConfig {
             max_send_wr: 1024,
-            ..mlx5::qp::RcQpConfig::default()
+            ..RcQpConfig::default()
         };
-
-        // ------ Per-peer QP exchange (sequential; each peer gets a dest_id) ------
-        let deadline = Instant::now() + Duration::from_secs(cfg.exchange_timeout_secs);
-        let mut node_to_dest = HashMap::new();
-        for (idx, peer) in cfg.peer_node_ids.iter().enumerate() {
-            let dest_id = idx as u16;
-            // Server side: prepare peer for the remote relay
-            let server_local = server
-                .prepare_peer(dest_id, 64 * 1024, 64 * 1024, 512, 4096, &qp_config)
-                .map_err(|e| {
-                    RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
-                })?;
-            let server_out =
-                server_qp_path(&cfg.registry_dir, &cfg.local_node_id, peer);
-            write_qp_info(&server_out, &server_local).map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "write_qp_info({}): {e}",
-                    server_out.display()
-                ))
-            })?;
-
-            // Relay side: prepare destination for the remote server
-            let relay_local = daemon
-                .prepare_destination(dest_id, 64 * 1024, 64 * 1024, &qp_config)
-                .map_err(|e| {
-                    RpcError::ConnectionError(format!(
-                        "daemon.prepare_destination({dest_id}): {e:?}"
-                    ))
-                })?;
-            let relay_out =
-                relay_qp_path(&cfg.registry_dir, &cfg.local_node_id, peer);
-            write_qp_info(&relay_out, &relay_local).map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "write_qp_info({}): {e}",
-                    relay_out.display()
-                ))
-            })?;
-
-            // Read peer's published info and finalize connections.
-            let peer_relay_path = relay_qp_path(&cfg.registry_dir, peer, &cfg.local_node_id);
-            let peer_relay_info = read_qp_info_when_ready(&peer_relay_path, deadline)?;
-            server.connect_peer(dest_id, &peer_relay_info).map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "server.connect_peer({dest_id}): {e:?}"
-                ))
-            })?;
-
-            let peer_server_path = server_qp_path(&cfg.registry_dir, peer, &cfg.local_node_id);
-            let peer_server_info = read_qp_info_when_ready(&peer_server_path, deadline)?;
-            daemon
-                .connect_destination(dest_id, &peer_server_info)
-                .map_err(|e| {
-                    RpcError::ConnectionError(format!(
-                        "daemon.connect_destination({dest_id}): {e:?}"
-                    ))
-                })?;
-
-            node_to_dest.insert(peer.clone(), dest_id);
-        }
 
         // ------ Client ------
         let arena = unsafe { DmaArena::new(arena_base, cfg.arena_size) };
@@ -528,17 +567,120 @@ impl LocustaTransport {
             server,
             server_buffer_allocator,
             _server_buffer_mrs: server_buffer_mrs,
-            node_to_dest,
+            node_to_dest: HashMap::new(),
             channel_base_ptr: shm_base,
             channel_layout_total: layout.total_size,
             inflight: HashMap::new(),
             // Pre-size for typical metadata header + path (≤256B). Will
             // grow once if larger inputs arrive.
             small_req_scratch: Vec::with_capacity(256),
+            registry_dir: cfg.registry_dir.clone(),
+            local_node_id: cfg.local_node_id.clone(),
+            qp_config,
+            next_dest_id: 0,
         };
-        Ok(Self {
-            inner: Rc::new(RefCell::new(inner)),
-        })
+        let inner = Rc::new(RefCell::new(inner));
+
+        // ------ Per-peer QP exchange (sequential; each peer gets a dest_id) ------
+        let deadline = Instant::now() + Duration::from_secs(cfg.exchange_timeout_secs);
+        {
+            let mut inner_mut = inner.borrow_mut();
+            for peer in &cfg.peer_node_ids {
+                inner_mut.add_peer_blocking(peer, deadline)?;
+            }
+        }
+        Ok(Self { inner })
+    }
+
+    /// Run the full QP handshake against `peer` at runtime, blocking
+    /// the calling thread until the handshake completes or `timeout`
+    /// elapses. Returns the freshly-allocated dest_id. Idempotent —
+    /// if `peer` is already connected returns the existing dest_id.
+    ///
+    /// This is the building block that lets BenchFS dynamically accept
+    /// connections from late-joining clients (the FFI / IOR path) that
+    /// were not known at `init` time.
+    pub fn add_peer(
+        &self,
+        peer: &NodeId,
+        timeout: Duration,
+    ) -> Result<u16, RpcError> {
+        let deadline = Instant::now() + timeout;
+        let mut inner = self.inner.borrow_mut();
+        inner.add_peer_blocking(peer, deadline)
+    }
+
+    /// Scan `registry_dir` for peer files belonging to nodes not yet
+    /// in `node_to_dest` whose **both** publications (`server_*` and
+    /// `relay_*` pointing at us) have already appeared. For each such
+    /// peer, run the full handshake. Returns the list of node ids
+    /// newly connected on this call.
+    ///
+    /// Designed to be polled by a long-running accept task on the
+    /// server side. Re-entrant: a partially-published peer (only one
+    /// of the two files present) is skipped this round and re-checked
+    /// on the next call.
+    ///
+    /// Skips any file whose basename is the local node — peers don't
+    /// connect to themselves.
+    pub fn try_accept_pending_peers(
+        &self,
+        per_peer_timeout: Duration,
+    ) -> Result<Vec<NodeId>, RpcError> {
+        let (registry_dir, local_node_id, known_peers) = {
+            let inner = self.inner.borrow();
+            (
+                inner.registry_dir.clone(),
+                inner.local_node_id.clone(),
+                inner.node_to_dest.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        // Two prefixes mark "peer X published its half pointing at us":
+        //   server_<X>_to_relay_<self>.qpinfo
+        //   relay_<X>_to_server_<self>.qpinfo
+        // Both must exist before we attempt the handshake (so
+        // read_qp_info_when_ready never has to wait).
+        let server_suffix = format!("_to_relay_{local_node_id}.qpinfo");
+        let relay_suffix = format!("_to_server_{local_node_id}.qpinfo");
+        let mut candidates_server: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut candidates_relay: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let dir_iter = fs::read_dir(&registry_dir).map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "read_dir({}): {e}",
+                registry_dir.display()
+            ))
+        })?;
+        for entry in dir_iter.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if let Some(rest) = name.strip_prefix("server_")
+                && let Some(peer) = rest.strip_suffix(&server_suffix)
+            {
+                candidates_server.insert(peer.to_string());
+            } else if let Some(rest) = name.strip_prefix("relay_")
+                && let Some(peer) = rest.strip_suffix(&relay_suffix)
+            {
+                candidates_relay.insert(peer.to_string());
+            }
+        }
+        let known: std::collections::HashSet<&NodeId> = known_peers.iter().collect();
+        let mut added = Vec::new();
+        for peer in candidates_server.intersection(&candidates_relay) {
+            if peer == &local_node_id {
+                continue;
+            }
+            if known.contains(&peer.to_string()) {
+                continue;
+            }
+            // Both publications exist — handshake should be quick. Use
+            // the supplied timeout as a sanity cap.
+            self.add_peer(peer, per_peer_timeout)?;
+            added.push(peer.clone());
+        }
+        Ok(added)
     }
 
     fn lookup_dest(&self, dest: &NodeId) -> Result<u16, RpcError> {
@@ -548,6 +690,11 @@ impl LocustaTransport {
             .get(dest)
             .copied()
             .ok_or_else(|| RpcError::ConnectionError(format!("unknown peer node: {dest}")))
+    }
+
+    /// Returns true if `peer` is already in `node_to_dest`.
+    pub fn has_peer(&self, peer: &NodeId) -> bool {
+        self.inner.borrow().node_to_dest.contains_key(peer)
     }
 
     /// Async future that polls `LocustaInner` until the response for

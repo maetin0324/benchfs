@@ -17,6 +17,8 @@
 #   LOOKUP_PATH=...    path string for metadata-style modes
 #                      (default /test/file.bin)
 #   PAYLOAD_BYTES=N    DMA size for put/get modes (default 4 MiB)
+#   DYNAMIC=1          skip static peer init, exercise add_peer +
+#                      try_accept_pending_peers handshake instead
 
 set -e
 hostname
@@ -50,6 +52,11 @@ SERVE_SECS=${SERVE_SECS:-120}
 MODE=${MODE:-metadata}
 LOOKUP_PATH=${LOOKUP_PATH:-/test/file.bin}
 PAYLOAD_BYTES=${PAYLOAD_BYTES:-4194304}
+if [ "${DYNAMIC:-0}" = "1" ]; then
+    DYNAMIC_FLAG="--dynamic"
+else
+    DYNAMIC_FLAG=""
+fi
 
 # Build per-rank wrapper. mpirun dispatches it to each rank; the wrapper
 # looks at OMPI_COMM_WORLD_RANK and execs `benchfs_locusta_demo` with the
@@ -64,14 +71,15 @@ echo "[rank=\$OMPI_COMM_WORLD_RANK host=\$(hostname -s)] starting"
 case "\$OMPI_COMM_WORLD_RANK" in
     0)
         "$DEMO_BIN" --role server --local server_node --peer client_node \\
-            --registry-dir "$REGISTRY" --serve-secs $SERVE_SECS --mode $MODE
+            --registry-dir "$REGISTRY" --serve-secs $SERVE_SECS --mode $MODE $DYNAMIC_FLAG
         ;;
     1)
-        # Give the server a moment to publish its QP info.
+        # Give the server a moment to publish its QP info (static mode) or
+        # come up enough that its accept loop is scanning (dynamic mode).
         sleep 2
         "$DEMO_BIN" --role client --local client_node --peer server_node \\
             --registry-dir "$REGISTRY" --pings $PINGS --mode $MODE \\
-            --path $LOOKUP_PATH --payload-bytes $PAYLOAD_BYTES
+            --path $LOOKUP_PATH --payload-bytes $PAYLOAD_BYTES $DYNAMIC_FLAG
         ;;
     *)
         echo "[rank=\$OMPI_COMM_WORLD_RANK] unexpected rank; exiting"

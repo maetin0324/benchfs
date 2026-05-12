@@ -168,11 +168,31 @@ impl ConnectionPool {
         // Locusta short-circuit: skip the UCX endpoint dance, build a
         // locusta-backed `RpcClient` that routes every `execute<T>`
         // through `T::call_locusta(peer, transport)`.
+        //
+        // If the locusta transport doesn't yet have a dest_id for
+        // `node_id` (the late-joining FFI/IOR client path), run the
+        // RDMA QP handshake before returning the cached client. Both
+        // sides exchange QP info via the same file registry that
+        // `LocustaTransport::init` uses for statically-known peers.
         #[cfg(feature = "transport-locusta")]
         if let Some(transport) = &self.locusta_transport {
+            let peer_node_id = node_id.to_string();
+            if !transport.has_peer(&peer_node_id) {
+                tracing::info!(
+                    node_id = node_id,
+                    "locusta: peer not yet connected, running add_peer handshake"
+                );
+                transport
+                    .add_peer(&peer_node_id, std::time::Duration::from_secs(30))
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "locusta add_peer({node_id}) failed: {e:?}"
+                        ))
+                    })?;
+            }
             let client = Rc::new(RpcClient::new_locusta(
                 Rc::clone(transport),
-                node_id.to_string(),
+                peer_node_id,
             ));
             self.connections
                 .borrow_mut()

@@ -635,6 +635,39 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                 },
                 "locusta_dispatch_poll".to_string(),
             );
+
+            // Accept loop: scan the registry directory for late-joining
+            // clients (IOR ranks, etc.) that publish their QP info after
+            // server startup. Static peers wired in `init_locusta_runtime`
+            // are already connected; this only handles the dynamic ones.
+            let accept_transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    tracing::info!("Starting locusta client_accept loop");
+                    let scan_interval = std::time::Duration::from_millis(100);
+                    let per_peer_timeout = std::time::Duration::from_secs(10);
+                    loop {
+                        match accept_transport.try_accept_pending_peers(per_peer_timeout) {
+                            Ok(added) if !added.is_empty() => {
+                                tracing::info!(
+                                    "locusta accepted {} new client peer(s): {:?}",
+                                    added.len(),
+                                    added
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    "try_accept_pending_peers error: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                        futures_timer::Delay::new(scan_interval).await;
+                    }
+                },
+                "locusta_client_accept".to_string(),
+            );
         }
     } else {
         pluvio_runtime::spawn_with_name(
