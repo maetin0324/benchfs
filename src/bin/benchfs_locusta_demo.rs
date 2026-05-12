@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use zerocopy::{FromBytes, IntoBytes};
 
+use benchfs::rpc::data_ops::{WriteChunkByIdRequest, WriteChunkResponseHeader};
 use benchfs::rpc::locusta_call::LocustaCallable;
 use benchfs::rpc::metadata_ops::{
     MetadataLookupRequest, MetadataLookupRequestHeader, MetadataLookupResponseHeader,
@@ -105,6 +106,9 @@ enum Mode {
     /// server replies with a pre-filled `SharedRdmaBuffer` that is
     /// RDMA-read into the client's recv buffer.
     Get,
+    /// Phase 2.2b: production `WriteChunkByIdRequest::call_locusta(...)`
+    /// — exercises the AmRpc `Put` dispatch via `LocustaCallable`.
+    AmrpcPut,
 }
 
 fn main() {
@@ -171,7 +175,7 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
                         // header bytes followed by the path. The only
                         // difference is the client-side marshalling path.
                         Mode::Metadata | Mode::Amrpc => serve_metadata_lookup(h.small_req()),
-                        Mode::Put | Mode::Get => {
+                        Mode::Put | Mode::Get | Mode::AmrpcPut => {
                             eprintln!("[server] unexpected RoundtripEager in {mode:?} mode");
                             vec![0u8; 8]
                         }
@@ -201,9 +205,23 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
                 }
                 rrrpc::server::Request::RoundtripPutReady(h) => {
                     // Put phase 2: DMA write complete; buffer.as_ptr() is filled.
-                    // For the demo we just ack — the buffer is dropped via
-                    // RegisteredFixedBuffer's Arc → FixedBuffer Drop → pool.
-                    h.reply(vec![0u8; 8]);
+                    // Reply shape depends on the mode the client used:
+                    // Mode::Put expects an opaque 8B ack, Mode::AmrpcPut
+                    // expects a WriteChunkResponseHeader (16B).
+                    let reply = match mode {
+                        Mode::AmrpcPut => {
+                            // Acknowledge the full DMA write — the client's
+                            // LocustaCallable decoder will read this as
+                            // WriteChunkResponseHeader. `RdmaBuffer::len`
+                            // is a trait method, so use the explicit path.
+                            use rrrpc::server::RdmaBuffer;
+                            let resp =
+                                WriteChunkResponseHeader::success(h.buffer().len() as u64);
+                            resp.as_bytes().to_vec()
+                        }
+                        _ => vec![0u8; 8],
+                    };
+                    h.reply(reply);
                     reqs += 1;
                 }
                 rrrpc::server::Request::RoundtripGet(h) => {
@@ -303,8 +321,8 @@ fn run_client(
             buf.extend_from_slice(path.as_bytes());
             buf
         }
-        // Amrpc mode constructs the request struct itself; small_req unused.
-        Mode::Amrpc => Vec::new(),
+        // Amrpc/AmrpcPut modes construct the request struct itself; small_req unused.
+        Mode::Amrpc | Mode::AmrpcPut => Vec::new(),
         Mode::Put | Mode::Get => vec![0u8; 8], // tiny header for DMA modes
     };
 
@@ -343,8 +361,15 @@ fn run_client(
     let waker: Waker = Waker::from(Arc::new(NoopWaker));
     let mut cx = Context::from_waker(&waker);
 
+    // Pre-allocated payload for AmrpcPut so the loop measures wire latency only.
+    let amrpc_put_data: Vec<u8> = if mode == Mode::AmrpcPut {
+        vec![0x5Au8; payload_bytes]
+    } else {
+        Vec::new()
+    };
+
     let payload_summary = match mode {
-        Mode::Put | Mode::Get => format!("dma={} bytes", payload_bytes),
+        Mode::Put | Mode::Get | Mode::AmrpcPut => format!("dma={} bytes", payload_bytes),
         _ => format!("eager={} bytes", small_req.len()),
     };
     println!(
@@ -417,6 +442,27 @@ fn run_client(
                     }
                 }
             }
+            Mode::AmrpcPut => {
+                // Production path: WriteChunkByIdRequest::call_locusta(...)
+                // — exercises the LocustaCallable `Put` default impl on the
+                // real BenchFS chunk write request type.
+                let req = WriteChunkByIdRequest::new(
+                    1, /* file_id */
+                    0, /* offset */
+                    &amrpc_put_data,
+                );
+                let mut fut = Box::pin(req.call_locusta(&peer_id, transport));
+                let hdr_result = loop {
+                    match Pin::as_mut(&mut fut).poll(&mut cx) {
+                        Poll::Ready(r) => break r,
+                        Poll::Pending => std::thread::yield_now(),
+                    }
+                };
+                hdr_result.map(|hdr| benchfs::rpc::transport::RpcResponse {
+                    header_bytes: hdr.as_bytes().to_vec(),
+                    data_len: 0,
+                })
+            }
         };
         let dt = t0.elapsed();
         total_latency_ns += dt.as_nanos();
@@ -446,6 +492,19 @@ fn run_client(
                                 "[client] first Get response: data_len={} head=0x{:02x} tail=0x{:02x}",
                                 resp.data_len, head, tail
                             );
+                        }
+                        Mode::AmrpcPut => {
+                            let bytes = &resp.header_bytes;
+                            let sz = std::mem::size_of::<WriteChunkResponseHeader>();
+                            if bytes.len() >= sz {
+                                let rh =
+                                    WriteChunkResponseHeader::read_from_bytes(&bytes[..sz])
+                                        .expect("decode");
+                                println!(
+                                    "[client] first AmrpcPut response: bytes_written={} status={}",
+                                    rh.bytes_written, rh.status
+                                );
+                            }
                         }
                         _ => {}
                     }
