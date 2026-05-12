@@ -1267,6 +1267,13 @@ pub struct IOUringChunkStore {
     /// writes to the same chunk. Best-effort: a missing entry just
     /// triggers a redundant stat, never a missed header write.
     header_initialized: RefCell<std::collections::HashSet<ChunkKey>>,
+
+    /// Cache of (path_hash, shard) pairs whose directory we've already
+    /// confirmed exists. Lets `ensure_chunk_dir` skip the sync
+    /// `dir.exists()` stat on every subsequent chunk in the same
+    /// shard. With ior-easy FPP and 2048 chunks per rank file, this
+    /// turns ~2048 sync syscalls per file into 16 (shard count).
+    known_shard_dirs: RefCell<std::collections::HashSet<(String, u64)>>,
 }
 
 impl IOUringChunkStore {
@@ -1298,6 +1305,7 @@ impl IOUringChunkStore {
             chunk_size: CHUNK_SIZE,
             backend,
             header_initialized: RefCell::new(std::collections::HashSet::new()),
+            known_shard_dirs: RefCell::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1348,11 +1356,21 @@ impl IOUringChunkStore {
     /// Ensure the directory for a chunk exists (including shard subdirectory)
     fn ensure_chunk_dir(&self, file_path: &str, chunk_index: u64) -> ChunkStoreResult<PathBuf> {
         let path_hash = self.hash_path(file_path);
-        let shard = self.shard_dir(chunk_index);
-        let dir = self.base_dir.join(path_hash).join(shard);
+        let shard = chunk_index % Self::SHARD_COUNT;
+        // Fast path: we've already created/observed this shard dir.
+        // Job 17063 timing showed each chunk's open_chunk_file → ensure_chunk_dir
+        // doing a sync `dir.exists()` stat per chunk; with 2048 chunks per rank
+        // file and only 16 shards, ~99% of those stats are redundant.
+        let cache_key = (path_hash.clone(), shard);
+        if self.known_shard_dirs.borrow().contains(&cache_key) {
+            return Ok(self.base_dir.join(&cache_key.0).join(self.shard_dir(chunk_index)));
+        }
+        let shard_str = self.shard_dir(chunk_index);
+        let dir = self.base_dir.join(&path_hash).join(&shard_str);
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
         }
+        self.known_shard_dirs.borrow_mut().insert(cache_key);
         Ok(dir)
     }
 
