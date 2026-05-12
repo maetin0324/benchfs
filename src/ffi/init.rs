@@ -619,14 +619,25 @@ pub extern "C" fn benchfs_init(
                             "FFI client: LocustaTransport ready, registry={}",
                             cfg.registry_dir.display()
                         );
-                        // No Reactor registration on purpose. The
-                        // client-side `WaitForResponse::poll` busy-polls
-                        // and calls `inner.tick()` inside, so the state
-                        // machines advance whenever an async RPC is
-                        // in-flight. Registering a separate
-                        // tick-reactor caused intermittent rank-0
-                        // freezes server-side; we keep the architecture
-                        // symmetric on the client side just in case.
+                        // Register a no-op "keepalive" reactor so the
+                        // pluvio executor's stuck-watchdog (1M iter
+                        // without made_progress) doesn't fire while
+                        // a long async RPC is in flight. The reactor
+                        // doesn't touch locusta state — tick happens
+                        // inside `WaitForResponse::poll` — but its
+                        // mere existence as a Running reactor sets
+                        // made_progress=true each iteration.
+                        struct KeepAliveReactor;
+                        impl pluvio_runtime::reactor::Reactor for KeepAliveReactor {
+                            fn poll(&self) {}
+                            fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
+                                pluvio_runtime::reactor::ReactorStatus::Running
+                            }
+                        }
+                        runtime.register_reactor(
+                            "locusta_keepalive",
+                            Rc::new(KeepAliveReactor),
+                        );
                         Some(Rc::new(t))
                     }
                     Err(e) => {
