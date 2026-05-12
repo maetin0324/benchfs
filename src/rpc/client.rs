@@ -195,17 +195,18 @@ pub struct LocustaBackend {
 ///
 /// The client executes RPCs by taking any type that implements the `RpcCall` trait.
 pub struct RpcClient {
-    conn: Connection,
+    /// UCX endpoint+worker. `None` when this client is locusta-backed —
+    /// the locusta path has no need for a UCX `Worker` so we don't
+    /// require the caller to construct a dummy one.
+    conn: Option<Connection>,
     // Store reply stream opaquely since pluvio_ucx may not export AmStream
     #[allow(dead_code)]
     reply_stream_id: RefCell<Option<u16>>,
-    /// Client's own WorkerAddress for direct response
+    /// Client's own WorkerAddress for direct response (UCX only).
     worker_address: Vec<u8>,
     /// When `Some`, `execute<T>` dispatches via locusta instead of UCX.
-    /// Set by `RpcClient::new_locusta` or via
-    /// `ConnectionPool::new_locusta`. The `conn` field is then unused
-    /// (kept around to preserve binary layout; a fresh dummy worker is
-    /// supplied at construction time).
+    /// Set by [`RpcClient::new_locusta`] or via
+    /// `ConnectionPool::new_locusta`.
     #[cfg(feature = "transport-locusta")]
     locusta: Option<LocustaBackend>,
 }
@@ -232,7 +233,7 @@ impl RpcClient {
             });
 
         Self {
-            conn,
+            conn: Some(conn),
             reply_stream_id: RefCell::new(None),
             worker_address,
             #[cfg(feature = "transport-locusta")]
@@ -241,17 +242,14 @@ impl RpcClient {
     }
 
     /// Construct an `RpcClient` that routes every `execute<T>` through
-    /// locusta. The `conn` is still required by the struct layout —
-    /// pass a fresh, never-used UCX `Connection` (the caller is
-    /// expected to have a dummy worker handy).
+    /// locusta. No UCX `Connection` required.
     #[cfg(feature = "transport-locusta")]
     pub fn new_locusta(
-        conn: Connection,
         transport: std::rc::Rc<crate::rpc::transport_locusta::LocustaTransport>,
         peer_node_id: String,
     ) -> Self {
         Self {
-            conn,
+            conn: None,
             reply_stream_id: RefCell::new(None),
             worker_address: Vec::new(),
             locusta: Some(LocustaBackend {
@@ -276,9 +274,10 @@ impl RpcClient {
         &self.worker_address
     }
 
-    /// Get the underlying connection
-    pub fn connection(&self) -> &Connection {
-        &self.conn
+    /// Get the underlying UCX connection if this client is UCX-backed.
+    /// Returns `None` for locusta-backed clients.
+    pub fn connection(&self) -> Option<&Connection> {
+        self.conn.as_ref()
     }
 
     /// Initialize the reply stream for receiving RPC responses
@@ -407,7 +406,7 @@ impl RpcClient {
         );
 
         let stream_start = exec_start.map(|_| Instant::now());
-        let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
+        let reply_stream = self.conn.as_ref().unwrap().worker.am_stream(reply_stream_id).map_err(|e| {
             RpcError::TransportError(format!(
                 "Failed to create reply AM stream: {:?}",
                 e.to_string()
@@ -433,7 +432,7 @@ impl RpcClient {
             proto
         );
 
-        let send_future = self.conn.endpoint().am_send_vectorized(
+        let send_future = self.conn.as_ref().unwrap().endpoint().am_send_vectorized(
             rpc_id as u32,
             zerocopy::IntoBytes::as_bytes(header),
             &data,
@@ -656,7 +655,7 @@ impl RpcClient {
         let data = request.request_data();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        let send_future = self.conn.endpoint().am_send_vectorized(
+        let send_future = self.conn.as_ref().unwrap().endpoint().am_send_vectorized(
             rpc_id as u32,
             zerocopy::IntoBytes::as_bytes(header),
             &data,

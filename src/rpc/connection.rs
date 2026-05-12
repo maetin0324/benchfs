@@ -50,6 +50,11 @@ pub struct ConnectionPool {
     connections: RefCell<HashMap<String, Rc<RpcClient>>>,
     /// Cache of worker address bytes (needed to keep the memory valid for WorkerAddressInner)
     address_cache: RefCell<HashMap<String, Vec<u8>>>,
+    /// When `Some`, every `get_or_connect(node_id)` returns a locusta-
+    /// backed `RpcClient` instead of opening a UCX endpoint. The pool's
+    /// UCX `worker` is then unused for outgoing RPCs.
+    #[cfg(feature = "transport-locusta")]
+    locusta_transport: Option<Rc<crate::rpc::transport_locusta::LocustaTransport>>,
 }
 
 impl ConnectionPool {
@@ -69,6 +74,28 @@ impl ConnectionPool {
             registry,
             connections: RefCell::new(HashMap::new()),
             address_cache: RefCell::new(HashMap::new()),
+            #[cfg(feature = "transport-locusta")]
+            locusta_transport: None,
+        })
+    }
+
+    /// Construct a `ConnectionPool` whose `get_or_connect` returns
+    /// locusta-backed clients. The `worker` is still required (the
+    /// caller will typically have one from prior UCX init) but goes
+    /// unused for outgoing RPCs.
+    #[cfg(feature = "transport-locusta")]
+    pub fn new_locusta<P: AsRef<std::path::Path>>(
+        worker: Rc<Worker>,
+        registry_dir: P,
+        transport: Rc<crate::rpc::transport_locusta::LocustaTransport>,
+    ) -> Result<Self, RpcError> {
+        let registry = WorkerAddressRegistry::new(registry_dir)?;
+        Ok(Self {
+            worker,
+            registry,
+            connections: RefCell::new(HashMap::new()),
+            address_cache: RefCell::new(HashMap::new()),
+            locusta_transport: Some(transport),
         })
     }
 
@@ -77,6 +104,16 @@ impl ConnectionPool {
     /// # Arguments
     /// * `node_id` - Unique identifier for this node
     pub fn register_self(&self, node_id: &str) -> Result<(), RpcError> {
+        // Locusta backend exchanges QP info via its own file registry —
+        // there is no UCX worker address to publish.
+        #[cfg(feature = "transport-locusta")]
+        if self.locusta_transport.is_some() {
+            tracing::info!(
+                node_id = node_id,
+                "skipping UCX register_self (locusta backend handles its own QP exchange)"
+            );
+            return Ok(());
+        }
         let address = self.worker.address().map_err(|e| {
             RpcError::ConnectionError(format!("Failed to get worker address: {:?}", e))
         })?;
@@ -106,7 +143,13 @@ impl ConnectionPool {
             let connections = self.connections.borrow();
             if let Some(client) = connections.get(node_id) {
                 // Check if the endpoint is still open
-                if !client.connection().endpoint().is_closed() {
+                // For locusta-backed clients there is no UCX endpoint —
+                // reusing the cached client is always safe.
+                let ucx_alive = client
+                    .connection()
+                    .map(|c| !c.endpoint().is_closed())
+                    .unwrap_or(true);
+                if ucx_alive {
                     tracing::debug!("Reusing existing connection to {}", node_id);
                     return Ok(client.clone());
                 } else {
@@ -121,6 +164,23 @@ impl ConnectionPool {
 
         // Remove closed connection if it exists
         self.connections.borrow_mut().remove(node_id);
+
+        // Locusta short-circuit: skip the UCX endpoint dance, build a
+        // locusta-backed `RpcClient` that routes every `execute<T>`
+        // through `T::call_locusta(peer, transport)`.
+        #[cfg(feature = "transport-locusta")]
+        if let Some(transport) = &self.locusta_transport {
+            let client = Rc::new(RpcClient::new_locusta(
+                Rc::clone(transport),
+                node_id.to_string(),
+            ));
+            self.connections
+                .borrow_mut()
+                .insert(node_id.to_string(), client.clone());
+            TOTAL_CONNECTIONS_CREATED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(node_id = node_id, "Created new locusta-backed RpcClient");
+            return Ok(client);
+        }
 
         // Lookup worker address
         tracing::info!(
