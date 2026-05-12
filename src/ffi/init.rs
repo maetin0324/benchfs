@@ -619,13 +619,15 @@ pub extern "C" fn benchfs_init(
                             "FFI client: LocustaTransport ready, registry={}",
                             cfg.registry_dir.display()
                         );
-                        let transport = Rc::new(t);
-                        // Register locusta as a reactor so each runtime
-                        // tick drives the state machines. Without this
-                        // pluvio's 1M-iteration stuck watchdog fires
-                        // while a long write RPC is in flight.
-                        runtime.register_reactor("locusta", Rc::clone(&transport));
-                        Some(transport)
+                        // No Reactor registration on purpose. The
+                        // client-side `WaitForResponse::poll` busy-polls
+                        // and calls `inner.tick()` inside, so the state
+                        // machines advance whenever an async RPC is
+                        // in-flight. Registering a separate
+                        // tick-reactor caused intermittent rank-0
+                        // freezes server-side; we keep the architecture
+                        // symmetric on the client side just in case.
+                        Some(Rc::new(t))
                     }
                     Err(e) => {
                         set_error_message(&format!("Failed to init LocustaTransport: {:?}", e));

@@ -578,19 +578,21 @@ fn run_server(
 
     #[cfg(feature = "transport-locusta")]
     let locusta_state = if use_locusta {
-        let s = init_locusta_runtime(
+        Some(init_locusta_runtime(
             &node_id,
             state.mpi_rank,
             state.mpi_size,
             registry_dir,
             handler_context.clone(),
-        )?;
-        // Lightweight Reactor: just tick locusta's state machines each
-        // executor iteration. Dispatch (drain ready + spawn handlers)
-        // happens on a separate task below — keeping them separate
-        // avoids hot-loop starvation of timer-woken tasks.
-        runtime.register_reactor("locusta", Rc::clone(&s.transport));
-        Some(s)
+        )?)
+        // NOTE: no `runtime.register_reactor("locusta", ...)` here on
+        // purpose. The dispatch task below (poll_once_spawn) ticks
+        // locusta state machines itself. WaitForResponse::poll also
+        // ticks inside its busy-poll loop. Registering a separate
+        // tick reactor caused intermittent freezes on rank 0 in jobs
+        // 17035 / 17038 — likely a try_borrow_mut race with the
+        // dispatch task. Pluvio's stuck watchdog is satisfied as
+        // long as some task completes; the dispatch task does.
     } else {
         None
     };
@@ -660,7 +662,10 @@ fn run_server(
                     );
                     let mut iter: u64 = 0;
                     loop {
-                        dispatch.drain_and_spawn(&transport);
+                        // `poll_once_spawn` ticks locusta state machines
+                        // AND drains ready requests. No separate Reactor
+                        // is needed (see commit removing tick-reactor).
+                        dispatch.poll_once_spawn(&transport);
                         iter = iter.wrapping_add(1);
                         if iter == 1 || iter % 100_000 == 0 {
                             tracing::info!(
