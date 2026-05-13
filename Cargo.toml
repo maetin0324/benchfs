@@ -79,6 +79,11 @@ ctrlc = "3.4"
 # debugging; the underlying bug should still be fixed.
 mimalloc = { version = "0.1", optional = true, default-features = false }
 
+# Heap profiler used to investigate the mdtest-hard heap corruption.
+# Recording requires running with `BENCHFS_DHAT=<output.json>` so each
+# rank writes its own profile. See `--features dhat-heap`.
+dhat = { version = "0.3", optional = true }
+
 [dev-dependencies]
 tempfile = "3.0"
 proptest = "1.4"
@@ -98,6 +103,13 @@ transport-locusta = ["dep:rrrpc", "dep:mlx5"]
 # Workaround for mdtest-hard's tcache-corruption symptom; see
 # `project_mdtest_hard_heap_corruption.md` in memory.
 mimalloc-allocator = ["dep:mimalloc"]
+
+# Wire `dhat::Alloc` as the `#[global_allocator]` and start a heap
+# profiler in `benchfs_init` that flushes to `$BENCHFS_DHAT` on
+# `benchfs_finalize` (defaulting to `dhat-<pid>.json` in CWD).
+# Use with `dhat-rs` viewer (e.g. https://nnethercote.github.io/dh_view/)
+# to find the dominant allocation sites during mdtest-hard.
+dhat-heap = ["dep:dhat"]
 
 # Debug profile with full debug symbols for perf profiling
 [profile.dev]

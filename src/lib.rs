@@ -60,9 +60,15 @@
 //! # }
 //! ```
 
-#[cfg(feature = "mimalloc-allocator")]
+#[cfg(all(feature = "mimalloc-allocator", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// dhat takes precedence over mimalloc when both features are enabled —
+// the heap profiler must wrap the allocator to track every alloc/free.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 
 pub mod api;
 pub mod cache;

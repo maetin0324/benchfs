@@ -28,6 +28,63 @@ use pluvio_timer::TimerReactor;
 use pluvio_ucx::{Context as UcxContext, reactor::UCXReactor};
 use pluvio_uring::reactor::IoUringReactor;
 
+#[cfg(feature = "dhat-heap")]
+mod dhat_profile {
+    //! Process-global dhat profiler lifecycle.
+    //!
+    //! `benchfs_init` starts the profiler on the first call from this
+    //! process. `benchfs_finalize` flushes the report when the last
+    //! `benchfs_context_t` is freed by dropping the profiler. Multi-phase
+    //! io500 (init/finalize per phase) is handled by reference-counting
+    //! the live context pointers.
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static PROFILER: OnceLock<Mutex<Option<dhat::Profiler>>> = OnceLock::new();
+    static CTX_COUNT: Mutex<usize> = Mutex::new(0);
+
+    fn slot() -> &'static Mutex<Option<dhat::Profiler>> {
+        PROFILER.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn start_if_first() {
+        let mut count = CTX_COUNT.lock().expect("CTX_COUNT poisoned");
+        if *count == 0 {
+            // BENCHFS_DHAT_DIR — directory; we write `dhat-<pid>.json`.
+            // BENCHFS_DHAT — explicit full path; takes precedence.
+            // Fallback: CWD/dhat-<pid>.json.
+            let pid = std::process::id();
+            let out = if let Ok(p) = std::env::var("BENCHFS_DHAT") {
+                p
+            } else if let Ok(dir) = std::env::var("BENCHFS_DHAT_DIR") {
+                let _ = std::fs::create_dir_all(&dir);
+                format!("{dir}/dhat-{pid}.json")
+            } else {
+                format!("dhat-benchfs-{pid}.json")
+            };
+            let p = dhat::Profiler::builder().file_name(&out).build();
+            *slot().lock().expect("PROFILER poisoned") = Some(p);
+            eprintln!("[dhat] profiler started (pid={pid}), output={out}");
+        }
+        *count += 1;
+    }
+
+    pub fn stop_if_last() {
+        let mut count = CTX_COUNT.lock().expect("CTX_COUNT poisoned");
+        if *count == 0 {
+            return;
+        }
+        *count -= 1;
+        if *count == 0 {
+            // Drop the profiler to flush the JSON report.
+            let mut guard = slot().lock().expect("PROFILER poisoned");
+            if guard.take().is_some() {
+                eprintln!("[dhat] profiler stopped, report written");
+            }
+        }
+    }
+}
+
 /// Discover available nodes from registry directory
 ///
 /// This function scans the registry directory for `node_*.addr` files
@@ -319,6 +376,8 @@ pub extern "C" fn benchfs_init(
     is_server: i32,
     chunk_size: usize,
 ) -> *mut benchfs_context_t {
+    #[cfg(feature = "dhat-heap")]
+    dhat_profile::start_if_first();
     // Use default chunk size if 0 is passed
     let chunk_size = if chunk_size == 0 {
         crate::metadata::CHUNK_SIZE
@@ -949,11 +1008,16 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
 
     if use_locusta_client {
         tracing::info!("benchfs_finalize: locusta client — preserving TLS state for next phase");
+        #[cfg(feature = "dhat-heap")]
+        dhat_profile::stop_if_last();
         return;
     }
 
     // Clean up thread-local storage
     super::runtime::cleanup_runtime();
+
+    #[cfg(feature = "dhat-heap")]
+    dhat_profile::stop_if_last();
 
     tracing::info!("BenchFS finalized");
 }
