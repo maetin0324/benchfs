@@ -998,29 +998,39 @@ impl LocustaTransport {
     /// connect to themselves.
     pub fn try_accept_pending_peers(
         &self,
-        per_peer_timeout: Duration,
+        _per_peer_timeout: Duration,
     ) -> Result<Vec<NodeId>, RpcError> {
         // UDP-based accept: drain whatever is queued on the local
-        // socket without blocking. Each REQUEST handled here also
-        // completes the locusta `connect_*` transitions *before*
-        // replying, so the peer's first RDMA send is safe.
-        //
-        // We treat `per_peer_timeout` as the per-recv timeout; a short
-        // value (≤10 ms) keeps the accept loop responsive when no
-        // packets are queued. The caller is expected to retry this
-        // method on a heartbeat.
-        let recv_timeout = per_peer_timeout.min(Duration::from_millis(10));
+        // socket. The first call uses a longer recv timeout (so the
+        // initial REQUEST burst doesn't get split across multiple
+        // 100 ms sleep cycles); subsequent calls in the same drain go
+        // non-blocking so we exit as soon as the queue empties.
         let mut added = Vec::new();
-        // Drain up to `MAX_PER_TICK` requests per call to keep one tick
-        // bounded. The accept loop polls every 100 ms, so 32×100µs of
-        // work ≈ 3.2 ms per tick worst-case.
-        const MAX_PER_TICK: usize = 32;
+        // Drain aggressively — at io500 4 phys × ppn=8 = 128 clients
+        // each prewarming to 16 servers, every server has to accept
+        // ~128 REQUESTs in a short burst. Old 32-per-tick × 100 ms
+        // scan-interval ≈ 320/s wasn't keeping up; bump to 256 so the
+        // burst clears in one tick.
+        const MAX_PER_TICK: usize = 256;
+        let mut first = true;
         for _ in 0..MAX_PER_TICK {
+            // First recv uses a 2 ms timeout (catches a packet that
+            // arrived just before we entered this tick); subsequent
+            // recvs use 1 µs (effectively non-blocking, the kernel
+            // returns EAGAIN immediately when the queue is empty).
+            // `set_read_timeout` rejects `Duration::ZERO`, so we use
+            // 1 µs as the floor.
+            let recv_timeout = if first {
+                Duration::from_millis(2)
+            } else {
+                Duration::from_micros(1)
+            };
             let mut inner = self.inner.borrow_mut();
             match inner.handle_one_udp_request(recv_timeout) {
                 Ok(Some(peer)) => {
                     tracing::info!("udp accept: handshaked new peer {peer}");
                     added.push(peer);
+                    first = false;
                 }
                 Ok(None) => break,
                 Err(e) => {

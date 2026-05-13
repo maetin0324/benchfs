@@ -250,6 +250,31 @@ fn parse_addr(s: &str) -> io::Result<SocketAddrV4> {
 pub fn bind_udp_socket() -> io::Result<(UdpSocket, SocketAddrV4)> {
     let advertised_ip = resolve_advertised_ip()?;
     let socket = UdpSocket::bind(SocketAddrV4::new(advertised_ip, 0))?;
+    // Pump the per-socket recv buffer up so a 128-client prewarm burst
+    // doesn't drop REQUEST packets while the accept loop is busy in
+    // the middle of a `prepare_peer` / RDMA QP setup (each ≈ ms,
+    // multiplied by the 32-per-tick drain). Default Linux UDP rcvbuf
+    // is ~208 KiB ≈ 1066 of our 200 B packets; 4 MiB ≈ 20 000 packets
+    // gives ample slack.
+    let want_rcv: libc::c_int = 4 * 1024 * 1024;
+    let rc = unsafe {
+        use std::os::fd::AsRawFd;
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &want_rcv as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&want_rcv) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        // Non-fatal: kernel may clamp to `net.core.rmem_max`. Log and
+        // continue with whatever it gave us.
+        tracing::warn!(
+            "SO_RCVBUF setsockopt failed (errno={}); using default size",
+            std::io::Error::last_os_error()
+        );
+    }
     let port = match socket.local_addr()? {
         std::net::SocketAddr::V4(v4) => v4.port(),
         _ => unreachable!("we bound v4"),
