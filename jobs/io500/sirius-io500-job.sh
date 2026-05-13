@@ -415,6 +415,16 @@ write_ini() {
     mdtest_hard_run="TRUE"
   fi
 
+  # SKIP_IOR=1 disables all ior-easy / ior-hard phases. Used to isolate
+  # the mdtest-hard heap-corruption debug loop without paying the
+  # ior-easy + ior-hard warm-up time.
+  local ior_easy_run="TRUE"
+  local ior_hard_run="${hard_run}"
+  if [ "${SKIP_IOR:-0}" = "1" ]; then
+    ior_easy_run="FALSE"
+    ior_hard_run="FALSE"
+  fi
+
   # The api line also carries BENCHFS-specific aiori options
   # (registry/datadir/chunk-size) — io500 splits api on whitespace and feeds
   # the rest into IOR's option parser.
@@ -443,11 +453,11 @@ transferSize = ${transfer_size}
 blockSize = ${block_size}
 filePerProc = ${file_per_proc}
 uniqueDir = FALSE
-run = TRUE
+run = ${ior_easy_run}
 
 [ior-easy-write]
 API =
-run = TRUE
+run = ${ior_easy_run}
 
 [mdtest-easy]
 API =
@@ -464,23 +474,23 @@ run = ${mdtest_run}
 API =
 segmentCount = 100000
 collective =
-run = ${hard_run}
+run = ${ior_hard_run}
 
 [ior-hard-write]
-run = ${hard_run}
+run = ${ior_hard_run}
 
 [mdtest-hard]
 run = ${mdtest_hard_run}
 [mdtest-hard-write]
 run = ${mdtest_hard_run}
 [find]
-run = ${mdtest_hard_run}
+run = FALSE
 [ior-easy-read]
-run = TRUE
+run = ${ior_easy_run}
 [mdtest-easy-stat]
 run = ${mdtest_run}
 [ior-hard-read]
-run = ${hard_run}
+run = ${ior_hard_run}
 [mdtest-hard-stat]
 run = ${mdtest_hard_run}
 [mdtest-easy-delete]
