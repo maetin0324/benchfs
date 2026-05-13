@@ -12,7 +12,7 @@
 
 #![cfg(feature = "transport-locusta")]
 
-use std::alloc::{alloc, Layout};
+use std::alloc::{Layout, alloc};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -22,22 +22,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mlx5::pd::AccessFlags;
+use mlx5::qp::RcQpConfig;
 use rrrpc::arena::DmaArena;
 use rrrpc::rdma_util::RecvBufferPool;
 use rrrpc::relay::client::{Client, Response, ResponseFuture};
 use rrrpc::relay::daemon::{Channel, RdmaContext, RelayConfig, RelayDaemon};
 use rrrpc::relay::jiffy::JiffyQueue;
-use rrrpc::relay::shm::{init_channel_header, ChannelHeader, ChannelState, ShmLayout};
+use rrrpc::relay::shm::{ChannelHeader, ChannelState, ShmLayout, init_channel_header};
 use rrrpc::relay::spsc::FastForwardRing;
-use rrrpc::server::{RdmaBuffer, Request, ServerConfig, ServerContext, ServerRdmaContext};
+use rrrpc::server::{Request, ServerConfig, ServerContext, ServerRdmaContext};
 use rrrpc::wire::{CompletionSlot, QpExchangeInfo, RequestSlot};
 
 use mlx5::pd::MemoryRegion;
 use pluvio_uring::allocator::FixedBufferAllocator;
 
-use crate::rpc::locusta_buffer::{register_with_pd, RegisteredFixedBuffer};
-use crate::rpc::transport::{NodeId, RpcResponse, RpcTransport};
 use crate::rpc::RpcError;
+use crate::rpc::locusta_buffer::{RegisteredFixedBuffer, register_with_pd};
+use crate::rpc::transport::{NodeId, RpcResponse, RpcTransport};
 
 const QP_INFO_SIZE: usize = std::mem::size_of::<QpExchangeInfo>();
 const _: () = assert!(QP_INFO_SIZE == 64);
@@ -69,18 +70,159 @@ pub struct LocustaInner {
     /// re-using avoids the per-RPC `Vec` churn that hurt the `LocustaCallable`
     /// path.
     pub small_req_scratch: Vec<u8>,
+    /// Filesystem directory used for QP info exchange (same value passed
+    /// in `LocustaConfig`). Cached so `add_peer` can find / write files
+    /// after `init`.
+    pub registry_dir: PathBuf,
+    /// Local node id (same value passed in `LocustaConfig`).
+    pub local_node_id: NodeId,
+    /// QP config reused for every new peer.
+    pub qp_config: RcQpConfig,
+    /// Next dest_id to hand out from `add_peer`. Starts at
+    /// `cfg.peer_node_ids.len()` after `init` and increments with each
+    /// successful dynamic add.
+    pub next_dest_id: u16,
 }
 
 impl LocustaInner {
     /// Pump the polling state machines. Called both from the async wait
     /// futures and (in Phase 1c) from a registered Reactor.
     pub fn tick(&mut self) {
+        let t0 = std::time::Instant::now();
         self.daemon.poll_client_requests();
+        let t1 = t0.elapsed().as_micros() as u64;
         self.daemon.process_pending_dma_writes();
+        let t2 = t0.elapsed().as_micros() as u64;
         self.daemon.flush_all_destinations();
+        let t3 = t0.elapsed().as_micros() as u64;
         self.daemon.poll_server_completions();
+        let t4 = t0.elapsed().as_micros() as u64;
         self.client.poll();
+        let t5 = t0.elapsed().as_micros() as u64;
         self.server.poll();
+        let t6 = t0.elapsed().as_micros() as u64;
+        // Sample slow ticks (≥1ms) to keep log volume manageable. Under
+        // a healthy system every tick should be sub-100µs.
+        if t6 >= 1000 && crate::stats::is_stats_enabled() {
+            tracing::info!(
+                target: "pluvio_tick_timing",
+                kind = "locusta_tick",
+                cli_req_us = t1,
+                dma_write_us = t2 - t1,
+                flush_dest_us = t3 - t2,
+                srv_complete_us = t4 - t3,
+                client_poll_us = t5 - t4,
+                server_poll_us = t6 - t5,
+                total_us = t6,
+                "TICK_TIMING_SLOW"
+            );
+        }
+        // Periodically dump the daemon's credit_reads_issued counter so we
+        // can see whether the relay ring is going full and stalling (credit
+        // reads are an RDMA round trip; under congestion they balloon).
+        if crate::stats::is_stats_enabled() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(100_000) {
+                tracing::info!(
+                    target: "pluvio_tick_timing",
+                    kind = "credit_reads",
+                    tick_n = n,
+                    credit_reads_issued = self.daemon.debug_credit_reads_issued,
+                    "CREDIT_READ_COUNT"
+                );
+            }
+        }
+    }
+
+    /// Run the full 4-step QP handshake against `peer` and register the
+    /// resulting dest_id under `peer` in `node_to_dest`. Blocks the
+    /// calling thread (with 50ms sleeps) until both of the peer's QP
+    /// info files appear, or `deadline` is reached.
+    ///
+    /// Used by `LocustaTransport::init` for each pre-configured peer
+    /// and by `LocustaTransport::add_peer` at runtime. The protocol is
+    /// symmetric — whichever side runs first writes its files and
+    /// spin-reads for the other side; whichever side runs second sees
+    /// the files immediately and returns quickly.
+    fn add_peer_blocking(&mut self, peer: &str, deadline: Instant) -> Result<u16, RpcError> {
+        if let Some(&existing) = self.node_to_dest.get(peer) {
+            return Ok(existing);
+        }
+        let dest_id = self.next_dest_id;
+
+        // Per-QP recv ring + send buffer size. The 64 KiB default holds
+        // ~256 small-message slots; that's plenty for steady-state traffic
+        // — observed credit_reads_issued stays at 0 in production (job
+        // 18004), so the recv ring is never full. Knobs left in place for
+        // future experimentation but defaults preserved to avoid the
+        // startup-time MR registration storm at higher sizes (1 MiB × 64
+        // peers × 16 servers = 1 GiB pinned during accept-burst broke QP
+        // handshake timing in 18004).
+        let recv_ring_size: u32 = std::env::var("BENCHFS_LOCUSTA_RECV_RING_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024);
+        let send_buf_size: u32 = std::env::var("BENCHFS_LOCUSTA_SEND_BUF_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024);
+
+        // Server side: prepare peer for the remote relay
+        let server_local = self
+            .server
+            .prepare_peer(
+                dest_id,
+                recv_ring_size,
+                send_buf_size,
+                512,
+                4096,
+                &self.qp_config,
+            )
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
+            })?;
+        let server_out = server_qp_path(&self.registry_dir, &self.local_node_id, peer);
+        write_qp_info(&server_out, &server_local).map_err(|e| {
+            RpcError::ConnectionError(format!("write_qp_info({}): {e}", server_out.display()))
+        })?;
+
+        // Relay side: prepare destination for the remote server
+        let relay_local = self
+            .daemon
+            .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
+            })?;
+        let relay_out = relay_qp_path(&self.registry_dir, &self.local_node_id, peer);
+        write_qp_info(&relay_out, &relay_local).map_err(|e| {
+            RpcError::ConnectionError(format!("write_qp_info({}): {e}", relay_out.display()))
+        })?;
+
+        // Wait for peer's published info and finalize connections.
+        let peer_relay_path = relay_qp_path(&self.registry_dir, peer, &self.local_node_id);
+        let peer_relay_info = read_qp_info_when_ready(&peer_relay_path, deadline)?;
+        self.server
+            .connect_peer(dest_id, &peer_relay_info)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("server.connect_peer({dest_id}): {e:?}"))
+            })?;
+
+        let peer_server_path = server_qp_path(&self.registry_dir, peer, &self.local_node_id);
+        let peer_server_info = read_qp_info_when_ready(&peer_server_path, deadline)?;
+        self.daemon
+            .connect_destination(dest_id, &peer_server_info)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("daemon.connect_destination({dest_id}): {e:?}"))
+            })?;
+
+        self.node_to_dest.insert(peer.to_string(), dest_id);
+        self.next_dest_id = self
+            .next_dest_id
+            .checked_add(1)
+            .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
+        Ok(dest_id)
     }
 
     /// Returns true once the response for `completion_id` is ready.
@@ -136,11 +278,19 @@ pub struct LocustaConfig {
     pub exchange_timeout_secs: u64,
     /// Number of pluvio FixedBuffer slots for the server-side RDMA pool.
     /// 0 disables the pool (Put/Get server handlers will not be usable).
-    /// Phase 2.1 default: 4 slots × 4 MiB each.
+    /// Phase 2.1 default: 4 slots × 4 MiB each. Ignored when
+    /// `external_server_allocator` is `Some`.
     pub server_buf_slots: usize,
     /// Per-slot size for the server-side buffer pool. Set ≥ the largest
-    /// expected chunk (4 MiB for BenchFS).
+    /// expected chunk (4 MiB for BenchFS). Ignored when
+    /// `external_server_allocator` is `Some`.
     pub server_buf_size: usize,
+    /// Phase 2.4 production wiring: if `Some`, locusta registers this
+    /// caller-owned `FixedBufferAllocator` with the server PD instead
+    /// of allocating a separate pool. Lets the chunk store and the
+    /// locusta server share one set of pinned buffers, enabling
+    /// zero-copy `network ↔ io_uring`.
+    pub external_server_allocator: Option<Rc<FixedBufferAllocator>>,
 }
 
 impl Default for LocustaConfig {
@@ -157,16 +307,92 @@ impl Default for LocustaConfig {
             exchange_timeout_secs: 120,
             server_buf_slots: 4,
             server_buf_size: 4 * 1024 * 1024,
+            external_server_allocator: None,
         }
     }
 }
 
+/// Open an mlx5 device.
+///
+/// Device selection priority (highest first):
+/// 1. `BENCHFS_MLX5_DEVICE` — explicit name (e.g. `"mlx5_2"`).
+/// 2. `BENCHFS_MLX5_DEVICE_INDEX` — 0-based index into the device list.
+/// 3. Auto-spread from `OMPI_COMM_WORLD_LOCAL_RANK` modulo `num_devices` —
+///    so 4-HCA Sirius nodes get balanced HCA assignment across ranks on
+///    the same phys node (matches per-vnode NUMA layout when ppn ≤ HCA
+///    count, balances send-side load when ppn > HCA count). Disable by
+///    setting `BENCHFS_MLX5_AUTO_SPREAD=0`.
+/// 4. Fallback: first device that opens.
 fn open_mlx5_device() -> Result<mlx5::device::Context, RpcError> {
-    let device_list = mlx5::device::DeviceList::list().map_err(|e| {
-        RpcError::ConnectionError(format!("mlx5::device::DeviceList::list: {e:?}"))
-    })?;
+    let device_list = mlx5::device::DeviceList::list()
+        .map_err(|e| RpcError::ConnectionError(format!("mlx5::device::DeviceList::list: {e:?}")))?;
+    if device_list.is_empty() {
+        return Err(RpcError::ConnectionError(
+            "no mlx5 devices found".to_string(),
+        ));
+    }
+    let available: Vec<String> = device_list.iter().map(|d| d.name()).collect();
+    let want_name = std::env::var("BENCHFS_MLX5_DEVICE").ok();
+    let want_index = std::env::var("BENCHFS_MLX5_DEVICE_INDEX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+
+    if let Some(name) = want_name.as_deref() {
+        for device in device_list.iter() {
+            if device.name() == name {
+                let ctx = device.open().map_err(|e| {
+                    RpcError::ConnectionError(format!("open device {name}: {e:?}"))
+                })?;
+                eprintln!("[locusta] selected mlx5 device {name} (env BENCHFS_MLX5_DEVICE)");
+                return Ok(ctx);
+            }
+        }
+        return Err(RpcError::ConnectionError(format!(
+            "BENCHFS_MLX5_DEVICE={name} not found; available: {available:?}"
+        )));
+    }
+
+    if let Some(idx) = want_index {
+        let device = device_list.get(idx).ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "BENCHFS_MLX5_DEVICE_INDEX={idx} out of range; available: {available:?}"
+            ))
+        })?;
+        let name = device.name();
+        let ctx = device.open().map_err(|e| {
+            RpcError::ConnectionError(format!("open device idx={idx} ({name}): {e:?}"))
+        })?;
+        eprintln!(
+            "[locusta] selected mlx5 device {name} (env BENCHFS_MLX5_DEVICE_INDEX={idx})"
+        );
+        return Ok(ctx);
+    }
+
+    let auto_spread = std::env::var("BENCHFS_MLX5_AUTO_SPREAD")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if auto_spread {
+        if let Some(local_rank) = std::env::var("OMPI_COMM_WORLD_LOCAL_RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            let idx = local_rank % device_list.len();
+            if let Ok(ctx) = device_list[idx].open() {
+                let name = device_list[idx].name();
+                eprintln!(
+                    "[locusta] selected mlx5 device {name} (auto-spread idx={idx} from OMPI_COMM_WORLD_LOCAL_RANK={local_rank}, devices={available:?})"
+                );
+                return Ok(ctx);
+            }
+        }
+    }
+
     for device in device_list.iter() {
         if let Ok(ctx) = device.open() {
+            let name = device.name();
+            eprintln!(
+                "[locusta] selected mlx5 device {name} (default fallback); available: {available:?}"
+            );
             return Ok(ctx);
         }
     }
@@ -281,20 +507,22 @@ fn write_qp_info(path: &Path, info: &QpExchangeInfo) -> std::io::Result<()> {
     Ok(())
 }
 
+fn try_read_qp_info(path: &Path) -> Option<QpExchangeInfo> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() != QP_INFO_SIZE {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<QpExchangeInfo>::uninit();
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), info.as_mut_ptr() as *mut u8, QP_INFO_SIZE);
+        Some(info.assume_init())
+    }
+}
+
 fn read_qp_info_when_ready(path: &Path, deadline: Instant) -> Result<QpExchangeInfo, RpcError> {
     loop {
-        if let Ok(bytes) = fs::read(path) {
-            if bytes.len() == QP_INFO_SIZE {
-                let mut info = std::mem::MaybeUninit::<QpExchangeInfo>::uninit();
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        info.as_mut_ptr() as *mut u8,
-                        QP_INFO_SIZE,
-                    );
-                    return Ok(info.assume_init());
-                }
-            }
+        if let Some(info) = try_read_qp_info(path) {
+            return Ok(info);
         }
         if Instant::now() > deadline {
             return Err(RpcError::ConnectionError(format!(
@@ -307,11 +535,15 @@ fn read_qp_info_when_ready(path: &Path, deadline: Instant) -> Result<QpExchangeI
 }
 
 fn server_qp_path(registry: &Path, server_node: &str, client_node: &str) -> PathBuf {
-    registry.join(format!("server_{server_node}_to_relay_{client_node}.qpinfo"))
+    registry.join(format!(
+        "server_{server_node}_to_relay_{client_node}.qpinfo"
+    ))
 }
 
 fn relay_qp_path(registry: &Path, client_node: &str, server_node: &str) -> PathBuf {
-    registry.join(format!("relay_{client_node}_to_server_{server_node}.qpinfo"))
+    registry.join(format!(
+        "relay_{client_node}_to_server_{server_node}.qpinfo"
+    ))
 }
 
 impl LocustaTransport {
@@ -330,10 +562,7 @@ impl LocustaTransport {
     /// use `dest_id = index` to identify the remote peer.
     pub fn init(cfg: &LocustaConfig) -> Result<Self, RpcError> {
         fs::create_dir_all(&cfg.registry_dir).map_err(|e| {
-            RpcError::ConnectionError(format!(
-                "mkdir {}: {e}",
-                cfg.registry_dir.display()
-            ))
+            RpcError::ConnectionError(format!("mkdir {}: {e}", cfg.registry_dir.display()))
         })?;
         let ctx = open_mlx5_device()?;
 
@@ -371,9 +600,7 @@ impl LocustaTransport {
                 pd.register(
                     arena_base,
                     layout.dma_arena_len,
-                    AccessFlags::LOCAL_WRITE
-                        | AccessFlags::REMOTE_WRITE
-                        | AccessFlags::REMOTE_READ,
+                    AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
                 )
             }
             .map_err(|e| RpcError::ConnectionError(format!("arena MR register: {e:?}")))?
@@ -416,87 +643,32 @@ impl LocustaTransport {
             cfg.cq_size,
         )?);
 
-        // ------ Server-side RDMA buffer pool (Phase 2.1) ------
+        // ------ Server-side RDMA buffer pool ------
         //
-        // Allocates pluvio FixedBuffers without io_uring registration, then
-        // registers them with the server's PD. The same pluvio handle type
-        // can later be threaded through io_uring once the chunk-store
-        // integration (Phase 2.2) lands.
-        let (server_buffer_allocator, server_buffer_mrs) = if cfg.server_buf_slots > 0 {
+        // Phase 2.4 prefers an externally-supplied allocator (which is
+        // already io_uring-registered by the chunk store). Otherwise
+        // fall back to a freshly-allocated standalone pool — used by
+        // the demo binary which has no real chunk_store.
+        let (server_buffer_allocator, server_buffer_mrs) = if let Some(alloc) =
+            cfg.external_server_allocator.clone()
+        {
             let pd = &server.rdma.as_ref().unwrap().pd;
-            let alloc = FixedBufferAllocator::new_without_uring(
-                cfg.server_buf_slots,
-                cfg.server_buf_size,
-            );
+            let mrs = register_with_pd(&alloc, pd)?;
+            (Some(alloc), mrs)
+        } else if cfg.server_buf_slots > 0 {
+            let pd = &server.rdma.as_ref().unwrap().pd;
+            let alloc =
+                FixedBufferAllocator::new_without_uring(cfg.server_buf_slots, cfg.server_buf_size);
             let mrs = register_with_pd(&alloc, pd)?;
             (Some(alloc), mrs)
         } else {
             (None, Vec::new())
         };
 
-        let qp_config = mlx5::qp::RcQpConfig {
+        let qp_config = RcQpConfig {
             max_send_wr: 1024,
-            ..mlx5::qp::RcQpConfig::default()
+            ..RcQpConfig::default()
         };
-
-        // ------ Per-peer QP exchange (sequential; each peer gets a dest_id) ------
-        let deadline = Instant::now() + Duration::from_secs(cfg.exchange_timeout_secs);
-        let mut node_to_dest = HashMap::new();
-        for (idx, peer) in cfg.peer_node_ids.iter().enumerate() {
-            let dest_id = idx as u16;
-            // Server side: prepare peer for the remote relay
-            let server_local = server
-                .prepare_peer(dest_id, 64 * 1024, 64 * 1024, 512, 4096, &qp_config)
-                .map_err(|e| {
-                    RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
-                })?;
-            let server_out =
-                server_qp_path(&cfg.registry_dir, &cfg.local_node_id, peer);
-            write_qp_info(&server_out, &server_local).map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "write_qp_info({}): {e}",
-                    server_out.display()
-                ))
-            })?;
-
-            // Relay side: prepare destination for the remote server
-            let relay_local = daemon
-                .prepare_destination(dest_id, 64 * 1024, 64 * 1024, &qp_config)
-                .map_err(|e| {
-                    RpcError::ConnectionError(format!(
-                        "daemon.prepare_destination({dest_id}): {e:?}"
-                    ))
-                })?;
-            let relay_out =
-                relay_qp_path(&cfg.registry_dir, &cfg.local_node_id, peer);
-            write_qp_info(&relay_out, &relay_local).map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "write_qp_info({}): {e}",
-                    relay_out.display()
-                ))
-            })?;
-
-            // Read peer's published info and finalize connections.
-            let peer_relay_path = relay_qp_path(&cfg.registry_dir, peer, &cfg.local_node_id);
-            let peer_relay_info = read_qp_info_when_ready(&peer_relay_path, deadline)?;
-            server.connect_peer(dest_id, &peer_relay_info).map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "server.connect_peer({dest_id}): {e:?}"
-                ))
-            })?;
-
-            let peer_server_path = server_qp_path(&cfg.registry_dir, peer, &cfg.local_node_id);
-            let peer_server_info = read_qp_info_when_ready(&peer_server_path, deadline)?;
-            daemon
-                .connect_destination(dest_id, &peer_server_info)
-                .map_err(|e| {
-                    RpcError::ConnectionError(format!(
-                        "daemon.connect_destination({dest_id}): {e:?}"
-                    ))
-                })?;
-
-            node_to_dest.insert(peer.clone(), dest_id);
-        }
 
         // ------ Client ------
         let arena = unsafe { DmaArena::new(arena_base, cfg.arena_size) };
@@ -514,17 +686,123 @@ impl LocustaTransport {
             server,
             server_buffer_allocator,
             _server_buffer_mrs: server_buffer_mrs,
-            node_to_dest,
+            node_to_dest: HashMap::new(),
             channel_base_ptr: shm_base,
             channel_layout_total: layout.total_size,
             inflight: HashMap::new(),
             // Pre-size for typical metadata header + path (≤256B). Will
             // grow once if larger inputs arrive.
             small_req_scratch: Vec::with_capacity(256),
+            registry_dir: cfg.registry_dir.clone(),
+            local_node_id: cfg.local_node_id.clone(),
+            qp_config,
+            next_dest_id: 0,
         };
-        Ok(Self {
-            inner: Rc::new(RefCell::new(inner)),
-        })
+        let inner = Rc::new(RefCell::new(inner));
+
+        // ------ Per-peer QP exchange (sequential; each peer gets a dest_id) ------
+        let deadline = Instant::now() + Duration::from_secs(cfg.exchange_timeout_secs);
+        {
+            let mut inner_mut = inner.borrow_mut();
+            for peer in &cfg.peer_node_ids {
+                inner_mut.add_peer_blocking(peer, deadline)?;
+            }
+        }
+        Ok(Self { inner })
+    }
+
+    /// Run the full QP handshake against `peer` at runtime, blocking
+    /// the calling thread until the handshake completes or `timeout`
+    /// elapses. Returns the freshly-allocated dest_id. Idempotent —
+    /// if `peer` is already connected returns the existing dest_id.
+    ///
+    /// This is the building block that lets BenchFS dynamically accept
+    /// connections from late-joining clients (the FFI / IOR path) that
+    /// were not known at `init` time.
+    pub fn add_peer(&self, peer: &NodeId, timeout: Duration) -> Result<u16, RpcError> {
+        let deadline = Instant::now() + timeout;
+        let mut inner = self.inner.borrow_mut();
+        inner.add_peer_blocking(peer, deadline)
+    }
+
+    /// Scan `registry_dir` for peer files belonging to nodes not yet
+    /// in `node_to_dest` whose **both** publications (`server_*` and
+    /// `relay_*` pointing at us) have already appeared. For each such
+    /// peer, run the full handshake. Returns the list of node ids
+    /// newly connected on this call.
+    ///
+    /// Designed to be polled by a long-running accept task on the
+    /// server side. Re-entrant: a partially-published peer (only one
+    /// of the two files present) is skipped this round and re-checked
+    /// on the next call.
+    ///
+    /// Skips any file whose basename is the local node — peers don't
+    /// connect to themselves.
+    pub fn try_accept_pending_peers(
+        &self,
+        per_peer_timeout: Duration,
+    ) -> Result<Vec<NodeId>, RpcError> {
+        let (registry_dir, local_node_id, known_peers) = {
+            let inner = self.inner.borrow();
+            (
+                inner.registry_dir.clone(),
+                inner.local_node_id.clone(),
+                inner.node_to_dest.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        // Two prefixes mark "peer X published its half pointing at us":
+        //   server_<X>_to_relay_<self>.qpinfo
+        //   relay_<X>_to_server_<self>.qpinfo
+        // Both must exist before we attempt the handshake (so
+        // read_qp_info_when_ready never has to wait).
+        let server_suffix = format!("_to_relay_{local_node_id}.qpinfo");
+        let relay_suffix = format!("_to_server_{local_node_id}.qpinfo");
+        let mut candidates_server: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut candidates_relay: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let dir_iter = fs::read_dir(&registry_dir).map_err(|e| {
+            RpcError::ConnectionError(format!("read_dir({}): {e}", registry_dir.display()))
+        })?;
+        for entry in dir_iter.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if let Some(rest) = name.strip_prefix("server_")
+                && let Some(peer) = rest.strip_suffix(&server_suffix)
+            {
+                candidates_server.insert(peer.to_string());
+            } else if let Some(rest) = name.strip_prefix("relay_")
+                && let Some(peer) = rest.strip_suffix(&relay_suffix)
+            {
+                candidates_relay.insert(peer.to_string());
+            }
+        }
+        let mut added = Vec::new();
+        let candidates_count = candidates_server.intersection(&candidates_relay).count();
+        if candidates_count > 0 {
+            tracing::debug!(
+                "try_accept_pending_peers: {} server-side, {} relay-side, {} intersect; known={}",
+                candidates_server.len(),
+                candidates_relay.len(),
+                candidates_count,
+                known_peers.len()
+            );
+        }
+        for peer in candidates_server.intersection(&candidates_relay) {
+            if peer == &local_node_id {
+                continue;
+            }
+            if known_peers.iter().any(|k| k == peer) {
+                continue;
+            }
+            // Both publications exist — handshake should be quick. Use
+            // the supplied timeout as a sanity cap.
+            tracing::info!("try_accept_pending_peers: handshaking new peer {}", peer);
+            self.add_peer(peer, per_peer_timeout)?;
+            added.push(peer.clone());
+        }
+        Ok(added)
     }
 
     fn lookup_dest(&self, dest: &NodeId) -> Result<u16, RpcError> {
@@ -534,6 +812,11 @@ impl LocustaTransport {
             .get(dest)
             .copied()
             .ok_or_else(|| RpcError::ConnectionError(format!("unknown peer node: {dest}")))
+    }
+
+    /// Returns true if `peer` is already in `node_to_dest`.
+    pub fn has_peer(&self, peer: &NodeId) -> bool {
+        self.inner.borrow().node_to_dest.contains_key(peer)
     }
 
     /// Async future that polls `LocustaInner` until the response for
@@ -552,28 +835,96 @@ struct WaitForResponse {
     completion_id: u64,
 }
 
+thread_local! {
+    /// Timestamp of the previous WaitForResponse poll that returned
+    /// `Pending`. Reset to None whenever a poll returns `Ready` so the
+    /// next `wait_for`'s first poll doesn't see a phantom gap.
+    static LAST_WAIT_FOR_PENDING: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    /// Per-wait poll counter — counts how many busy-poll iterations the
+    /// current wait_for has executed without yet seeing its completion.
+    /// Reset to 0 on every Ready return.
+    static WAIT_FOR_POLL_COUNT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// Per-wait start timestamp so we can compute total wait time as
+    /// observed by WaitForResponse itself (cross-check against
+    /// SEND_PUT_TIMING's rtt_us).
+    static WAIT_FOR_START: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl std::future::Future for WaitForResponse {
     type Output = Result<Response, RpcError>;
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        let stats = crate::stats::is_stats_enabled();
+        let now_for_gap = if stats {
+            let now = std::time::Instant::now();
+            if let Some(prev) = LAST_WAIT_FOR_PENDING.with(|c| c.get()) {
+                let gap_us = now.duration_since(prev).as_micros() as u64;
+                if gap_us >= 1000 {
+                    tracing::info!(
+                        target: "rpc_client_timing",
+                        kind = "wait_for_intra_gap",
+                        gap_us = gap_us,
+                        "WAIT_FOR_INTRA_GAP_SLOW"
+                    );
+                }
+            }
+            // First poll of this wait_for? Record start.
+            if WAIT_FOR_START.with(|c| c.get()).is_none() {
+                WAIT_FOR_START.with(|c| c.set(Some(now)));
+                WAIT_FOR_POLL_COUNT.with(|c| c.set(0));
+            }
+            Some(now)
+        } else {
+            None
+        };
         let mut inner = self.inner.borrow_mut();
         inner.tick();
         if let Some(resp) = inner.try_take(self.completion_id) {
+            if stats {
+                LAST_WAIT_FOR_PENDING.with(|c| c.set(None));
+                let n_polls = WAIT_FOR_POLL_COUNT.with(|c| c.get()) + 1;
+                let elapsed_us = WAIT_FOR_START
+                    .with(|c| c.get())
+                    .map(|t| t.elapsed().as_micros() as u64)
+                    .unwrap_or(0);
+                WAIT_FOR_START.with(|c| c.set(None));
+                WAIT_FOR_POLL_COUNT.with(|c| c.set(0));
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(100) {
+                    tracing::info!(
+                        target: "rpc_client_timing",
+                        kind = "wait_for_complete",
+                        n = n,
+                        poll_count = n_polls,
+                        elapsed_us = elapsed_us,
+                        "WAIT_FOR_COMPLETE"
+                    );
+                }
+            }
             return std::task::Poll::Ready(Ok(resp));
         }
-        // Not ready: wake immediately so the runtime re-polls us. This is
-        // a busy-yield bridge — Phase 1c will replace it with a Reactor
-        // that wakes a stored Waker only when locusta state changes.
+        if let Some(now) = now_for_gap {
+            LAST_WAIT_FOR_PENDING.with(|c| c.set(Some(now)));
+            WAIT_FOR_POLL_COUNT.with(|c| c.set(c.get() + 1));
+        }
         cx.waker().wake_by_ref();
         std::task::Poll::Pending
     }
 }
 
 /// Helper for the server side of the loop: drain incoming requests and
-/// invoke a user-provided handler. Phase 2 will replace this with the
-/// AmRpc dispatch table.
+/// invoke a user-provided handler. The 2-byte `rpc_id` prefix encoded by
+/// [`stage_small_req`] is **not** stripped — handlers reading
+/// `h.small_req()` will see `[rpc_id_lo, rpc_id_hi, ...body]`. Use
+/// [`extract_rpc_id`] (or the higher-level `LocustaServerDispatch`) to
+/// decode it.
 pub fn drain_server_requests<F>(inner: &mut LocustaInner, mut handler: F)
 where
     F: FnMut(Request<RegisteredFixedBuffer>),
@@ -586,31 +937,79 @@ where
     inner.server.flush_all();
 }
 
-/// Flatten `parts` into `inner.small_req_scratch`, clearing the previous
-/// contents first. Returns the slice view of the populated bytes — borrows
-/// `inner` for the duration of the immediate caller's expression.
-fn stage_small_req<'b>(inner: &'b mut LocustaInner, parts: &[std::io::IoSlice<'_>]) -> &'b [u8] {
+/// Size of the BenchFS-level `rpc_id` prefix that
+/// [`LocustaTransport::send_*`] prepends to every locusta `small_req`.
+/// Server-side dispatchers strip this before handing the body to the
+/// RPC's parser.
+pub const LOCUSTA_RPC_ID_PREFIX_LEN: usize = 2;
+
+/// Decode the 2-byte little-endian `rpc_id` prefix from a `small_req`.
+/// Returns `(rpc_id, body_slice)` where `body_slice = small_req[2..]`.
+///
+/// Returns `None` if `small_req` is shorter than 2 bytes (malformed).
+pub fn extract_rpc_id(small_req: &[u8]) -> Option<(u16, &[u8])> {
+    if small_req.len() < LOCUSTA_RPC_ID_PREFIX_LEN {
+        return None;
+    }
+    let rpc_id = u16::from_le_bytes([small_req[0], small_req[1]]);
+    Some((rpc_id, &small_req[LOCUSTA_RPC_ID_PREFIX_LEN..]))
+}
+
+/// Flatten `parts` into `inner.small_req_scratch`, prepended by a
+/// 2-byte little-endian `rpc_id`. Returns the slice view of the
+/// populated bytes — borrows `inner` for the duration of the immediate
+/// caller's expression.
+///
+/// Every locusta send path goes through this so the wire format is
+/// uniform: server-side handlers can always read `small_req[0..2]` as
+/// the rpc_id and dispatch accordingly.
+fn stage_small_req<'b>(
+    inner: &'b mut LocustaInner,
+    rpc_id: u16,
+    parts: &[std::io::IoSlice<'_>],
+) -> &'b [u8] {
     inner.small_req_scratch.clear();
-    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let total: usize = LOCUSTA_RPC_ID_PREFIX_LEN + parts.iter().map(|p| p.len()).sum::<usize>();
     inner.small_req_scratch.reserve(total);
+    inner
+        .small_req_scratch
+        .extend_from_slice(&rpc_id.to_le_bytes());
     for slice in parts {
         inner.small_req_scratch.extend_from_slice(slice);
     }
     &inner.small_req_scratch
 }
 
+/// Register `LocustaTransport` as a pluvio reactor: each runtime tick
+/// will call `inner.tick()`. This makes the runtime see locusta as
+/// "making progress" so the 1M-iteration stuck watchdog doesn't fire
+/// while a long DMA RPC is in flight, and removes the need for
+/// `WaitForResponse` to busy-poll inline.
+impl pluvio_runtime::reactor::Reactor for LocustaTransport {
+    fn poll(&self) {
+        // try_borrow_mut so we don't panic if a future is currently
+        // holding the inner borrow (it will tick on its own anyway).
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.tick();
+        }
+    }
+    fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
+        pluvio_runtime::reactor::ReactorStatus::Running
+    }
+}
+
 impl RpcTransport for LocustaTransport {
     fn send_eager<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
             let dest_id = self.lookup_dest(dest)?;
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
-                let small_req = stage_small_req(&mut inner, parts);
+                let small_req = stage_small_req(&mut inner, rpc_id, parts);
                 // Re-borrow trick: stage_small_req keeps the borrow on the
                 // scratch field; submitting needs a separate mutable borrow
                 // on `client`. Both fields are disjoint members of inner so
@@ -621,9 +1020,9 @@ impl RpcTransport for LocustaTransport {
                     unsafe { std::slice::from_raw_parts(small_req_ptr, small_req_len) };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
-                    let fut = batch.call_eager(dest_id, small_req_slice).map_err(|e| {
-                        RpcError::TransportError(format!("call_eager: {e:?}"))
-                    })?;
+                    let fut = batch
+                        .call_eager(dest_id, small_req_slice)
+                        .map_err(|e| RpcError::TransportError(format!("call_eager: {e:?}")))?;
                     let id = fut.req_id();
                     (id, fut)
                 };
@@ -649,15 +1048,13 @@ impl RpcTransport for LocustaTransport {
     fn send_put<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
         payload: &'a [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
+            let t0 = std::time::Instant::now();
             let dest_id = self.lookup_dest(dest)?;
-            // Allocate a DMA buffer and stage the payload into it. The
-            // arena is shared with the relay's MR so this is what
-            // call_put will RDMA-write to the server.
             let dma_buf = {
                 let mut inner = self.inner.borrow_mut();
                 let mut buf = inner.client.alloc(payload.len() as u32).ok_or_else(|| {
@@ -669,13 +1066,13 @@ impl RpcTransport for LocustaTransport {
                 buf.as_mut_slice().copy_from_slice(payload);
                 buf
             };
+            let t_alloc = t0.elapsed().as_micros() as u64;
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
-                let small_req = stage_small_req(&mut inner, parts);
-                let small_req_slice = unsafe {
-                    std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
-                };
+                let small_req = stage_small_req(&mut inner, rpc_id, parts);
+                let small_req_slice =
+                    unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
                     let fut = batch
@@ -687,10 +1084,28 @@ impl RpcTransport for LocustaTransport {
                 inner.inflight.insert(id, fut);
                 id
             };
+            let t_submit = t0.elapsed().as_micros() as u64;
             let response = self.wait_for(completion_id).await?;
-            // Buffer must outlive the relay's DMA write — we held it on
-            // the stack until completion, so it's safe to release now.
+            let t_wait = t0.elapsed().as_micros() as u64;
             drop(dma_buf);
+
+            if crate::stats::is_stats_enabled() && payload.len() >= 4 * 1024 * 1024 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(100) {
+                    tracing::info!(
+                        target: "rpc_client_timing",
+                        kind = "send_put_4m",
+                        n = n,
+                        alloc_us = t_alloc,
+                        submit_us = t_submit,
+                        rtt_us = t_wait - t_submit,
+                        total_us = t_wait,
+                        "SEND_PUT_TIMING"
+                    );
+                }
+            }
 
             let header_bytes = match response.small_res_data() {
                 rrrpc::relay::client::SmallResData::Inline { buf, len } => {
@@ -707,7 +1122,7 @@ impl RpcTransport for LocustaTransport {
     fn send_get<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
         recv: &'a mut [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
@@ -725,10 +1140,9 @@ impl RpcTransport for LocustaTransport {
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
-                let small_req = stage_small_req(&mut inner, parts);
-                let small_req_slice = unsafe {
-                    std::slice::from_raw_parts(small_req.as_ptr(), small_req.len())
-                };
+                let small_req = stage_small_req(&mut inner, rpc_id, parts);
+                let small_req_slice =
+                    unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
                 let (id, fut) = {
                     let mut batch = inner.client.batch();
                     let fut = batch
@@ -773,21 +1187,19 @@ impl RpcTransport for LocustaTransport {
     fn send_oneway<'a>(
         &'a self,
         dest: &'a NodeId,
-        _rpc_id: u16,
+        rpc_id: u16,
         parts: &'a [std::io::IoSlice<'a>],
     ) -> impl std::future::Future<Output = Result<(), RpcError>> + 'a {
         async move {
             let dest_id = self.lookup_dest(dest)?;
             let mut inner = self.inner.borrow_mut();
-            let small_req = stage_small_req(&mut inner, parts);
+            let small_req = stage_small_req(&mut inner, rpc_id, parts);
             let small_req_slice =
                 unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
             inner
                 .client
                 .send_oneway_eager(dest_id, small_req_slice)
-                .map_err(|e| {
-                RpcError::TransportError(format!("send_oneway_eager: {e:?}"))
-            })?;
+                .map_err(|e| RpcError::TransportError(format!("send_oneway_eager: {e:?}")))?;
             Ok(())
         }
     }

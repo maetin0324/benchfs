@@ -119,10 +119,10 @@ where
 /// the second call; that double-panicked unwind, then aborted the whole process.
 pub fn init_with_hostname(level: &str) {
     use std::sync::Once;
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::EnvFilter;
 
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -172,10 +172,10 @@ pub type PerfettoGuard = TraceGuard;
 /// A `TraceGuard` that must be kept alive for tracing to work
 pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> TraceGuard {
     use crate::perfetto::TaskPerfettoLayer;
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
@@ -189,8 +189,8 @@ pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> TraceGua
         .unwrap_or_else(|e| panic!("Failed to create trace file {:?}: {}", trace_path, e));
 
     // Use our custom TaskPerfettoLayer with track ID integration
-    let perfetto_layer = TaskPerfettoLayer::new(std::sync::Mutex::new(trace_file))
-        .with_debug_annotations(true);
+    let perfetto_layer =
+        TaskPerfettoLayer::new(std::sync::Mutex::new(trace_file)).with_debug_annotations(true);
 
     tracing_subscriber::registry()
         .with(filter)
@@ -224,10 +224,10 @@ pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> TraceGua
 /// The trace file will be flushed when this guard is dropped.
 pub fn init_with_chrome(level: &str, trace_path: &std::path::Path) -> TraceGuard {
     use tracing_chrome::ChromeLayerBuilder;
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pluvio_timer::{timeout, TimeoutError};
+use pluvio_timer::{TimeoutError, timeout};
 use tracing::instrument;
 
 use crate::rpc::{AmRpc, Connection, RpcError};
@@ -89,7 +89,10 @@ pub fn write_retry_stats_to_csv(path: &str, node_id: &str) -> std::io::Result<()
     }
 
     let mut file = File::create(path)?;
-    writeln!(file, "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate")?;
+    writeln!(
+        file,
+        "node_id,total_requests,total_retries,retry_successes,retry_failures,retry_rate"
+    )?;
     writeln!(
         file,
         "{},{},{},{},{},{:.4}",
@@ -179,16 +182,36 @@ fn get_retry_config() -> RetryConfig {
     }
 }
 
+/// Optional locusta backend attached to an `RpcClient`.
+///
+/// When set, `execute<T>` short-circuits the UCX path and forwards to
+/// `T::call_locusta(peer, transport)` via the `LocustaCallable` blanket
+/// impl. This lets every existing `AmRpc::call(&*client)` call site
+/// transparently use locusta when `BENCHFS_TRANSPORT=locusta`.
+#[cfg(feature = "transport-locusta")]
+pub struct LocustaBackend {
+    pub transport: std::rc::Rc<crate::rpc::transport_locusta::LocustaTransport>,
+    pub peer_node_id: String,
+}
+
 /// RPC client for making RPC calls
 ///
 /// The client executes RPCs by taking any type that implements the `RpcCall` trait.
 pub struct RpcClient {
-    conn: Connection,
+    /// UCX endpoint+worker. `None` when this client is locusta-backed —
+    /// the locusta path has no need for a UCX `Worker` so we don't
+    /// require the caller to construct a dummy one.
+    conn: Option<Connection>,
     // Store reply stream opaquely since pluvio_ucx may not export AmStream
     #[allow(dead_code)]
     reply_stream_id: RefCell<Option<u16>>,
-    /// Client's own WorkerAddress for direct response
+    /// Client's own WorkerAddress for direct response (UCX only).
     worker_address: Vec<u8>,
+    /// When `Some`, `execute<T>` dispatches via locusta instead of UCX.
+    /// Set by [`RpcClient::new_locusta`] or via
+    /// `ConnectionPool::new_locusta`.
+    #[cfg(feature = "transport-locusta")]
+    locusta: Option<LocustaBackend>,
 }
 
 impl RpcClient {
@@ -213,10 +236,40 @@ impl RpcClient {
             });
 
         Self {
-            conn,
+            conn: Some(conn),
             reply_stream_id: RefCell::new(None),
             worker_address,
+            #[cfg(feature = "transport-locusta")]
+            locusta: None,
         }
+    }
+
+    /// Construct an `RpcClient` that routes every `execute<T>` through
+    /// locusta. No UCX `Connection` required.
+    #[cfg(feature = "transport-locusta")]
+    pub fn new_locusta(
+        transport: std::rc::Rc<crate::rpc::transport_locusta::LocustaTransport>,
+        peer_node_id: String,
+    ) -> Self {
+        Self {
+            conn: None,
+            reply_stream_id: RefCell::new(None),
+            worker_address: Vec::new(),
+            locusta: Some(LocustaBackend {
+                transport,
+                peer_node_id,
+            }),
+        }
+    }
+
+    /// Whether this client is locusta-backed.
+    #[cfg(feature = "transport-locusta")]
+    pub fn is_locusta(&self) -> bool {
+        self.locusta.is_some()
+    }
+    #[cfg(not(feature = "transport-locusta"))]
+    pub fn is_locusta(&self) -> bool {
+        false
     }
 
     /// Get the client's WorkerAddress
@@ -224,9 +277,10 @@ impl RpcClient {
         &self.worker_address
     }
 
-    /// Get the underlying connection
-    pub fn connection(&self) -> &Connection {
-        &self.conn
+    /// Get the underlying UCX connection if this client is UCX-backed.
+    /// Returns `None` for locusta-backed clients.
+    pub fn connection(&self) -> Option<&Connection> {
+        self.conn.as_ref()
     }
 
     /// Initialize the reply stream for receiving RPC responses
@@ -272,6 +326,18 @@ impl RpcClient {
     pub async fn execute<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         increment_request_count();
 
+        // Locusta fast path: skip the UCX retry/timeout machinery —
+        // locusta uses RC QPs (reliable delivery) so transient retries
+        // are unnecessary, and the call_locusta blanket impl handles
+        // serialization + dispatch in-place.
+        #[cfg(feature = "transport-locusta")]
+        if let Some(backend) = &self.locusta {
+            use crate::rpc::locusta_call::LocustaCallable;
+            return request
+                .call_locusta(&backend.peer_node_id, &backend.transport)
+                .await;
+        }
+
         let retry_config = get_retry_config();
         let mut attempt = 0u32;
         let mut delay = retry_config.initial_delay;
@@ -299,7 +365,7 @@ impl RpcClient {
                     );
                     pluvio_timer::sleep(delay).await;
                     delay = Duration::from_secs_f64(
-                        delay.as_secs_f64() * retry_config.backoff_multiplier
+                        delay.as_secs_f64() * retry_config.backoff_multiplier,
                     );
                 }
                 Err(e) => {
@@ -323,7 +389,11 @@ impl RpcClient {
     #[async_backtrace::framed]
     async fn execute_once<T: AmRpc>(&self, request: &T) -> Result<T::ResponseHeader, RpcError> {
         let stats_enabled = is_stats_enabled();
-        let exec_start = if stats_enabled { Some(Instant::now()) } else { None };
+        let exec_start = if stats_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         let timeout_duration = get_rpc_timeout();
         let rpc_id = T::rpc_id();
@@ -343,13 +413,21 @@ impl RpcClient {
         );
 
         let stream_start = exec_start.map(|_| Instant::now());
-        let reply_stream = self.conn.worker.am_stream(reply_stream_id).map_err(|e| {
-            RpcError::TransportError(format!(
-                "Failed to create reply AM stream: {:?}",
-                e.to_string()
-            ))
-        })?;
-        let stream_us = stream_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let reply_stream = self
+            .conn
+            .as_ref()
+            .unwrap()
+            .worker
+            .am_stream(reply_stream_id)
+            .map_err(|e| {
+                RpcError::TransportError(format!(
+                    "Failed to create reply AM stream: {:?}",
+                    e.to_string()
+                ))
+            })?;
+        let stream_us = stream_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         tracing::trace!("Created reply stream: stream_id={}", reply_stream_id);
 
@@ -369,7 +447,7 @@ impl RpcClient {
             proto
         );
 
-        let send_future = self.conn.endpoint().am_send_vectorized(
+        let send_future = self.conn.as_ref().unwrap().endpoint().am_send_vectorized(
             rpc_id as u32,
             zerocopy::IntoBytes::as_bytes(header),
             &data,
@@ -400,7 +478,9 @@ impl RpcClient {
                 return Err(RpcError::Timeout);
             }
         }
-        let send_us = send_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let send_us = send_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         tracing::debug!(
             "Waiting for reply on stream_id={}, rpc_id={}, timeout_secs={}",
@@ -432,7 +512,9 @@ impl RpcClient {
                 return Err(RpcError::Timeout);
             }
         };
-        let wait_us = wait_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let wait_us = wait_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         tracing::debug!(
             "Received reply message: rpc_id={}, reply_stream_id={}",
@@ -476,7 +558,9 @@ impl RpcClient {
             }
         }
 
-        let recv_us = recv_start.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0);
+        let recv_us = recv_start
+            .map(|s| s.elapsed().as_micros() as u64)
+            .unwrap_or(0);
 
         if let Some(start) = exec_start {
             let total_us = start.elapsed().as_micros() as u64;
@@ -515,6 +599,27 @@ impl RpcClient {
     pub async fn execute_no_reply<T: AmRpc>(&self, request: &T) -> Result<(), RpcError> {
         increment_request_count();
 
+        // Locusta fast path — fire-and-forget via `send_oneway`. Build
+        // the same vectored small_req as `call_locusta` would, but
+        // discard the reply.
+        #[cfg(feature = "transport-locusta")]
+        if let Some(backend) = &self.locusta {
+            use crate::rpc::transport::RpcTransport;
+            use std::io::IoSlice;
+            use zerocopy::IntoBytes;
+            let header_bytes = request.request_header().as_bytes();
+            let data = request.request_data();
+            let mut parts: Vec<IoSlice<'_>> = Vec::with_capacity(1 + data.len());
+            parts.push(IoSlice::new(header_bytes));
+            for s in data {
+                parts.push(IoSlice::new(s));
+            }
+            return backend
+                .transport
+                .send_oneway(&backend.peer_node_id, T::rpc_id(), &parts)
+                .await;
+        }
+
         let retry_config = get_retry_config();
         let mut attempt = 0u32;
         let mut delay = retry_config.initial_delay;
@@ -542,7 +647,7 @@ impl RpcClient {
                     );
                     pluvio_timer::sleep(delay).await;
                     delay = Duration::from_secs_f64(
-                        delay.as_secs_f64() * retry_config.backoff_multiplier
+                        delay.as_secs_f64() * retry_config.backoff_multiplier,
                     );
                 }
                 Err(e) => {
@@ -571,7 +676,7 @@ impl RpcClient {
         let data = request.request_data();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
-        let send_future = self.conn.endpoint().am_send_vectorized(
+        let send_future = self.conn.as_ref().unwrap().endpoint().am_send_vectorized(
             rpc_id as u32,
             zerocopy::IntoBytes::as_bytes(header),
             &data,

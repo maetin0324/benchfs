@@ -101,7 +101,11 @@ impl IOUringBackend {
         };
 
         // Measure io_uring write_fixed operation time (only when stats enabled)
-        let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
+        let start = if is_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let write_len = data_len.min(fixed_buffer.len()) as u32;
 
@@ -175,7 +179,11 @@ impl IOUringBackend {
         };
 
         // Measure io_uring read_fixed operation time (only when stats enabled)
-        let start = if is_stats_enabled() { Some(std::time::Instant::now()) } else { None };
+        let start = if is_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let read_len = read_len.min(fixed_buffer.len()) as u32;
 
@@ -207,6 +215,76 @@ impl IOUringBackend {
 
         Ok((bytes_read, fixed_buffer))
     }
+
+    /// Write to file directly from an externally-owned registered buffer.
+    ///
+    /// Lets the locusta RPC server submit `WriteFixed` against the RDMA
+    /// landing buffer in-place, instead of forcing `IOUringBackend::write`'s
+    /// `acquire().await + 4 MiB memcpy` path (job 17061 timing identified
+    /// this as ~0.4 ms/chunk on the WRITE_READY handler hot path).
+    ///
+    /// # Safety
+    /// `ptr` must point inside a buffer registered with this backend's
+    /// allocator (i.e. acquired from `self.allocator`), and `buf_index` must
+    /// be that buffer's slot index. The memory must remain valid until the
+    /// returned future resolves.
+    #[async_backtrace::framed]
+    pub async fn write_via_registered(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        ptr: *const u8,
+        len: u32,
+        buf_index: u16,
+    ) -> StorageResult<usize> {
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
+        let bytes_written = dma_file
+            .write_fixed_raw(offset, ptr, len, buf_index)
+            .await
+            .map_err(StorageError::IoError)?;
+        if bytes_written < 0 {
+            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                -bytes_written,
+            )));
+        }
+        Ok(bytes_written as usize)
+    }
+
+    /// Read from file directly into an externally-owned registered buffer.
+    /// See [`write_via_registered`] for safety constraints.
+    #[async_backtrace::framed]
+    pub async fn read_via_registered(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        ptr: *mut u8,
+        len: u32,
+        buf_index: u16,
+    ) -> StorageResult<usize> {
+        let dma_file = {
+            let files = self.files.borrow();
+            files
+                .get(&handle.0)
+                .cloned()
+                .ok_or(StorageError::InvalidHandle(handle))?
+        };
+        let bytes_read = dma_file
+            .read_fixed_raw(offset, ptr, len, buf_index)
+            .await
+            .map_err(StorageError::IoError)?;
+        if bytes_read < 0 {
+            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                -bytes_read,
+            )));
+        }
+        Ok(bytes_read as usize)
+    }
 }
 
 // Default implementation removed - allocator must be provided
@@ -225,9 +303,10 @@ impl StorageBackend for IOUringBackend {
         let mode = 0o644u32;
 
         // Async file open via io_uring OpenAt
-        let dma_file = DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
-            .await
-            .map_err(|e| Self::map_io_error(e, path))?;
+        let dma_file =
+            DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
+                .await
+                .map_err(|e| Self::map_io_error(e, path))?;
 
         let dma_file = Rc::new(dma_file);
         let fd = self.allocate_fd();
@@ -363,9 +442,10 @@ impl StorageBackend for IOUringBackend {
         let linux_flags = libc::O_WRONLY | libc::O_CREAT;
 
         // Async file create via io_uring OpenAt
-        let dma_file = DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
-            .await
-            .map_err(|e| Self::map_io_error(e, path))?;
+        let dma_file =
+            DmaFile::open_with_reactor(path_str, linux_flags, mode, self.reactor.clone())
+                .await
+                .map_err(|e| Self::map_io_error(e, path))?;
 
         let dma_file = Rc::new(dma_file);
         let fd = self.allocate_fd();
@@ -592,9 +672,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("new_file.txt");
 
-        runtime
-            .clone()
-            .run_with_name_and_runtime("iouring_backend_test_create_write", async move {
+        runtime.clone().run_with_name_and_runtime(
+            "iouring_backend_test_create_write",
+            async move {
                 let backend = IOUringBackend::new(allocator, reactor);
 
                 // ファイルを作成
@@ -611,6 +691,7 @@ mod tests {
 
                 // ファイルが存在することを確認
                 assert!(test_file.exists());
-            });
+            },
+        );
     }
 }

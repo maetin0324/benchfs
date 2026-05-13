@@ -443,9 +443,7 @@ pub extern "C" fn benchfs_read(
             });
 
             match n {
-                Ok(bytes_read) => {
-                    Ok(bytes_read)
-                }
+                Ok(bytes_read) => Ok(bytes_read),
                 Err(e) => Err(e.to_string()),
             }
         });

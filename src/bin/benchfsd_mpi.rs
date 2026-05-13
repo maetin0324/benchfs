@@ -16,12 +16,14 @@
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
-use benchfs::logging::{init_with_chrome, init_with_perfetto, TraceGuard};
+use benchfs::logging::{TraceGuard, init_with_chrome, init_with_perfetto};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::{RpcServer, get_server_rpc_stats};
-use benchfs::storage::{ChunkStore, DummyChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore, PosixChunkStore};
+use benchfs::storage::{
+    ChunkStore, DummyChunkStore, FileChunkStore, IOUringBackend, IOUringChunkStore, PosixChunkStore,
+};
 
 use pluvio_runtime::executor::{Runtime, SchedulingConfig};
 use pluvio_timer::TimerReactor;
@@ -36,6 +38,108 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// One-shot yield future: returns Pending once (registering its waker as
+/// already-ready so the executor re-polls it on the next iteration), then
+/// resolves. Lets a hot poll loop give other tasks a slot without going
+/// through a timer.
+#[cfg(feature = "transport-locusta")]
+#[derive(Default)]
+struct YieldOnce {
+    yielded: bool,
+}
+
+#[cfg(feature = "transport-locusta")]
+impl std::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.yielded {
+            std::task::Poll::Ready(())
+        } else {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+}
+
+#[cfg(feature = "transport-locusta")]
+struct LocustaRuntimeState {
+    transport: Rc<benchfs::rpc::transport_locusta::LocustaTransport>,
+    dispatch: Rc<benchfs::rpc::locusta_server::LocustaServerDispatch>,
+}
+
+#[cfg(feature = "transport-locusta")]
+fn init_locusta_runtime(
+    node_id: &str,
+    mpi_rank: i32,
+    mpi_size: i32,
+    registry_dir: &str,
+    handler_context: Rc<RpcHandlerContext>,
+) -> Result<LocustaRuntimeState, Box<dyn std::error::Error>> {
+    use benchfs::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
+    use benchfs::rpc::locusta_server::LocustaServerDispatch;
+    use benchfs::rpc::metadata_ops::{
+        MetadataCreateDirRequest, MetadataCreateFileRequest, MetadataDeleteRequest,
+        MetadataLookupRequest, MetadataUpdateRequest,
+    };
+    use benchfs::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
+
+    // Peer list: every other MPI rank gets a `node_<rank>` id. The
+    // locusta file-based QP exchange is symmetric so all ranks build
+    // the same view.
+    let peer_node_ids: Vec<String> = (0..mpi_size)
+        .filter(|&r| r != mpi_rank)
+        .map(|r| format!("node_{}", r))
+        .collect();
+
+    let arena_size: u32 = std::env::var("BENCHFS_LOCUSTA_ARENA_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8 * 1024 * 1024);
+    let ring_capacity: u32 = std::env::var("BENCHFS_LOCUSTA_RING_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let cfg = LocustaConfig {
+        registry_dir: PathBuf::from(registry_dir).join("locusta_qp"),
+        local_node_id: node_id.to_string(),
+        peer_node_ids,
+        external_server_allocator: Some(Rc::clone(&handler_context.allocator)),
+        arena_size,
+        ring_capacity,
+        ..LocustaConfig::default()
+    };
+    std::fs::create_dir_all(&cfg.registry_dir)?;
+    tracing::info!(
+        "Initializing LocustaTransport (peers={}, registry={})",
+        cfg.peer_node_ids.len(),
+        cfg.registry_dir.display()
+    );
+    let transport = Rc::new(LocustaTransport::init(&cfg)?);
+    tracing::info!(
+        "LocustaTransport connected to {} peers",
+        cfg.peer_node_ids.len()
+    );
+
+    // Register every supported RPC's `LocustaServerHandler`.
+    let mut dispatch = LocustaServerDispatch::new(handler_context);
+    dispatch.register::<MetadataLookupRequest>();
+    dispatch.register::<MetadataCreateFileRequest>();
+    dispatch.register::<MetadataCreateDirRequest>();
+    dispatch.register::<MetadataDeleteRequest>();
+    dispatch.register::<MetadataUpdateRequest>();
+    dispatch.register::<WriteChunkByIdRequest<'_>>();
+    dispatch.register::<ReadChunkByIdRequest<'_>>();
+
+    Ok(LocustaRuntimeState {
+        transport,
+        dispatch: Rc::new(dispatch),
+    })
+}
 
 /// Server state
 struct ServerState {
@@ -95,7 +199,9 @@ fn main() {
     let mut positional_args: Vec<&String> = Vec::new();
 
     // Set BENCHFS_RPC_TIMEOUT to 3 second for MPI environment
-    unsafe { std::env::set_var("BENCHFS_RPC_TIMEOUT", "3"); }
+    unsafe {
+        std::env::set_var("BENCHFS_RPC_TIMEOUT", "3");
+    }
 
     let mut i = 1;
     while i < args.len() {
@@ -158,14 +264,22 @@ fn main() {
                 "Usage: mpirun -n <num_nodes> {} <registry_dir> [config_file] [options]",
                 args[0]
             );
-            eprintln!("  registry_dir:            Shared directory for service discovery (required)");
-            eprintln!("  config_file:             Configuration file (optional, default: benchfs.toml)");
+            eprintln!(
+                "  registry_dir:            Shared directory for service discovery (required)"
+            );
+            eprintln!(
+                "  config_file:             Configuration file (optional, default: benchfs.toml)"
+            );
             eprintln!("  --trace-output <path>:   Enable Perfetto tracing (optional)");
             eprintln!("                           Each rank creates <path>_rank<N>.json");
             eprintln!("  --stats-output <path>:   Enable CSV stats output (optional)");
             eprintln!("                           Each rank creates <path>_rank<N>.csv");
-            eprintln!("  --enable-stats:          Enable detailed timing statistics collection (optional)");
-            eprintln!("                           Adds overhead, use only for performance analysis");
+            eprintln!(
+                "  --enable-stats:          Enable detailed timing statistics collection (optional)"
+            );
+            eprintln!(
+                "                           Adds overhead, use only for performance analysis"
+            );
         }
         std::process::exit(1);
     }
@@ -177,7 +291,14 @@ fn main() {
         "benchfs.toml"
     };
 
-    // Enable detailed timing statistics if requested
+    // Enable detailed timing statistics if requested (CLI flag or env var)
+    if !enable_stats
+        && std::env::var("ENABLE_STATS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    {
+        enable_stats = true;
+    }
     if enable_stats {
         benchfs::stats::set_stats_enabled(true);
         if mpi_rank == 0 {
@@ -253,7 +374,6 @@ fn main() {
         tracing::info!("Stats output enabled: {}", stats_path.display());
     }
 
-
     // Synchronize all ranks before starting servers
     world.barrier();
 
@@ -270,7 +390,10 @@ fn main() {
     tracing::info!("Rank {}: BenchFS server stopped", mpi_rank);
 }
 
-fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_server(
+    state: Rc<ServerState>,
+    enable_perfetto_tracks: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = &state.config;
     let node_id = state.node_id();
     let registry_dir = state
@@ -281,8 +404,8 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
     // Create pluvio runtime with optional Perfetto task tracking
     // Tuned for high-throughput I/O: larger batch size and more frequent reactor polling
     let scheduling_config = SchedulingConfig {
-        task_batch_size: 64,          // Increased from 16 for better throughput
-        reactor_poll_interval: 2,     // Reduced from 8 for lower io_uring latency
+        task_batch_size: 64,      // Increased from 16 for better throughput
+        reactor_poll_interval: 2, // Reduced from 8 for lower io_uring latency
         enable_perfetto_tracks,
         ..Default::default()
     };
@@ -385,13 +508,20 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                 complete_timeout_us,
                 (queue_size as usize * chunk_size) / (1024 * 1024 * 1024)
             );
-            let uring_reactor = IoUringReactor::builder()
+            let sq_poll_idle_ms: Option<u32> = std::env::var("BENCHFS_IOURING_SQ_POLL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let mut builder = IoUringReactor::builder()
                 .queue_size(queue_size)
                 .buffer_size(chunk_size)
                 .submit_depth(submit_depth)
                 .wait_submit_timeout(std::time::Duration::from_micros(submit_timeout_us))
-                .wait_complete_timeout(std::time::Duration::from_micros(complete_timeout_us))
-                .build();
+                .wait_complete_timeout(std::time::Duration::from_micros(complete_timeout_us));
+            if let Some(ms) = sq_poll_idle_ms {
+                tracing::info!("Enabling io_uring SQ_POLL with idle_ms={}", ms);
+                builder = builder.sq_poll(ms);
+            }
+            let uring_reactor = builder.build();
 
             let allocator = uring_reactor.allocator.clone();
             let reactor_for_backend = uring_reactor.clone();
@@ -455,7 +585,10 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
             (chunk_store, allocator)
         }
         _ => {
-            tracing::info!("Using file-based storage backend (backend={})", effective_backend);
+            tracing::info!(
+                "Using file-based storage backend (backend={})",
+                effective_backend
+            );
 
             // io_uring reactor for allocator only.
             // buffer_size must match chunk_size for RPC data transfers.
@@ -484,10 +617,63 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
     ));
 
     // Create RPC server
-    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context));
+    let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));
+
+    // BENCHFS_TRANSPORT=locusta swaps the connection pool for a
+    // locusta-backed one *and* fires up the server-side dispatch loop.
+    // All other state (chunk store, metadata manager, RpcHandlerContext)
+    // is reused as-is — the only difference is the wire mechanism.
+    let use_locusta = std::env::var("BENCHFS_TRANSPORT")
+        .map(|v| v.eq_ignore_ascii_case("locusta"))
+        .unwrap_or(false);
+
+    #[cfg(feature = "transport-locusta")]
+    let locusta_state = if use_locusta {
+        Some(init_locusta_runtime(
+            &node_id,
+            state.mpi_rank,
+            state.mpi_size,
+            registry_dir,
+            handler_context.clone(),
+        )?)
+        // NOTE: no `runtime.register_reactor("locusta", ...)` here on
+        // purpose. The dispatch task below (poll_once_spawn) ticks
+        // locusta state machines itself. WaitForResponse::poll also
+        // ticks inside its busy-poll loop. Registering a separate
+        // tick reactor caused intermittent freezes on rank 0 in jobs
+        // 17035 / 17038 — likely a try_borrow_mut race with the
+        // dispatch task. Pluvio's stuck watchdog is satisfied as
+        // long as some task completes; the dispatch task does.
+    } else {
+        None
+    };
+    #[cfg(not(feature = "transport-locusta"))]
+    let locusta_state: Option<()> = if use_locusta {
+        return Err("BENCHFS_TRANSPORT=locusta requires --features transport-locusta".into());
+    } else {
+        None
+    };
 
     // Create connection pool for inter-node communication
-    let connection_pool = Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?);
+    let connection_pool = {
+        #[cfg(feature = "transport-locusta")]
+        {
+            if let Some(state_locusta) = &locusta_state {
+                Rc::new(ConnectionPool::new_locusta(
+                    worker.clone(),
+                    registry_dir,
+                    Rc::clone(&state_locusta.transport),
+                )?)
+            } else {
+                Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?)
+            }
+        }
+        #[cfg(not(feature = "transport-locusta"))]
+        {
+            let _ = &locusta_state;
+            Rc::new(ConnectionPool::new(worker.clone(), registry_dir)?)
+        }
+    };
 
     // Registration will be done after runtime starts (moved to async task below)
 
@@ -498,21 +684,150 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
     let handler_ready = std::rc::Rc::new(std::cell::RefCell::new(false));
     let handler_ready_clone = handler_ready.clone();
 
-    pluvio_runtime::spawn_with_name(
-        async move {
-            tracing::info!("Registering RPC handlers...");
-            match server_clone.register_all_handlers().await {
-                Ok(_) => {
-                    tracing::info!("RPC handlers registered successfully");
-                    *handler_ready_clone.borrow_mut() = true;
+    #[cfg(feature = "transport-locusta")]
+    let locusta_ready_flag = locusta_state.is_some();
+    #[cfg(not(feature = "transport-locusta"))]
+    let locusta_ready_flag = false;
+
+    if locusta_ready_flag {
+        // Locusta path: server-side dispatch is wired the moment
+        // `LocustaServerDispatch::new` returned. The UCX handler
+        // registration would crash (no UCX endpoint setup), so skip it
+        // entirely.
+        *handler_ready_clone.borrow_mut() = true;
+        #[cfg(feature = "transport-locusta")]
+        {
+            // Dispatch task: drains ready locusta requests and spawns
+            // handler futures. Uses futures_timer::Delay(100µs) between
+            // iterations — short enough to keep latency low, long
+            // enough to avoid starving timer-woken tasks (10x the
+            // 1µs that caused issues; futures_timer's thread-based
+            // implementation handles this rate fine).
+            let dispatch = Rc::clone(&locusta_state.as_ref().unwrap().dispatch);
+            let transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    tracing::info!(
+                        "Starting LocustaServerDispatch drain task ({} handlers registered)",
+                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>(
+                        )
+                    );
+                    // Adaptive backoff so the dispatch loop doesn't impose
+                    // a hard 100us latency floor on every RPC. When work was
+                    // drained, busy-yield to come back fast (the executor
+                    // gives other tasks one round between yields). When
+                    // idle for a few iterations, fall back to a short
+                    // sleep so this task doesn't starve other work.
+                    //
+                    // Tuning knobs:
+                    //   BENCHFS_LOCUSTA_DISPATCH_SLEEP_US — idle sleep (default 20us)
+                    //   BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD — empty polls
+                    //     before sleeping (default 16)
+                    let idle_sleep_us: u64 = std::env::var("BENCHFS_LOCUSTA_DISPATCH_SLEEP_US")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(20);
+                    let idle_threshold: u32 =
+                        std::env::var("BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(16);
+                    let mut iter: u64 = 0;
+                    let mut empty_polls: u32 = 0;
+                    loop {
+                        let drained = dispatch.poll_once_spawn(&transport);
+                        iter = iter.wrapping_add(1);
+                        if iter == 1 || iter % 1_000_000 == 0 {
+                            tracing::info!(
+                                "locusta dispatch drain heartbeat iter={} (idle_threshold={}, idle_sleep_us={})",
+                                iter,
+                                idle_threshold,
+                                idle_sleep_us
+                            );
+                        }
+                        if drained > 0 {
+                            empty_polls = 0;
+                            // Hot path — yield once so other tasks
+                            // (handlers, accept loop) get a slot, then
+                            // re-poll immediately.
+                            YieldOnce::default().await;
+                        } else {
+                            empty_polls = empty_polls.saturating_add(1);
+                            if empty_polls < idle_threshold {
+                                YieldOnce::default().await;
+                            } else {
+                                pluvio_timer::sleep(std::time::Duration::from_micros(
+                                    idle_sleep_us,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                },
+                "locusta_dispatch_drain".to_string(),
+            );
+
+            // Accept loop: scan the registry directory for late-joining
+            // clients (IOR ranks, etc.) that publish their QP info after
+            // server startup. Static peers wired in `init_locusta_runtime`
+            // are already connected; this only handles the dynamic ones.
+            let accept_transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    tracing::info!("Starting locusta client_accept loop");
+                    let scan_interval = std::time::Duration::from_millis(100);
+                    let per_peer_timeout = std::time::Duration::from_secs(10);
+                    let mut iter: u64 = 0;
+                    loop {
+                        iter = iter.wrapping_add(1);
+                        match accept_transport.try_accept_pending_peers(per_peer_timeout) {
+                            Ok(added) if !added.is_empty() => {
+                                tracing::info!(
+                                    "locusta accepted {} new client peer(s) on iter {}: {:?}",
+                                    added.len(),
+                                    iter,
+                                    added
+                                );
+                            }
+                            Ok(_) => {
+                                if iter == 1 || iter % 50 == 0 {
+                                    tracing::info!(
+                                        "locusta accept loop heartbeat iter={} (no new peers)",
+                                        iter
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "try_accept_pending_peers error on iter {}: {:?}",
+                                    iter,
+                                    e
+                                );
+                            }
+                        }
+                        pluvio_timer::sleep(scan_interval).await;
+                    }
+                },
+                "locusta_client_accept".to_string(),
+            );
+        }
+    } else {
+        pluvio_runtime::spawn_with_name(
+            async move {
+                tracing::info!("Registering RPC handlers...");
+                match server_clone.register_all_handlers().await {
+                    Ok(_) => {
+                        tracing::info!("RPC handlers registered successfully");
+                        *handler_ready_clone.borrow_mut() = true;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to register RPC handlers: {:?}", e);
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to register RPC handlers: {:?}", e);
-                }
-            }
-        },
-        "rpc_handler_registration".to_string(),
-    );
+            },
+            "rpc_handler_registration".to_string(),
+        );
+    }
 
     // Spawn node registration task (must run after RPC handlers are ready)
     let pool_clone = connection_pool.clone();
@@ -542,13 +857,13 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                     ));
                 }
 
-                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                pluvio_timer::sleep(std::time::Duration::from_millis(100)).await;
             }
 
             tracing::info!("RPC handlers ready, now registering node address");
 
             // Small delay to ensure AM streams are fully established
-            futures_timer::Delay::new(std::time::Duration::from_millis(200)).await;
+            pluvio_timer::sleep(std::time::Duration::from_millis(200)).await;
 
             // Register this node's worker address
             if let Err(e) = pool_clone.register_self(&node_id_clone) {
@@ -618,7 +933,7 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                     );
                 }
 
-                futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
+                pluvio_timer::sleep(std::time::Duration::from_millis(500)).await;
             }
 
             Ok::<(), std::io::Error>(())
@@ -676,7 +991,11 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                             );
                         }
                         Err(e) => {
-                            tracing::error!("Failed to create stats file {}: {}", path.display(), e);
+                            tracing::error!(
+                                "Failed to create stats file {}: {}",
+                                path.display(),
+                                e
+                            );
                         }
                     }
                 }
@@ -721,7 +1040,7 @@ fn run_server(state: Rc<ServerState>, enable_perfetto_tracks: bool) -> Result<()
                         break;
                     }
                     // Yield to allow other tasks to run
-                    futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                    pluvio_timer::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
                 // ========== Graceful Shutdown Sequence ==========
@@ -827,10 +1146,7 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> 
             Some(guard)
         } else if enable_chrome {
             let guard = init_with_chrome(level, trace_path);
-            tracing::info!(
-                "Chrome tracing enabled, output: {}",
-                trace_path.display()
-            );
+            tracing::info!("Chrome tracing enabled, output: {}", trace_path.display());
             Some(guard)
         } else {
             // Trace output path given but no format enabled - default to Perfetto

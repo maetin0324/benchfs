@@ -50,6 +50,11 @@ pub struct ConnectionPool {
     connections: RefCell<HashMap<String, Rc<RpcClient>>>,
     /// Cache of worker address bytes (needed to keep the memory valid for WorkerAddressInner)
     address_cache: RefCell<HashMap<String, Vec<u8>>>,
+    /// When `Some`, every `get_or_connect(node_id)` returns a locusta-
+    /// backed `RpcClient` instead of opening a UCX endpoint. The pool's
+    /// UCX `worker` is then unused for outgoing RPCs.
+    #[cfg(feature = "transport-locusta")]
+    locusta_transport: Option<Rc<crate::rpc::transport_locusta::LocustaTransport>>,
 }
 
 impl ConnectionPool {
@@ -69,6 +74,28 @@ impl ConnectionPool {
             registry,
             connections: RefCell::new(HashMap::new()),
             address_cache: RefCell::new(HashMap::new()),
+            #[cfg(feature = "transport-locusta")]
+            locusta_transport: None,
+        })
+    }
+
+    /// Construct a `ConnectionPool` whose `get_or_connect` returns
+    /// locusta-backed clients. The `worker` is still required (the
+    /// caller will typically have one from prior UCX init) but goes
+    /// unused for outgoing RPCs.
+    #[cfg(feature = "transport-locusta")]
+    pub fn new_locusta<P: AsRef<std::path::Path>>(
+        worker: Rc<Worker>,
+        registry_dir: P,
+        transport: Rc<crate::rpc::transport_locusta::LocustaTransport>,
+    ) -> Result<Self, RpcError> {
+        let registry = WorkerAddressRegistry::new(registry_dir)?;
+        Ok(Self {
+            worker,
+            registry,
+            connections: RefCell::new(HashMap::new()),
+            address_cache: RefCell::new(HashMap::new()),
+            locusta_transport: Some(transport),
         })
     }
 
@@ -77,6 +104,20 @@ impl ConnectionPool {
     /// # Arguments
     /// * `node_id` - Unique identifier for this node
     pub fn register_self(&self, node_id: &str) -> Result<(), RpcError> {
+        // Locusta backend exchanges QP info via its own file registry —
+        // there is no UCX worker address to publish. Still publish an
+        // empty `<node_id>.addr` sentinel so the rest of BenchFS (the
+        // `Waiting for N nodes to register` polling loop and the FFI
+        // client's `discover_data_nodes`) sees this node as up.
+        #[cfg(feature = "transport-locusta")]
+        if self.locusta_transport.is_some() {
+            tracing::info!(
+                node_id = node_id,
+                "locusta backend: writing empty .addr sentinel for discovery"
+            );
+            self.registry.register(node_id, b"locusta")?;
+            return Ok(());
+        }
         let address = self.worker.address().map_err(|e| {
             RpcError::ConnectionError(format!("Failed to get worker address: {:?}", e))
         })?;
@@ -106,7 +147,13 @@ impl ConnectionPool {
             let connections = self.connections.borrow();
             if let Some(client) = connections.get(node_id) {
                 // Check if the endpoint is still open
-                if !client.connection().endpoint().is_closed() {
+                // For locusta-backed clients there is no UCX endpoint —
+                // reusing the cached client is always safe.
+                let ucx_alive = client
+                    .connection()
+                    .map(|c| !c.endpoint().is_closed())
+                    .unwrap_or(true);
+                if ucx_alive {
                     tracing::debug!("Reusing existing connection to {}", node_id);
                     return Ok(client.clone());
                 } else {
@@ -121,6 +168,40 @@ impl ConnectionPool {
 
         // Remove closed connection if it exists
         self.connections.borrow_mut().remove(node_id);
+
+        // Locusta short-circuit: skip the UCX endpoint dance, build a
+        // locusta-backed `RpcClient` that routes every `execute<T>`
+        // through `T::call_locusta(peer, transport)`.
+        //
+        // If the locusta transport doesn't yet have a dest_id for
+        // `node_id` (the late-joining FFI/IOR client path), run the
+        // RDMA QP handshake before returning the cached client. Both
+        // sides exchange QP info via the same file registry that
+        // `LocustaTransport::init` uses for statically-known peers.
+        #[cfg(feature = "transport-locusta")]
+        if let Some(transport) = &self.locusta_transport {
+            let peer_node_id = node_id.to_string();
+            if !transport.has_peer(&peer_node_id) {
+                tracing::info!(
+                    node_id = node_id,
+                    "locusta: peer not yet connected, running add_peer handshake"
+                );
+                transport
+                    .add_peer(&peer_node_id, std::time::Duration::from_secs(120))
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "locusta add_peer({node_id}) failed: {e:?}"
+                        ))
+                    })?;
+            }
+            let client = Rc::new(RpcClient::new_locusta(Rc::clone(transport), peer_node_id));
+            self.connections
+                .borrow_mut()
+                .insert(node_id.to_string(), client.clone());
+            TOTAL_CONNECTIONS_CREATED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(node_id = node_id, "Created new locusta-backed RpcClient");
+            return Ok(client);
+        }
 
         // Lookup worker address
         tracing::info!(
@@ -186,7 +267,9 @@ impl ConnectionPool {
         node_id: &str,
         timeout_secs: u64,
     ) -> Result<Rc<RpcClient>, RpcError> {
-        // Wait for address to be available
+        // Wait for address to be available. For locusta the registry
+        // file content is just a sentinel — we don't unpack it, but the
+        // wait still has value as a "server is up" signal.
         let worker_address_bytes = self.registry.wait_for(node_id, timeout_secs).await?;
 
         // Check if connection already exists
@@ -196,6 +279,14 @@ impl ConnectionPool {
                 tracing::debug!("Reusing existing connection to {}", node_id);
                 return Ok(client.clone());
             }
+        }
+
+        // Locusta path: never touch the .addr bytes. `get_or_connect`
+        // already runs the QP handshake via `LocustaTransport::add_peer`
+        // for any peer not yet present.
+        #[cfg(feature = "transport-locusta")]
+        if self.locusta_transport.is_some() {
+            return self.get_or_connect(node_id).await;
         }
 
         // Store address bytes in cache to ensure the memory remains valid

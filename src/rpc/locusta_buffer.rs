@@ -44,6 +44,18 @@ pub struct RegisteredFixedBuffer {
     len: usize,
     lkey: u32,
     rkey: u32,
+    /// io_uring fixed buffer index — lets the io_uring backend submit a
+    /// `WriteFixed` / `ReadFixed` SQE against this buffer without
+    /// allocating + memcpy'ing into a separate `FixedBuffer`. Saves a
+    /// 4 MiB memcpy per chunk RPC (job 17061 timing showed ~0.4ms/chunk).
+    buf_index: u16,
+}
+
+impl RegisteredFixedBuffer {
+    /// io_uring fixed-buffer index for direct `WriteFixed`/`ReadFixed` SQEs.
+    pub fn buf_index(&self) -> u16 {
+        self.buf_index
+    }
 }
 
 // The locusta `RdmaBuffer` trait demands `Send + 'static`. Pluvio's
@@ -69,6 +81,7 @@ impl RegisteredFixedBuffer {
         let len = fb.len();
         let lkey = fb.rdma_lkey();
         let rkey = fb.rdma_rkey();
+        let buf_index = fb.index() as u16;
         assert!(
             lkey != 0,
             "FixedBuffer used for RDMA but allocator was never registered \
@@ -80,6 +93,7 @@ impl RegisteredFixedBuffer {
             len,
             lkey,
             rkey,
+            buf_index,
         }
     }
 }

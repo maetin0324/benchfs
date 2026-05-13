@@ -152,9 +152,24 @@ export RUST_BACKTRACE=full
 : ${BENCHFS_RPC_TIMEOUT:=120}
 : ${BENCHFS_IOURING_QUEUE_SIZE:=2048}
 : ${BENCHFS_IOURING_SUBMIT_DEPTH:=512}
+# wait_submit_timeout / wait_complete_timeout in the io_uring reactor gate
+# whether the runtime polls the reactor. Defaults (1ms) park CQEs for up
+# to 1ms before processing — directly inflating chunk-write p99. Drop to
+# 10us so completions are drained promptly.
+: ${BENCHFS_IOURING_SUBMIT_TIMEOUT_US:=10}
+: ${BENCHFS_IOURING_COMPLETE_TIMEOUT_US:=10}
 export BENCHFS_RPC_TIMEOUT
 export BENCHFS_IOURING_QUEUE_SIZE
 export BENCHFS_IOURING_SUBMIT_DEPTH
+export BENCHFS_IOURING_SUBMIT_TIMEOUT_US
+export BENCHFS_IOURING_COMPLETE_TIMEOUT_US
+
+# Locusta server dispatch tuning. Defaults match the conservative
+# values baked into benchfsd_mpi; override here for sweep runs.
+: ${BENCHFS_LOCUSTA_DISPATCH_SLEEP_US:=20}
+: ${BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD:=16}
+export BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+export BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
 
 cmd_mpirun_util=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self)
 cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
@@ -281,6 +296,10 @@ EOF
   export BENCHFS_INNER_BINARY="${BENCHFS_PREFIX}/benchfsd_mpi"
   cat > "${datadir_wrapper}" <<'WRAPPER_EOF'
 #!/bin/bash
+# Raise fd limit per-process — mpirun's remote launchers don't inherit
+# the qsub-script's ulimit, so each benchfsd starts with the system soft
+# default. fd cache for chunk files needs ≥65k fds per server vnode.
+ulimit -n 1048576 2>/dev/null || ulimit -n 524288 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536 2>/dev/null || true
 LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK:-0}
 LOCAL_SCRATCH_DIRS=()
 LOCAL_NUMA_NODES=()
@@ -328,6 +347,21 @@ WRAPPER_EOF
     -x BENCHFS_RPC_TIMEOUT
     -x BENCHFS_IOURING_QUEUE_SIZE
     -x BENCHFS_IOURING_SUBMIT_DEPTH
+    -x BENCHFS_IOURING_SUBMIT_TIMEOUT_US
+    -x BENCHFS_IOURING_COMPLETE_TIMEOUT_US
+    -x BENCHFS_IOURING_SQ_POLL_MS
+    -x PLUVIO_URING_ALWAYS_POLL
+    -x BENCHFS_CHUNK_FD_CACHE_SIZE
+    -x BENCHFS_CHUNK_LAYOUT
+    -x BENCHFS_LOCUSTA_ARENA_SIZE
+    -x BENCHFS_LOCUSTA_RING_CAPACITY
+    -x BENCHFS_LOCUSTA_RECV_RING_SIZE
+    -x BENCHFS_LOCUSTA_SEND_BUF_SIZE
+    -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+    -x LOCUSTA_DAEMON_EVENT_BUDGET
+    -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
+    -x BENCHFS_TRANSPORT
+    -x ENABLE_STATS
     "${datadir_wrapper}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -496,6 +530,12 @@ run_io500() {
     -x RUST_LOG="${RUST_LOG_C}"
     -x RUST_BACKTRACE
     -x BENCHFS_EXPECTED_NODES="${VNODES}"
+    -x BENCHFS_TRANSPORT
+    -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+    -x LOCUSTA_DAEMON_EVENT_BUDGET
+    -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
+    -x BENCHFS_LOCUSTA_ARENA_SIZE
+    -x BENCHFS_LOCUSTA_RING_CAPACITY
     -x BENCHFS_RPC_TIMEOUT
     "${asan_args[@]}"
     "${IO500_DIR}/io500"
@@ -503,10 +543,16 @@ run_io500() {
   )
   echo "Running: ${cmd[*]}"
   # Pick the stonewall that's actually in play for this invocation: final runs
-  # use FINAL_STONEWALL, sweep runs use SWEEP_STONEWALL. The previous formula
-  # (SWEEP_STONEWALL*6+600) capped the final run at 780s and killed io500
-  # mid-ior-easy-write when FINAL_STONEWALL=120 and multiple phases were enabled.
-  local stonewall_for_timeout="${IO500_STONEWALL_FOR_TIMEOUT:-${SWEEP_STONEWALL}}"
+  # use FINAL_STONEWALL, sweep runs use SWEEP_STONEWALL. Caller can override
+  # via IO500_STONEWALL_FOR_TIMEOUT. Default for the final run is
+  # FINAL_STONEWALL so all enabled phases get a budget proportional to their
+  # actual stonewall (job 17043 was killed at 14 min mid-find-easy because
+  # this fell back to SWEEP_STONEWALL=30 → timeout=840s).
+  local default_stonewall="${SWEEP_STONEWALL}"
+  if [ "${out_dir}" = "${FINAL_DIR}" ]; then
+    default_stonewall="${FINAL_STONEWALL}"
+  fi
+  local stonewall_for_timeout="${IO500_STONEWALL_FOR_TIMEOUT:-${default_stonewall}}"
   local timeout_s=$(( stonewall_for_timeout > 0 ? stonewall_for_timeout * 8 + 600 : 1800 ))
   timeout --signal=TERM --kill-after=30 "${timeout_s}" \
     "${cmd[@]}" > "${out_dir}/io500_stdout.log" 2> "${out_dir}/io500_stderr.log" || true

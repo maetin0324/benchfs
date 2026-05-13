@@ -429,7 +429,8 @@ mod tests {
         runtime
             .clone()
             .run_with_name_and_runtime("local_fs_test_create_directory", async move {
-                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor).unwrap();
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor)
+                    .unwrap();
 
                 let dir_path = Path::new("/testdir");
 
@@ -451,7 +452,8 @@ mod tests {
         runtime
             .clone()
             .run_with_name_and_runtime("local_fs_test_list_directory", async move {
-                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor).unwrap();
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor)
+                    .unwrap();
 
                 // ディレクトリを作成
                 fs.create_directory(Path::new("/dir1"), 0o755)
@@ -471,10 +473,11 @@ mod tests {
         let (runtime, allocator, reactor) = setup_runtime();
         let temp_dir = TempDir::new().unwrap();
 
-        runtime
-            .clone()
-            .run_with_name_and_runtime("local_fs_test_create_and_open_file", async move {
-                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor).unwrap();
+        runtime.clone().run_with_name_and_runtime(
+            "local_fs_test_create_and_open_file",
+            async move {
+                let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor)
+                    .unwrap();
 
                 let file_path = Path::new("/test.txt");
 
@@ -493,7 +496,8 @@ mod tests {
                 let metadata = fs.get_file_metadata(2).unwrap(); // inode=2 (1はルート)
                 assert_eq!(metadata.path, "/test.txt");
                 assert_eq!(metadata.size, 0);
-            });
+            },
+        );
     }
 
     #[test]
@@ -518,7 +522,8 @@ mod tests {
         let reactor_for_fs = reactor.clone();
         runtime.register_reactor("io_uring_reactor", reactor);
 
-        let fs = LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor_for_fs).unwrap();
+        let fs =
+            LocalFileSystem::new(temp_dir.path().to_path_buf(), allocator, reactor_for_fs).unwrap();
 
         // ルートディレクトリのinodeを確認
         let root_inode = fs.get_inode(Path::new("/"));

@@ -6,7 +6,7 @@ pub mod manager;
 pub mod types;
 
 pub use cache::{CacheStats, MetadataCache, MetadataCacheEntry};
-pub use consistent_hash::{koyama_hash, ConsistentHashRing};
+pub use consistent_hash::{ConsistentHashRing, koyama_hash};
 pub use id_generator::{IdGenerator, IdGeneratorError, IdGeneratorResult};
 pub use manager::{MetadataError, MetadataManager, MetadataResult};
 pub use types::{DirectoryMetadata, FileMetadata, FilePermissions, InodeType, NodeId};

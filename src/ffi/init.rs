@@ -170,11 +170,7 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
                 }
             } else {
                 // No expected_nodes set - return as soon as we find any nodes
-                tracing::info!(
-                    "Discovered {} data nodes: {:?}",
-                    node_ids.len(),
-                    node_ids
-                );
+                tracing::info!("Discovered {} data nodes: {:?}", node_ids.len(), node_ids);
                 return Ok(node_ids);
             }
         }
@@ -335,7 +331,10 @@ pub extern "C" fn benchfs_init(
     // RPC_CLIENT_TIMING and other stats-gated paths emit data.
     // The server binary (benchfsd_mpi) sets this directly; the FFI
     // client must read it from env (mpirun -x ENABLE_STATS).
-    if std::env::var("ENABLE_STATS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+    if std::env::var("ENABLE_STATS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
         crate::stats::set_stats_enabled(true);
     }
 
@@ -388,6 +387,28 @@ pub extern "C" fn benchfs_init(
         data_dir_str
     );
 
+    // io500 calls benchfs_init/finalize once per phase (ior-easy, mdtest-easy,
+    // ...). Under BENCHFS_TRANSPORT=locusta, tearing down the locusta
+    // transport between phases leaves the server side with stale dest_id→QP
+    // mappings; the next phase's RPCs hit dead QPs and trigger CQE
+    // syndrome=21 (TRANSPORT_RETRY_EXC_ERR) after the ~30s retry budget
+    // exhausts (job 17042). Make the FFI idempotent for locusta clients:
+    // if TLS already holds a BenchFS instance, hand out a fresh Box
+    // wrapping a clone of the existing Rc and skip the full re-init.
+    let use_locusta_client = is_server == 0
+        && std::env::var("BENCHFS_TRANSPORT")
+            .map(|v| v.eq_ignore_ascii_case("locusta"))
+            .unwrap_or(false);
+    if use_locusta_client {
+        if let Some(existing) = super::runtime::get_benchfs_ctx_rc() {
+            tracing::info!(
+                "benchfs_init: reusing existing locusta client context (idempotent re-init)"
+            );
+            let boxed = Box::new(existing);
+            return Box::into_raw(boxed) as *mut benchfs_context_t;
+        }
+    }
+
     // Create BenchFS instance based on mode
     let benchfs = if is_server != 0 {
         // ===== SERVER MODE =====
@@ -419,8 +440,11 @@ pub extern "C" fn benchfs_init(
         tracing::info!("Starting IoUringReactor initialization...");
         let start = std::time::Instant::now();
 
-        tracing::info!("Configuring io_uring with buffer_size={} bytes ({} MiB)",
-            chunk_size, chunk_size / (1024 * 1024));
+        tracing::info!(
+            "Configuring io_uring with buffer_size={} bytes ({} MiB)",
+            chunk_size,
+            chunk_size / (1024 * 1024)
+        );
         let uring_reactor = IoUringReactor::builder()
             .queue_size(32) // Reduced to prevent kernel resource contention
             .buffer_size(chunk_size) // Match chunk_size from config
@@ -580,12 +604,118 @@ pub extern "C" fn benchfs_init(
 
         ucx_reactor.register_worker(worker.clone());
 
-        // Create connection pool
-        let connection_pool = match ConnectionPool::new(worker, registry_dir_str) {
-            Ok(pool) => Rc::new(pool),
-            Err(e) => {
-                set_error_message(&format!("Failed to create connection pool: {:?}", e));
-                return std::ptr::null_mut();
+        // BENCHFS_TRANSPORT=locusta: build a locusta-backed connection pool
+        // with no static peers. Every `get_or_connect(node)` will lazy-run
+        // `LocustaTransport::add_peer(node, 30s)` before returning a
+        // locusta-backed RpcClient. Falls through to UCX otherwise.
+        let use_locusta = std::env::var("BENCHFS_TRANSPORT")
+            .map(|v| v.eq_ignore_ascii_case("locusta"))
+            .unwrap_or(false);
+        #[cfg(not(feature = "transport-locusta"))]
+        if use_locusta {
+            set_error_message("BENCHFS_TRANSPORT=locusta requires the transport-locusta feature");
+            return std::ptr::null_mut();
+        }
+        #[cfg(feature = "transport-locusta")]
+        let locusta_transport: Option<Rc<crate::rpc::transport_locusta::LocustaTransport>> =
+            if use_locusta {
+                use crate::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
+                use std::path::PathBuf;
+                let arena_size: u32 = std::env::var("BENCHFS_LOCUSTA_ARENA_SIZE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8 * 1024 * 1024);
+                let ring_capacity: u32 = std::env::var("BENCHFS_LOCUSTA_RING_CAPACITY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(128);
+                let cfg = LocustaConfig {
+                    registry_dir: PathBuf::from(registry_dir_str).join("locusta_qp"),
+                    local_node_id: node_id_str.to_string(),
+                    peer_node_ids: Vec::new(),
+                    arena_size,
+                    ring_capacity,
+                    ..LocustaConfig::default()
+                };
+                if let Err(e) = std::fs::create_dir_all(&cfg.registry_dir) {
+                    set_error_message(&format!(
+                        "Failed to create locusta registry dir {}: {}",
+                        cfg.registry_dir.display(),
+                        e
+                    ));
+                    return std::ptr::null_mut();
+                }
+                match LocustaTransport::init(&cfg) {
+                    Ok(t) => {
+                        tracing::info!(
+                            "FFI client: LocustaTransport ready, registry={}",
+                            cfg.registry_dir.display()
+                        );
+                        // Register a no-op "keepalive" reactor so the
+                        // pluvio executor's stuck-watchdog (1M iter
+                        // without made_progress) doesn't fire while
+                        // a long async RPC is in flight. The reactor
+                        // doesn't touch locusta state — tick happens
+                        // inside `WaitForResponse::poll` — but its
+                        // mere existence as a Running reactor sets
+                        // made_progress=true each iteration.
+                        struct KeepAliveReactor;
+                        impl pluvio_runtime::reactor::Reactor for KeepAliveReactor {
+                            fn poll(&self) {}
+                            fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
+                                pluvio_runtime::reactor::ReactorStatus::Running
+                            }
+                        }
+                        runtime.register_reactor("locusta_keepalive", Rc::new(KeepAliveReactor));
+                        Some(Rc::new(t))
+                    }
+                    Err(e) => {
+                        set_error_message(&format!("Failed to init LocustaTransport: {:?}", e));
+                        return std::ptr::null_mut();
+                    }
+                }
+            } else {
+                None
+            };
+
+        // Create connection pool. Locusta path skips UCX endpoint setup
+        // entirely and short-circuits inside ConnectionPool::get_or_connect.
+        let connection_pool = {
+            #[cfg(feature = "transport-locusta")]
+            {
+                if let Some(transport) = locusta_transport {
+                    match ConnectionPool::new_locusta(worker.clone(), registry_dir_str, transport) {
+                        Ok(pool) => Rc::new(pool),
+                        Err(e) => {
+                            set_error_message(&format!(
+                                "Failed to create locusta connection pool: {:?}",
+                                e
+                            ));
+                            return std::ptr::null_mut();
+                        }
+                    }
+                } else {
+                    match ConnectionPool::new(worker, registry_dir_str) {
+                        Ok(pool) => Rc::new(pool),
+                        Err(e) => {
+                            set_error_message(&format!(
+                                "Failed to create connection pool: {:?}",
+                                e
+                            ));
+                            return std::ptr::null_mut();
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "transport-locusta"))]
+            {
+                match ConnectionPool::new(worker, registry_dir_str) {
+                    Ok(pool) => Rc::new(pool),
+                    Err(e) => {
+                        set_error_message(&format!("Failed to create connection pool: {:?}", e));
+                        return std::ptr::null_mut();
+                    }
+                }
             }
         };
 
@@ -799,10 +929,27 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
         }
     }
 
-    // Convert back to Rc<BenchFS> and drop it
-    // This will automatically trigger Drop implementations for all components
+    // Locusta clients: io500 calls benchfs_init/finalize per phase. We
+    // keep TLS state alive across phases so the locusta server-side
+    // dest_id→QP mapping stays valid (see benchfs_init for context).
+    // Only drop the Box wrapper that C owns; the underlying Rc is
+    // still held by the TLS BENCHFS_CTX and will be dropped on
+    // process exit.
+    let use_locusta_client = std::env::var("BENCHFS_TRANSPORT")
+        .map(|v| v.eq_ignore_ascii_case("locusta"))
+        .unwrap_or(false)
+        && super::runtime::get_benchfs_ctx_rc().is_some();
+
+    // Convert back to Rc<BenchFS> and drop one Rc clone. Other Rc
+    // clones (TLS, ConnectionPool, etc.) keep the instance alive on
+    // the locusta path.
     unsafe {
         let _ = Box::from_raw(ctx as *mut Rc<BenchFS>);
+    }
+
+    if use_locusta_client {
+        tracing::info!("benchfs_finalize: locusta client — preserving TLS state for next phase");
+        return;
     }
 
     // Clean up thread-local storage

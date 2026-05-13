@@ -465,12 +465,21 @@ impl BenchFS {
                                     );
 
                                     // Fetch metadata from remote server to cache locally
-                                    let lookup_request = MetadataLookupRequest::new(path.to_string());
+                                    let lookup_request =
+                                        MetadataLookupRequest::new(path.to_string());
                                     match lookup_request.call(&*client).await {
-                                        Ok(lookup_response) if lookup_response.is_success() && lookup_response.is_file() => {
+                                        Ok(lookup_response)
+                                            if lookup_response.is_success()
+                                                && lookup_response.is_file() =>
+                                        {
                                             // Cache the existing file metadata locally
-                                            let file_meta = FileMetadata::new(path.to_string(), lookup_response.size);
-                                            if let Err(e) = self.metadata_manager.store_file_metadata(file_meta) {
+                                            let file_meta = FileMetadata::new(
+                                                path.to_string(),
+                                                lookup_response.size,
+                                            );
+                                            if let Err(e) =
+                                                self.metadata_manager.store_file_metadata(file_meta)
+                                            {
                                                 tracing::warn!(
                                                     "Failed to cache metadata after EEXIST fallback: {:?}",
                                                     e
@@ -859,8 +868,8 @@ impl BenchFS {
         // Sum up bytes read from all chunks
         let mut bytes_read = 0;
         for result in chunk_results_handles {
-            let (chunk_index, read_result) = result
-                .map_err(|e| ApiError::Internal(format!("Chunk read task failed: {}", e)))?;
+            let (chunk_index, read_result) =
+                result.map_err(|e| ApiError::Internal(format!("Chunk read task failed: {}", e)))?;
             match read_result {
                 Ok(len) => bytes_read += len,
                 Err(e) => {
@@ -1150,7 +1159,10 @@ impl BenchFS {
                                 Some(Err(e)) => {
                                     tracing::warn!(
                                         "Failed to connect for metadata sync on close: {} (attempt {}/{}): {:?}",
-                                        handle.path, attempt, max_attempts, e
+                                        handle.path,
+                                        attempt,
+                                        max_attempts,
+                                        e
                                     );
                                     continue;
                                 }
@@ -1180,7 +1192,10 @@ impl BenchFS {
                                 Some(Ok(response)) if response.is_success() => {
                                     tracing::debug!(
                                         "Synced metadata on close: {} (size: {}, attempt {}/{})",
-                                        handle.path, file_meta.size, attempt, max_attempts
+                                        handle.path,
+                                        file_meta.size,
+                                        attempt,
+                                        max_attempts
                                     );
                                     synced = true;
                                     break;
@@ -1188,13 +1203,19 @@ impl BenchFS {
                                 Some(Ok(response)) => {
                                     tracing::warn!(
                                         "Failed to sync metadata on close: {} (status: {}, attempt {}/{})",
-                                        handle.path, response.status, attempt, max_attempts
+                                        handle.path,
+                                        response.status,
+                                        attempt,
+                                        max_attempts
                                     );
                                 }
                                 Some(Err(e)) => {
                                     tracing::warn!(
                                         "Metadata sync RPC error on close: {} (attempt {}/{}): {:?}",
-                                        handle.path, attempt, max_attempts, e
+                                        handle.path,
+                                        attempt,
+                                        max_attempts,
+                                        e
                                     );
                                 }
                                 None => {} // timeout already logged
@@ -1204,7 +1225,9 @@ impl BenchFS {
                         if !synced {
                             tracing::error!(
                                 "Metadata sync FAILED after {} attempts: {} (size {} not visible to subsequent reads)",
-                                max_attempts, handle.path, file_meta.size
+                                max_attempts,
+                                handle.path,
+                                file_meta.size
                             );
                         }
                     }
@@ -1414,7 +1437,7 @@ impl BenchFS {
                         if is_local {
                             // Fsync local chunk (requires chunk_store)
                             let chunk_store = fs.chunk_store.as_ref().expect(
-                                "is_local=true but chunk_store is None; this indicates a bug"
+                                "is_local=true but chunk_store is None; this indicates a bug",
                             );
                             chunk_store
                                 .fsync_chunk(&file_path, chunk_index)
@@ -1475,12 +1498,16 @@ impl BenchFS {
 
         // Check for any errors
         for result in results {
-            let chunk_result = result
-                .map_err(|e| ApiError::Internal(format!("Fsync task failed: {}", e)))?;
+            let chunk_result =
+                result.map_err(|e| ApiError::Internal(format!("Fsync task failed: {}", e)))?;
             chunk_result?;
         }
 
-        tracing::debug!("fsync completed for file {} ({} chunks)", handle.path, chunk_count);
+        tracing::debug!(
+            "fsync completed for file {} ({} chunks)",
+            handle.path,
+            chunk_count
+        );
 
         Ok(())
     }
@@ -1670,10 +1697,7 @@ impl BenchFS {
 
                 // Delete from chunk store (only if available)
                 if let Some(chunk_store) = &self.chunk_store {
-                    if let Err(e) = chunk_store
-                        .delete_chunk(&file_meta.path, chunk_idx)
-                        .await
-                    {
+                    if let Err(e) = chunk_store.delete_chunk(&file_meta.path, chunk_idx).await {
                         tracing::warn!(
                             "Failed to delete chunk {} for path {}: {:?}",
                             chunk_idx,
@@ -1872,8 +1896,11 @@ impl BenchFSBuilder {
         let metadata_manager = Rc::new(MetadataManager::new(self.node_id.clone()));
         let chunk_cache = ChunkCache::with_memory_limit(self.chunk_cache_mb);
         let chunk_manager = ChunkManager::with_chunk_size(self.chunk_size);
-        tracing::info!("BenchFS configured with chunk_size={} bytes ({} MiB)",
-            self.chunk_size, self.chunk_size / (1024 * 1024));
+        tracing::info!(
+            "BenchFS configured with chunk_size={} bytes ({} MiB)",
+            self.chunk_size,
+            self.chunk_size / (1024 * 1024)
+        );
 
         // Determine placement nodes
         let placement_nodes = self
@@ -1926,7 +1953,7 @@ impl BenchFSBuilder {
 mod tests {
     use super::*;
     use crate::storage::IOUringBackend;
-    use pluvio_runtime::executor::{set_runtime, Runtime};
+    use pluvio_runtime::executor::{Runtime, set_runtime};
     use pluvio_uring::reactor::IoUringReactor;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1973,7 +2000,9 @@ mod tests {
 
     fn run_test<F>(test: F)
     where
-        F: FnOnce(Rc<IOUringChunkStore>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+        F: FnOnce(
+                Rc<IOUringChunkStore>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
             + 'static,
     {
         let runtime = Runtime::new(256);
@@ -1983,14 +2012,13 @@ mod tests {
         // Set thread-local runtime for TLS-based spawn functions (spawn_with_name, etc.)
         set_runtime(runtime.clone());
 
-        runtime.clone().run_with_name_and_runtime(
-            "benchfs_file_ops_test",
-            async move {
+        runtime
+            .clone()
+            .run_with_name_and_runtime("benchfs_file_ops_test", async move {
                 // Create chunk store inside async context where runtime is available
                 let chunk_store = create_chunk_store_in_async(allocator, reactor);
                 test(chunk_store).await;
-            },
-        );
+            });
     }
 
     #[test]

@@ -105,8 +105,8 @@ for nnodes in "${nnodes_list[@]}"; do
       qsub
       -q mcrp
       -A NBB
-      -l select="${nnodes}"
-      -l place=exclhost
+      -l select="${nnodes}:ncpus=24:mem=124gb:ngpus=1"
+      -l place="${PBS_PLACE:-exclhost}"
       -l walltime="${ELAPSTIM_REQ}"
       -v SCRRAID=no
       -V

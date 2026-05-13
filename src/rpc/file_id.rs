@@ -31,8 +31,8 @@
 //! let chunk_id = file_id.chunk_id();     // Upper 32 bits
 //! ```
 
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::metadata::consistent_hash::koyama_hash;
 
@@ -267,10 +267,7 @@ mod tests {
             "/very/long/path/to/some/deeply/nested/file.txt",
         ];
 
-        let hashes: Vec<u32> = paths
-            .iter()
-            .map(|p| FileId::compute_path_hash(p))
-            .collect();
+        let hashes: Vec<u32> = paths.iter().map(|p| FileId::compute_path_hash(p)).collect();
 
         // All hashes should be unique (no collisions for these test paths)
         for i in 0..hashes.len() {

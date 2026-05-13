@@ -193,7 +193,11 @@ impl AmRpc for MetadataLookupRequest {
     }
 
     #[async_backtrace::framed]
-    #[instrument(level = "trace", name = "rpc_metadata_lookup_handler", skip(ctx, am_msg))]
+    #[instrument(
+        level = "trace",
+        name = "rpc_metadata_lookup_handler",
+        skip(ctx, am_msg)
+    )]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -367,7 +371,11 @@ impl AmRpc for MetadataCreateFileRequest {
     }
 
     #[async_backtrace::framed]
-    #[instrument(level = "trace", name = "rpc_metadata_create_file_handler", skip(ctx, am_msg))]
+    #[instrument(
+        level = "trace",
+        name = "rpc_metadata_create_file_handler",
+        skip(ctx, am_msg)
+    )]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -502,7 +510,11 @@ impl AmRpc for MetadataCreateDirRequest {
     }
 
     #[async_backtrace::framed]
-    #[instrument(level = "trace", name = "rpc_metadata_create_dir_handler", skip(ctx, am_msg))]
+    #[instrument(
+        level = "trace",
+        name = "rpc_metadata_create_dir_handler",
+        skip(ctx, am_msg)
+    )]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -704,7 +716,11 @@ impl AmRpc for MetadataDeleteRequest {
     }
 
     #[async_backtrace::framed]
-    #[instrument(level = "trace", name = "rpc_metadata_delete_handler", skip(ctx, am_msg))]
+    #[instrument(
+        level = "trace",
+        name = "rpc_metadata_delete_handler",
+        skip(ctx, am_msg)
+    )]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
@@ -923,7 +939,11 @@ impl AmRpc for MetadataUpdateRequest {
     }
 
     #[async_backtrace::framed]
-    #[instrument(level = "trace", name = "rpc_metadata_update_handler", skip(ctx, am_msg))]
+    #[instrument(
+        level = "trace",
+        name = "rpc_metadata_update_handler",
+        skip(ctx, am_msg)
+    )]
     async fn server_handler(
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,

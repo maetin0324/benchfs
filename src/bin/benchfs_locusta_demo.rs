@@ -36,13 +36,15 @@ use clap::{Parser, ValueEnum};
 use zerocopy::{FromBytes, IntoBytes};
 
 use benchfs::rpc::data_ops::{WriteChunkByIdRequest, WriteChunkResponseHeader};
+use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::locusta_call::LocustaCallable;
+use benchfs::rpc::locusta_server::LocustaServerDispatch;
 use benchfs::rpc::metadata_ops::{
     MetadataLookupRequest, MetadataLookupRequestHeader, MetadataLookupResponseHeader,
 };
 use benchfs::rpc::transport::RpcTransport;
 use benchfs::rpc::transport_locusta::{
-    drain_server_requests, LocustaConfig, LocustaTransport,
+    LocustaConfig, LocustaTransport, drain_server_requests, extract_rpc_id,
 };
 
 /// RpcId used by BenchFS for `MetadataLookup`. Mirrors
@@ -78,6 +80,12 @@ struct Args {
     /// (client) DMA payload size for put/get modes (default 4 MiB).
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     payload_bytes: usize,
+    /// Skip the static QP exchange at init time — both sides start with
+    /// an empty peer list. Server uses `try_accept_pending_peers`; the
+    /// client calls `add_peer` explicitly before issuing RPCs. Exercises
+    /// the late-join handshake path used by FFI/IOR clients in Phase 3.
+    #[arg(long, default_value_t = false)]
+    dynamic: bool,
 }
 
 #[derive(Copy, Clone, ValueEnum, Debug, PartialEq, Eq)]
@@ -109,6 +117,11 @@ enum Mode {
     /// Phase 2.2b: production `WriteChunkByIdRequest::call_locusta(...)`
     /// — exercises the AmRpc `Put` dispatch via `LocustaCallable`.
     AmrpcPut,
+    /// Phase 2.4: same wire as `Amrpc` on the client, but the server
+    /// runs the production [`LocustaServerDispatch`] backed by a real
+    /// `RpcHandlerContext`. Validates the full server-side dispatch
+    /// path (rpc_id lookup, handler invocation, reply consumer).
+    Dispatch,
 }
 
 fn main() {
@@ -124,16 +137,44 @@ fn main() {
     let cfg = LocustaConfig {
         registry_dir: args.registry_dir.clone(),
         local_node_id: args.local.clone(),
-        peer_node_ids: vec![args.peer.clone()],
+        peer_node_ids: if args.dynamic {
+            Vec::new()
+        } else {
+            vec![args.peer.clone()]
+        },
         ..LocustaConfig::default()
     };
 
     let transport = LocustaTransport::init(&cfg).expect("LocustaTransport::init");
     println!(
-        "[{:?}] connected — node_to_dest={:?}",
+        "[{:?}] init done (dynamic={}) — node_to_dest={:?}",
         args.role,
+        args.dynamic,
         transport.inner.borrow().node_to_dest
     );
+
+    // Dynamic path: client explicitly adds the peer after init; server
+    // discovers it via the registry-scan accept loop driven inside
+    // `run_server` below.
+    if args.dynamic {
+        match args.role {
+            Role::Client => {
+                let t0 = Instant::now();
+                transport
+                    .add_peer(&args.peer, Duration::from_secs(30))
+                    .expect("dynamic add_peer");
+                println!(
+                    "[Client] dynamic add_peer({}) handshake took {:?}",
+                    args.peer,
+                    t0.elapsed()
+                );
+            }
+            Role::Server => {
+                // Server's accept loop is launched inside `run_server` so
+                // it runs interleaved with the request poll loop.
+            }
+        }
+    }
 
     match args.role {
         Role::Server => run_server(&transport, args.serve_secs, args.mode),
@@ -151,10 +192,55 @@ fn main() {
 fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
     use benchfs::rpc::locusta_buffer::RegisteredFixedBuffer;
 
+    // For Mode::Dispatch only — build a real LocustaServerDispatch backed
+    // by a minimal RpcHandlerContext, pre-populating one file entry so
+    // the lookup hits.
+    let dispatch_setup = if mode == Mode::Dispatch {
+        use benchfs::metadata::FileMetadata;
+        let ctx = std::rc::Rc::new(RpcHandlerContext::new_bench());
+        ctx.metadata_manager
+            .store_file_metadata(FileMetadata::new("/test/file.bin".to_string(), 1024 * 1024))
+            .expect("seed file metadata");
+        let mut dispatch = LocustaServerDispatch::new(ctx);
+        dispatch.register::<MetadataLookupRequest>();
+        Some(dispatch)
+    } else {
+        None
+    };
+
     let deadline = Instant::now() + Duration::from_secs(serve_secs);
     let mut reqs = 0u64;
     let mut polls = 0u64;
+    let mut next_accept_at = Instant::now();
     while Instant::now() < deadline {
+        // Periodic registry scan — picks up dynamically-joining clients.
+        // Cheap when nothing new is present (a single readdir).
+        if Instant::now() >= next_accept_at {
+            match transport.try_accept_pending_peers(Duration::from_secs(10)) {
+                Ok(added) if !added.is_empty() => {
+                    println!("[server] try_accept_pending_peers added: {:?}", added);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[server] try_accept_pending_peers error: {:?}", e);
+                }
+            }
+            next_accept_at = Instant::now() + Duration::from_millis(100);
+        }
+        if let Some(dispatch) = dispatch_setup.as_ref() {
+            // Mode::Dispatch — production polling path. `poll_once` ticks
+            // the locusta state machines and runs every ready request
+            // through the registered handler.
+            dispatch.poll_once(transport);
+            reqs = reqs.saturating_add(1); // dispatcher doesn't count; rough estimate
+            polls += 1;
+            if polls % 1_000_000 == 0 {
+                eprintln!("[server] polls={polls} (dispatch mode)");
+            }
+            std::thread::yield_now();
+            continue;
+        }
+
         let mut inner = transport.inner.borrow_mut();
         inner.daemon.poll_client_requests();
         inner.daemon.process_pending_dma_writes();
@@ -169,12 +255,19 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
         drain_server_requests(&mut *inner, |req| {
             match req {
                 rrrpc::server::Request::RoundtripEager(h) => {
+                    // All locusta send_* paths prepend a 2-byte rpc_id.
+                    // Strip it before dispatching to the per-RPC body parser.
+                    let (_rpc_id, body) =
+                        extract_rpc_id(h.small_req()).expect("small_req missing rpc_id prefix");
                     let reply = match mode {
                         Mode::Raw => vec![0u8; 8],
                         // Both Metadata and Amrpc send the same wire format —
                         // header bytes followed by the path. The only
                         // difference is the client-side marshalling path.
-                        Mode::Metadata | Mode::Amrpc => serve_metadata_lookup(h.small_req()),
+                        Mode::Metadata | Mode::Amrpc => serve_metadata_lookup(body),
+                        Mode::Dispatch => {
+                            unreachable!("Dispatch handled by LocustaServerDispatch path");
+                        }
                         Mode::Put | Mode::Get | Mode::AmrpcPut => {
                             eprintln!("[server] unexpected RoundtripEager in {mode:?} mode");
                             vec![0u8; 8]
@@ -215,8 +308,7 @@ fn run_server(transport: &LocustaTransport, serve_secs: u64, mode: Mode) {
                             // WriteChunkResponseHeader. `RdmaBuffer::len`
                             // is a trait method, so use the explicit path.
                             use rrrpc::server::RdmaBuffer;
-                            let resp =
-                                WriteChunkResponseHeader::success(h.buffer().len() as u64);
+                            let resp = WriteChunkResponseHeader::success(h.buffer().len() as u64);
                             resp.as_bytes().to_vec()
                         }
                         _ => vec![0u8; 8],
@@ -321,14 +413,14 @@ fn run_client(
             buf.extend_from_slice(path.as_bytes());
             buf
         }
-        // Amrpc/AmrpcPut modes construct the request struct itself; small_req unused.
-        Mode::Amrpc | Mode::AmrpcPut => Vec::new(),
+        // Amrpc/AmrpcPut/Dispatch modes construct the request struct itself; small_req unused.
+        Mode::Amrpc | Mode::AmrpcPut | Mode::Dispatch => Vec::new(),
         Mode::Put | Mode::Get => vec![0u8; 8], // tiny header for DMA modes
     };
 
     // Pre-build the AmRpc request once so the latency loop only measures
     // the wire round-trip, not allocation overhead.
-    let amrpc_req = if mode == Mode::Amrpc {
+    let amrpc_req = if matches!(mode, Mode::Amrpc | Mode::Dispatch) {
         Some(MetadataLookupRequest::new(path.to_string()))
     } else {
         None
@@ -383,8 +475,7 @@ fn run_client(
         let result: Result<_, _> = match mode {
             Mode::Raw | Mode::Metadata => {
                 let parts = [IoSlice::new(&small_req)];
-                let mut fut =
-                    Box::pin(transport.send_eager(&peer_id, RPC_METADATA_LOOKUP, &parts));
+                let mut fut = Box::pin(transport.send_eager(&peer_id, RPC_METADATA_LOOKUP, &parts));
                 loop {
                     match Pin::as_mut(&mut fut).poll(&mut cx) {
                         Poll::Ready(r) => break r,
@@ -392,7 +483,7 @@ fn run_client(
                     }
                 }
             }
-            Mode::Amrpc => {
+            Mode::Amrpc | Mode::Dispatch => {
                 // Exercise the production code path: LocustaCallable
                 // blanket impl on AmRpc serializes header+request_data,
                 // dispatches via call_type, and deserializes the response.
@@ -470,14 +561,13 @@ fn run_client(
             Ok(resp) => {
                 if i == 0 {
                     match mode {
-                        Mode::Metadata | Mode::Amrpc => {
+                        Mode::Metadata | Mode::Amrpc | Mode::Dispatch => {
                             let bytes = &resp.header_bytes;
                             let sz = std::mem::size_of::<MetadataLookupResponseHeader>();
                             if bytes.len() >= sz {
-                                let rh = MetadataLookupResponseHeader::read_from_bytes(
-                                    &bytes[..sz],
-                                )
-                                .expect("decode");
+                                let rh =
+                                    MetadataLookupResponseHeader::read_from_bytes(&bytes[..sz])
+                                        .expect("decode");
                                 println!(
                                     "[client] first response ({:?}): entry_type={} status={} size={}",
                                     mode, rh.entry_type, rh.status, rh.size
@@ -497,9 +587,8 @@ fn run_client(
                             let bytes = &resp.header_bytes;
                             let sz = std::mem::size_of::<WriteChunkResponseHeader>();
                             if bytes.len() >= sz {
-                                let rh =
-                                    WriteChunkResponseHeader::read_from_bytes(&bytes[..sz])
-                                        .expect("decode");
+                                let rh = WriteChunkResponseHeader::read_from_bytes(&bytes[..sz])
+                                    .expect("decode");
                                 println!(
                                     "[client] first AmrpcPut response: bytes_written={} status={}",
                                     rh.bytes_written, rh.status

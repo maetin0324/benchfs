@@ -162,6 +162,16 @@ pub fn set_connection_pool(pool: Rc<ConnectionPool>) {
     });
 }
 
+/// Return a clone of the thread-local BenchFS Rc, if any.
+///
+/// Used by the FFI init path to support idempotent re-initialization
+/// for the locusta transport: io500 calls benchfs_init/finalize per
+/// phase, but we want the locusta client state to survive across
+/// phase boundaries so the server-side dest_id→QP mapping stays valid.
+pub fn get_benchfs_ctx_rc() -> Option<Rc<BenchFS>> {
+    BENCHFS_CTX.with(|ctx| ctx.borrow().as_ref().cloned())
+}
+
 /// Execute a closure with access to the BenchFS context
 ///
 /// This helper function provides safe access to the thread-local BenchFS instance.
