@@ -239,19 +239,22 @@ fn parse_addr(s: &str) -> io::Result<SocketAddrV4> {
     Ok(SocketAddrV4::new(ip, port))
 }
 
-/// Bind a UDP socket on the host's primary outward interface (using
-/// `0.0.0.0:0` for ephemeral port), but advertise the IP that other
-/// hosts on the cluster can reach us at. The advertised IP comes from
-/// `hostname -i` or an explicit `BENCHFS_LOCUSTA_BIND_IP` env var.
+/// Bind a UDP socket on the cluster-internal IPoIB interface and
+/// advertise the same `ip:port` to peers. Binding to a specific IP
+/// (instead of `0.0.0.0`) forces outgoing packets to leave through
+/// the same interface — important on Sirius where each node has both
+/// `eno1` (1 GbE management, 10.20.x) and `ibp65s0` (IPoIB, 10.10.x):
+/// without a bound source IP, the kernel picks one based on the
+/// per-route preference and the RESPONSE comes back with a different
+/// source than what the client expects.
 pub fn bind_udp_socket() -> io::Result<(UdpSocket, SocketAddrV4)> {
-    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
-    let local_port = match socket.local_addr()? {
+    let advertised_ip = resolve_advertised_ip()?;
+    let socket = UdpSocket::bind(SocketAddrV4::new(advertised_ip, 0))?;
+    let port = match socket.local_addr()? {
         std::net::SocketAddr::V4(v4) => v4.port(),
         _ => unreachable!("we bound v4"),
     };
-    let advertised_ip = resolve_advertised_ip()?;
-    let advertised = SocketAddrV4::new(advertised_ip, local_port);
-    Ok((socket, advertised))
+    Ok((socket, SocketAddrV4::new(advertised_ip, port)))
 }
 
 fn resolve_advertised_ip() -> io::Result<Ipv4Addr> {

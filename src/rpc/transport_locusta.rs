@@ -266,7 +266,15 @@ impl LocustaInner {
                         }
                     };
                     match pkt.msg_type {
-                        MSG_RESPONSE if from_v4 == peer_addr => break pkt,
+                        // Match by node_id, NOT by source IP. The
+                        // kernel may pick a different source interface
+                        // for the return path than what the registry
+                        // advertised (Sirius has both IPoIB and a
+                        // separate 1 GbE management network), so the
+                        // RESPONSE's `from` address won't necessarily
+                        // equal `peer_addr`. The node_id in the packet
+                        // identifies the sender unambiguously.
+                        MSG_RESPONSE if pkt.node_id == peer => break pkt,
                         MSG_REQUEST => {
                             // Inline-accept an unsolicited request from
                             // another peer so we don't drop it.
@@ -280,7 +288,8 @@ impl LocustaInner {
                         }
                         _ => {
                             tracing::debug!(
-                                "stray packet from {from} type={} (waiting on {peer})",
+                                "stray packet from {from} (node_id={}) type={} (waiting on {peer})",
+                                pkt.node_id,
                                 pkt.msg_type
                             );
                             continue;
