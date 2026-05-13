@@ -150,7 +150,21 @@ impl LocustaInner {
         if let Some(&existing) = self.node_to_dest.get(peer) {
             return Ok(existing);
         }
+        // Commit to this dest_id and advance the counter BEFORE any
+        // fallible RDMA / Lustre I/O. The locusta slabs assert that each
+        // `prepare_*(id)` matches `slab.vacant_key()` (strictly
+        // monotonic). If a later step (Lustre `read_qp_info_when_ready`
+        // timeout, RDMA QP modify) fails after the slab insert, that
+        // slot is gone — bumping the counter ensures the next call uses
+        // a fresh, unused id. Job 18059 (10 phys × ppn=16 = 640 clients
+        // × 40 servers) hit this: one Lustre stall left dest_id=1 in
+        // the slab but next_dest_id at 1, so the next get_or_connect
+        // tried prepare_destination(1) again and tripped the assert.
         let dest_id = self.next_dest_id;
+        self.next_dest_id = self
+            .next_dest_id
+            .checked_add(1)
+            .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
 
         // Per-QP recv ring + send buffer size. The 64 KiB default holds
         // ~256 small-message slots; that's plenty for steady-state traffic
@@ -218,10 +232,6 @@ impl LocustaInner {
             })?;
 
         self.node_to_dest.insert(peer.to_string(), dest_id);
-        self.next_dest_id = self
-            .next_dest_id
-            .checked_add(1)
-            .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
         Ok(dest_id)
     }
 
