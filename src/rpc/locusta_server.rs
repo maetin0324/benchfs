@@ -140,7 +140,35 @@ impl LocustaServerDispatch {
         let mut count = 0usize;
         drain_server_requests(&mut *inner, |req| {
             if let Some(fut) = self.dispatch(req) {
-                pluvio_runtime::executor::spawn(fut);
+                // Capture timestamp at spawn-call site. The wrapper
+                // future records dispatch-to-first-poll latency on the
+                // very first poll — i.e. how long the future sat in the
+                // pluvio task queue before the executor picked it up.
+                // This is the key signal for diagnosing scheduler
+                // starvation; if it spikes alongside the client-side
+                // p99, the tail is in pluvio scheduling rather than in
+                // handler body work.
+                let t_spawn = std::time::Instant::now();
+                let wrapped: Pin<Box<dyn Future<Output = ()> + 'static>> =
+                    Box::pin(async move {
+                        let dispatch_lat_us = t_spawn.elapsed().as_micros() as u64;
+                        if crate::stats::is_stats_enabled() {
+                            use std::sync::atomic::{AtomicU64, Ordering};
+                            static N: AtomicU64 = AtomicU64::new(0);
+                            let n = N.fetch_add(1, Ordering::Relaxed);
+                            if n.is_multiple_of(1000) {
+                                tracing::info!(
+                                    target: "rpc_handler_timing",
+                                    kind = "handler_dispatch",
+                                    n = n,
+                                    dispatch_lat_us = dispatch_lat_us,
+                                    "HANDLER_DISPATCH_LAT"
+                                );
+                            }
+                        }
+                        fut.await;
+                    });
+                pluvio_runtime::executor::spawn(wrapped);
                 count += 1;
             }
         });

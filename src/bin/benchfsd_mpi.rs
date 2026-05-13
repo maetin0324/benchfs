@@ -96,11 +96,21 @@ fn init_locusta_runtime(
         .map(|r| format!("node_{}", r))
         .collect();
 
+    let arena_size: u32 = std::env::var("BENCHFS_LOCUSTA_ARENA_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8 * 1024 * 1024);
+    let ring_capacity: u32 = std::env::var("BENCHFS_LOCUSTA_RING_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
     let cfg = LocustaConfig {
         registry_dir: PathBuf::from(registry_dir).join("locusta_qp"),
         local_node_id: node_id.to_string(),
         peer_node_ids,
         external_server_allocator: Some(Rc::clone(&handler_context.allocator)),
+        arena_size,
+        ring_capacity,
         ..LocustaConfig::default()
     };
     std::fs::create_dir_all(&cfg.registry_dir)?;
@@ -281,7 +291,14 @@ fn main() {
         "benchfs.toml"
     };
 
-    // Enable detailed timing statistics if requested
+    // Enable detailed timing statistics if requested (CLI flag or env var)
+    if !enable_stats
+        && std::env::var("ENABLE_STATS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    {
+        enable_stats = true;
+    }
     if enable_stats {
         benchfs::stats::set_stats_enabled(true);
         if mpi_rank == 0 {
@@ -491,13 +508,20 @@ fn run_server(
                 complete_timeout_us,
                 (queue_size as usize * chunk_size) / (1024 * 1024 * 1024)
             );
-            let uring_reactor = IoUringReactor::builder()
+            let sq_poll_idle_ms: Option<u32> = std::env::var("BENCHFS_IOURING_SQ_POLL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let mut builder = IoUringReactor::builder()
                 .queue_size(queue_size)
                 .buffer_size(chunk_size)
                 .submit_depth(submit_depth)
                 .wait_submit_timeout(std::time::Duration::from_micros(submit_timeout_us))
-                .wait_complete_timeout(std::time::Duration::from_micros(complete_timeout_us))
-                .build();
+                .wait_complete_timeout(std::time::Duration::from_micros(complete_timeout_us));
+            if let Some(ms) = sq_poll_idle_ms {
+                tracing::info!("Enabling io_uring SQ_POLL with idle_ms={}", ms);
+                builder = builder.sq_poll(ms);
+            }
+            let uring_reactor = builder.build();
 
             let allocator = uring_reactor.allocator.clone();
             let reactor_for_backend = uring_reactor.clone();
@@ -685,7 +709,8 @@ fn run_server(
                 async move {
                     tracing::info!(
                         "Starting LocustaServerDispatch drain task ({} handlers registered)",
-                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>()
+                        std::any::type_name::<benchfs::rpc::locusta_server::LocustaServerDispatch>(
+                        )
                     );
                     // Adaptive backoff so the dispatch loop doesn't impose
                     // a hard 100us latency floor on every RPC. When work was
@@ -698,18 +723,15 @@ fn run_server(
                     //   BENCHFS_LOCUSTA_DISPATCH_SLEEP_US — idle sleep (default 20us)
                     //   BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD — empty polls
                     //     before sleeping (default 16)
-                    let idle_sleep_us: u64 = std::env::var(
-                        "BENCHFS_LOCUSTA_DISPATCH_SLEEP_US",
-                    )
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(20);
-                    let idle_threshold: u32 = std::env::var(
-                        "BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD",
-                    )
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(16);
+                    let idle_sleep_us: u64 = std::env::var("BENCHFS_LOCUSTA_DISPATCH_SLEEP_US")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(20);
+                    let idle_threshold: u32 =
+                        std::env::var("BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(16);
                     let mut iter: u64 = 0;
                     let mut empty_polls: u32 = 0;
                     loop {
@@ -718,7 +740,9 @@ fn run_server(
                         if iter == 1 || iter % 1_000_000 == 0 {
                             tracing::info!(
                                 "locusta dispatch drain heartbeat iter={} (idle_threshold={}, idle_sleep_us={})",
-                                iter, idle_threshold, idle_sleep_us
+                                iter,
+                                idle_threshold,
+                                idle_sleep_us
                             );
                         }
                         if drained > 0 {
@@ -732,9 +756,9 @@ fn run_server(
                             if empty_polls < idle_threshold {
                                 YieldOnce::default().await;
                             } else {
-                                pluvio_timer::sleep(
-                                    std::time::Duration::from_micros(idle_sleep_us),
-                                )
+                                pluvio_timer::sleep(std::time::Duration::from_micros(
+                                    idle_sleep_us,
+                                ))
                                 .await;
                             }
                         }

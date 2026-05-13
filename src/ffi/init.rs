@@ -621,10 +621,20 @@ pub extern "C" fn benchfs_init(
             if use_locusta {
                 use crate::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
                 use std::path::PathBuf;
+                let arena_size: u32 = std::env::var("BENCHFS_LOCUSTA_ARENA_SIZE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8 * 1024 * 1024);
+                let ring_capacity: u32 = std::env::var("BENCHFS_LOCUSTA_RING_CAPACITY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(128);
                 let cfg = LocustaConfig {
                     registry_dir: PathBuf::from(registry_dir_str).join("locusta_qp"),
                     local_node_id: node_id_str.to_string(),
                     peer_node_ids: Vec::new(),
+                    arena_size,
+                    ring_capacity,
                     ..LocustaConfig::default()
                 };
                 if let Err(e) = std::fs::create_dir_all(&cfg.registry_dir) {
@@ -656,10 +666,7 @@ pub extern "C" fn benchfs_init(
                                 pluvio_runtime::reactor::ReactorStatus::Running
                             }
                         }
-                        runtime.register_reactor(
-                            "locusta_keepalive",
-                            Rc::new(KeepAliveReactor),
-                        );
+                        runtime.register_reactor("locusta_keepalive", Rc::new(KeepAliveReactor));
                         Some(Rc::new(t))
                     }
                     Err(e) => {
@@ -941,9 +948,7 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     }
 
     if use_locusta_client {
-        tracing::info!(
-            "benchfs_finalize: locusta client — preserving TLS state for next phase"
-        );
+        tracing::info!("benchfs_finalize: locusta client — preserving TLS state for next phase");
         return;
     }
 

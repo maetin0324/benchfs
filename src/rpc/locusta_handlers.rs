@@ -389,25 +389,39 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                 let len = data_len.min(buf.len()) as u32;
                 let buf_index = buf.buf_index();
                 let io_start = std::time::Instant::now();
-                let io_store = ctx.chunk_store.as_any().downcast_ref::<crate::storage::IOUringChunkStore>();
+                let io_store = ctx
+                    .chunk_store
+                    .as_any()
+                    .downcast_ref::<crate::storage::IOUringChunkStore>();
                 let resp = match io_store {
                     Some(store) => {
                         match store
-                            .write_chunk_via_registered(&path, chunk_index, offset, ptr, len, buf_index)
+                            .write_chunk_via_registered(
+                                &path,
+                                chunk_index,
+                                offset,
+                                ptr,
+                                len,
+                                buf_index,
+                            )
                             .await
                         {
                             Ok(bytes) => WriteChunkResponseHeader::success(bytes as u64),
                             Err(e) => {
-                                eprintln!("[locusta_handlers] WriteChunkById via_registered failed: {e:?}");
+                                eprintln!(
+                                    "[locusta_handlers] WriteChunkById via_registered failed: {e:?}"
+                                );
                                 WriteChunkResponseHeader::error(-5)
                             }
                         }
                     }
                     None => {
-                        let slice: &[u8] = unsafe {
-                            std::slice::from_raw_parts(ptr, len as usize)
-                        };
-                        match ctx.chunk_store.write_chunk(&path, chunk_index, offset, slice).await {
+                        let slice: &[u8] = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                        match ctx
+                            .chunk_store
+                            .write_chunk(&path, chunk_index, offset, slice)
+                            .await
+                        {
                             Ok(bytes) => WriteChunkResponseHeader::success(bytes as u64),
                             Err(e) => {
                                 eprintln!("[locusta_handlers] WriteChunkById store failed: {e:?}");
@@ -493,7 +507,10 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                     }
                 };
 
-                let io_store = ctx.chunk_store.as_any().downcast_ref::<crate::storage::IOUringChunkStore>();
+                let io_store = ctx
+                    .chunk_store
+                    .as_any()
+                    .downcast_ref::<crate::storage::IOUringChunkStore>();
                 let (n, fb) = match io_store {
                     Some(store) => {
                         match store
@@ -502,7 +519,9 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                         {
                             Ok((n, fb)) => (n, fb),
                             Err(e) => {
-                                eprintln!("[locusta_handlers] ReadChunkById store_fixed failed: {e:?}");
+                                eprintln!(
+                                    "[locusta_handlers] ReadChunkById store_fixed failed: {e:?}"
+                                );
                                 drop(h);
                                 return;
                             }

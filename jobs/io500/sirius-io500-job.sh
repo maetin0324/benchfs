@@ -152,9 +152,17 @@ export RUST_BACKTRACE=full
 : ${BENCHFS_RPC_TIMEOUT:=120}
 : ${BENCHFS_IOURING_QUEUE_SIZE:=2048}
 : ${BENCHFS_IOURING_SUBMIT_DEPTH:=512}
+# wait_submit_timeout / wait_complete_timeout in the io_uring reactor gate
+# whether the runtime polls the reactor. Defaults (1ms) park CQEs for up
+# to 1ms before processing — directly inflating chunk-write p99. Drop to
+# 10us so completions are drained promptly.
+: ${BENCHFS_IOURING_SUBMIT_TIMEOUT_US:=10}
+: ${BENCHFS_IOURING_COMPLETE_TIMEOUT_US:=10}
 export BENCHFS_RPC_TIMEOUT
 export BENCHFS_IOURING_QUEUE_SIZE
 export BENCHFS_IOURING_SUBMIT_DEPTH
+export BENCHFS_IOURING_SUBMIT_TIMEOUT_US
+export BENCHFS_IOURING_COMPLETE_TIMEOUT_US
 
 # Locusta server dispatch tuning. Defaults match the conservative
 # values baked into benchfsd_mpi; override here for sweep runs.
@@ -288,6 +296,10 @@ EOF
   export BENCHFS_INNER_BINARY="${BENCHFS_PREFIX}/benchfsd_mpi"
   cat > "${datadir_wrapper}" <<'WRAPPER_EOF'
 #!/bin/bash
+# Raise fd limit per-process — mpirun's remote launchers don't inherit
+# the qsub-script's ulimit, so each benchfsd starts with the system soft
+# default. fd cache for chunk files needs ≥65k fds per server vnode.
+ulimit -n 1048576 2>/dev/null || ulimit -n 524288 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536 2>/dev/null || true
 LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK:-0}
 LOCAL_SCRATCH_DIRS=()
 LOCAL_NUMA_NODES=()
@@ -335,9 +347,21 @@ WRAPPER_EOF
     -x BENCHFS_RPC_TIMEOUT
     -x BENCHFS_IOURING_QUEUE_SIZE
     -x BENCHFS_IOURING_SUBMIT_DEPTH
+    -x BENCHFS_IOURING_SUBMIT_TIMEOUT_US
+    -x BENCHFS_IOURING_COMPLETE_TIMEOUT_US
+    -x BENCHFS_IOURING_SQ_POLL_MS
+    -x PLUVIO_URING_ALWAYS_POLL
+    -x BENCHFS_CHUNK_FD_CACHE_SIZE
+    -x BENCHFS_CHUNK_LAYOUT
+    -x BENCHFS_LOCUSTA_ARENA_SIZE
+    -x BENCHFS_LOCUSTA_RING_CAPACITY
+    -x BENCHFS_LOCUSTA_RECV_RING_SIZE
+    -x BENCHFS_LOCUSTA_SEND_BUF_SIZE
     -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+    -x LOCUSTA_DAEMON_EVENT_BUDGET
     -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
     -x BENCHFS_TRANSPORT
+    -x ENABLE_STATS
     "${datadir_wrapper}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -508,7 +532,10 @@ run_io500() {
     -x BENCHFS_EXPECTED_NODES="${VNODES}"
     -x BENCHFS_TRANSPORT
     -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+    -x LOCUSTA_DAEMON_EVENT_BUDGET
     -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
+    -x BENCHFS_LOCUSTA_ARENA_SIZE
+    -x BENCHFS_LOCUSTA_RING_CAPACITY
     -x BENCHFS_RPC_TIMEOUT
     "${asan_args[@]}"
     "${IO500_DIR}/io500"
