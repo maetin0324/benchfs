@@ -99,6 +99,14 @@ pub struct LocustaInner {
     /// need to talk to a peer; subsequent connects reuse the cached
     /// address.
     pub peer_udp_addrs: HashMap<NodeId, SocketAddrV4>,
+    /// Last RESPONSE packet we sent to each peer, keyed by node_id.
+    /// On UDP, the initial RESPONSE may be lost and the peer will
+    /// retransmit its REQUEST — without re-sending the cached
+    /// RESPONSE we'd just drop the duplicate REQUEST (because the
+    /// peer is already in `node_to_dest`) and the peer would time
+    /// out forever. We don't re-run `prepare_*` / `connect_*` on
+    /// retransmits — those mutate locusta slabs and would blow up.
+    pub cached_responses: HashMap<NodeId, (SocketAddrV4, [u8; PACKET_SIZE])>,
 }
 
 impl LocustaInner {
@@ -379,8 +387,17 @@ impl LocustaInner {
         }
         self.peer_udp_addrs.insert(peer.clone(), from_v4);
         if self.node_to_dest.contains_key(&peer) {
-            // Already connected: drop a re-try quietly.
-            tracing::debug!("udp REQUEST from already-connected peer {peer}; ignoring retry");
+            // Already connected. The peer is retransmitting because
+            // our first RESPONSE was lost — re-send the cached one so
+            // it can move on.
+            if let Some((addr, bytes)) = self.cached_responses.get(&peer).cloned() {
+                tracing::debug!("udp REQUEST retry from {peer}; re-sending cached RESPONSE");
+                if let Err(e) = self.udp_socket.send_to(&bytes, addr) {
+                    tracing::warn!("re-send to {peer} failed: {e}");
+                }
+            } else {
+                tracing::warn!("udp REQUEST retry from {peer} but no cached response");
+            }
             return Ok(None);
         }
         self.accept_request_inline(pkt, from_v4)?;
@@ -401,7 +418,16 @@ impl LocustaInner {
         from_v4: SocketAddrV4,
     ) -> Result<(), RpcError> {
         let peer = request.node_id.clone();
-        if peer == self.local_node_id || self.node_to_dest.contains_key(&peer) {
+        if peer == self.local_node_id {
+            return Ok(());
+        }
+        if self.node_to_dest.contains_key(&peer) {
+            // Already-connected: retransmit cached RESPONSE.
+            if let Some((addr, bytes)) = self.cached_responses.get(&peer).cloned() {
+                if let Err(e) = self.udp_socket.send_to(&bytes, addr) {
+                    tracing::warn!("re-send to {peer} failed: {e}");
+                }
+            }
             return Ok(());
         }
 
@@ -468,7 +494,9 @@ impl LocustaInner {
                 RpcError::ConnectionError(format!("send_to({from_v4}, response): {e}"))
             })?;
 
-        self.node_to_dest.insert(peer, dest_id);
+        self.node_to_dest.insert(peer.clone(), dest_id);
+        self.cached_responses
+            .insert(peer, (from_v4, response_bytes));
         Ok(())
     }
 
@@ -917,6 +945,7 @@ impl LocustaTransport {
             udp_socket,
             local_udp_addr,
             peer_udp_addrs: HashMap::new(),
+            cached_responses: HashMap::new(),
         };
         let inner = Rc::new(RefCell::new(inner));
 
