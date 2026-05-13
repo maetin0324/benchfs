@@ -88,12 +88,52 @@ impl LocustaInner {
     /// Pump the polling state machines. Called both from the async wait
     /// futures and (in Phase 1c) from a registered Reactor.
     pub fn tick(&mut self) {
+        let t0 = std::time::Instant::now();
         self.daemon.poll_client_requests();
+        let t1 = t0.elapsed().as_micros() as u64;
         self.daemon.process_pending_dma_writes();
+        let t2 = t0.elapsed().as_micros() as u64;
         self.daemon.flush_all_destinations();
+        let t3 = t0.elapsed().as_micros() as u64;
         self.daemon.poll_server_completions();
+        let t4 = t0.elapsed().as_micros() as u64;
         self.client.poll();
+        let t5 = t0.elapsed().as_micros() as u64;
         self.server.poll();
+        let t6 = t0.elapsed().as_micros() as u64;
+        // Sample slow ticks (≥1ms) to keep log volume manageable. Under
+        // a healthy system every tick should be sub-100µs.
+        if t6 >= 1000 && crate::stats::is_stats_enabled() {
+            tracing::info!(
+                target: "pluvio_tick_timing",
+                kind = "locusta_tick",
+                cli_req_us = t1,
+                dma_write_us = t2 - t1,
+                flush_dest_us = t3 - t2,
+                srv_complete_us = t4 - t3,
+                client_poll_us = t5 - t4,
+                server_poll_us = t6 - t5,
+                total_us = t6,
+                "TICK_TIMING_SLOW"
+            );
+        }
+        // Periodically dump the daemon's credit_reads_issued counter so we
+        // can see whether the relay ring is going full and stalling (credit
+        // reads are an RDMA round trip; under congestion they balloon).
+        if crate::stats::is_stats_enabled() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(100_000) {
+                tracing::info!(
+                    target: "pluvio_tick_timing",
+                    kind = "credit_reads",
+                    tick_n = n,
+                    credit_reads_issued = self.daemon.debug_credit_reads_issued,
+                    "CREDIT_READ_COUNT"
+                );
+            }
+        }
     }
 
     /// Run the full 4-step QP handshake against `peer` and register the
@@ -112,10 +152,34 @@ impl LocustaInner {
         }
         let dest_id = self.next_dest_id;
 
+        // Per-QP recv ring + send buffer size. The 64 KiB default holds
+        // ~256 small-message slots; that's plenty for steady-state traffic
+        // — observed credit_reads_issued stays at 0 in production (job
+        // 18004), so the recv ring is never full. Knobs left in place for
+        // future experimentation but defaults preserved to avoid the
+        // startup-time MR registration storm at higher sizes (1 MiB × 64
+        // peers × 16 servers = 1 GiB pinned during accept-burst broke QP
+        // handshake timing in 18004).
+        let recv_ring_size: u32 = std::env::var("BENCHFS_LOCUSTA_RECV_RING_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024);
+        let send_buf_size: u32 = std::env::var("BENCHFS_LOCUSTA_SEND_BUF_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024);
+
         // Server side: prepare peer for the remote relay
         let server_local = self
             .server
-            .prepare_peer(dest_id, 64 * 1024, 64 * 1024, 512, 4096, &self.qp_config)
+            .prepare_peer(
+                dest_id,
+                recv_ring_size,
+                send_buf_size,
+                512,
+                4096,
+                &self.qp_config,
+            )
             .map_err(|e| {
                 RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
             })?;
@@ -127,7 +191,7 @@ impl LocustaInner {
         // Relay side: prepare destination for the remote server
         let relay_local = self
             .daemon
-            .prepare_destination(dest_id, 64 * 1024, 64 * 1024, &self.qp_config)
+            .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
             })?;
@@ -248,11 +312,87 @@ impl Default for LocustaConfig {
     }
 }
 
+/// Open an mlx5 device.
+///
+/// Device selection priority (highest first):
+/// 1. `BENCHFS_MLX5_DEVICE` — explicit name (e.g. `"mlx5_2"`).
+/// 2. `BENCHFS_MLX5_DEVICE_INDEX` — 0-based index into the device list.
+/// 3. Auto-spread from `OMPI_COMM_WORLD_LOCAL_RANK` modulo `num_devices` —
+///    so 4-HCA Sirius nodes get balanced HCA assignment across ranks on
+///    the same phys node (matches per-vnode NUMA layout when ppn ≤ HCA
+///    count, balances send-side load when ppn > HCA count). Disable by
+///    setting `BENCHFS_MLX5_AUTO_SPREAD=0`.
+/// 4. Fallback: first device that opens.
 fn open_mlx5_device() -> Result<mlx5::device::Context, RpcError> {
     let device_list = mlx5::device::DeviceList::list()
         .map_err(|e| RpcError::ConnectionError(format!("mlx5::device::DeviceList::list: {e:?}")))?;
+    if device_list.is_empty() {
+        return Err(RpcError::ConnectionError(
+            "no mlx5 devices found".to_string(),
+        ));
+    }
+    let available: Vec<String> = device_list.iter().map(|d| d.name()).collect();
+    let want_name = std::env::var("BENCHFS_MLX5_DEVICE").ok();
+    let want_index = std::env::var("BENCHFS_MLX5_DEVICE_INDEX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+
+    if let Some(name) = want_name.as_deref() {
+        for device in device_list.iter() {
+            if device.name() == name {
+                let ctx = device.open().map_err(|e| {
+                    RpcError::ConnectionError(format!("open device {name}: {e:?}"))
+                })?;
+                eprintln!("[locusta] selected mlx5 device {name} (env BENCHFS_MLX5_DEVICE)");
+                return Ok(ctx);
+            }
+        }
+        return Err(RpcError::ConnectionError(format!(
+            "BENCHFS_MLX5_DEVICE={name} not found; available: {available:?}"
+        )));
+    }
+
+    if let Some(idx) = want_index {
+        let device = device_list.get(idx).ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "BENCHFS_MLX5_DEVICE_INDEX={idx} out of range; available: {available:?}"
+            ))
+        })?;
+        let name = device.name();
+        let ctx = device.open().map_err(|e| {
+            RpcError::ConnectionError(format!("open device idx={idx} ({name}): {e:?}"))
+        })?;
+        eprintln!(
+            "[locusta] selected mlx5 device {name} (env BENCHFS_MLX5_DEVICE_INDEX={idx})"
+        );
+        return Ok(ctx);
+    }
+
+    let auto_spread = std::env::var("BENCHFS_MLX5_AUTO_SPREAD")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if auto_spread {
+        if let Some(local_rank) = std::env::var("OMPI_COMM_WORLD_LOCAL_RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            let idx = local_rank % device_list.len();
+            if let Ok(ctx) = device_list[idx].open() {
+                let name = device_list[idx].name();
+                eprintln!(
+                    "[locusta] selected mlx5 device {name} (auto-spread idx={idx} from OMPI_COMM_WORLD_LOCAL_RANK={local_rank}, devices={available:?})"
+                );
+                return Ok(ctx);
+            }
+        }
+    }
+
     for device in device_list.iter() {
         if let Ok(ctx) = device.open() {
+            let name = device.name();
+            eprintln!(
+                "[locusta] selected mlx5 device {name} (default fallback); available: {available:?}"
+            );
             return Ok(ctx);
         }
     }
@@ -639,8 +779,7 @@ impl LocustaTransport {
             }
         }
         let mut added = Vec::new();
-        let candidates_count =
-            candidates_server.intersection(&candidates_relay).count();
+        let candidates_count = candidates_server.intersection(&candidates_relay).count();
         if candidates_count > 0 {
             tracing::debug!(
                 "try_accept_pending_peers: {} server-side, {} relay-side, {} intersect; known={}",
@@ -659,10 +798,7 @@ impl LocustaTransport {
             }
             // Both publications exist — handshake should be quick. Use
             // the supplied timeout as a sanity cap.
-            tracing::info!(
-                "try_accept_pending_peers: handshaking new peer {}",
-                peer
-            );
+            tracing::info!("try_accept_pending_peers: handshaking new peer {}", peer);
             self.add_peer(peer, per_peer_timeout)?;
             added.push(peer.clone());
         }
@@ -699,20 +835,85 @@ struct WaitForResponse {
     completion_id: u64,
 }
 
+thread_local! {
+    /// Timestamp of the previous WaitForResponse poll that returned
+    /// `Pending`. Reset to None whenever a poll returns `Ready` so the
+    /// next `wait_for`'s first poll doesn't see a phantom gap.
+    static LAST_WAIT_FOR_PENDING: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    /// Per-wait poll counter — counts how many busy-poll iterations the
+    /// current wait_for has executed without yet seeing its completion.
+    /// Reset to 0 on every Ready return.
+    static WAIT_FOR_POLL_COUNT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// Per-wait start timestamp so we can compute total wait time as
+    /// observed by WaitForResponse itself (cross-check against
+    /// SEND_PUT_TIMING's rtt_us).
+    static WAIT_FOR_START: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl std::future::Future for WaitForResponse {
     type Output = Result<Response, RpcError>;
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        let stats = crate::stats::is_stats_enabled();
+        let now_for_gap = if stats {
+            let now = std::time::Instant::now();
+            if let Some(prev) = LAST_WAIT_FOR_PENDING.with(|c| c.get()) {
+                let gap_us = now.duration_since(prev).as_micros() as u64;
+                if gap_us >= 1000 {
+                    tracing::info!(
+                        target: "rpc_client_timing",
+                        kind = "wait_for_intra_gap",
+                        gap_us = gap_us,
+                        "WAIT_FOR_INTRA_GAP_SLOW"
+                    );
+                }
+            }
+            // First poll of this wait_for? Record start.
+            if WAIT_FOR_START.with(|c| c.get()).is_none() {
+                WAIT_FOR_START.with(|c| c.set(Some(now)));
+                WAIT_FOR_POLL_COUNT.with(|c| c.set(0));
+            }
+            Some(now)
+        } else {
+            None
+        };
         let mut inner = self.inner.borrow_mut();
         inner.tick();
         if let Some(resp) = inner.try_take(self.completion_id) {
+            if stats {
+                LAST_WAIT_FOR_PENDING.with(|c| c.set(None));
+                let n_polls = WAIT_FOR_POLL_COUNT.with(|c| c.get()) + 1;
+                let elapsed_us = WAIT_FOR_START
+                    .with(|c| c.get())
+                    .map(|t| t.elapsed().as_micros() as u64)
+                    .unwrap_or(0);
+                WAIT_FOR_START.with(|c| c.set(None));
+                WAIT_FOR_POLL_COUNT.with(|c| c.set(0));
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(100) {
+                    tracing::info!(
+                        target: "rpc_client_timing",
+                        kind = "wait_for_complete",
+                        n = n,
+                        poll_count = n_polls,
+                        elapsed_us = elapsed_us,
+                        "WAIT_FOR_COMPLETE"
+                    );
+                }
+            }
             return std::task::Poll::Ready(Ok(resp));
         }
-        // Not ready: wake immediately so the runtime re-polls us. This is
-        // a busy-yield bridge — Phase 1c will replace it with a Reactor
-        // that wakes a stored Waker only when locusta state changes.
+        if let Some(now) = now_for_gap {
+            LAST_WAIT_FOR_PENDING.with(|c| c.set(Some(now)));
+            WAIT_FOR_POLL_COUNT.with(|c| c.set(c.get() + 1));
+        }
         cx.waker().wake_by_ref();
         std::task::Poll::Pending
     }
@@ -852,10 +1053,8 @@ impl RpcTransport for LocustaTransport {
         payload: &'a [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
+            let t0 = std::time::Instant::now();
             let dest_id = self.lookup_dest(dest)?;
-            // Allocate a DMA buffer and stage the payload into it. The
-            // arena is shared with the relay's MR so this is what
-            // call_put will RDMA-write to the server.
             let dma_buf = {
                 let mut inner = self.inner.borrow_mut();
                 let mut buf = inner.client.alloc(payload.len() as u32).ok_or_else(|| {
@@ -867,6 +1066,7 @@ impl RpcTransport for LocustaTransport {
                 buf.as_mut_slice().copy_from_slice(payload);
                 buf
             };
+            let t_alloc = t0.elapsed().as_micros() as u64;
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
@@ -884,10 +1084,28 @@ impl RpcTransport for LocustaTransport {
                 inner.inflight.insert(id, fut);
                 id
             };
+            let t_submit = t0.elapsed().as_micros() as u64;
             let response = self.wait_for(completion_id).await?;
-            // Buffer must outlive the relay's DMA write — we held it on
-            // the stack until completion, so it's safe to release now.
+            let t_wait = t0.elapsed().as_micros() as u64;
             drop(dma_buf);
+
+            if crate::stats::is_stats_enabled() && payload.len() >= 4 * 1024 * 1024 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(100) {
+                    tracing::info!(
+                        target: "rpc_client_timing",
+                        kind = "send_put_4m",
+                        n = n,
+                        alloc_us = t_alloc,
+                        submit_us = t_submit,
+                        rtt_us = t_wait - t_submit,
+                        total_us = t_wait,
+                        "SEND_PUT_TIMING"
+                    );
+                }
+            }
 
             let header_bytes = match response.small_res_data() {
                 rrrpc::relay::client::SmallResData::Inline { buf, len } => {
