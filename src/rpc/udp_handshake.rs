@@ -260,15 +260,73 @@ fn resolve_advertised_ip() -> io::Result<Ipv4Addr> {
     {
         return Ok(ip);
     }
-    // Heuristic: probe outbound route to a well-known address. UDP
-    // `connect` doesn't send packets, just sets the default route so
-    // `local_addr` returns the kernel's chosen source IP.
-    let probe = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
-    probe.connect("8.8.8.8:9")?;
-    match probe.local_addr()? {
-        std::net::SocketAddr::V4(v4) => Ok(*v4.ip()),
-        _ => Err(io::Error::other("local_addr returned v6")),
+    // Sirius compute nodes can't reach the public internet, so the
+    // old `connect 8.8.8.8` route-probe trick fails with ENETUNREACH.
+    // Walk getifaddrs(3) instead and pick the first non-loopback IPv4.
+    // Prefer interfaces named `ib*` (Sirius's RDMA-capable IPoIB
+    // interfaces) so the control plane lives on the same fabric as
+    // the data plane.
+    let mut best: Option<(String, Ipv4Addr)> = None;
+    for (name, addr) in list_ipv4_interfaces()? {
+        if addr.is_loopback() {
+            continue;
+        }
+        let prefer_this = match &best {
+            None => true,
+            Some((cur_name, _)) => name.starts_with("ib") && !cur_name.starts_with("ib"),
+        };
+        if prefer_this {
+            best = Some((name, addr));
+        }
     }
+    best.map(|(_, ip)| ip)
+        .ok_or_else(|| io::Error::other("no non-loopback IPv4 interface found"))
+}
+
+/// Return `(interface_name, ipv4)` for every IPv4 interface returned
+/// by `getifaddrs(3)`. Includes the loopback; caller filters.
+fn list_ipv4_interfaces() -> io::Result<Vec<(String, Ipv4Addr)>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    let rc = unsafe { libc::getifaddrs(&mut head) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct Guard(*mut libc::ifaddrs);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { libc::freeifaddrs(self.0) };
+            }
+        }
+    }
+    let _guard = Guard(head);
+
+    let mut out = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: getifaddrs gives us a linked list; we deref the head
+        // pointer to walk it. Each `ifa_name` is a stable C string and
+        // each `ifa_addr` points to a sockaddr the OS keeps alive
+        // until we call freeifaddrs.
+        unsafe {
+            let entry = &*cur;
+            cur = entry.ifa_next;
+            if entry.ifa_addr.is_null() {
+                continue;
+            }
+            let family = (*entry.ifa_addr).sa_family as i32;
+            if family != libc::AF_INET {
+                continue;
+            }
+            let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
+            let raw_be = sin.sin_addr.s_addr;
+            let ip = Ipv4Addr::from(u32::from_be(raw_be));
+            let name_cstr = std::ffi::CStr::from_ptr(entry.ifa_name);
+            let name = name_cstr.to_string_lossy().into_owned();
+            out.push((name, ip));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
