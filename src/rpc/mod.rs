@@ -28,6 +28,8 @@ pub mod server;
 pub mod transport;
 #[cfg(feature = "transport-locusta")]
 pub mod transport_locusta;
+#[cfg(feature = "transport-locusta")]
+pub mod udp_handshake;
 
 /// RPC ID type for identifying different RPC operations
 pub type RpcId = u16;

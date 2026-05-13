@@ -547,6 +547,7 @@ run_io500() {
     -x BENCHFS_LOCUSTA_ARENA_SIZE
     -x BENCHFS_LOCUSTA_RING_CAPACITY
     -x BENCHFS_RPC_TIMEOUT
+    -x BENCHFS_PREWARM_CONNECTIONS
     -x BENCHFS_DHAT_DIR="${BENCHFS_DHAT_DIR:-${out_dir}/dhat}"
     "${asan_args[@]}"
     "${IO500_DIR}/io500"

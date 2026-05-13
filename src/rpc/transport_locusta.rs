@@ -16,7 +16,8 @@ use std::alloc::{Layout, alloc};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::net::{SocketAddrV4, UdpSocket};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,6 +40,9 @@ use pluvio_uring::allocator::FixedBufferAllocator;
 use crate::rpc::RpcError;
 use crate::rpc::locusta_buffer::{RegisteredFixedBuffer, register_with_pd};
 use crate::rpc::transport::{NodeId, RpcResponse, RpcTransport};
+use crate::rpc::udp_handshake::{
+    self, ExchangePacket, MSG_REQUEST, MSG_RESPONSE, PACKET_SIZE,
+};
 
 const QP_INFO_SIZE: usize = std::mem::size_of::<QpExchangeInfo>();
 const _: () = assert!(QP_INFO_SIZE == 64);
@@ -82,6 +86,19 @@ pub struct LocustaInner {
     /// `cfg.peer_node_ids.len()` after `init` and increments with each
     /// successful dynamic add.
     pub next_dest_id: u16,
+    /// UDP socket used for the QP-info exchange that replaces the
+    /// Lustre file polling protocol. Bound at `init`-time to an
+    /// ephemeral port; `local_udp_addr` is published into the
+    /// registry so peers can find us.
+    pub udp_socket: UdpSocket,
+    /// Externally-visible `ip:port` of [`udp_socket`] (matches what's
+    /// published in `{registry_dir}/locusta_udp/{local_node_id}`).
+    pub local_udp_addr: SocketAddrV4,
+    /// Cached UDP addresses of peers we've already looked up. The
+    /// registry file is one-shot — we only read it the first time we
+    /// need to talk to a peer; subsequent connects reuse the cached
+    /// address.
+    pub peer_udp_addrs: HashMap<NodeId, SocketAddrV4>,
 }
 
 impl LocustaInner {
@@ -136,44 +153,34 @@ impl LocustaInner {
         }
     }
 
-    /// Run the full 4-step QP handshake against `peer` and register the
-    /// resulting dest_id under `peer` in `node_to_dest`. Blocks the
-    /// calling thread (with 50ms sleeps) until both of the peer's QP
-    /// info files appear, or `deadline` is reached.
+    /// Set up a peer over UDP, replacing the old Lustre file-polling
+    /// protocol. Called from both [`LocustaTransport::init`] (for
+    /// statically-configured peers) and [`LocustaTransport::add_peer`]
+    /// (the lazy `get_or_connect` path).
     ///
-    /// Used by `LocustaTransport::init` for each pre-configured peer
-    /// and by `LocustaTransport::add_peer` at runtime. The protocol is
-    /// symmetric — whichever side runs first writes its files and
-    /// spin-reads for the other side; whichever side runs second sees
-    /// the files immediately and returns quickly.
+    /// Steps (initiator side):
+    ///   1. Allocate a fresh `dest_id` (advance counter before any
+    ///      fallible work — same rationale as the old slab-key fix).
+    ///   2. `prepare_peer` + `prepare_destination` on the local QPs.
+    ///   3. Look up the peer's UDP `ip:port` from
+    ///      `{registry_dir}/locusta_udp/{peer}` (one-shot read).
+    ///   4. Send REQUEST containing our two QP infos to peer's UDP.
+    ///   5. Receive RESPONSE containing the peer's two QP infos.
+    ///      The server-side handler completes its `connect_*` BEFORE
+    ///      replying, so by the time we read this byte the peer's QPs
+    ///      are already RTR/RTS — the first RDMA send won't RNR.
+    ///   6. `connect_peer` + `connect_destination` on our QPs.
     fn add_peer_blocking(&mut self, peer: &str, deadline: Instant) -> Result<u16, RpcError> {
         if let Some(&existing) = self.node_to_dest.get(peer) {
             return Ok(existing);
         }
-        // Commit to this dest_id and advance the counter BEFORE any
-        // fallible RDMA / Lustre I/O. The locusta slabs assert that each
-        // `prepare_*(id)` matches `slab.vacant_key()` (strictly
-        // monotonic). If a later step (Lustre `read_qp_info_when_ready`
-        // timeout, RDMA QP modify) fails after the slab insert, that
-        // slot is gone — bumping the counter ensures the next call uses
-        // a fresh, unused id. Job 18059 (10 phys × ppn=16 = 640 clients
-        // × 40 servers) hit this: one Lustre stall left dest_id=1 in
-        // the slab but next_dest_id at 1, so the next get_or_connect
-        // tried prepare_destination(1) again and tripped the assert.
+
         let dest_id = self.next_dest_id;
         self.next_dest_id = self
             .next_dest_id
             .checked_add(1)
             .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
 
-        // Per-QP recv ring + send buffer size. The 64 KiB default holds
-        // ~256 small-message slots; that's plenty for steady-state traffic
-        // — observed credit_reads_issued stays at 0 in production (job
-        // 18004), so the recv ring is never full. Knobs left in place for
-        // future experimentation but defaults preserved to avoid the
-        // startup-time MR registration storm at higher sizes (1 MiB × 64
-        // peers × 16 servers = 1 GiB pinned during accept-burst broke QP
-        // handshake timing in 18004).
         let recv_ring_size: u32 = std::env::var("BENCHFS_LOCUSTA_RECV_RING_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -183,7 +190,6 @@ impl LocustaInner {
             .and_then(|v| v.parse().ok())
             .unwrap_or(64 * 1024);
 
-        // Server side: prepare peer for the remote relay
         let server_local = self
             .server
             .prepare_peer(
@@ -197,42 +203,273 @@ impl LocustaInner {
             .map_err(|e| {
                 RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
             })?;
-        let server_out = server_qp_path(&self.registry_dir, &self.local_node_id, peer);
-        write_qp_info(&server_out, &server_local).map_err(|e| {
-            RpcError::ConnectionError(format!("write_qp_info({}): {e}", server_out.display()))
-        })?;
-
-        // Relay side: prepare destination for the remote server
         let relay_local = self
             .daemon
             .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
             })?;
-        let relay_out = relay_qp_path(&self.registry_dir, &self.local_node_id, peer);
-        write_qp_info(&relay_out, &relay_local).map_err(|e| {
-            RpcError::ConnectionError(format!("write_qp_info({}): {e}", relay_out.display()))
-        })?;
 
-        // Wait for peer's published info and finalize connections.
-        let peer_relay_path = relay_qp_path(&self.registry_dir, peer, &self.local_node_id);
-        let peer_relay_info = read_qp_info_when_ready(&peer_relay_path, deadline)?;
+        let peer_addr = self.resolve_peer_udp_addr(peer, deadline)?;
+
+        let request = ExchangePacket {
+            msg_type: MSG_REQUEST,
+            relay_qp: relay_local,
+            server_qp: server_local,
+            node_id: self.local_node_id.clone(),
+        };
+        let request_bytes = request.encode();
+
+        // Per-attempt UDP recv timeout. Shorter than the overall
+        // deadline so a dropped packet doesn't burn the full budget.
+        let recv_timeout = Duration::from_millis(500);
+        self.udp_socket
+            .set_read_timeout(Some(recv_timeout))
+            .map_err(|e| RpcError::ConnectionError(format!("set_read_timeout: {e}")))?;
+
+        // Send REQUEST and wait for the matching RESPONSE. While
+        // waiting we also service incoming REQUESTs (server-to-server
+        // setups may have peers handshaking us concurrently). A lost
+        // datagram retransmits on `recv_timeout`.
+        let mut last_send = Instant::now() - recv_timeout;
+        let response = loop {
+            if last_send.elapsed() >= recv_timeout {
+                self.udp_socket
+                    .send_to(&request_bytes, peer_addr)
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "send_to({peer_addr}, {peer}): {e}"
+                        ))
+                    })?;
+                last_send = Instant::now();
+            }
+            let mut buf = [0u8; PACKET_SIZE];
+            match self.udp_socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    let from_v4 = match from {
+                        std::net::SocketAddr::V4(v4) => v4,
+                        std::net::SocketAddr::V6(_) => continue,
+                    };
+                    let pkt = match ExchangePacket::decode(&buf[..n]) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::debug!("dropping malformed udp from {from}: {e}");
+                            continue;
+                        }
+                    };
+                    match pkt.msg_type {
+                        MSG_RESPONSE if from_v4 == peer_addr => break pkt,
+                        MSG_REQUEST => {
+                            // Inline-accept an unsolicited request from
+                            // another peer so we don't drop it.
+                            self.peer_udp_addrs.insert(pkt.node_id.clone(), from_v4);
+                            if let Err(e) =
+                                self.accept_request_inline(pkt, from_v4)
+                            {
+                                tracing::warn!("inline accept failed: {e:?}");
+                            }
+                            continue;
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "stray packet from {from} type={} (waiting on {peer})",
+                                pkt.msg_type
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(RpcError::ConnectionError(format!(
+                            "udp exchange timeout for {peer} (no response within deadline)"
+                        )));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return Err(RpcError::ConnectionError(format!(
+                        "recv_from waiting for {peer}: {e}"
+                    )));
+                }
+            }
+        };
+
         self.server
-            .connect_peer(dest_id, &peer_relay_info)
+            .connect_peer(dest_id, &response.relay_qp)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("server.connect_peer({dest_id}): {e:?}"))
             })?;
-
-        let peer_server_path = server_qp_path(&self.registry_dir, peer, &self.local_node_id);
-        let peer_server_info = read_qp_info_when_ready(&peer_server_path, deadline)?;
         self.daemon
-            .connect_destination(dest_id, &peer_server_info)
+            .connect_destination(dest_id, &response.server_qp)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("daemon.connect_destination({dest_id}): {e:?}"))
             })?;
 
         self.node_to_dest.insert(peer.to_string(), dest_id);
         Ok(dest_id)
+    }
+
+    /// Look up `peer`'s UDP `ip:port`, blocking until the registry
+    /// file appears (with backoff). Cached on first hit.
+    fn resolve_peer_udp_addr(
+        &mut self,
+        peer: &str,
+        deadline: Instant,
+    ) -> Result<SocketAddrV4, RpcError> {
+        if let Some(&cached) = self.peer_udp_addrs.get(peer) {
+            return Ok(cached);
+        }
+        let addr = udp_handshake::read_peer_udp_addr(&self.registry_dir, peer, deadline)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("read_peer_udp_addr({peer}): {e}"))
+            })?;
+        self.peer_udp_addrs.insert(peer.to_string(), addr);
+        Ok(addr)
+    }
+
+    /// Process one incoming UDP REQUEST if any are queued. Polled
+    /// repeatedly by the server's accept loop. Returns the connected
+    /// peer's node_id on success, or `None` if no packet was waiting.
+    pub fn handle_one_udp_request(
+        &mut self,
+        recv_timeout: Duration,
+    ) -> Result<Option<NodeId>, RpcError> {
+        self.udp_socket
+            .set_read_timeout(Some(recv_timeout))
+            .map_err(|e| RpcError::ConnectionError(format!("set_read_timeout: {e}")))?;
+        let mut buf = [0u8; PACKET_SIZE];
+        let (n, from) = match self.udp_socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(RpcError::ConnectionError(format!("udp recv_from: {e}")));
+            }
+        };
+
+        let pkt = ExchangePacket::decode(&buf[..n])
+            .map_err(|e| RpcError::ConnectionError(format!("decode request: {e}")))?;
+        let from_v4 = match from {
+            std::net::SocketAddr::V4(v4) => v4,
+            std::net::SocketAddr::V6(_) => {
+                return Err(RpcError::ConnectionError(
+                    "received v6 sender; expected v4".to_string(),
+                ));
+            }
+        };
+        if pkt.msg_type != MSG_REQUEST {
+            tracing::debug!(
+                "ignoring non-REQUEST UDP packet from {} type={}",
+                from,
+                pkt.msg_type
+            );
+            return Ok(None);
+        }
+        let peer = pkt.node_id.clone();
+        if peer == self.local_node_id {
+            return Ok(None);
+        }
+        self.peer_udp_addrs.insert(peer.clone(), from_v4);
+        if self.node_to_dest.contains_key(&peer) {
+            // Already connected: drop a re-try quietly.
+            tracing::debug!("udp REQUEST from already-connected peer {peer}; ignoring retry");
+            return Ok(None);
+        }
+        self.accept_request_inline(pkt, from_v4)?;
+        Ok(Some(peer))
+    }
+
+    /// Server-side QP setup for an incoming REQUEST. Allocates a fresh
+    /// `dest_id`, calls `prepare_peer` + `prepare_destination` +
+    /// `connect_peer` + `connect_destination` (in that order — the
+    /// connect steps run **before** the UDP RESPONSE goes out so the
+    /// peer's first RDMA send doesn't race against our QPs still being
+    /// in INIT). Used both by [`handle_one_udp_request`] and inline
+    /// from [`add_peer_blocking`] when an unsolicited REQUEST arrives
+    /// while we're awaiting a RESPONSE.
+    fn accept_request_inline(
+        &mut self,
+        request: ExchangePacket,
+        from_v4: SocketAddrV4,
+    ) -> Result<(), RpcError> {
+        let peer = request.node_id.clone();
+        if peer == self.local_node_id || self.node_to_dest.contains_key(&peer) {
+            return Ok(());
+        }
+
+        let dest_id = self.next_dest_id;
+        self.next_dest_id = self
+            .next_dest_id
+            .checked_add(1)
+            .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
+
+        let recv_ring_size: u32 = std::env::var("BENCHFS_LOCUSTA_RECV_RING_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024);
+        let send_buf_size: u32 = std::env::var("BENCHFS_LOCUSTA_SEND_BUF_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024);
+
+        let server_local = self
+            .server
+            .prepare_peer(
+                dest_id,
+                recv_ring_size,
+                send_buf_size,
+                512,
+                4096,
+                &self.qp_config,
+            )
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
+            })?;
+        let relay_local = self
+            .daemon
+            .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "daemon.prepare_destination({dest_id}): {e:?}"
+                ))
+            })?;
+
+        self.server
+            .connect_peer(dest_id, &request.relay_qp)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("server.connect_peer({dest_id}): {e:?}"))
+            })?;
+        self.daemon
+            .connect_destination(dest_id, &request.server_qp)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "daemon.connect_destination({dest_id}): {e:?}"
+                ))
+            })?;
+
+        let response = ExchangePacket {
+            msg_type: MSG_RESPONSE,
+            relay_qp: relay_local,
+            server_qp: server_local,
+            node_id: self.local_node_id.clone(),
+        };
+        let response_bytes = response.encode();
+        self.udp_socket
+            .send_to(&response_bytes, from_v4)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("send_to({from_v4}, response): {e}"))
+            })?;
+
+        self.node_to_dest.insert(peer, dest_id);
+        Ok(())
     }
 
     /// Returns true once the response for `completion_id` is ready.
@@ -507,55 +744,6 @@ fn build_server_rdma_context(
     })
 }
 
-fn write_qp_info(path: &Path, info: &QpExchangeInfo) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(info as *const QpExchangeInfo as *const u8, QP_INFO_SIZE)
-    };
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn try_read_qp_info(path: &Path) -> Option<QpExchangeInfo> {
-    let bytes = fs::read(path).ok()?;
-    if bytes.len() != QP_INFO_SIZE {
-        return None;
-    }
-    let mut info = std::mem::MaybeUninit::<QpExchangeInfo>::uninit();
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), info.as_mut_ptr() as *mut u8, QP_INFO_SIZE);
-        Some(info.assume_init())
-    }
-}
-
-fn read_qp_info_when_ready(path: &Path, deadline: Instant) -> Result<QpExchangeInfo, RpcError> {
-    loop {
-        if let Some(info) = try_read_qp_info(path) {
-            return Ok(info);
-        }
-        if Instant::now() > deadline {
-            return Err(RpcError::ConnectionError(format!(
-                "timed out waiting for {}",
-                path.display()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn server_qp_path(registry: &Path, server_node: &str, client_node: &str) -> PathBuf {
-    registry.join(format!(
-        "server_{server_node}_to_relay_{client_node}.qpinfo"
-    ))
-}
-
-fn relay_qp_path(registry: &Path, client_node: &str, server_node: &str) -> PathBuf {
-    registry.join(format!(
-        "relay_{client_node}_to_server_{server_node}.qpinfo"
-    ))
-}
-
 impl LocustaTransport {
     /// Initialize locusta state for `cfg.local_node_id`, connecting to every
     /// `cfg.peer_node_ids` via the shared file registry.
@@ -690,6 +878,25 @@ impl LocustaTransport {
             cfg.ring_capacity as u16,
         );
 
+        // ------ UDP control-plane socket ------
+        //
+        // Bind ephemeral; publish ip:port into the registry. Peers
+        // connect to us via this socket for the QP-info handshake,
+        // replacing the previous Lustre file-polling protocol that
+        // doesn't scale on Sirius (job 18060 hit 4213 read timeouts).
+        let (udp_socket, local_udp_addr) = udp_handshake::bind_udp_socket().map_err(|e| {
+            RpcError::ConnectionError(format!("bind udp socket: {e}"))
+        })?;
+        udp_handshake::publish_udp_addr(&cfg.registry_dir, &cfg.local_node_id, local_udp_addr)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!("publish_udp_addr: {e}"))
+            })?;
+        tracing::info!(
+            "locusta UDP control-plane: {} → {}",
+            cfg.local_node_id,
+            local_udp_addr
+        );
+
         let inner = LocustaInner {
             client,
             daemon,
@@ -707,6 +914,9 @@ impl LocustaTransport {
             local_node_id: cfg.local_node_id.clone(),
             qp_config,
             next_dest_id: 0,
+            udp_socket,
+            local_udp_addr,
+            peer_udp_addrs: HashMap::new(),
         };
         let inner = Rc::new(RefCell::new(inner));
 
@@ -752,65 +962,34 @@ impl LocustaTransport {
         &self,
         per_peer_timeout: Duration,
     ) -> Result<Vec<NodeId>, RpcError> {
-        let (registry_dir, local_node_id, known_peers) = {
-            let inner = self.inner.borrow();
-            (
-                inner.registry_dir.clone(),
-                inner.local_node_id.clone(),
-                inner.node_to_dest.keys().cloned().collect::<Vec<_>>(),
-            )
-        };
-        // Two prefixes mark "peer X published its half pointing at us":
-        //   server_<X>_to_relay_<self>.qpinfo
-        //   relay_<X>_to_server_<self>.qpinfo
-        // Both must exist before we attempt the handshake (so
-        // read_qp_info_when_ready never has to wait).
-        let server_suffix = format!("_to_relay_{local_node_id}.qpinfo");
-        let relay_suffix = format!("_to_server_{local_node_id}.qpinfo");
-        let mut candidates_server: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut candidates_relay: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let dir_iter = fs::read_dir(&registry_dir).map_err(|e| {
-            RpcError::ConnectionError(format!("read_dir({}): {e}", registry_dir.display()))
-        })?;
-        for entry in dir_iter.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            if let Some(rest) = name.strip_prefix("server_")
-                && let Some(peer) = rest.strip_suffix(&server_suffix)
-            {
-                candidates_server.insert(peer.to_string());
-            } else if let Some(rest) = name.strip_prefix("relay_")
-                && let Some(peer) = rest.strip_suffix(&relay_suffix)
-            {
-                candidates_relay.insert(peer.to_string());
-            }
-        }
+        // UDP-based accept: drain whatever is queued on the local
+        // socket without blocking. Each REQUEST handled here also
+        // completes the locusta `connect_*` transitions *before*
+        // replying, so the peer's first RDMA send is safe.
+        //
+        // We treat `per_peer_timeout` as the per-recv timeout; a short
+        // value (≤10 ms) keeps the accept loop responsive when no
+        // packets are queued. The caller is expected to retry this
+        // method on a heartbeat.
+        let recv_timeout = per_peer_timeout.min(Duration::from_millis(10));
         let mut added = Vec::new();
-        let candidates_count = candidates_server.intersection(&candidates_relay).count();
-        if candidates_count > 0 {
-            tracing::debug!(
-                "try_accept_pending_peers: {} server-side, {} relay-side, {} intersect; known={}",
-                candidates_server.len(),
-                candidates_relay.len(),
-                candidates_count,
-                known_peers.len()
-            );
-        }
-        for peer in candidates_server.intersection(&candidates_relay) {
-            if peer == &local_node_id {
-                continue;
+        // Drain up to `MAX_PER_TICK` requests per call to keep one tick
+        // bounded. The accept loop polls every 100 ms, so 32×100µs of
+        // work ≈ 3.2 ms per tick worst-case.
+        const MAX_PER_TICK: usize = 32;
+        for _ in 0..MAX_PER_TICK {
+            let mut inner = self.inner.borrow_mut();
+            match inner.handle_one_udp_request(recv_timeout) {
+                Ok(Some(peer)) => {
+                    tracing::info!("udp accept: handshaked new peer {peer}");
+                    added.push(peer);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("udp accept error: {e:?}");
+                    break;
+                }
             }
-            if known_peers.iter().any(|k| k == peer) {
-                continue;
-            }
-            // Both publications exist — handshake should be quick. Use
-            // the supplied timeout as a sanity cap.
-            tracing::info!("try_accept_pending_peers: handshaking new peer {}", peer);
-            self.add_peer(peer, per_peer_timeout)?;
-            added.push(peer.clone());
         }
         Ok(added)
     }
