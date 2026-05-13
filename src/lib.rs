@@ -60,6 +60,10 @@
 //! # }
 //! ```
 
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod api;
 pub mod cache;
 pub mod config;
