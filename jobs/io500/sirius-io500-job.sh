@@ -300,6 +300,9 @@ EOF
 # the qsub-script's ulimit, so each benchfsd starts with the system soft
 # default. fd cache for chunk files needs ≥65k fds per server vnode.
 ulimit -n 1048576 2>/dev/null || ulimit -n 524288 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+# Disable core dumps — when mdtest-hard crashes, multi-GB cores would land
+# on /home (Lustre) and risk filling space / disrupting SSH/Claude session.
+ulimit -c 0 2>/dev/null || true
 LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK:-0}
 LOCAL_SCRATCH_DIRS=()
 LOCAL_NUMA_NODES=()
@@ -461,7 +464,7 @@ run = ${ior_easy_run}
 
 [mdtest-easy]
 API =
-n = 1
+n = ${IO500_MDTEST_EASY_N:-1}
 run = ${mdtest_run}
 
 [mdtest-easy-write]
@@ -472,7 +475,7 @@ run = ${mdtest_run}
 
 [ior-hard]
 API =
-segmentCount = 100000
+segmentCount = ${IO500_IOR_HARD_SEGMENTS:-100000}
 collective =
 run = ${ior_hard_run}
 
@@ -480,11 +483,12 @@ run = ${ior_hard_run}
 run = ${ior_hard_run}
 
 [mdtest-hard]
+n = ${IO500_MDTEST_HARD_N:-1}
 run = ${mdtest_hard_run}
 [mdtest-hard-write]
 run = ${mdtest_hard_run}
 [find]
-run = FALSE
+run = ${IO500_FIND_RUN:-FALSE}
 [ior-easy-read]
 run = ${ior_easy_run}
 [mdtest-easy-stat]
@@ -511,6 +515,10 @@ run_io500() {
   local out_dir="$2"
   local np="$3"
   mkdir -p "${out_dir}"
+  # Defensive: disable core dumps. mdtest-hard heap corruption can produce
+  # multi-GB cores that fill /home (Lustre) and break SSH / the supervising
+  # Claude session.
+  ulimit -c 0 2>/dev/null || true
   # Optional heap UB diagnostics. Two modes:
   #   IO500_ASAN_LIB=<libasan.so> — full AddressSanitizer (often fails to
   #     init on UCX/MPI hosts because ASAN's shadow remap collides with
@@ -548,6 +556,8 @@ run_io500() {
     -x BENCHFS_LOCUSTA_RING_CAPACITY
     -x BENCHFS_RPC_TIMEOUT
     -x BENCHFS_PREWARM_CONNECTIONS
+    -x ENABLE_STATS
+    -x BENCHFS_SKIP_RECV_COPY
     -x BENCHFS_DHAT_DIR="${BENCHFS_DHAT_DIR:-${out_dir}/dhat}"
     "${asan_args[@]}"
     "${IO500_DIR}/io500"

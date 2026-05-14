@@ -259,6 +259,31 @@ off_t benchfs_lseek(benchfs_file_t* file, off_t offset, int whence);
  */
 const char* benchfs_get_error(void);
 
+/**
+ * Allocate an RDMA-registered IO buffer from the locusta arena.
+ *
+ * Pass-through to the locusta DMA arena: the returned pointer can be used
+ * directly as the read/write buffer for benchfs_read/benchfs_write, and the
+ * transport layer takes a zero-copy path that skips the
+ * `recv.copy_from_slice(dma_buf)` 4 MiB memcpy in
+ * `transport_locusta::send_get`.
+ *
+ * @param size Requested buffer size in bytes (rounded up to power of two by
+ *             the buddy allocator).
+ * @param out_ptr Set to the pointer to the buffer on success.
+ * @return 0 on success, negative error code on failure (-1 invalid arg,
+ *         -2 transport unavailable, -3 arena exhausted).
+ */
+int benchfs_alloc_io_buffer(size_t size, void** out_ptr);
+
+/**
+ * Free a buffer previously returned by benchfs_alloc_io_buffer.
+ *
+ * @param ptr Pointer returned by benchfs_alloc_io_buffer.
+ * @return 0 on success, -1 if the pointer is unknown.
+ */
+int benchfs_free_io_buffer(void* ptr);
+
 #ifdef __cplusplus
 }
 #endif

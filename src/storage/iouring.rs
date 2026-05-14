@@ -244,10 +244,30 @@ impl IOUringBackend {
                 .cloned()
                 .ok_or(StorageError::InvalidHandle(handle))?
         };
+        let start = if is_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let bytes_written = dma_file
             .write_fixed_raw(offset, ptr, len, buf_index)
             .await
             .map_err(StorageError::IoError)?;
+        if let Some(start) = start {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(1000) {
+                tracing::info!(
+                    target: "rpc_handler_timing",
+                    kind = "write_via_registered_iouring",
+                    n = n,
+                    iouring_us = start.elapsed().as_micros() as u64,
+                    len = len,
+                    "WRITE_REGISTERED_IOURING"
+                );
+            }
+        }
         if bytes_written < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
                 -bytes_written,
@@ -274,10 +294,30 @@ impl IOUringBackend {
                 .cloned()
                 .ok_or(StorageError::InvalidHandle(handle))?
         };
+        let start = if is_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let bytes_read = dma_file
             .read_fixed_raw(offset, ptr, len, buf_index)
             .await
             .map_err(StorageError::IoError)?;
+        if let Some(start) = start {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(1000) {
+                tracing::info!(
+                    target: "rpc_handler_timing",
+                    kind = "read_via_registered_iouring",
+                    n = n,
+                    iouring_us = start.elapsed().as_micros() as u64,
+                    len = len,
+                    "READ_REGISTERED_IOURING"
+                );
+            }
+        }
         if bytes_read < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
                 -bytes_read,

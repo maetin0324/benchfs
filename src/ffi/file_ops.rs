@@ -478,15 +478,21 @@ pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
     }
 
     unsafe {
-        // Take ownership of the handle and drop it
-        let handle = Box::from_raw(file as *mut FileHandle);
+        // WORKAROUND for mdtest heap UB (project_mdtest_hard_heap_corruption):
+        // the tight create/close loop in mdtest-easy and mdtest-hard
+        // surfaces a `malloc(): unaligned tcache chunk` abort somewhere
+        // downstream of the `Box::from_raw + drop` here. Leaking the
+        // FileHandle keeps the process alive long enough to complete the
+        // benchmark (each handle is ~120 B; 500k iter ≈ 60 MB leak).
+        // The underlying UB still needs a real fix — see Task #27.
+        let handle = Box::leak(Box::from_raw(file as *mut FileHandle));
 
         tracing::debug!("benchfs_close: path={:?}", handle.path);
 
         let result = with_benchfs_ctx(|fs| {
             let fs_ptr = fs as *const BenchFS;
             let fs_ref = &*fs_ptr;
-            block_on_with_name("close", async move { fs_ref.benchfs_close(&handle).await })
+            block_on_with_name("close", async move { fs_ref.benchfs_close(handle).await })
                 .map_err(|e| e.to_string())
         });
 

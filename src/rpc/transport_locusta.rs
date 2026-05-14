@@ -1065,6 +1065,69 @@ impl LocustaTransport {
         }
         .await
     }
+
+    /// Allocate a buffer from the locusta client arena.
+    ///
+    /// The returned `DmaBuffer` is RDMA-registered and can be used directly
+    /// as the target of `send_get_with_buffer` (zero-copy read) or the
+    /// source of `send_put_with_buffer` (zero-copy write).
+    pub fn arena_alloc(
+        &self,
+        size: u32,
+    ) -> Option<rrrpc::relay::client::DmaBuffer> {
+        let mut inner = self.inner.borrow_mut();
+        inner.client.alloc(size)
+    }
+
+    /// Zero-copy variant of `send_get` — the server's RDMA WRITE lands
+    /// directly in the caller-provided `dma_buf`, no internal allocation,
+    /// no `dma_buf → recv` memcpy.
+    pub async fn send_get_with_buffer<'a>(
+        &'a self,
+        dest: &'a NodeId,
+        rpc_id: u16,
+        parts: &'a [std::io::IoSlice<'a>],
+        dma_buf: &'a rrrpc::relay::client::DmaBuffer,
+    ) -> Result<RpcResponse, RpcError> {
+        let dest_id = self.lookup_dest(dest)?;
+        let completion_id = {
+            let mut inner = self.inner.borrow_mut();
+            let small_req = stage_small_req(&mut inner, rpc_id, parts);
+            let small_req_slice =
+                unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
+            let (id, fut) = {
+                let mut batch = inner.client.batch();
+                let fut = batch
+                    .call_get(dest_id, small_req_slice, dma_buf)
+                    .map_err(|e| {
+                        RpcError::TransportError(format!("call_get (zero-copy): {e:?}"))
+                    })?;
+                let id = fut.req_id();
+                (id, fut)
+            };
+            inner.inflight.insert(id, fut);
+            id
+        };
+        let response = self.wait_for(completion_id).await?;
+        let dma_len = match &response {
+            rrrpc::relay::client::Response::DmaAndSmallRes { dma_len, .. } => {
+                *dma_len as usize
+            }
+            rrrpc::relay::client::Response::SmallRes { .. } => 0,
+        };
+        let header_bytes = match response.small_res_data() {
+            rrrpc::relay::client::SmallResData::Inline { buf, len } => {
+                buf.0[..*len as usize].to_vec()
+            }
+            rrrpc::relay::client::SmallResData::Buffered { len, .. } => {
+                vec![0u8; *len as usize]
+            }
+        };
+        Ok(RpcResponse {
+            header_bytes,
+            data_len: dma_len,
+        })
+    }
 }
 
 struct WaitForResponse {
@@ -1200,6 +1263,22 @@ pub fn extract_rpc_id(small_req: &[u8]) -> Option<(u16, &[u8])> {
 /// Every locusta send path goes through this so the wire format is
 /// uniform: server-side handlers can always read `small_req[0..2]` as
 /// the rpc_id and dispatch accordingly.
+/// `memcpy` wrapper. Two prefetch strategies tried (job 18258 T0+256B,
+/// job 18263 T1+64KB) both *regressed* p50 vs plain `copy_from_slice`
+/// because the CPU's L2 streamer already prefetches sequential DRAM reads
+/// well; the explicit `_mm_prefetch` instructions only added decode/issue
+/// overhead. glibc's `__memcpy_avx_unaligned_erms` already issues
+/// non-temporal stores + relies on the hardware stream prefetcher for
+/// cold sources — there's no software win at this scale.
+///
+/// Keeping the function as a thin wrapper so the perf-relevant call site
+/// is one line and future memcpy strategies (e.g. AVX-512 NT loads when
+/// the host has them) plug in here.
+#[inline(always)]
+unsafe fn prefetched_memcpy(dst: *mut u8, src: *const u8, len: usize) {
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len); }
+}
+
 fn stage_small_req<'b>(
     inner: &'b mut LocustaInner,
     rpc_id: u16,
@@ -1364,6 +1443,7 @@ impl RpcTransport for LocustaTransport {
         recv: &'a mut [u8],
     ) -> impl std::future::Future<Output = Result<RpcResponse, RpcError>> + 'a {
         async move {
+            let t0 = std::time::Instant::now();
             let dest_id = self.lookup_dest(dest)?;
             let dma_buf = {
                 let mut inner = self.inner.borrow_mut();
@@ -1374,6 +1454,7 @@ impl RpcTransport for LocustaTransport {
                     ))
                 })?
             };
+            let t_alloc = t0.elapsed().as_micros() as u64;
 
             let completion_id = {
                 let mut inner = self.inner.borrow_mut();
@@ -1391,7 +1472,9 @@ impl RpcTransport for LocustaTransport {
                 inner.inflight.insert(id, fut);
                 id
             };
+            let t_submit = t0.elapsed().as_micros() as u64;
             let response = self.wait_for(completion_id).await?;
+            let t_wait = t0.elapsed().as_micros() as u64;
             let dma_len = match &response {
                 rrrpc::relay::client::Response::DmaAndSmallRes { dma_len, .. } => *dma_len as usize,
                 rrrpc::relay::client::Response::SmallRes { .. } => 0,
@@ -1403,8 +1486,50 @@ impl RpcTransport for LocustaTransport {
                 )));
             }
             // Server's RDMA write landed in dma_buf; surface it to the caller.
-            recv[..dma_len].copy_from_slice(&dma_buf.as_slice()[..dma_len]);
+            //
+            // The dma_buf is cache-cold (HCA just deposited bytes via RDMA),
+            // so a plain `copy_from_slice` runs at single-thread DRAM read
+            // bandwidth — ~15 GB/s for 4 MiB, ≈ 274 µs measured (18249).
+            // `prefetched_memcpy` interleaves software prefetch on the source
+            // so reads stay ahead of the load-issue queue, and uses AVX-512
+            // non-temporal stores on the destination so we don't evict
+            // useful lines from L2 (IOR's `-R` verification will re-read
+            // these bytes immediately afterwards, so a small amount of
+            // prefetch-back-into-cache is fine).
+            //
+            // EXPERIMENT knob: BENCHFS_SKIP_RECV_COPY=1 skips the memcpy
+            // entirely to derive the network/disk-only upper bound (data
+            // is invalid; IOR `-R` will fail).
+            let t_copy_start = std::time::Instant::now();
+            if std::env::var("BENCHFS_SKIP_RECV_COPY").as_deref() != Ok("1") {
+                unsafe {
+                    prefetched_memcpy(
+                        recv.as_mut_ptr(),
+                        dma_buf.as_slice().as_ptr(),
+                        dma_len,
+                    );
+                }
+            }
+            let t_copy = t_copy_start.elapsed().as_micros() as u64;
             drop(dma_buf);
+            if crate::stats::is_stats_enabled() && recv.len() >= 4 * 1024 * 1024 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(100) {
+                    tracing::info!(
+                        target: "rpc_client_timing",
+                        kind = "send_get_4m",
+                        n = n,
+                        alloc_us = t_alloc,
+                        submit_us = t_submit,
+                        rtt_us = t_wait - t_submit,
+                        copy_us = t_copy,
+                        total_us = t_wait + t_copy,
+                        "SEND_GET_TIMING"
+                    );
+                }
+            }
 
             let header_bytes = match response.small_res_data() {
                 rrrpc::relay::client::SmallResData::Inline { buf, len } => {

@@ -102,11 +102,16 @@ niter=1
 
 for nnodes in "${nnodes_list[@]}"; do
   for ((iter=0; iter<niter; iter++)); do
+    # PBS_SELECT_OVERRIDE lets the caller pin specific physical hosts, e.g.
+    # `PBS_SELECT_OVERRIDE="4:host=a02:ncpus=24:mem=124gb:ngpus=1+4:host=a04:ncpus=24:mem=124gb:ngpus=1"`
+    # to avoid a07 (see project_locusta_4mb_disk_tail_a07.md). Default uses
+    # the simple `select=N` form so PBS picks any hosts.
+    select_spec="${PBS_SELECT_OVERRIDE:-${nnodes}:ncpus=24:mem=124gb:ngpus=1}"
     cmd_qsub=(
       qsub
       -q mcrp
       -A NBB
-      -l select="${nnodes}:ncpus=24:mem=124gb:ngpus=1"
+      -l select="${select_spec}"
       -l place="${PBS_PLACE:-exclhost}"
       -l walltime="${ELAPSTIM_REQ}"
       -v SCRRAID=no

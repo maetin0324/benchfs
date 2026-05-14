@@ -116,11 +116,38 @@ pub trait LocustaCallable: AmRpc {
                 // — i.e. we have shared access to a writable region
                 // descriptor — and the existing UCX path relies on the
                 // same convention (see `data_ops.rs:209`).
-                let recv: &mut [u8] = unsafe {
-                    let ptr = resp_buf[0].as_ptr() as *mut u8;
-                    let len = resp_buf[0].len();
-                    std::slice::from_raw_parts_mut(ptr, len)
-                };
+                let recv_ptr = resp_buf[0].as_ptr();
+                let recv_len = resp_buf[0].len();
+                // Zero-copy fast path: if the caller's recv buffer was
+                // allocated from the locusta arena via
+                // `benchfs_alloc_io_buffer`, hand the underlying DmaBuffer
+                // straight to call_get so the server's RDMA WRITE lands in
+                // the application buffer directly — no intermediate
+                // `recv.copy_from_slice(dma_buf)` 4 MiB memcpy
+                // (transport_locusta.rs:1411, p50 ≈ 274 µs measured 18249).
+                if let Some(dma_buf_raw) =
+                    crate::ffi::io_buffer::io_buffer_ptr_raw(recv_ptr)
+                {
+                    // SAFETY: `dma_buf_raw` points into the IO_BUFFERS map,
+                    // which is single-thread TLS and only mutated by
+                    // `benchfs_alloc_io_buffer` / `benchfs_free_io_buffer`
+                    // from synchronous C calls. IOR holds the buffer for
+                    // the whole phase, so the DmaBuffer is stable through
+                    // this RPC's await.
+                    let dma_buf: &rrrpc::relay::client::DmaBuffer =
+                        unsafe { &*dma_buf_raw };
+                    let resp = transport
+                        .send_get_with_buffer(
+                            &peer_id,
+                            Self::rpc_id(),
+                            &header_only,
+                            dma_buf,
+                        )
+                        .await?;
+                    return decode(resp);
+                }
+                let recv: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(recv_ptr as *mut u8, recv_len) };
                 let resp = transport
                     .send_get(&peer_id, Self::rpc_id(), &header_only, recv)
                     .await?;

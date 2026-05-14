@@ -39,6 +39,16 @@ use crate::rpc::metadata_ops::{
 };
 use rrrpc::server::RdmaBuffer;
 
+thread_local! {
+    /// `(path_hash, chunk_id) → PutGrant arrival timestamp`. Populated in
+    /// the PutGrant branch and consumed in `RoundtripPutReady` so we can
+    /// emit `grant_to_ready_us` in `WRITE_READY_TIMING`. The map is only
+    /// touched when stats are enabled, so the cost is gated.
+    static PUT_GRANT_TS: std::cell::RefCell<
+        std::collections::HashMap<(u32, u64), std::time::Instant>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Helper: pull the rpc-specific request header out of the body,
 /// then return the trailing bytes (path or other variable-length data).
 fn split_header<'b, H>(body: &'b [u8]) -> Option<(H, &'b [u8])>
@@ -332,6 +342,17 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
         match req {
             Request::PutGrant(h) => {
                 let grant_start = std::time::Instant::now();
+                // Record PutGrant arrival timestamp keyed by chunk id so
+                // we can compute the grant→ready gap when PutReady fires
+                // for the same chunk. Lets us see where the missing time
+                // between server WRITE_GRANT and WRITE_READY actually sits
+                // (RDMA transit, daemon scheduling, etc).
+                if crate::stats::is_stats_enabled() {
+                    let key = (header.path_hash(), header.chunk_id() as u64);
+                    PUT_GRANT_TS.with(|m| {
+                        m.borrow_mut().insert(key, grant_start);
+                    });
+                }
                 // Phase 1: allocate a server-side RDMA-registered buffer
                 // big enough for the client's incoming DMA write.
                 // `try_acquire` has receiver `&Rc<Self>` so we use UFCS
@@ -374,6 +395,20 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
             }
             Request::RoundtripPutReady(h) => {
                 let ready_start = std::time::Instant::now();
+                // Compute grant→ready gap: time between PutGrant arrival
+                // and PutReady arrival = RDMA write transit + relay
+                // daemon scheduling. If this is large but io_us is small,
+                // the bottleneck is in the transit, not the disk.
+                let grant_to_ready_us = if crate::stats::is_stats_enabled() {
+                    let key = (header.path_hash(), header.chunk_id() as u64);
+                    PUT_GRANT_TS.with(|m| {
+                        m.borrow_mut()
+                            .remove(&key)
+                            .map(|t| ready_start.duration_since(t).as_micros() as u64)
+                    })
+                } else {
+                    None
+                };
                 // Phase 2: client's RDMA write has landed in the granted
                 // buffer. The buffer is RDMA-registered AND was acquired
                 // from the same io_uring allocator the chunk store uses,
@@ -444,6 +479,7 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                             n = n,
                             io_us = io_us,
                             total_us = total_us,
+                            grant_to_ready_us = grant_to_ready_us.unwrap_or(0),
                             data_len = data_len,
                             "WRITE_READY_TIMING"
                         );
@@ -484,6 +520,7 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
 
         match req {
             Request::RoundtripGet(h) => {
+                let handler_start = std::time::Instant::now();
                 let path = resolve_chunk_path(&ctx, header.path_hash());
                 let chunk_index = header.chunk_id() as u64;
                 let offset = header.offset;
@@ -498,6 +535,7 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                 // showed 5.78 GiB/s read vs 11.04 GiB/s write at the
                 // same chunk size, with dispatch latency ruled out).
                 let alloc = Rc::clone(&ctx.allocator);
+                let alloc_start = std::time::Instant::now();
                 let fb = match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(&alloc) {
                     Some(fb) => fb,
                     None => {
@@ -506,11 +544,13 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                         return;
                     }
                 };
+                let alloc_us = alloc_start.elapsed().as_micros() as u64;
 
                 let io_store = ctx
                     .chunk_store
                     .as_any()
                     .downcast_ref::<crate::storage::IOUringChunkStore>();
+                let io_start = std::time::Instant::now();
                 let (n, fb) = match io_store {
                     Some(store) => {
                         match store
@@ -549,6 +589,7 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                     }
                 };
 
+                let io_us = io_start.elapsed().as_micros() as u64;
                 let n = n.min(h.dma_len() as usize);
                 if nth < 5 {
                     tracing::info!(
@@ -558,7 +599,28 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                 }
                 let buf = RegisteredFixedBuffer::from_fixed_buffer(fb);
                 let resp = ReadChunkResponseHeader::success(n as u64);
+                let reply_start = std::time::Instant::now();
                 h.reply(buf, resp.as_bytes().to_vec());
+                let reply_us = reply_start.elapsed().as_micros() as u64;
+                let total_us = handler_start.elapsed().as_micros() as u64;
+                if crate::stats::is_stats_enabled() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let n_log = N.fetch_add(1, Ordering::Relaxed);
+                    if n_log.is_multiple_of(1000) {
+                        tracing::info!(
+                            target: "rpc_handler_timing",
+                            kind = "read_handler",
+                            n = n_log,
+                            alloc_us = alloc_us,
+                            io_us = io_us,
+                            reply_us = reply_us,
+                            total_us = total_us,
+                            data_len = n,
+                            "READ_HANDLER_TIMING"
+                        );
+                    }
+                }
                 if nth < 5 {
                     tracing::info!("[locusta_handlers] ReadChunkById #{nth}: h.reply returned");
                 }

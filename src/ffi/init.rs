@@ -487,8 +487,10 @@ pub extern "C" fn benchfs_init(
             }
         };
 
-        // Create runtime (Runtime::new() returns Rc<Runtime>)
-        let runtime = Runtime::new(256);
+        // Create runtime. Larger initial capacity reduces Slab Vec growths,
+        // which previously realloc'd the backing buffer during mdtest-hard's
+        // 100k+ small-task churn — suspected interaction with the heap UB.
+        let runtime = Runtime::new(65536);
         set_runtime(runtime.clone());
 
         // Register timer reactor (required for Delay/timeout futures)
@@ -630,8 +632,9 @@ pub extern "C" fn benchfs_init(
             registry_dir_str
         );
 
-        // Create runtime (Runtime::new() returns Rc<Runtime>)
-        let runtime = Runtime::new(256);
+        // Create runtime. 65536 initial slots = enough headroom that the
+        // Slab backing Vec never grows during a 1M-iter mdtest-hard run.
+        let runtime = Runtime::new(65536);
 
         // Set runtime in thread-local storage BEFORE any async operations
         set_runtime(runtime.clone());

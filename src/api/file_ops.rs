@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use futures_timer::Delay;
+use pluvio_timer::Delay;
 use pluvio_runtime::spawn_with_name;
 use tracing::instrument;
 
@@ -90,6 +90,11 @@ impl BenchFS {
         BenchFSBuilder::new(node_id, chunk_store)
             .with_connection_pool(connection_pool)
             .build()
+    }
+
+    /// Borrowed access to the connection pool (if any).
+    pub fn connection_pool_ref(&self) -> Option<&Rc<ConnectionPool>> {
+        self.connection_pool.as_ref()
     }
 
     /// Create a new BenchFS client with connection pool and custom target nodes (distributed mode)

@@ -394,6 +394,14 @@ impl ConnectionPool {
     pub fn connected_nodes(&self) -> Vec<String> {
         self.connections.borrow().keys().cloned().collect()
     }
+
+    /// Borrowed accessor for the underlying locusta transport, if present.
+    #[cfg(feature = "transport-locusta")]
+    pub fn locusta_transport_ref(
+        &self,
+    ) -> Option<&Rc<crate::rpc::transport_locusta::LocustaTransport>> {
+        self.locusta_transport.as_ref()
+    }
 }
 
 #[cfg(test)]
