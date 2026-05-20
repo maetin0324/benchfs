@@ -2,6 +2,7 @@
 pub mod chunk_store;
 pub mod error;
 pub mod inode;
+pub mod inode_store;
 pub mod iouring;
 pub mod local;
 
@@ -10,7 +11,12 @@ pub use chunk_store::{
     IOUringChunkStore, InMemoryChunkStore, PosixChunkStore,
 };
 pub use error::{StorageError, StorageResult};
-pub use inode::{BenchfsChunk0Extension, EXT_OFFSET, MSIZE, PosixMetadataHeader};
+pub use inode::{
+    BenchfsChunk0Extension, BenchfsInodeExtension2, EXT_OFFSET, EXT2_OFFSET, MAX_INLINE_PATH_BYTES,
+    MSIZE, OnDiskInode, OnDiskInodeType, PATH_OFFSET, PosixMetadataHeader, decode_inode,
+    encode_inode,
+};
+pub use inode_store::{FlushPolicy, InodeStore};
 pub use iouring::IOUringBackend;
 pub use local::LocalFileSystem;
 

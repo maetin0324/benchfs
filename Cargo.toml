@@ -59,12 +59,8 @@ once_cell = "1.19"
 mpi = { version = "0.8", features = ["derive"], optional = true }
 
 # Tracing output formats
-tracing-perfetto = "0.1.5"  # Native Perfetto format with task-level tracks
 tracing-chrome = "0.7"      # Chrome trace format (also viewable in Perfetto)
-rand = "0.8"        # Used for track UUID generation
-bytes = "1.11"      # For protobuf encoding
-prost = "0.12"      # For protobuf encoding
-thread-id = "4"     # For thread ID in Perfetto traces
+rand = "0.8"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
@@ -143,13 +139,3 @@ required-features = ["mpi-support"]
 [[bin]]
 name = "benchfs_perf"
 path = "src/bin/benchfs_perf.rs"
-
-[[bin]]
-name = "benchfs_locusta_demo"
-path = "src/bin/benchfs_locusta_demo.rs"
-required-features = ["transport-locusta"]
-
-# Benchmark configuration - currently disabled as benches/small.rs does not exist
-# [[bench]]
-# name = "small"
-# harness = false

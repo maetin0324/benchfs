@@ -12,6 +12,7 @@ pub mod buffer_pool;
 pub mod client;
 pub mod connection;
 pub mod data_ops;
+pub mod dir_index_ops;
 pub mod file_id;
 pub mod handlers;
 pub mod helpers;
@@ -24,6 +25,9 @@ pub mod locusta_handlers;
 #[cfg(feature = "transport-locusta")]
 pub mod locusta_server;
 pub mod metadata_ops;
+#[cfg(feature = "transport-locusta")]
+pub mod perf_breakdown;
+pub mod readdir_ops;
 pub mod server;
 pub mod transport;
 #[cfg(feature = "transport-locusta")]

@@ -11,7 +11,7 @@
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
-use benchfs::logging::{TraceGuard, init_with_chrome, init_with_perfetto};
+use benchfs::logging::{TraceGuard, init_with_chrome};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::handlers::RpcHandlerContext;
 use benchfs::rpc::server::RpcServer;
@@ -311,16 +311,11 @@ fn run_server(
 /// If `trace_output` is Some and a trace format is enabled, the trace file
 /// will be flushed when the returned guard is dropped.
 fn setup_logging(level: &str, trace_output: Option<&PathBuf>) -> Option<TraceGuard> {
-    // Check which trace format to use
-    let enable_perfetto = std::env::var("ENABLE_PERFETTO")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let enable_chrome = std::env::var("ENABLE_CHROME")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
+    let enable_chrome = benchfs::runtime_config::RuntimeConfig::global()
+        .observability
+        .chrome_tracing;
 
-    if let Some(trace_path) = trace_output {
-        // Create parent directory if needed
+    if let (Some(trace_path), true) = (trace_output, enable_chrome) {
         if let Some(parent) = trace_path.parent() {
             if !parent.exists() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -328,27 +323,9 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>) -> Option<TraceGua
                 }
             }
         }
-
-        if enable_perfetto {
-            let guard = init_with_perfetto(level, trace_path);
-            tracing::info!(
-                "Perfetto tracing enabled (task-level tracks), output: {}",
-                trace_path.display()
-            );
-            Some(guard)
-        } else if enable_chrome {
-            let guard = init_with_chrome(level, trace_path);
-            tracing::info!("Chrome tracing enabled, output: {}", trace_path.display());
-            Some(guard)
-        } else {
-            // Trace output path given but no format enabled - default to Perfetto
-            let guard = init_with_perfetto(level, trace_path);
-            tracing::info!(
-                "Perfetto tracing enabled (default), output: {}",
-                trace_path.display()
-            );
-            Some(guard)
-        }
+        let guard = init_with_chrome(level, trace_path);
+        tracing::info!("Chrome tracing enabled, output: {}", trace_path.display());
+        Some(guard)
     } else {
         benchfs::logging::init_with_hostname(level);
         None

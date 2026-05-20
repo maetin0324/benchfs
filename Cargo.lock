@@ -186,7 +186,6 @@ version = "0.1.0"
 dependencies = [
  "async-backtrace",
  "async-trait",
- "bytes",
  "cc",
  "chrono",
  "clap",
@@ -208,18 +207,15 @@ dependencies = [
  "pluvio_uring",
  "proptest",
  "proptest-state-machine",
- "prost",
  "rand 0.8.5",
  "rrrpc",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.17",
- "thread-id",
  "toml",
  "tracing",
  "tracing-chrome",
- "tracing-perfetto",
  "tracing-subscriber",
  "xxhash-rust",
  "zerocopy",
@@ -340,12 +336,6 @@ name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
-
-[[package]]
-name = "bytes"
-version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
 name = "cc"
@@ -1440,29 +1430,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prost"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deb1435c188b76130da55f17a466d252ff7b1418b2ad3e037d127b94e3411f29"
-dependencies = [
- "bytes",
- "prost-derive",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
-dependencies = [
- "anyhow",
- "itertools",
- "proc-macro2",
- "quote",
- "syn 2.0.108",
-]
-
-[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1890,16 +1857,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bf63baf9f5039dadc247375c29eb13706706cfde997d0330d05aa63a77d8820"
 
 [[package]]
-name = "thread-id"
-version = "4.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe8f25bbdd100db7e1d34acf7fd2dc59c4bf8f7483f505eaa7d4f12f76cc0ea"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "thread_local"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2012,22 +1969,6 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-perfetto"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf599f51530a7211f5aa92c84abdfc1137362d471f0473a4b1be8d625167fb0d"
-dependencies = [
- "anyhow",
- "bytes",
- "chrono",
- "prost",
- "rand 0.8.5",
- "thread-id",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,7 +1,14 @@
-# BenchFS Server Configuration Example
+# BenchFS Configuration — covers BOTH the server-side `ServerConfig`
+# (sections [node]/[storage]/[network]/[cache]) AND the runtime
+# `RuntimeConfig` (sections [transport]/[locusta]/[prewarm]/[iouring]/
+# [scheduling]/[rpc]/[stats]). Each struct ignores the other's sections.
 #
-# This configuration file demonstrates BenchFS settings with CHFS-inspired optimizations.
-# See docs/ARCHITECTURE_COMPARISON.md for detailed comparisons with CHFS.
+# The runtime-tuning sections (below the existing CHFS-comparison block)
+# replace the BENCHFS_* env vars: a single TOML edit propagates to every
+# client/server process. To override per-experiment, set
+# `BENCHFS_CONFIG=<path>` on the calling shell to point at a copy.
+#
+# See docs/ARCHITECTURE_COMPARISON.md for CHFS comparison.
 
 [node]
 # Unique node identifier
@@ -103,3 +110,74 @@ cache_ttl_secs = 0
 #
 # For detailed architectural comparison, see:
 # docs/ARCHITECTURE_COMPARISON.md
+
+
+# ============================================================================
+# Runtime tuning (RuntimeConfig) — replaces BENCHFS_* env vars.
+# Field shapes / defaults are in src/runtime_config.rs.
+# ============================================================================
+
+[transport]
+# "locusta" or "ucx" (empty/missing = UCX, historical default).
+backend = "locusta"
+
+[locusta]
+arena_size         = 268435456   # 256 MiB DMA arena (default 8 MiB exhausts on 4 MB transfers)
+max_inflight       = 128         # per-peer write credit; >128 over-drove HCA at 160 × 40 setup
+recv_ring_size     = 32768       # RC RQ size per peer (halved from 64K default for faster QP setup)
+send_buf_size      = 32768       # RC SQ buf size per peer (halved likewise)
+ring_capacity      = 128         # SHM ring slots between client and relay
+accept_interval_ms = 100         # server UDP accept-loop drain cadence
+
+[prewarm]
+enabled     = true
+# concurrency = 80 mimics join_all so a single 120 s timeout doesn't
+# serially block the next chunk (job 20366 hit pre-warm = 392 s with
+# chunked=8; job 20382 hit 29-321 s with chunked=80).
+concurrency = 80
+# stagger_ms_per_rank = N → rank R waits N×R ms before pre-warming.
+# Spreads node_0 fan-in: 24 ranks × 100 ms stagger spans 0–2400 ms,
+# capping concurrent inbound at ≤2-3 instead of 24. 0 disables.
+stagger_ms_per_rank = 100
+
+[iouring]
+queue_size          = 2048
+submit_depth        = 512
+sq_poll_ms          = 200        # 0 disables SQPOLL; 200 keeps the kernel thread warm
+chunk_fd_cache_size = 0          # ior-hard pattern saturates fd cache; 0 disables
+
+[scheduling]
+# pluvio_runtime tuning. reactor_poll_interval and status_cache_iters
+# are the two knobs investigated in jobs 20369/20371; neither moved p99
+# meaningfully so they stay at the conservative working values.
+reactor_poll_interval = 2
+status_cache_iters    = 100
+
+[rpc]
+max_concurrent_chunk_rpcs = 16
+sequential_chunk_rpcs     = false  # diagnostic only; enables sequential await
+disable_rdma              = false
+
+[stats]
+enabled          = false
+ucx_am_breakdown = false
+
+[metadata]
+# Metadata persistence policy. Off = original in-memory-only behavior
+# (matches the io500 baseline; no inode files are written).
+# writethrough = every CreateFile/CreateDir/Delete/Update pwrites a 4 KiB
+# inode file under <data_dir>/inodes/ before returning the RPC reply.
+# writeback = mutations mark the path dirty; a background task drains
+# the queue periodically (lost on crash, fast on the hot path).
+#
+# See src/storage/inode_store.rs and PLAN_METADATA_PERSISTENCE.md.
+persist              = "off"
+# Writeback-only: drain cadence in ms.
+flush_interval_ms    = 50
+# Writeback-only: high watermark; mutations yield to drain when exceeded.
+dirty_high_watermark = 16384
+# Distribute metadata ownership across all server nodes via consistent
+# hashing. Default true. Set to false to pin all metadata to node_0
+# (old workaround for an ppn=16 shared-file hang that has not re-appeared
+# at ppn≤8 fpp). BENCHFS_METADATA_DISTRIBUTED env var overrides this.
+distributed          = true

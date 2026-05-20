@@ -60,6 +60,13 @@ pub const MAGIC: u32 = 0xBE16_FA01;
 pub const VERSION: u8 = 1;
 pub const MSG_REQUEST: u8 = 0;
 pub const MSG_RESPONSE: u8 = 1;
+/// Immediate "I got your REQUEST, QP setup in progress" ack from server.
+/// Carries no QP info; the client uses it solely to suppress the
+/// retransmit timer so we don't pile a storm on top of an already-busy
+/// server during pre-warm. Wire layout is the same 201-byte
+/// [`PACKET_SIZE`] frame as REQUEST/RESPONSE (QP fields zeroed) so the
+/// decoder doesn't need a size branch.
+pub const MSG_ACK: u8 = 2;
 pub const NODE_ID_MAX: usize = 64;
 pub const PACKET_SIZE: usize = 8 + 64 + 64 + 1 + NODE_ID_MAX;
 
@@ -84,13 +91,11 @@ impl ExchangePacket {
         // SAFETY: QpExchangeInfo is repr(C), 64 bytes, with only POD
         // fields (u32/u16/u64/zeros). We copy it byte-for-byte to a
         // word-aligned offset that matches the assertion in lib code.
-        let relay_bytes: &[u8; 64] = unsafe {
-            &*(&self.relay_qp as *const QpExchangeInfo as *const [u8; 64])
-        };
+        let relay_bytes: &[u8; 64] =
+            unsafe { &*(&self.relay_qp as *const QpExchangeInfo as *const [u8; 64]) };
         buf[8..72].copy_from_slice(relay_bytes);
-        let server_bytes: &[u8; 64] = unsafe {
-            &*(&self.server_qp as *const QpExchangeInfo as *const [u8; 64])
-        };
+        let server_bytes: &[u8; 64] =
+            unsafe { &*(&self.server_qp as *const QpExchangeInfo as *const [u8; 64]) };
         buf[72..136].copy_from_slice(server_bytes);
 
         let id_bytes = self.node_id.as_bytes();
@@ -124,7 +129,7 @@ impl ExchangePacket {
             ));
         }
         let msg_type = buf[5];
-        if msg_type != MSG_REQUEST && msg_type != MSG_RESPONSE {
+        if msg_type != MSG_REQUEST && msg_type != MSG_RESPONSE && msg_type != MSG_ACK {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("bad msg_type {msg_type}"),
@@ -178,11 +183,7 @@ pub fn udp_registry_path(registry_dir: &Path, node_id: &str) -> PathBuf {
 /// Write `addr` into `{registry_dir}/locusta_udp/{node_id}` (creating
 /// the subdirectory if needed). Atomic: writes to a `.tmp` file first
 /// and renames over the target.
-pub fn publish_udp_addr(
-    registry_dir: &Path,
-    node_id: &str,
-    addr: SocketAddrV4,
-) -> io::Result<()> {
+pub fn publish_udp_addr(registry_dir: &Path, node_id: &str, addr: SocketAddrV4) -> io::Result<()> {
     let dir = registry_dir.join("locusta_udp");
     std::fs::create_dir_all(&dir)?;
     let final_path = dir.join(node_id);
@@ -254,9 +255,11 @@ pub fn bind_udp_socket() -> io::Result<(UdpSocket, SocketAddrV4)> {
     // doesn't drop REQUEST packets while the accept loop is busy in
     // the middle of a `prepare_peer` / RDMA QP setup (each ≈ ms,
     // multiplied by the 32-per-tick drain). Default Linux UDP rcvbuf
-    // is ~208 KiB ≈ 1066 of our 200 B packets; 4 MiB ≈ 20 000 packets
-    // gives ample slack.
-    let want_rcv: libc::c_int = 4 * 1024 * 1024;
+    // is ~208 KiB ≈ 1066 of our 200 B packets. 16 MiB ≈ 80 000 packets
+    // covers 10 phys × ppn=8 = 6400 clients × ≥1 retransmit each.
+    // (Was 4 MiB, sufficient for 24-rank pre-warm but overflowed at
+    // 6400-rank scale per job 20492 / project_ior_hard_ppn_sweep.)
+    let want_rcv: libc::c_int = 16 * 1024 * 1024;
     let rc = unsafe {
         use std::os::fd::AsRawFd;
         libc::setsockopt(
@@ -283,7 +286,10 @@ pub fn bind_udp_socket() -> io::Result<(UdpSocket, SocketAddrV4)> {
 }
 
 fn resolve_advertised_ip() -> io::Result<Ipv4Addr> {
-    if let Ok(s) = std::env::var("BENCHFS_LOCUSTA_BIND_IP")
+    if let Some(s) = crate::runtime_config::RuntimeConfig::global()
+        .locusta
+        .bind_ip
+        .as_deref()
         && let Ok(ip) = s.parse::<Ipv4Addr>()
     {
         return Ok(ip);
@@ -393,5 +399,21 @@ mod tests {
         buf[0..4].copy_from_slice(&0u32.to_be_bytes());
         let err = ExchangePacket::decode(&buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn ack_encode_decode_roundtrip() {
+        // ACK packets carry no QP info — both fields zeroed. Decode must
+        // accept the same 201 B frame as REQUEST/RESPONSE.
+        let pkt = ExchangePacket {
+            msg_type: MSG_ACK,
+            relay_qp: unsafe { std::mem::zeroed() },
+            server_qp: unsafe { std::mem::zeroed() },
+            node_id: "ack_sender".to_string(),
+        };
+        let bytes = pkt.encode();
+        let parsed = ExchangePacket::decode(&bytes).expect("decode");
+        assert_eq!(parsed.msg_type, MSG_ACK);
+        assert_eq!(parsed.node_id, "ack_sender");
     }
 }

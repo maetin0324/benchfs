@@ -172,17 +172,7 @@ int benchfs_remove(benchfs_context_t* ctx, const char* path);
  * @param buf Buffer to receive file status
  * @return BENCHFS_SUCCESS on success, error code on failure
  */
-int benchfs_stat(benchfs_context_t* ctx, const char* path, struct stat* buf);
-
-/**
- * Get file status (BenchFS-specific version)
- *
- * @param ctx BenchFS context
- * @param path File path
- * @param buf Buffer to receive file status
- * @return BENCHFS_SUCCESS on success, error code on failure
- */
-int benchfs_stat_bfs(benchfs_context_t* ctx, const char* path, benchfs_stat_t* buf);
+int benchfs_stat(benchfs_context_t* ctx, const char* path, benchfs_stat_t* buf);
 
 /**
  * Get file size
@@ -243,6 +233,42 @@ int benchfs_truncate(benchfs_context_t* ctx, const char* path, off_t size);
 int benchfs_access(benchfs_context_t* ctx, const char* path, int mode);
 
 /**
+ * Filler callback for benchfs_readdir (readdirplus semantics).
+ *
+ * @param arg     The opaque pointer passed to benchfs_readdir.
+ * @param name    NUL-terminated entry basename (NOT full path).
+ * @param entry_type  0=regular file, 1=directory, 2=symlink.
+ * @param size    File size in bytes (regular files). 0 for directories,
+ *                symlinks, or when size is unavailable. Callers can use
+ *                this directly for POSIX find `-size` predicates without
+ *                issuing a separate stat() RPC.
+ * @return 0 to continue, non-zero to stop iteration early.
+ */
+typedef int (*benchfs_readdir_filler)(
+    void* arg, const char* name, int entry_type, uint64_t size);
+
+/**
+ * Read directory contents (CHFS-style scatter readdir).
+ *
+ * Fans out a Readdir RPC to every node in the metadata ring, merges the
+ * results, dedups by basename, and invokes `filler` once per unique entry
+ * directly under `path`.
+ *
+ * @param ctx     BenchFS context.
+ * @param path    Directory path.
+ * @param filler  Callback invoked for each entry.
+ * @param arg     Opaque pointer forwarded to the filler.
+ * @return Number of entries delivered to the filler on success
+ *         (clamped to INT_MAX), or a negative BENCHFS_E* on failure.
+ */
+int benchfs_readdir(
+    benchfs_context_t* ctx,
+    const char* path,
+    benchfs_readdir_filler filler,
+    void* arg
+);
+
+/**
  * Seek to a position in a file
  *
  * @param file File handle
@@ -283,6 +309,17 @@ int benchfs_alloc_io_buffer(size_t size, void** out_ptr);
  * @return 0 on success, -1 if the pointer is unknown.
  */
 int benchfs_free_io_buffer(void* ptr);
+
+/**
+ * Test whether a pointer was returned by benchfs_alloc_io_buffer.
+ *
+ * Used by the IOR aligned_buffer_alloc shim to decide whether to call
+ * benchfs_free_io_buffer or the standard free() path.
+ *
+ * @param ptr Pointer to test (any value is safe; no dereference).
+ * @return 1 if ptr is a registered benchfs IO buffer, 0 otherwise.
+ */
+int benchfs_is_io_buffer(const void* ptr);
 
 #ifdef __cplusplus
 }

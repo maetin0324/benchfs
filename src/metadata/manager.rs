@@ -1,12 +1,13 @@
 use super::{
     consistent_hash::ConsistentHashRing,
     id_generator::IdGenerator,
-    types::{DirectoryMetadata, FileMetadata, InodeId, NodeId},
+    types::{DirectoryMetadata, FileMetadata, InodeId, InodeType, NodeId},
 };
 use crate::cache::{CachePolicy, MetadataCache};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use tracing::instrument;
 
 /// メタデータ管理エラー
@@ -46,6 +47,22 @@ pub struct MetadataManager {
     /// ローカルに保存されているディレクトリメタデータ (path -> metadata)
     local_dir_metadata: RefCell<HashMap<String, DirectoryMetadata>>,
 
+    /// 親パス → 直接の子エントリ (name → type) の索引。
+    /// readdir で O(子数) 検索するための補助構造。job 20645 の
+    /// find phase が mdtest-easy で 30s timeout していたのは
+    /// `list_local_entries` が全 file/dir metadata を線形スキャン
+    /// していたため (3M+ エントリで非現実的)。
+    /// すべての store_*_metadata / remove_*_metadata で更新する。
+    local_dir_children: RefCell<HashMap<String, HashMap<String, InodeType>>>,
+
+    /// `local_dir_children` のソート済みビュー。`list_local_entries` の
+    /// paginated readdir では同じ親に対して連続して call が来る (offset を
+    /// 進めながら)。job 20666 で 1.28 M children を毎回 O(N log N) で
+    /// sort して 520 ms/call ×1700 calls = 884 s の find phase 時間を
+    /// 消費していた。書き込み中はキャッシュ invalidate、読み出し phase
+    /// では一度だけ sort して再利用 — find 全体を ~12 s 程度に短縮できる。
+    sorted_children_cache: RefCell<HashMap<String, Rc<Vec<(String, InodeType)>>>>,
+
     /// メタデータキャッシュ
     cache: MetadataCache,
 
@@ -81,9 +98,109 @@ impl MetadataManager {
             ring: RefCell::new(ring),
             local_file_metadata: RefCell::new(HashMap::new()),
             local_dir_metadata: RefCell::new(HashMap::new()),
+            local_dir_children: RefCell::new(HashMap::new()),
+            sorted_children_cache: RefCell::new(HashMap::new()),
             cache: MetadataCache::new(cache_policy),
             self_node_id,
             id_generator,
+        }
+    }
+
+    /// `path` を末尾 segment を分割し、`(parent, child)` を返す。
+    /// ルートや末尾スラッシュは正規化済みであることを想定。
+    /// 例: `/A/B/C` → `Some(("/A/B", "C"))`、`/X` → `Some(("/", "X"))`、`/` → `None`。
+    fn split_parent_child(path: &str) -> Option<(String, String)> {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return None; // root
+        }
+        let idx = trimmed.rfind('/')?;
+        let parent = if idx == 0 {
+            "/".to_string()
+        } else {
+            trimmed[..idx].to_string()
+        };
+        let child = trimmed[idx + 1..].to_string();
+        if child.is_empty() {
+            return None;
+        }
+        Some((parent, child))
+    }
+
+    /// 親パスの子索引に `(child, ty)` を追加し、さらに祖先方向にも virtual
+    /// directory placeholder を伝播する。これにより、明示的に mkdir されて
+    /// いない中間ディレクトリ (mdtest-hard の deeply-nested tree など) も
+    /// readdir で見える。既存の Directory placeholder は実体
+    /// (file/symlink) で上書きされ、その逆は起きない (CHFS の
+    /// `fs_add_entry` と同じ規則)。
+    /// public: CHFS-style 中央 parent index で他 server からの
+    /// DirIndexUpdate RPC handler から呼ばれるため。
+    pub fn dir_index_insert(&self, path: &str, ty: InodeType) {
+        let mut idx = self.local_dir_children.borrow_mut();
+        let mut cache = self.sorted_children_cache.borrow_mut();
+        let mut cur = path.to_string();
+        let mut leaf_ty = ty;
+        loop {
+            let Some((parent, child)) = Self::split_parent_child(&cur) else {
+                break;
+            };
+            let entry = idx.entry(parent.clone()).or_default();
+            let modified = match entry.get(&child) {
+                Some(InodeType::Directory) => {
+                    if !matches!(leaf_ty, InodeType::Directory) {
+                        entry.insert(child.clone(), leaf_ty);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Some(_) => false,
+                None => {
+                    entry.insert(child.clone(), leaf_ty);
+                    true
+                }
+            };
+            if modified {
+                cache.remove(&parent);
+            }
+            if parent == "/" {
+                break;
+            }
+            cur = parent;
+            leaf_ty = InodeType::Directory;
+        }
+    }
+
+    /// 親パスの子索引から `child` を削除。エントリが空になった場合は
+    /// 親自体も除去し、祖先方向にも空エントリの掃除を伝播する。
+    /// 明示的に mkdir されたパスとの整合性を厳密には保たないが
+    /// (祖先が空になっても他の兄弟が残っている場合は無触)、readdir の
+    /// 動作には影響しない。
+    /// public: CHFS-style 中央 parent index で他 server からの
+    /// DirIndexUpdate RPC handler から呼ばれるため。
+    pub fn dir_index_remove(&self, path: &str) {
+        let mut idx = self.local_dir_children.borrow_mut();
+        let mut cache = self.sorted_children_cache.borrow_mut();
+        let mut cur = path.to_string();
+        loop {
+            let Some((parent, child)) = Self::split_parent_child(&cur) else {
+                break;
+            };
+            let Some(entry) = idx.get_mut(&parent) else {
+                break;
+            };
+            if entry.remove(&child).is_some() {
+                cache.remove(&parent);
+            }
+            if !entry.is_empty() {
+                break;
+            }
+            idx.remove(&parent);
+            cache.remove(&parent);
+            if parent == "/" {
+                break;
+            }
+            cur = parent;
         }
     }
 
@@ -147,13 +264,14 @@ impl MetadataManager {
     pub fn store_file_metadata(&self, metadata: FileMetadata) -> MetadataResult<()> {
         let path = metadata.path.clone();
 
-        let mut local_metadata = self.local_file_metadata.borrow_mut();
-
-        if local_metadata.contains_key(&path) {
-            return Err(MetadataError::AlreadyExists(path));
+        {
+            let mut local_metadata = self.local_file_metadata.borrow_mut();
+            if local_metadata.contains_key(&path) {
+                return Err(MetadataError::AlreadyExists(path));
+            }
+            local_metadata.insert(path.clone(), metadata);
         }
-
-        local_metadata.insert(path.clone(), metadata);
+        self.dir_index_insert(&path, InodeType::File);
         tracing::debug!("Stored file metadata for: {}", path);
 
         Ok(())
@@ -217,11 +335,13 @@ impl MetadataManager {
             MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
         })?;
 
-        let mut local_metadata = self.local_file_metadata.borrow_mut();
-
-        local_metadata
-            .remove(path_str)
-            .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+        {
+            let mut local_metadata = self.local_file_metadata.borrow_mut();
+            local_metadata
+                .remove(path_str)
+                .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+        }
+        self.dir_index_remove(path_str);
 
         // Invalidate cache
         self.cache.invalidate_file(path_str);
@@ -236,13 +356,14 @@ impl MetadataManager {
     pub fn store_dir_metadata(&self, metadata: DirectoryMetadata) -> MetadataResult<()> {
         let path = metadata.path.clone();
 
-        let mut local_metadata = self.local_dir_metadata.borrow_mut();
-
-        if local_metadata.contains_key(&path) {
-            return Err(MetadataError::AlreadyExists(path));
+        {
+            let mut local_metadata = self.local_dir_metadata.borrow_mut();
+            if local_metadata.contains_key(&path) {
+                return Err(MetadataError::AlreadyExists(path));
+            }
+            local_metadata.insert(path.clone(), metadata);
         }
-
-        local_metadata.insert(path.clone(), metadata);
+        self.dir_index_insert(&path, InodeType::Directory);
         tracing::debug!("Stored directory metadata for: {}", path);
 
         Ok(())
@@ -303,11 +424,13 @@ impl MetadataManager {
             MetadataError::InvalidPath(format!("Invalid UTF-8 in path: {:?}", path))
         })?;
 
-        let mut local_metadata = self.local_dir_metadata.borrow_mut();
-
-        local_metadata
-            .remove(path_str)
-            .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+        {
+            let mut local_metadata = self.local_dir_metadata.borrow_mut();
+            local_metadata
+                .remove(path_str)
+                .ok_or_else(|| MetadataError::NotFound(path_str.to_string()))?;
+        }
+        self.dir_index_remove(path_str);
 
         // Invalidate cache
         self.cache.invalidate_dir(path_str);
@@ -315,6 +438,97 @@ impl MetadataManager {
         tracing::debug!("Removed directory metadata for: {}", path_str);
 
         Ok(())
+    }
+
+    /// 親パス直下のエントリをローカルメタデータから列挙 (CHFS-style scatter readdir)
+    ///
+    /// CHFS の `fs_readdir_cb` / `fs_add_entry` と同じ規則:
+    ///
+    /// - パスが `<parent>/` で始まるエントリのみを対象とする
+    /// - 残りが '/' を含まない → 直接の子 (File or Directory) として返す
+    /// - 残りが '/' を含む → 最初のセグメントを virtual directory として返す
+    ///   (deeply nested mdtest tree 用)
+    ///
+    /// `offset` は dedup 済みエントリのスキップ数、`limit` は返却上限。
+    /// 戻り値: `(entries, is_truncated)` — `is_truncated=true` のとき続きがある。
+    pub fn list_local_entries(
+        &self,
+        parent: &str,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<(String, InodeType)>, bool) {
+        // Normalize parent: strip trailing slash except for root.
+        let key = if parent.len() > 1 && parent.ends_with('/') {
+            &parent[..parent.len() - 1]
+        } else {
+            parent
+        };
+
+        // Cache-first: paginated readdir over a large dir (mdtest_tree.0
+        // with 1.28M children, see job 20666 timing) used to re-sort on
+        // every call and dominate the find phase at ~520 ms/call. The
+        // sorted Vec is rebuilt lazily after any insert/remove via
+        // `sorted_children_cache.remove(parent)`.
+        let sorted: Rc<Vec<(String, InodeType)>> = {
+            if let Some(cached) = self.sorted_children_cache.borrow().get(key) {
+                Rc::clone(cached)
+            } else {
+                let idx = self.local_dir_children.borrow();
+                let Some(children) = idx.get(key) else {
+                    return (Vec::new(), false);
+                };
+                let mut entries: Vec<(String, InodeType)> =
+                    children.iter().map(|(n, t)| (n.clone(), *t)).collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let rc = Rc::new(entries);
+                self.sorted_children_cache
+                    .borrow_mut()
+                    .insert(key.to_string(), Rc::clone(&rc));
+                rc
+            }
+        };
+
+        let total = sorted.len();
+        let start = offset.min(total);
+        let end = (start + limit).min(total);
+        let truncated = end < total;
+        let out: Vec<(String, InodeType)> = sorted[start..end].to_vec();
+        (out, truncated)
+    }
+
+    /// readdirplus 用: list_local_entries と同じ paginated/sorted
+    /// children を返すが、各エントリに size を付ける。FileMetadata
+    /// が無い場合 (race or directory) は size = 0。
+    pub fn list_local_entries_with_size(
+        &self,
+        parent: &str,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<(String, InodeType, u64)>, bool) {
+        let (entries, truncated) = self.list_local_entries(parent, offset, limit);
+        let key = if parent.len() > 1 && parent.ends_with('/') {
+            &parent[..parent.len() - 1]
+        } else {
+            parent
+        };
+        let files = self.local_file_metadata.borrow();
+        let out: Vec<(String, InodeType, u64)> = entries
+            .into_iter()
+            .map(|(name, ty)| {
+                let size = if matches!(ty, InodeType::File) {
+                    let full = if key == "/" {
+                        format!("/{}", name)
+                    } else {
+                        format!("{}/{}", key, name)
+                    };
+                    files.get(&full).map(|m| m.size).unwrap_or(0)
+                } else {
+                    0
+                };
+                (name, ty, size)
+            })
+            .collect();
+        (out, truncated)
     }
 
     /// ローカルに保存されているファイルメタデータの数
@@ -325,6 +539,24 @@ impl MetadataManager {
     /// ローカルに保存されているディレクトリメタデータの数
     pub fn local_dir_count(&self) -> usize {
         self.local_dir_metadata.borrow().len()
+    }
+
+    /// Take a snapshot of every local file (path, size). Used by the
+    /// `OnFinalize` flush path at shutdown to enumerate everything that
+    /// needs to be persisted to disk in one pass. Returns owned Strings
+    /// so the caller doesn't hold the RefCell borrow.
+    pub fn snapshot_local_files(&self) -> Vec<(String, u64)> {
+        self.local_file_metadata
+            .borrow()
+            .iter()
+            .map(|(p, m)| (p.clone(), m.size))
+            .collect()
+    }
+
+    /// Take a snapshot of every local directory path. Companion to
+    /// `snapshot_local_files`.
+    pub fn snapshot_local_dirs(&self) -> Vec<String> {
+        self.local_dir_metadata.borrow().keys().cloned().collect()
     }
 
     /// リング内のノード数
@@ -541,5 +773,104 @@ mod tests {
 
         manager.remove_dir_metadata(&path).unwrap();
         assert_eq!(manager.local_dir_count(), 0);
+    }
+
+    #[test]
+    fn test_list_local_entries_direct_children() {
+        let manager = MetadataManager::new("node1".to_string());
+
+        manager
+            .store_file_metadata(FileMetadata::new("/dir/a.txt".to_string(), 1))
+            .unwrap();
+        manager
+            .store_file_metadata(FileMetadata::new("/dir/b.txt".to_string(), 2))
+            .unwrap();
+        manager
+            .store_dir_metadata(DirectoryMetadata::new(10, "/dir/sub".to_string()))
+            .unwrap();
+
+        let (entries, truncated) = manager.list_local_entries("/dir", 0, 100);
+        assert!(!truncated);
+        assert_eq!(entries.len(), 3);
+        let names: std::collections::BTreeSet<String> =
+            entries.iter().map(|(n, _)| n.clone()).collect();
+        assert!(names.contains("a.txt"));
+        assert!(names.contains("b.txt"));
+        assert!(names.contains("sub"));
+    }
+
+    #[test]
+    fn test_list_local_entries_virtual_subdir() {
+        // mdtest-hard tree pattern: only deeply-nested files exist as
+        // metadata; intermediate directories must be synthesized.
+        let manager = MetadataManager::new("node1".to_string());
+
+        manager
+            .store_file_metadata(FileMetadata::new(
+                "/root/00000000/00000000/f0".to_string(),
+                1,
+            ))
+            .unwrap();
+        manager
+            .store_file_metadata(FileMetadata::new(
+                "/root/00000000/00000001/f1".to_string(),
+                1,
+            ))
+            .unwrap();
+        manager
+            .store_file_metadata(FileMetadata::new(
+                "/root/00000001/00000000/f2".to_string(),
+                1,
+            ))
+            .unwrap();
+
+        // readdir("/root") → ["00000000", "00000001"] as virtual dirs.
+        let (entries, _) = manager.list_local_entries("/root", 0, 100);
+        let names: std::collections::BTreeSet<String> =
+            entries.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("00000000"));
+        assert!(names.contains("00000001"));
+        for (_, ty) in &entries {
+            assert!(matches!(ty, InodeType::Directory));
+        }
+    }
+
+    #[test]
+    fn test_list_local_entries_root() {
+        let manager = MetadataManager::new("node1".to_string());
+
+        manager
+            .store_file_metadata(FileMetadata::new("/top.txt".to_string(), 1))
+            .unwrap();
+        manager
+            .store_dir_metadata(DirectoryMetadata::new(20, "/topdir".to_string()))
+            .unwrap();
+
+        let (entries, _) = manager.list_local_entries("/", 0, 100);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_list_local_entries_offset_limit() {
+        let manager = MetadataManager::new("node1".to_string());
+        for i in 0..10 {
+            manager
+                .store_file_metadata(FileMetadata::new(format!("/x/f{i}"), 1))
+                .unwrap();
+        }
+
+        let (first, truncated1) = manager.list_local_entries("/x", 0, 3);
+        assert_eq!(first.len(), 3);
+        assert!(truncated1);
+
+        let (second, _) = manager.list_local_entries("/x", 3, 100);
+        assert_eq!(second.len(), 7);
+        // No overlap.
+        let first_names: std::collections::BTreeSet<String> =
+            first.iter().map(|(n, _)| n.clone()).collect();
+        for (n, _) in &second {
+            assert!(!first_names.contains(n));
+        }
     }
 }

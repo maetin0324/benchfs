@@ -17,6 +17,22 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE:-$0}" )" &> /dev/null && pwd )"
 source "${SCRIPT_DIR}/../benchfs/common.sh"
 TIMESTAMP="$(timestamp)"
 
+# Optional TOML profile: BENCHFS_PROFILE=jobs/profiles/locusta_default.toml
+# Caller-shell env vars take precedence (the loader skips already-set keys),
+# so per-experiment overrides still work without editing the TOML.
+if [ -n "${BENCHFS_PROFILE:-}" ]; then
+  if [ ! -f "${BENCHFS_PROFILE}" ]; then
+    # try relative to project root
+    PROJECT_ROOT_PRE="$( cd "${SCRIPT_DIR}/../.." && pwd )"
+    if [ -f "${PROJECT_ROOT_PRE}/${BENCHFS_PROFILE}" ]; then
+      BENCHFS_PROFILE="${PROJECT_ROOT_PRE}/${BENCHFS_PROFILE}"
+    fi
+  fi
+  echo "Loading benchfs profile: ${BENCHFS_PROFILE}"
+  # shellcheck source=/dev/null
+  source "${SCRIPT_DIR}/../profiles/load_profile.sh" "${BENCHFS_PROFILE}"
+fi
+
 # Default workflow is single-run with the empirical best ior-easy config
 # (transfer=4m block=4g ppn=4 fpp=TRUE chunk=4m). Set SKIP_SWEEP=0 to fall
 # back to the original 24-config sweep + final-best workflow.

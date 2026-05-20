@@ -1275,19 +1275,54 @@ pub struct IOUringChunkStore {
     /// turns ~2048 sync syscalls per file into 16 (shard count).
     known_shard_dirs: RefCell<std::collections::HashSet<(String, u64)>>,
 
-    /// LRU-ish fd cache: each (file_path, chunk_index) → opened FileHandle
-    /// (O_RDWR | O_DIRECT). Holding fds open across the ior-easy-write
-    /// → ior-easy-read transition lets the read phase skip the per-chunk
-    /// `OpenAt` SQE entirely. 17070 profile showed open_us mean 49µs is
-    /// non-trivial; eliminating it for reads on hot chunks is the
-    /// cheapest path to closing the read-throughput gap.
-    /// Capped via `BENCHFS_CHUNK_FD_CACHE_SIZE` (default 32768). When
-    /// the cap is hit we close the LRU entry. Disabled if the env is
-    /// set to `0`.
-    fd_cache: RefCell<std::collections::HashMap<(String, u64), FileHandle>>,
-    /// LRU ordering for fd_cache (front = most recently used).
-    fd_lru: RefCell<std::collections::VecDeque<(String, u64)>>,
+    /// FIFO fd cache: each (file_path, chunk_index, use_direct) → opened
+    /// FileHandle. Holding fds open across phase transitions lets later
+    /// writes/reads skip the per-chunk `OpenAt` SQE. 17070 profile showed
+    /// open_us mean 49µs is non-trivial; 20183 showed 38% of ior-hard
+    /// per-RPC server time is open(). The `use_direct` axis in the key
+    /// keeps O_DIRECT-opened entries (4 KiB-aligned IO) and non-direct
+    /// entries (unaligned ior-hard 47 KiB) in separate slots, so a
+    /// follow-up unaligned op can't EINVAL on an O_DIRECT fd cached from
+    /// the prior aligned phase (job 17075 hazard).
+    ///
+    /// Eviction is FIFO via `fd_cache_order` — on full cache, the oldest
+    /// inserted entry is closed. We skip MRU promotion on hit (O(N) on
+    /// VecDeque) since ior-hard reuses chunks heavily within its phase
+    /// (90 writes per chunk), so insertion order ≈ LRU order in practice.
+    /// Capped via `BENCHFS_CHUNK_FD_CACHE_SIZE` (default 0 = disabled).
+    fd_cache: RefCell<std::collections::HashMap<(String, u64, bool), FileHandle>>,
+    fd_cache_order: RefCell<std::collections::VecDeque<(String, u64, bool)>>,
     fd_cache_cap: usize,
+
+    /// mmap fast-path cache for non-O_DIRECT chunks (i.e. ior-hard's
+    /// unaligned 47 KiB writes). Each entry is `(path, chunk_index) →
+    /// (raw_fd, mmap_ptr, mmap_len)`. Writes that hit this cache skip
+    /// io_uring entirely and `memcpy` directly into the MAP_SHARED
+    /// region — page cache absorbs the write at ~2µs vs io_uring's
+    /// ~100µs random-write floor. The fd is owned by this cache (NOT
+    /// shared with `fd_cache`) so eviction can safely munmap+close.
+    /// Enabled only when `BENCHFS_CHUNK_MMAP_WRITE=1`; disabled otherwise.
+    mmap_cache: RefCell<std::collections::HashMap<(String, u64), MmapEntry>>,
+    mmap_cache_order: RefCell<std::collections::VecDeque<(String, u64)>>,
+    mmap_enabled: bool,
+
+    /// Tracks `(file_path, chunk_index)` pairs that have had their extent
+    /// pre-allocated via `fallocate(KEEP_SIZE)` in the unified-layout file.
+    /// Per-chunk layout already fallocates inside `get_or_open_chunk_file`,
+    /// but unified collapses N chunks into one file and we must do the
+    /// equivalent lazily — once per (file, chunk_id) on its first write —
+    /// or ext4 extent-tree growth dominates every first-write-to-offset.
+    /// A blanket fallocate at file-open time over-allocates by ~80x in
+    /// FPP mode (40-server unified holds N rank files, each only
+    /// receiving 1/40 of that rank's data — `data_per_rank / 40`).
+    unified_chunk_prealloc: RefCell<std::collections::HashSet<(String, u64)>>,
+}
+
+#[derive(Copy, Clone)]
+struct MmapEntry {
+    fd: i32,
+    ptr: *mut u8,
+    len: usize,
 }
 
 impl IOUringChunkStore {
@@ -1313,11 +1348,10 @@ impl IOUringChunkStore {
         // Default off: caching `O_DIRECT`-opened fds across phases produced
         // EINVAL on follow-up non-aligned writes in mdtest (job 17075),
         // and EMFILE without an in-wrapper ulimit bump (job 17074). Opt
-        // in via the env var once both hazards are resolved.
-        let fd_cache_cap = std::env::var("BENCHFS_CHUNK_FD_CACHE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
+        // in via `[iouring] chunk_fd_cache_size = N` in benchfs.toml.
+        let fd_cache_cap = crate::runtime_config::RuntimeConfig::global()
+            .iouring
+            .chunk_fd_cache_size;
 
         tracing::info!(
             "IOUringChunkStore initialized (fd_cache_cap={}, O_DIRECT enabled for both READ and WRITE)",
@@ -1333,10 +1367,20 @@ impl IOUringChunkStore {
             fd_cache: RefCell::new(std::collections::HashMap::with_capacity(
                 fd_cache_cap.min(1024),
             )),
-            fd_lru: RefCell::new(std::collections::VecDeque::with_capacity(
+            fd_cache_order: RefCell::new(std::collections::VecDeque::with_capacity(
                 fd_cache_cap.min(1024),
             )),
             fd_cache_cap,
+            mmap_cache: RefCell::new(std::collections::HashMap::with_capacity(
+                fd_cache_cap.min(1024),
+            )),
+            mmap_cache_order: RefCell::new(std::collections::VecDeque::with_capacity(
+                fd_cache_cap.min(1024),
+            )),
+            unified_chunk_prealloc: RefCell::new(std::collections::HashSet::new()),
+            mmap_enabled: crate::runtime_config::RuntimeConfig::global()
+                .storage
+                .chunk_mmap_write,
         })
     }
 
@@ -1384,22 +1428,55 @@ impl IOUringChunkStore {
             .join(format!("{}", chunk_index))
     }
 
-    /// Unified path-level data file used when `BENCHFS_CHUNK_LAYOUT=unified`.
-    /// All chunks for a logical file land in a single sparse file at
-    /// `base_dir/path_hash/data`, indexed by `chunk_index * chunk_size`.
-    /// This collapses thousands of per-chunk file opens (and their ext4
-    /// inode-allocation overhead) into a handful of per-path opens.
-    fn unified_data_path(&self, file_path: &str) -> PathBuf {
+    /// Number of sharded sub-files per logical file when unified layout is
+    /// enabled. Splitting one big sparse file into N inodes lets the kernel's
+    /// per-inode page-cache lock be acquired in parallel for buffered writes
+    /// — the lock contention is the real ceiling for ior-hard's 47 KiB
+    /// unaligned writes (job 20250 profile showed each io_uring write
+    /// pays ~128 µs regardless of in-flight depth, consistent with serialized
+    /// i_lock acquisition).
+    fn unified_shard_count(&self) -> u64 {
+        crate::runtime_config::RuntimeConfig::global()
+            .storage
+            .unified_shards
+            .max(1) as u64
+    }
+
+    /// Unified path-level data file. With `BENCHFS_UNIFIED_SHARDS=1` (default)
+    /// all chunks for a logical file land in one sparse file; with shards > 1
+    /// chunks are spread across N sub-files keyed by `chunk_index % N`. The
+    /// shard index becomes part of the filename so chunks within a shard sit
+    /// at offsets `(chunk_index / N) * chunk_size`.
+    fn unified_data_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
         let path_hash = self.hash_path(file_path);
-        self.base_dir.join(path_hash).join("data")
+        let shards = self.unified_shard_count();
+        if shards <= 1 {
+            self.base_dir.join(path_hash).join("data")
+        } else {
+            let shard = chunk_index % shards;
+            self.base_dir
+                .join(path_hash)
+                .join(format!("data.{:02x}", shard))
+        }
+    }
+
+    /// File-relative byte offset for a `(chunk_index, offset_within_chunk)`
+    /// pair under the current unified-shard scheme.
+    fn unified_file_offset(&self, chunk_index: u64, offset_within_chunk: u64) -> u64 {
+        let shards = self.unified_shard_count();
+        let within_shard_idx = if shards <= 1 {
+            chunk_index
+        } else {
+            chunk_index / shards
+        };
+        within_shard_idx * self.chunk_size as u64 + offset_within_chunk
     }
 
     fn unified_layout_enabled(&self) -> bool {
-        // Read each call — cheap atomic env lookup. Could cache in a OnceLock
-        // if it shows up in profiles.
-        std::env::var("BENCHFS_CHUNK_LAYOUT")
-            .map(|v| v.eq_ignore_ascii_case("unified"))
-            .unwrap_or(false)
+        crate::runtime_config::RuntimeConfig::global()
+            .storage
+            .chunk_layout
+            .eq_ignore_ascii_case("unified")
     }
 
     /// Ensure the directory for a chunk exists (including shard subdirectory)
@@ -1671,14 +1748,17 @@ impl IOUringChunkStore {
     async fn get_or_open_unified_file(
         &self,
         file_path: &str,
+        chunk_index: u64,
         write: bool,
         use_direct: bool,
     ) -> ChunkStoreResult<(FileHandle, bool)> {
-        // Reuse the same fd_cache map; key by (path, 0) since there's only
-        // one file per path. When the cache is disabled (cap=0), still
-        // cache unified opens — they're capped at one per path which is
-        // tiny (≤32 for io500 ior-easy FPP).
-        let key = (file_path.to_string(), 0u64);
+        // Key by (path, shard, use_direct). With shards=1 this collapses to
+        // a single per-path entry like before; with shards > 1 each shard
+        // gets its own cached fd so concurrent writes to different shards
+        // don't contend on the same inode lock in the kernel page cache.
+        let shards = self.unified_shard_count();
+        let shard_idx = if shards <= 1 { 0 } else { chunk_index % shards };
+        let key = (file_path.to_string(), shard_idx, use_direct);
         {
             let cache = self.fd_cache.borrow();
             if let Some(&h) = cache.get(&key) {
@@ -1693,7 +1773,7 @@ impl IOUringChunkStore {
                 std::fs::create_dir_all(&dir)?;
             }
         }
-        let data_path = self.unified_data_path(file_path);
+        let data_path = self.unified_data_path(file_path, chunk_index);
         let flags = OpenFlags {
             read: true,
             write: true,
@@ -1703,9 +1783,32 @@ impl IOUringChunkStore {
             direct: use_direct,
         };
         let handle = self.backend.open(&data_path, flags).await?;
+        let mut evicted: Vec<FileHandle> = Vec::new();
         {
             let mut cache = self.fd_cache.borrow_mut();
-            cache.insert(key, handle);
+            let mut order = self.fd_cache_order.borrow_mut();
+            // Unified path caches even when cap=0 (≤1 fd per path), but
+            // when cap>0 we still respect the FIFO limit so unified +
+            // per-chunk entries don't exhaust fds together.
+            if self.fd_cache_cap > 0 {
+                while cache.len() >= self.fd_cache_cap {
+                    match order.pop_front() {
+                        Some(old) => {
+                            if let Some(h) = cache.remove(&old) {
+                                evicted.push(h);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            cache.insert(key.clone(), handle);
+            order.push_back(key);
+        }
+        for h in evicted {
+            if let Err(e) = self.backend.close(h).await {
+                tracing::warn!("Failed to close evicted unified fd: {:?}", e);
+            }
         }
         Ok((handle, true))
     }
@@ -1728,15 +1831,17 @@ impl IOUringChunkStore {
         use_direct: bool,
     ) -> ChunkStoreResult<(FileHandle, bool)> {
         if self.fd_cache_cap == 0 {
-            let h = self
+            // `open_chunk_file` itself returns (handle, cached). With
+            // fd_cache_cap=0 the cached flag is always false, but we
+            // still need to unpack the tuple correctly.
+            return self
                 .open_chunk_file(file_path, chunk_index, write, use_direct)
-                .await?;
-            return Ok((h, false));
+                .await;
         }
-        // Cache key is (path, chunk_index, use_direct) implicitly: we
-        // store only one flavor per (path, chunk). If a later call
-        // wants a different `use_direct` flag we bypass the cache.
-        let key = (file_path.to_string(), chunk_index);
+        // Cache key includes use_direct so an O_DIRECT entry cached from
+        // an aligned ior-easy phase doesn't get returned to an unaligned
+        // ior-hard 47 KiB request (which would EINVAL on submit).
+        let key = (file_path.to_string(), chunk_index, use_direct);
         {
             let cache = self.fd_cache.borrow();
             if let Some(&h) = cache.get(&key) {
@@ -1758,16 +1863,46 @@ impl IOUringChunkStore {
             direct: use_direct,
         };
         let handle = self.backend.open(&chunk_file_path, flags).await?;
+        // Pre-allocate the full chunk size on first open-for-write so
+        // strided 47 KiB ior-hard writes don't pay ext4 extent allocation
+        // on every first-write-to-offset. Best-effort (FALLOC_FL_KEEP_SIZE
+        // so the file's logical size stays where we'd otherwise set it).
+        // We only do this once per (path, chunk_index) — subsequent cache
+        // hits skip this path entirely.
+        if write {
+            let chunk_size = self.chunk_size as libc::off_t;
+            // SAFETY: handle.0 is a valid open fd from backend.open above.
+            let rc = unsafe { libc::fallocate(handle.0, libc::FALLOC_FL_KEEP_SIZE, 0, chunk_size) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                // Not fatal — write path will trigger allocation on demand.
+                tracing::trace!(
+                    "fallocate on chunk {} failed (non-fatal): {:?}",
+                    chunk_index,
+                    err
+                );
+            }
+        }
+        let mut evicted: Vec<FileHandle> = Vec::new();
         {
             let mut cache = self.fd_cache.borrow_mut();
-            if cache.len() < self.fd_cache_cap {
-                cache.insert(key, handle);
-                // VecDeque LRU bookkeeping is intentionally O(N) on touch;
-                // skipped here to keep the hot path branch-free. The cap
-                // is sized so we never need to evict in practice.
-            } else {
-                // Over cap — return the fd uncached. Caller will close.
-                return Ok((handle, false));
+            let mut order = self.fd_cache_order.borrow_mut();
+            while cache.len() >= self.fd_cache_cap {
+                match order.pop_front() {
+                    Some(old) => {
+                        if let Some(h) = cache.remove(&old) {
+                            evicted.push(h);
+                        }
+                    }
+                    None => break,
+                }
+            }
+            cache.insert(key.clone(), handle);
+            order.push_back(key);
+        }
+        for h in evicted {
+            if let Err(e) = self.backend.close(h).await {
+                tracing::warn!("Failed to close evicted fd: {:?}", e);
             }
         }
         Ok((handle, true))
@@ -1787,9 +1922,17 @@ impl IOUringChunkStore {
         chunk_index: u64,
         write: bool,
         use_direct: bool,
-    ) -> ChunkStoreResult<FileHandle> {
+    ) -> ChunkStoreResult<(FileHandle, bool)> {
         let open_start = std::time::Instant::now();
 
+        // NOTE: fd cache lookup was attempted here but caused EIO in
+        // mdtest-hard (iter56) — eviction closes a handle that an in-
+        // flight RPC task still holds. mdtest-hard touches each file
+        // exactly once during the write phase, so caching wouldn't help
+        // anyway: the dominant cost is the first-touch O_CREAT, not
+        // repeated opens. Read phase could benefit, but reusing the
+        // existing get_or_open_chunk_file path (which is unified-layout
+        // only) is the cleaner refactor.
         // Ensure shard directory exists (includes path_hash and shard subdirectory)
         if write {
             self.ensure_chunk_dir(file_path, chunk_index)?;
@@ -1831,7 +1974,7 @@ impl IOUringChunkStore {
             use_direct
         );
 
-        Ok(handle)
+        Ok((handle, false))
     }
 
     /// Write a chunk to file using io_uring
@@ -1862,23 +2005,77 @@ impl IOUringChunkStore {
         // still write at offset 0 (the metadata server's own writes), but
         // the bulk-data path no longer pays the header overhead and stays
         // raw-data-at-offset-0 like the 5/9 baseline (106 GiB/s).
-        let handle = self
-            .open_chunk_file(file_path, chunk_index, true, use_direct)
-            .await?;
+        let host = gethostname::gethostname()
+            .to_string_lossy()
+            .into_owned();
+        // Transient io_uring ENOMEM retry. iter77-84 showed
+        // `IORING_OP_WRITE_FIXED` CQE.res = -ENOMEM from kernel
+        // `io_rw_alloc_async` under high in-flight pressure (~1 in
+        // millions). locusta has no client-side retry so even one
+        // ENOMEM aborts IOR. Sleep+retry up to 3 times absorbs the
+        // transient.
+        let max_attempts: u32 = 3;
+        let mut attempt: u32 = 0;
+        let written = loop {
+            attempt += 1;
+            let (handle, cached) = match self
+                .open_chunk_file(file_path, chunk_index, true, use_direct)
+                .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!(
+                        "[{host}][chunk_store_fail] stage=OPEN attempt={attempt} path={} chunk={} offset={} len={} use_direct={} err={:?}",
+                        file_path, chunk_index, offset, bytes_to_write, use_direct, e
+                    );
+                    return Err(e);
+                }
+            };
 
-        let result = self
-            .backend
-            .write(handle, offset, &data[..bytes_to_write])
-            .await;
+            let result = self
+                .backend
+                .write(handle, offset, &data[..bytes_to_write])
+                .await;
 
-        // Close the file handle immediately (no caching)
-        if let Err(e) = self.backend.close(handle).await {
-            tracing::warn!("Failed to close chunk file after write: {:?}", e);
-        }
+            if !cached {
+                if let Err(e) = self.backend.close(handle).await {
+                    eprintln!(
+                        "[{host}][chunk_store_fail] stage=CLOSE path={} chunk={} err={:?}",
+                        file_path, chunk_index, e
+                    );
+                }
+            }
 
-        result?;
+            match result {
+                Ok(n) => break n,
+                Err(e) => {
+                    let is_enomem = matches!(
+                        &e,
+                        crate::storage::error::StorageError::IoError(io_err) if io_err.raw_os_error() == Some(libc::ENOMEM)
+                    );
+                    if is_enomem && attempt < max_attempts {
+                        eprintln!(
+                            "[{host}][chunk_store_fail] stage=WRITE ENOMEM attempt={attempt}/{max_attempts} path={} chunk={} offset={} len={} — retrying",
+                            file_path, chunk_index, offset, bytes_to_write
+                        );
+                        pluvio_timer::sleep(std::time::Duration::from_millis(
+                            1u64 << (attempt - 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    eprintln!(
+                        "[{host}][chunk_store_fail] stage=WRITE attempt={attempt}/{max_attempts} path={} chunk={} offset={} len={} use_direct={} cached={} err={:?}",
+                        file_path, chunk_index, offset, bytes_to_write, use_direct, cached, e
+                    );
+                    return Err(ChunkStoreError::IoError(std::io::Error::other(format!(
+                        "{e:?}"
+                    ))));
+                }
+            }
+        };
 
-        tracing::trace!("Wrote {} bytes", bytes_to_write);
+        tracing::trace!("Wrote {} bytes (attempts={})", written, attempt);
 
         Ok(bytes_to_write)
     }
@@ -1901,7 +2098,7 @@ impl IOUringChunkStore {
         // 144 GiB/s read benchmark relied on. Drop O_DIRECT only when the
         // request can't satisfy O_DIRECT alignment (ior-hard with 47008 B).
         let use_direct = Self::direct_io_aligned(offset, length);
-        let handle = self
+        let (handle, cached) = self
             .open_chunk_file(file_path, chunk_index, false, use_direct)
             .await?;
 
@@ -1909,9 +2106,10 @@ impl IOUringChunkStore {
         let mut buffer = vec![0u8; length as usize];
         let result = self.backend.read(handle, offset, &mut buffer).await;
 
-        // Close the file handle immediately (no caching)
-        if let Err(e) = self.backend.close(handle).await {
-            tracing::warn!("Failed to close chunk file after read: {:?}", e);
+        if !cached {
+            if let Err(e) = self.backend.close(handle).await {
+                tracing::warn!("Failed to close chunk file after read: {:?}", e);
+            }
         }
 
         let bytes_read = result?;
@@ -2087,7 +2285,9 @@ impl IOUringChunkStore {
     ///
     /// # Safety
     /// See [`IOUringBackend::write_via_registered`].
-    #[async_backtrace::framed]
+    // async_backtrace removed from hot path: 1-2µs per call thread-local
+    // push/pop on the ior-hard 47 KiB write path adds up at 320k RPC/s
+    // aggregate (job 20166). Keep on lower-frequency methods.
     pub async fn write_chunk_via_registered(
         &self,
         file_path: &str,
@@ -2102,12 +2302,21 @@ impl IOUringChunkStore {
         }
         let use_direct = Self::direct_io_aligned(offset, len as u64);
         let unified = self.unified_layout_enabled();
+
+        // mmap fast path for non-O_DIRECT chunks (ior-hard 47 KiB unaligned
+        // writes). Bypasses io_uring entirely; memcpy into MAP_SHARED region
+        // commits to page cache at memcpy speed (~2µs vs ~100µs).
+        if self.mmap_enabled && !use_direct && !unified {
+            return self
+                .write_chunk_via_mmap(file_path, chunk_index, offset, ptr, len)
+                .await;
+        }
         let open_start = std::time::Instant::now();
         let (handle, cached, file_offset) = if unified {
             let (h, c) = self
-                .get_or_open_unified_file(file_path, true, use_direct)
+                .get_or_open_unified_file(file_path, chunk_index, true, use_direct)
                 .await?;
-            (h, c, chunk_index * self.chunk_size as u64 + offset)
+            (h, c, self.unified_file_offset(chunk_index, offset))
         } else {
             let (h, c) = self
                 .get_or_open_chunk_file(file_path, chunk_index, true, use_direct)
@@ -2115,11 +2324,32 @@ impl IOUringChunkStore {
             (h, c, offset)
         };
         let open_us = open_start.elapsed().as_micros() as u64;
+        // Transient io_uring ENOMEM retry (see write_chunk).
         let write_start = std::time::Instant::now();
-        let result = self
-            .backend
-            .write_via_registered(handle, file_offset, ptr, len, buf_index)
-            .await;
+        let max_attempts: u32 = 3;
+        let mut attempt: u32 = 0;
+        let result = loop {
+            attempt += 1;
+            let r = self
+                .backend
+                .write_via_registered(handle, file_offset, ptr, len, buf_index)
+                .await;
+            let is_enomem = matches!(
+                &r,
+                Err(crate::storage::error::StorageError::IoError(io_err))
+                    if io_err.raw_os_error() == Some(libc::ENOMEM)
+            );
+            if is_enomem && attempt < max_attempts {
+                eprintln!(
+                    "[write_chunk_via_registered] WRITE ENOMEM attempt={attempt}/{max_attempts} path={} chunk={} offset={} len={} — retrying",
+                    file_path, chunk_index, offset, len
+                );
+                pluvio_timer::sleep(std::time::Duration::from_millis(1u64 << (attempt - 1)))
+                    .await;
+                continue;
+            }
+            break r;
+        };
         let write_us = write_start.elapsed().as_micros() as u64;
         let close_start = std::time::Instant::now();
         if !cached {
@@ -2153,9 +2383,134 @@ impl IOUringChunkStore {
         )
     }
 
+    /// mmap fast-path write. Skips io_uring entirely — memcpy from the
+    /// caller's registered buffer directly into a MAP_SHARED page-cache
+    /// region. For ior-hard's random 47 KiB writes this is ~50× faster
+    /// than `write_via_registered` (memcpy 47 KiB ≈ 2µs vs io_uring's
+    /// ~100µs NVMe-bound floor). Data is durable at fsync / munmap time;
+    /// io500 ior-hard tolerates that since it fsyncs at close.
+    async fn write_chunk_via_mmap(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        offset: u64,
+        ptr: *const u8,
+        len: u32,
+    ) -> ChunkStoreResult<usize> {
+        let key = (file_path.to_string(), chunk_index);
+        // Cache lookup
+        let entry_opt = {
+            let cache = self.mmap_cache.borrow();
+            cache.get(&key).copied()
+        };
+        let entry = match entry_opt {
+            Some(e) => e,
+            None => self.get_or_mmap_chunk(file_path, chunk_index, &key).await?,
+        };
+        if (offset as usize)
+            .checked_add(len as usize)
+            .map(|e| e > entry.len)
+            .unwrap_or(true)
+        {
+            return Err(ChunkStoreError::InvalidOffset(offset));
+        }
+        // SAFETY: entry.ptr came from a successful mmap of `entry.len` bytes
+        // and is alive until munmap on eviction. The cache holds it, so it's
+        // alive across this synchronous memcpy. `ptr` is the caller's
+        // registered DMA buffer, valid for the duration of this future.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, entry.ptr.add(offset as usize), len as usize);
+        }
+        Ok(len as usize)
+    }
+
+    /// Open + mmap a chunk file. Caller-owned (no fd_cache sharing) so
+    /// eviction can safely munmap+close without affecting the io_uring
+    /// fd_cache. Inserts into `mmap_cache` with FIFO eviction.
+    async fn get_or_mmap_chunk(
+        &self,
+        file_path: &str,
+        chunk_index: u64,
+        key: &(String, u64),
+    ) -> ChunkStoreResult<MmapEntry> {
+        self.ensure_chunk_dir(file_path, chunk_index)?;
+        let chunk_file_path = self.chunk_path(file_path, chunk_index);
+        let c_path = std::ffi::CString::new(chunk_file_path.as_os_str().as_encoded_bytes())
+            .map_err(|_| {
+                ChunkStoreError::IoError(std::io::Error::other("path contains nul byte"))
+            })?;
+        // O_RDWR | O_CREAT, no O_DIRECT (mmap requires page cache).
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT,
+                0o644 as libc::mode_t,
+            )
+        };
+        if fd < 0 {
+            return Err(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+        }
+        let chunk_size = self.chunk_size;
+        // Pre-allocate so mmap covers a fully-backed range.
+        let rc = unsafe { libc::fallocate(fd, 0, 0, chunk_size as libc::off_t) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(ChunkStoreError::IoError(err));
+        }
+        let mmap_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                chunk_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if mmap_ptr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(ChunkStoreError::IoError(err));
+        }
+        let entry = MmapEntry {
+            fd,
+            ptr: mmap_ptr as *mut u8,
+            len: chunk_size,
+        };
+        // FIFO insert + evict.
+        let mut to_evict: Vec<MmapEntry> = Vec::new();
+        {
+            let mut cache = self.mmap_cache.borrow_mut();
+            let mut order = self.mmap_cache_order.borrow_mut();
+            while cache.len() >= self.fd_cache_cap.max(1) {
+                match order.pop_front() {
+                    Some(k) => {
+                        if let Some(e) = cache.remove(&k) {
+                            to_evict.push(e);
+                        }
+                    }
+                    None => break,
+                }
+            }
+            cache.insert(key.clone(), entry);
+            order.push_back(key.clone());
+        }
+        for e in to_evict {
+            unsafe {
+                // Async msync would be ideal but blocks single-thread executor.
+                // Skip explicit msync; kernel flushes dirty pages on close
+                // and on memory pressure. fsync at file-close time handles
+                // durability.
+                libc::munmap(e.ptr as *mut libc::c_void, e.len);
+                libc::close(e.fd);
+            }
+        }
+        Ok(entry)
+    }
+
     /// Zero-copy read into an externally-owned registered buffer.
     /// See [`write_chunk_via_registered`] for safety constraints.
-    #[async_backtrace::framed]
     pub async fn read_chunk_via_registered(
         &self,
         file_path: &str,
@@ -2172,9 +2527,9 @@ impl IOUringChunkStore {
         let unified = self.unified_layout_enabled();
         let (handle, cached, file_offset) = if unified {
             let (h, c) = self
-                .get_or_open_unified_file(file_path, false, use_direct)
+                .get_or_open_unified_file(file_path, chunk_index, false, use_direct)
                 .await?;
-            (h, c, chunk_index * self.chunk_size as u64 + offset)
+            (h, c, self.unified_file_offset(chunk_index, offset))
         } else {
             let (h, c) = self
                 .get_or_open_chunk_file(file_path, chunk_index, false, use_direct)
@@ -2222,7 +2577,7 @@ impl IOUringChunkStore {
 
         // Restored 5/9 layout (see write_chunk above).
         let open_start = std::time::Instant::now();
-        let handle = self
+        let (handle, cached) = self
             .open_chunk_file(file_path, chunk_index, true, use_direct)
             .await?;
         let open_elapsed = open_start.elapsed();
@@ -2236,10 +2591,11 @@ impl IOUringChunkStore {
             .await;
         let write_elapsed = write_start.elapsed();
 
-        // Close the file handle immediately (no caching)
         let close_start = std::time::Instant::now();
-        if let Err(e) = self.backend.close(handle).await {
-            tracing::warn!("Failed to close chunk file after write_fixed: {:?}", e);
+        if !cached {
+            if let Err(e) = self.backend.close(handle).await {
+                tracing::warn!("Failed to close chunk file after write_fixed: {:?}", e);
+            }
         }
         let close_elapsed = close_start.elapsed();
 
@@ -2308,14 +2664,14 @@ impl IOUringChunkStore {
         let open_start = std::time::Instant::now();
         let (handle, cached, file_offset) = if unified {
             let (h, c) = self
-                .get_or_open_unified_file(file_path, false, use_direct)
+                .get_or_open_unified_file(file_path, chunk_index, false, use_direct)
                 .await?;
-            (h, c, chunk_index * self.chunk_size as u64 + offset)
+            (h, c, self.unified_file_offset(chunk_index, offset))
         } else {
-            let h = self
+            let (h, c) = self
                 .open_chunk_file(file_path, chunk_index, false, use_direct)
                 .await?;
-            (h, false, offset)
+            (h, c, offset)
         };
         let open_elapsed = open_start.elapsed();
 

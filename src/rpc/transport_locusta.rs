@@ -41,11 +41,26 @@ use crate::rpc::RpcError;
 use crate::rpc::locusta_buffer::{RegisteredFixedBuffer, register_with_pd};
 use crate::rpc::transport::{NodeId, RpcResponse, RpcTransport};
 use crate::rpc::udp_handshake::{
-    self, ExchangePacket, MSG_REQUEST, MSG_RESPONSE, PACKET_SIZE,
+    self, ExchangePacket, MSG_ACK, MSG_REQUEST, MSG_RESPONSE, PACKET_SIZE,
 };
 
 const QP_INFO_SIZE: usize = std::mem::size_of::<QpExchangeInfo>();
 const _: () = assert!(QP_INFO_SIZE == 64);
+
+/// Whether the pluvio Reactor is the sole driver of `LocustaInner::tick()`.
+///
+/// Sourced from `RuntimeConfig::global().locusta.reactor_mode`. When enabled:
+///   * `LocustaTransport` is registered as a pluvio `Reactor` and its
+///     `poll()` calls `inner.tick()` each runtime tick.
+///   * `WaitForResponse::poll` skips its own `inner.tick()` to avoid
+///     double-ticking the same state machines from two borrows.
+///   * The server-side dispatch task uses `drain_and_spawn` (no tick)
+///     instead of `poll_once_spawn`.
+pub fn reactor_mode_enabled() -> bool {
+    crate::runtime_config::RuntimeConfig::global()
+        .locusta
+        .reactor_mode
+}
 
 /// Inner state held behind a `Rc<RefCell<...>>` so async futures can
 /// reach into it from poll-time.
@@ -189,15 +204,11 @@ impl LocustaInner {
             .checked_add(1)
             .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
 
-        let recv_ring_size: u32 = std::env::var("BENCHFS_LOCUSTA_RECV_RING_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64 * 1024);
-        let send_buf_size: u32 = std::env::var("BENCHFS_LOCUSTA_SEND_BUF_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64 * 1024);
-
+        // Tuning comes from [locusta] section in benchfs.toml.
+        let rc = crate::runtime_config::RuntimeConfig::global();
+        let recv_ring_size = rc.locusta.recv_ring_size;
+        let send_buf_size = rc.locusta.send_buf_size;
+        let max_inflight = rc.locusta.max_inflight;
         let server_local = self
             .server
             .prepare_peer(
@@ -205,7 +216,7 @@ impl LocustaInner {
                 recv_ring_size,
                 send_buf_size,
                 512,
-                4096,
+                max_inflight,
                 &self.qp_config,
             )
             .map_err(|e| {
@@ -228,28 +239,42 @@ impl LocustaInner {
         };
         let request_bytes = request.encode();
 
-        // Per-attempt UDP recv timeout. Shorter than the overall
-        // deadline so a dropped packet doesn't burn the full budget.
-        let recv_timeout = Duration::from_millis(500);
+        // Per-attempt UDP recv timeout. Starts at 500 ms (matches
+        // typical UDP round-trip + server QP setup) and grows
+        // exponentially after each retransmit, capped at 8 s. At
+        // 10 phys × ppn=8 = 6400 inbound REQUESTs per server, a
+        // fixed 500 ms retransmit makes 80 clients send 12 800
+        // pkt/s into a single server that can only drain ~100-1000
+        // QP-setups/s, so the kernel UDP rcvbuf overflows and the
+        // storm self-amplifies (job 20492-class). Exponential
+        // backoff caps the steady-state ingress while still letting
+        // a single dropped packet recover in ≤1 s.
+        let initial_recv_timeout = Duration::from_millis(500);
+        const MAX_RECV_TIMEOUT: Duration = Duration::from_secs(8);
         self.udp_socket
-            .set_read_timeout(Some(recv_timeout))
+            .set_read_timeout(Some(initial_recv_timeout))
             .map_err(|e| RpcError::ConnectionError(format!("set_read_timeout: {e}")))?;
 
         // Send REQUEST and wait for the matching RESPONSE. While
         // waiting we also service incoming REQUESTs (server-to-server
         // setups may have peers handshaking us concurrently). A lost
         // datagram retransmits on `recv_timeout`.
+        let mut recv_timeout = initial_recv_timeout;
         let mut last_send = Instant::now() - recv_timeout;
         let response = loop {
             if last_send.elapsed() >= recv_timeout {
                 self.udp_socket
                     .send_to(&request_bytes, peer_addr)
                     .map_err(|e| {
-                        RpcError::ConnectionError(format!(
-                            "send_to({peer_addr}, {peer}): {e}"
-                        ))
+                        RpcError::ConnectionError(format!("send_to({peer_addr}, {peer}): {e}"))
                     })?;
                 last_send = Instant::now();
+                // Double the backoff for the next attempt, capped at
+                // MAX_RECV_TIMEOUT. Also reflect it into the socket
+                // so recv_from blocks at most that long before we
+                // re-decide to retransmit.
+                recv_timeout = std::cmp::min(recv_timeout * 2, MAX_RECV_TIMEOUT);
+                let _ = self.udp_socket.set_read_timeout(Some(recv_timeout));
             }
             let mut buf = [0u8; PACKET_SIZE];
             match self.udp_socket.recv_from(&mut buf) {
@@ -275,13 +300,39 @@ impl LocustaInner {
                         // equal `peer_addr`. The node_id in the packet
                         // identifies the sender unambiguously.
                         MSG_RESPONSE if pkt.node_id == peer => break pkt,
+                        MSG_ACK if pkt.node_id == peer => {
+                            // Server says "REQUEST received, QP setup
+                            // in progress". Don't retransmit — bump the
+                            // next-send deadline well past any plausible
+                            // QP setup time. `recv_from` keeps blocking
+                            // on `recv_timeout`, so we still get the
+                            // eventual RESPONSE.
+                            last_send = Instant::now() + Duration::from_secs(30);
+                            tracing::debug!("udp ACK from {peer}; suppressing retransmits");
+                            continue;
+                        }
                         MSG_REQUEST => {
                             // Inline-accept an unsolicited request from
                             // another peer so we don't drop it.
                             self.peer_udp_addrs.insert(pkt.node_id.clone(), from_v4);
-                            if let Err(e) =
-                                self.accept_request_inline(pkt, from_v4)
-                            {
+                            // Send ACK immediately to suppress the other
+                            // peer's retransmits (same logic as the
+                            // server-accept path in handle_one_udp_request).
+                            let ack = ExchangePacket {
+                                msg_type: MSG_ACK,
+                                relay_qp: unsafe { std::mem::zeroed() },
+                                server_qp: unsafe { std::mem::zeroed() },
+                                node_id: self.local_node_id.clone(),
+                            };
+                            let ack_bytes = ack.encode();
+                            if let Err(e) = self.udp_socket.send_to(&ack_bytes, from_v4) {
+                                tracing::warn!(
+                                    "ack send to {} ({}) failed: {e}",
+                                    pkt.node_id,
+                                    from_v4
+                                );
+                            }
+                            if let Err(e) = self.accept_request_inline(pkt, from_v4) {
                                 tracing::warn!("inline accept failed: {e:?}");
                             }
                             continue;
@@ -341,9 +392,7 @@ impl LocustaInner {
             return Ok(cached);
         }
         let addr = udp_handshake::read_peer_udp_addr(&self.registry_dir, peer, deadline)
-            .map_err(|e| {
-                RpcError::ConnectionError(format!("read_peer_udp_addr({peer}): {e}"))
-            })?;
+            .map_err(|e| RpcError::ConnectionError(format!("read_peer_udp_addr({peer}): {e}")))?;
         self.peer_udp_addrs.insert(peer.to_string(), addr);
         Ok(addr)
     }
@@ -409,6 +458,23 @@ impl LocustaInner {
             }
             return Ok(None);
         }
+        // Send ACK immediately — before the slow QP-setup work in
+        // `accept_request_inline` — so the client's retransmit timer
+        // stalls during the seconds we may take to finish prepare/
+        // connect. At 10 phys × ppn=8 = 80 inbound REQUESTs per server
+        // tick, even with exponential backoff the kernel UDP queue
+        // grows uncomfortably; an ACK is a 201 B reply we can fire in
+        // microseconds.
+        let ack = ExchangePacket {
+            msg_type: MSG_ACK,
+            relay_qp: unsafe { std::mem::zeroed() },
+            server_qp: unsafe { std::mem::zeroed() },
+            node_id: self.local_node_id.clone(),
+        };
+        let ack_bytes = ack.encode();
+        if let Err(e) = self.udp_socket.send_to(&ack_bytes, from_v4) {
+            tracing::warn!("ack send to {peer} ({from_v4}) failed: {e}");
+        }
         self.accept_request_inline(pkt, from_v4)?;
         Ok(Some(peer))
     }
@@ -446,15 +512,11 @@ impl LocustaInner {
             .checked_add(1)
             .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
 
-        let recv_ring_size: u32 = std::env::var("BENCHFS_LOCUSTA_RECV_RING_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64 * 1024);
-        let send_buf_size: u32 = std::env::var("BENCHFS_LOCUSTA_SEND_BUF_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64 * 1024);
-
+        // Tuning comes from [locusta] section in benchfs.toml.
+        let rc = crate::runtime_config::RuntimeConfig::global();
+        let recv_ring_size = rc.locusta.recv_ring_size;
+        let send_buf_size = rc.locusta.send_buf_size;
+        let max_inflight = rc.locusta.max_inflight;
         let server_local = self
             .server
             .prepare_peer(
@@ -462,7 +524,7 @@ impl LocustaInner {
                 recv_ring_size,
                 send_buf_size,
                 512,
-                4096,
+                max_inflight,
                 &self.qp_config,
             )
             .map_err(|e| {
@@ -472,9 +534,7 @@ impl LocustaInner {
             .daemon
             .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
             .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "daemon.prepare_destination({dest_id}): {e:?}"
-                ))
+                RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
             })?;
 
         self.server
@@ -485,9 +545,7 @@ impl LocustaInner {
         self.daemon
             .connect_destination(dest_id, &request.server_qp)
             .map_err(|e| {
-                RpcError::ConnectionError(format!(
-                    "daemon.connect_destination({dest_id}): {e:?}"
-                ))
+                RpcError::ConnectionError(format!("daemon.connect_destination({dest_id}): {e:?}"))
             })?;
 
         let response = ExchangePacket {
@@ -499,9 +557,7 @@ impl LocustaInner {
         let response_bytes = response.encode();
         self.udp_socket
             .send_to(&response_bytes, from_v4)
-            .map_err(|e| {
-                RpcError::ConnectionError(format!("send_to({from_v4}, response): {e}"))
-            })?;
+            .map_err(|e| RpcError::ConnectionError(format!("send_to({from_v4}, response): {e}")))?;
 
         self.node_to_dest.insert(peer.clone(), dest_id);
         self.cached_responses
@@ -616,45 +672,40 @@ fn open_mlx5_device() -> Result<mlx5::device::Context, RpcError> {
         ));
     }
     let available: Vec<String> = device_list.iter().map(|d| d.name()).collect();
-    let want_name = std::env::var("BENCHFS_MLX5_DEVICE").ok();
-    let want_index = std::env::var("BENCHFS_MLX5_DEVICE_INDEX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
+    let rc = crate::runtime_config::RuntimeConfig::global();
+    let want_name = rc.locusta.mlx5_device.clone();
+    let want_index = rc.locusta.mlx5_device_index.map(|v| v as usize);
 
     if let Some(name) = want_name.as_deref() {
         for device in device_list.iter() {
             if device.name() == name {
-                let ctx = device.open().map_err(|e| {
-                    RpcError::ConnectionError(format!("open device {name}: {e:?}"))
-                })?;
-                eprintln!("[locusta] selected mlx5 device {name} (env BENCHFS_MLX5_DEVICE)");
+                let ctx = device
+                    .open()
+                    .map_err(|e| RpcError::ConnectionError(format!("open device {name}: {e:?}")))?;
+                eprintln!("[locusta] selected mlx5 device {name} (locusta.mlx5_device)");
                 return Ok(ctx);
             }
         }
         return Err(RpcError::ConnectionError(format!(
-            "BENCHFS_MLX5_DEVICE={name} not found; available: {available:?}"
+            "locusta.mlx5_device={name} not found; available: {available:?}"
         )));
     }
 
     if let Some(idx) = want_index {
         let device = device_list.get(idx).ok_or_else(|| {
             RpcError::ConnectionError(format!(
-                "BENCHFS_MLX5_DEVICE_INDEX={idx} out of range; available: {available:?}"
+                "locusta.mlx5_device_index={idx} out of range; available: {available:?}"
             ))
         })?;
         let name = device.name();
         let ctx = device.open().map_err(|e| {
             RpcError::ConnectionError(format!("open device idx={idx} ({name}): {e:?}"))
         })?;
-        eprintln!(
-            "[locusta] selected mlx5 device {name} (env BENCHFS_MLX5_DEVICE_INDEX={idx})"
-        );
+        eprintln!("[locusta] selected mlx5 device {name} (locusta.mlx5_device_index={idx})");
         return Ok(ctx);
     }
 
-    let auto_spread = std::env::var("BENCHFS_MLX5_AUTO_SPREAD")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    let auto_spread = rc.locusta.mlx5_auto_spread;
     if auto_spread {
         if let Some(local_rank) = std::env::var("OMPI_COMM_WORLD_LOCAL_RANK")
             .ok()
@@ -921,13 +972,10 @@ impl LocustaTransport {
         // connect to us via this socket for the QP-info handshake,
         // replacing the previous Lustre file-polling protocol that
         // doesn't scale on Sirius (job 18060 hit 4213 read timeouts).
-        let (udp_socket, local_udp_addr) = udp_handshake::bind_udp_socket().map_err(|e| {
-            RpcError::ConnectionError(format!("bind udp socket: {e}"))
-        })?;
+        let (udp_socket, local_udp_addr) = udp_handshake::bind_udp_socket()
+            .map_err(|e| RpcError::ConnectionError(format!("bind udp socket: {e}")))?;
         udp_handshake::publish_udp_addr(&cfg.registry_dir, &cfg.local_node_id, local_udp_addr)
-            .map_err(|e| {
-                RpcError::ConnectionError(format!("publish_udp_addr: {e}"))
-            })?;
+            .map_err(|e| RpcError::ConnectionError(format!("publish_udp_addr: {e}")))?;
         tracing::info!(
             "locusta UDP control-plane: {} → {}",
             cfg.local_node_id,
@@ -1071,10 +1119,7 @@ impl LocustaTransport {
     /// The returned `DmaBuffer` is RDMA-registered and can be used directly
     /// as the target of `send_get_with_buffer` (zero-copy read) or the
     /// source of `send_put_with_buffer` (zero-copy write).
-    pub fn arena_alloc(
-        &self,
-        size: u32,
-    ) -> Option<rrrpc::relay::client::DmaBuffer> {
+    pub fn arena_alloc(&self, size: u32) -> Option<rrrpc::relay::client::DmaBuffer> {
         let mut inner = self.inner.borrow_mut();
         inner.client.alloc(size)
     }
@@ -1110,23 +1155,56 @@ impl LocustaTransport {
         };
         let response = self.wait_for(completion_id).await?;
         let dma_len = match &response {
-            rrrpc::relay::client::Response::DmaAndSmallRes { dma_len, .. } => {
-                *dma_len as usize
-            }
+            rrrpc::relay::client::Response::DmaAndSmallRes { dma_len, .. } => *dma_len as usize,
             rrrpc::relay::client::Response::SmallRes { .. } => 0,
         };
-        let header_bytes = match response.small_res_data() {
-            rrrpc::relay::client::SmallResData::Inline { buf, len } => {
-                buf.0[..*len as usize].to_vec()
-            }
-            rrrpc::relay::client::SmallResData::Buffered { len, .. } => {
-                vec![0u8; *len as usize]
-            }
+        let header_bytes = {
+            let inner = self.inner.borrow();
+            copy_small_res_data(&inner, response.small_res_data())
         };
         Ok(RpcResponse {
             header_bytes,
             data_len: dma_len,
         })
+    }
+
+    /// Zero-copy variant of `send_put` — the caller-provided `dma_buf`
+    /// (already in the locusta arena, RDMA-registered) is RDMA-written
+    /// directly to the server. Skips the alloc + memcpy on the hot path
+    /// (job 20146 timing: `alloc_us` ≈ 95 µs/4 MiB = ~42 GB/s memcpy
+    /// bottleneck for write).
+    pub async fn send_put_with_buffer<'a>(
+        &'a self,
+        dest: &'a NodeId,
+        rpc_id: u16,
+        parts: &'a [std::io::IoSlice<'a>],
+        dma_buf: &'a rrrpc::relay::client::DmaBuffer,
+    ) -> Result<RpcResponse, RpcError> {
+        let dest_id = self.lookup_dest(dest)?;
+        let completion_id = {
+            let mut inner = self.inner.borrow_mut();
+            let small_req = stage_small_req(&mut inner, rpc_id, parts);
+            let small_req_slice =
+                unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
+            let (id, fut) = {
+                let mut batch = inner.client.batch();
+                let fut = batch
+                    .call_put(dest_id, small_req_slice, dma_buf)
+                    .map_err(|e| {
+                        RpcError::TransportError(format!("call_put (zero-copy): {e:?}"))
+                    })?;
+                let id = fut.req_id();
+                (id, fut)
+            };
+            inner.inflight.insert(id, fut);
+            id
+        };
+        let response = self.wait_for(completion_id).await?;
+        let header_bytes = {
+            let inner = self.inner.borrow();
+            copy_small_res_data(&inner, response.small_res_data())
+        };
+        Ok(RpcResponse::header_only(header_bytes))
     }
 }
 
@@ -1183,7 +1261,14 @@ impl std::future::Future for WaitForResponse {
             None
         };
         let mut inner = self.inner.borrow_mut();
-        inner.tick();
+        // In reactor mode the pluvio Reactor is the sole tick driver, so
+        // skip it here to avoid double-ticking the same locusta state
+        // machines from two distinct borrows. The reactor's poll() runs
+        // every `reactor_poll_interval` runtime iterations (= 2 with the
+        // locusta profile), so completions become visible quickly.
+        if !reactor_mode_enabled() {
+            inner.tick();
+        }
         if let Some(resp) = inner.try_take(self.completion_id) {
             if stats {
                 LAST_WAIT_FOR_PENDING.with(|c| c.set(None));
@@ -1276,7 +1361,9 @@ pub fn extract_rpc_id(small_req: &[u8]) -> Option<(u16, &[u8])> {
 /// the host has them) plug in here.
 #[inline(always)]
 unsafe fn prefetched_memcpy(dst: *mut u8, src: *const u8, len: usize) {
-    unsafe { std::ptr::copy_nonoverlapping(src, dst, len); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+    }
 }
 
 fn stage_small_req<'b>(
@@ -1296,21 +1383,81 @@ fn stage_small_req<'b>(
     &inner.small_req_scratch
 }
 
-/// Register `LocustaTransport` as a pluvio reactor: each runtime tick
-/// will call `inner.tick()`. This makes the runtime see locusta as
-/// "making progress" so the 1M-iteration stuck watchdog doesn't fire
-/// while a long DMA RPC is in flight, and removes the need for
-/// `WaitForResponse` to busy-poll inline.
+/// Copy a small-response payload out of locusta into an owned `Vec<u8>`.
+///
+/// Inline responses (≤52 B) are embedded in the completion slot. Buffered
+/// responses live in the client's DMA arena at `(offset, len)`; the lease
+/// is held inside `data` (the `_buffer` field of `SmallResData::Buffered`)
+/// so the arena slot stays valid for the duration of this call.
+///
+/// 以前は Buffered パスでゼロを返していたため、readdir のように >52B
+/// になるレスポンスが空読みされて pfind が無限ループする不具合があった。
+fn copy_small_res_data(inner: &LocustaInner, data: &rrrpc::relay::client::SmallResData) -> Vec<u8> {
+    match data {
+        rrrpc::relay::client::SmallResData::Inline { buf, len } => buf.0[..*len as usize].to_vec(),
+        rrrpc::relay::client::SmallResData::Buffered { offset, len, .. } => unsafe {
+            std::slice::from_raw_parts(inner.client.arena.ptr(*offset), *len as usize).to_vec()
+        },
+    }
+}
+
+/// Pluvio Reactor impl. In reactor mode (`BENCHFS_LOCUSTA_REACTOR=1`)
+/// this is the **sole** driver of `LocustaInner::tick()`:
+/// `WaitForResponse::poll` and the server-side dispatch task both skip
+/// their own ticks. That avoids the try_borrow_mut race that surfaced
+/// in jobs 17035/17038 when two tick paths fought over the same
+/// RefCell. In legacy mode (env unset) the reactor is not registered;
+/// `WaitForResponse` and the dispatch task tick locusta themselves.
+///
+/// `status()` is `Running` iff there is observable in-flight work
+/// (outstanding client RPCs). The server side cannot reliably peek
+/// for incoming requests without polling, so we keep `Running` while
+/// any client RPC is open OR until we've polled at least once with no
+/// outstanding work — see the `last_observed_progress` flag.
 impl pluvio_runtime::reactor::Reactor for LocustaTransport {
     fn poll(&self) {
-        // try_borrow_mut so we don't panic if a future is currently
-        // holding the inner borrow (it will tick on its own anyway).
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+        // `borrow_mut` (not try_) is correct here because in reactor
+        // mode we guarantee no other tick caller. If reactor mode is
+        // off but the impl is somehow still being polled (no production
+        // path does this today), fall back to try_borrow_mut to keep
+        // backward-compatible.
+        if reactor_mode_enabled() {
+            let mut inner = self.inner.borrow_mut();
+            inner.tick();
+        } else if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner.tick();
         }
     }
     fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
-        pluvio_runtime::reactor::ReactorStatus::Running
+        // In legacy mode we keep the "always Running" behaviour so the
+        // pluvio idle-park watchdog never trips.
+        if !reactor_mode_enabled() {
+            return pluvio_runtime::reactor::ReactorStatus::Running;
+        }
+        // Reactor mode: ask cheaply whether we have anything to do.
+        // `try_borrow` lets us skip a status answer that would race the
+        // tick path; pluvio caches status() for `status_cache_iterations`
+        // (default 100) ticks, so a momentary Running answer is harmless.
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                if !inner.inflight.is_empty() {
+                    pluvio_runtime::reactor::ReactorStatus::Running
+                } else {
+                    // No client-side work pending. We cannot peek into
+                    // the server's ready queue without polling, so we
+                    // stay Running on the server side (always-on
+                    // benchfsd) but Stopped on the client side (FFI/
+                    // pfind), distinguished by whether server_buffer_
+                    // allocator is present.
+                    if inner.server_buffer_allocator.is_some() {
+                        pluvio_runtime::reactor::ReactorStatus::Running
+                    } else {
+                        pluvio_runtime::reactor::ReactorStatus::Stopped
+                    }
+                }
+            }
+            Err(_) => pluvio_runtime::reactor::ReactorStatus::Running,
+        }
     }
 }
 
@@ -1346,16 +1493,9 @@ impl RpcTransport for LocustaTransport {
                 id
             };
             let response = self.wait_for(completion_id).await?;
-            let header_bytes = match response.small_res_data() {
-                rrrpc::relay::client::SmallResData::Inline { buf, len } => {
-                    buf.0[..*len as usize].to_vec()
-                }
-                rrrpc::relay::client::SmallResData::Buffered { len, .. } => {
-                    // For Phase 1 we don't expose the buffered slot's
-                    // contents (would require holding the lease alive).
-                    // Eager paths in BenchFS use ≤52B inline.
-                    vec![0u8; *len as usize]
-                }
+            let header_bytes = {
+                let inner = self.inner.borrow();
+                copy_small_res_data(&inner, response.small_res_data())
             };
             Ok(RpcResponse::header_only(header_bytes))
         }
@@ -1423,13 +1563,9 @@ impl RpcTransport for LocustaTransport {
                 }
             }
 
-            let header_bytes = match response.small_res_data() {
-                rrrpc::relay::client::SmallResData::Inline { buf, len } => {
-                    buf.0[..*len as usize].to_vec()
-                }
-                rrrpc::relay::client::SmallResData::Buffered { len, .. } => {
-                    vec![0u8; *len as usize]
-                }
+            let header_bytes = {
+                let inner = self.inner.borrow();
+                copy_small_res_data(&inner, response.small_res_data())
             };
             Ok(RpcResponse::header_only(header_bytes))
         }
@@ -1497,17 +1633,16 @@ impl RpcTransport for LocustaTransport {
             // these bytes immediately afterwards, so a small amount of
             // prefetch-back-into-cache is fine).
             //
-            // EXPERIMENT knob: BENCHFS_SKIP_RECV_COPY=1 skips the memcpy
-            // entirely to derive the network/disk-only upper bound (data
-            // is invalid; IOR `-R` will fail).
+            // EXPERIMENT knob: `[locusta] skip_recv_copy = true` skips
+            // the memcpy entirely to derive the network/disk-only upper
+            // bound (data is invalid; IOR `-R` will fail).
             let t_copy_start = std::time::Instant::now();
-            if std::env::var("BENCHFS_SKIP_RECV_COPY").as_deref() != Ok("1") {
+            if !crate::runtime_config::RuntimeConfig::global()
+                .locusta
+                .skip_recv_copy
+            {
                 unsafe {
-                    prefetched_memcpy(
-                        recv.as_mut_ptr(),
-                        dma_buf.as_slice().as_ptr(),
-                        dma_len,
-                    );
+                    prefetched_memcpy(recv.as_mut_ptr(), dma_buf.as_slice().as_ptr(), dma_len);
                 }
             }
             let t_copy = t_copy_start.elapsed().as_micros() as u64;
@@ -1531,13 +1666,9 @@ impl RpcTransport for LocustaTransport {
                 }
             }
 
-            let header_bytes = match response.small_res_data() {
-                rrrpc::relay::client::SmallResData::Inline { buf, len } => {
-                    buf.0[..*len as usize].to_vec()
-                }
-                rrrpc::relay::client::SmallResData::Buffered { len, .. } => {
-                    vec![0u8; *len as usize]
-                }
+            let header_bytes = {
+                let inner = self.inner.borrow();
+                copy_small_res_data(&inner, response.small_res_data())
             };
             Ok(RpcResponse {
                 header_bytes,

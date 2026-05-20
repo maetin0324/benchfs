@@ -148,65 +148,8 @@ pub fn init_with_hostname(level: &str) {
 /// This guard must be kept alive for the duration of tracing.
 /// The trace file will be flushed when this guard is dropped.
 pub enum TraceGuard {
-    /// Guard for Perfetto format traces
-    Perfetto,
     /// Guard for Chrome trace format (holds the FlushGuard)
     Chrome(tracing_chrome::FlushGuard),
-}
-
-/// Perfetto tracing guard (legacy alias)
-pub type PerfettoGuard = TraceGuard;
-
-/// Initialize tracing with native Perfetto trace format output for performance analysis
-///
-/// This function sets up both console logging (with hostname prefix) and
-/// Perfetto trace file output (.pftrace format) with task-level track support.
-/// Each spawned task (when using runtime with `enable_perfetto_tracks`) will
-/// appear on a separate track in the Perfetto UI.
-///
-/// # Arguments
-/// * `level` - Log level filter (e.g., "info", "debug", "trace")
-/// * `trace_path` - Path to the output trace file (.pftrace extension recommended)
-///
-/// # Returns
-/// A `TraceGuard` that must be kept alive for tracing to work
-pub fn init_with_perfetto(level: &str, trace_path: &std::path::Path) -> TraceGuard {
-    use crate::perfetto::TaskPerfettoLayer;
-    use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-
-    // Console output layer with hostname formatter
-    let fmt_layer = fmt::layer()
-        .event_format(HostnameFormatter::new())
-        .with_writer(std::io::stdout);
-
-    // Create the trace output file
-    let trace_file = std::fs::File::create(trace_path)
-        .unwrap_or_else(|e| panic!("Failed to create trace file {:?}: {}", trace_path, e));
-
-    // Use our custom TaskPerfettoLayer with track ID integration
-    let perfetto_layer =
-        TaskPerfettoLayer::new(std::sync::Mutex::new(trace_file)).with_debug_annotations(true);
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer)
-        .with(perfetto_layer)
-        .init();
-
-    let hostname_os = gethostname::gethostname();
-    let hostname = hostname_os.to_str().unwrap_or("unknown");
-    tracing::info!(
-        "Logging initialized on host: {} with Perfetto trace output (task-level tracks): {}",
-        hostname,
-        trace_path.display()
-    );
-
-    TraceGuard::Perfetto
 }
 
 /// Initialize tracing with Chrome trace format output for performance analysis

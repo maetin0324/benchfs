@@ -8,8 +8,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use pluvio_timer::Delay;
 use pluvio_runtime::spawn_with_name;
+use pluvio_timer::Delay;
 use tracing::instrument;
 
 use crate::api::types::{ApiError, ApiResult, FileHandle, OpenFlags};
@@ -22,7 +22,9 @@ use crate::rpc::AmRpc;
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::data_ops::{ReadChunkByIdRequest, WriteChunkByIdRequest};
 use crate::rpc::file_id::FileId;
-use crate::rpc::metadata_ops::{MetadataCreateFileRequest, MetadataLookupRequest};
+use crate::rpc::metadata_ops::{
+    MetadataCreateFileRequest, MetadataDeleteRequest, MetadataLookupRequest,
+};
 use crate::stats::is_stats_enabled;
 use crate::storage::IOUringChunkStore;
 
@@ -95,6 +97,24 @@ impl BenchFS {
     /// Borrowed access to the connection pool (if any).
     pub fn connection_pool_ref(&self) -> Option<&Rc<ConnectionPool>> {
         self.connection_pool.as_ref()
+    }
+
+    /// Borrowed access to the metadata routing ring (if distributed mode).
+    pub fn metadata_ring_ref(&self) -> Option<&Rc<ConsistentHashRing>> {
+        self.metadata_ring.as_ref()
+    }
+
+    /// Borrowed access to the data routing ring (if distributed mode).
+    pub fn data_ring_ref(&self) -> Option<&Rc<ConsistentHashRing>> {
+        self.data_ring.as_ref()
+    }
+
+    /// This node's identifier. Always set; mirrors
+    /// `self.metadata_manager.self_node_id()` so client code paths can
+    /// resolve their own id without reaching into the server-only
+    /// metadata manager.
+    pub fn self_node_id(&self) -> String {
+        self.metadata_manager.self_node_id()
     }
 
     /// Create a new BenchFS client with connection pool and custom target nodes (distributed mode)
@@ -213,21 +233,6 @@ impl BenchFS {
         self.node_id.clone()
     }
 
-    /// CHFS POSIX-style chunk routing key.
-    ///
-    /// Chunk 0 uses the bare path (matching the metadata routing key) so
-    /// the chunk-0 file always lives on the metadata-owner node and the
-    /// metadata RPC handler can stat / write its CHFS-style header
-    /// directly. Chunks 1+ append `/<index>` to spread data across nodes
-    /// independently of metadata placement.
-    fn chunk_routing_key(file_path: &str, chunk_index: u64) -> String {
-        if chunk_index == 0 {
-            file_path.to_string()
-        } else {
-            format!("{}/{}", file_path, chunk_index)
-        }
-    }
-
     /// Get file metadata with automatic caching for distributed mode
     ///
     /// This helper function tries to get metadata locally first.
@@ -236,12 +241,17 @@ impl BenchFS {
         use std::path::Path;
         let path_ref = Path::new(path);
 
-        // Try local first
+        // Try local cache first. `benchfs_open` is responsible for refreshing
+        // the cache from the authoritative metadata owner via upsert, so a
+        // hit here is the correct global view for the lifetime of this open.
+        // Doing a remote RPC on every read/write call (as a prior iter did)
+        // floods the metadata owner with millions of MetadataLookup RPCs and
+        // collapses ior-hard-write throughput.
         if let Ok(meta) = self.metadata_manager.get_file_metadata(path_ref) {
             return Ok(meta);
         }
 
-        // If not local and in distributed mode, fetch from remote
+        // Final remote fallback (path was treated as local but not found there).
         let metadata_node = self.get_metadata_node(path);
         if let Some(pool) = &self.connection_pool {
             match pool.get_or_connect(&metadata_node).await {
@@ -250,14 +260,19 @@ impl BenchFS {
                     match request.call(&*client).await {
                         Ok(response) if response.is_success() && response.is_file() => {
                             let meta = FileMetadata::new(path.to_string(), response.size);
-                            // Note: In path-based KV design, chunk locations are not tracked in metadata
-
-                            // Cache locally for future access
-                            if let Err(e) = self.metadata_manager.store_file_metadata(meta.clone())
+                            // Upsert: update an existing cache entry (which may
+                            // hold a stale per-rank size from the write phase),
+                            // falling back to insert when no entry exists yet.
+                            if self
+                                .metadata_manager
+                                .update_file_metadata(meta.clone())
+                                .is_err()
                             {
-                                tracing::warn!("Failed to cache metadata locally: {:?}", e);
-                            } else {
-                                tracing::debug!("Cached metadata for {} locally", path);
+                                if let Err(e) =
+                                    self.metadata_manager.store_file_metadata(meta.clone())
+                                {
+                                    tracing::warn!("Failed to cache metadata locally: {:?}", e);
+                                }
                             }
                             Ok(meta)
                         }
@@ -307,18 +322,28 @@ impl BenchFS {
                         let request = MetadataLookupRequest::new(path.to_string());
                         match request.call(&*client).await {
                             Ok(response) if response.is_success() && response.is_file() => {
-                                // File found on remote server - create local cache entry
+                                // File found on remote server - refresh local cache.
+                                // Use upsert (update→fallback-to-store) so that
+                                // re-opening a shared file after a remote write
+                                // phase replaces the stale per-rank write-extent
+                                // with the global authoritative size. iter29
+                                // localized ior-hard-read mismatches to exactly
+                                // this case (rank's local cache held its own
+                                // write-max, not the global max).
                                 let meta = FileMetadata::new(path.to_string(), response.size);
-                                // Cache locally for future access
-                                if let Err(e) =
-                                    self.metadata_manager.store_file_metadata(meta.clone())
+                                if self
+                                    .metadata_manager
+                                    .update_file_metadata(meta.clone())
+                                    .is_err()
                                 {
-                                    tracing::warn!(
-                                        "Failed to cache metadata in benchfs_open: {:?}",
-                                        e
-                                    );
-                                } else {
-                                    tracing::debug!("Cached metadata for {} in benchfs_open", path);
+                                    if let Err(e) =
+                                        self.metadata_manager.store_file_metadata(meta.clone())
+                                    {
+                                        tracing::warn!(
+                                            "Failed to cache metadata in benchfs_open: {:?}",
+                                            e
+                                        );
+                                    }
                                 }
                                 Some(meta)
                             }
@@ -432,6 +457,44 @@ impl BenchFS {
                     .map_err(|e| ApiError::Internal(format!("Failed to create file: {:?}", e)))?;
 
                 0 // Dummy inode
+            } else if std::env::var("BENCHFS_OPEN_META_ASYNC")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                // Fire-and-forget remote MetadataCreateFile to hide the
+                // open RTT. mdtest-hard sits on the critical path of
+                // 2 sync RTTs (open + write) → ~886 µs/op observed at
+                // 316 kIOPS. Spawning the create lets benchfs_write run
+                // in parallel; the metadata server processes the create
+                // before the WriteChunkById's metadata-side checks run
+                // (chunk_store does not consult metadata anyway).
+                //
+                // Safety: mdtest uses file_per_process so no EEXIST race.
+                // We pre-populate the local cache so any subsequent
+                // operations on this fd see an existing metadata entry.
+                let file_meta = FileMetadata::new(path.to_string(), 0);
+                if let Err(e) = self
+                    .metadata_manager
+                    .store_file_metadata(file_meta)
+                {
+                    tracing::warn!(
+                        "Failed to pre-cache async-open metadata for {}: {:?}",
+                        path,
+                        e
+                    );
+                }
+                if let Some(pool) = self.connection_pool.clone() {
+                    let path_owned = path.to_string();
+                    let owner = metadata_node.clone();
+                    pluvio_runtime::spawn(async move {
+                        if let Ok(client) = pool.get_or_connect(&owner).await {
+                            let req =
+                                MetadataCreateFileRequest::new(path_owned, 0, 0o644);
+                            let _ = req.call(&*client).await;
+                        }
+                    });
+                }
+                0
             } else {
                 // Remote file creation via RPC
                 if let Some(pool) = &self.connection_pool {
@@ -747,9 +810,11 @@ impl BenchFS {
                                         chunk_index,
                                         e
                                     );
-                                    // Fill with zeros on error
-                                    chunk_buf.fill(0);
-                                    (chunk_index, Ok(chunk_buf.len()))
+                                    // Propagate the error instead of silently zero-filling.
+                                    // Silent zero-fill caused ior-hard-read 288 verification
+                                    // errors: IOR believed the read succeeded with `buf.len()`
+                                    // bytes (all zero), then saw the data signature mismatch.
+                                    (chunk_index, Err(()))
                                 }
                             }
                         } else if let Some(pool) = &fs.connection_pool {
@@ -826,14 +891,13 @@ impl BenchFS {
                                                 "Remote read (FileId) failed with status {}",
                                                 response.status
                                             );
-                                            // Fill with zeros on error
-                                            chunk_buf.fill(0);
-                                            (chunk_index, Ok(chunk_buf.len()))
+                                            // Propagate failure — see local-error branch above
+                                            // for why silent zero-fill is wrong.
+                                            (chunk_index, Err(()))
                                         }
                                         Err(e) => {
                                             tracing::error!("RPC error (FileId read): {:?}", e);
-                                            chunk_buf.fill(0);
-                                            (chunk_index, Ok(chunk_buf.len()))
+                                            (chunk_index, Err(()))
                                         }
                                     }
                                 }
@@ -843,19 +907,16 @@ impl BenchFS {
                                         node_id,
                                         e
                                     );
-                                    chunk_buf.fill(0);
-                                    (chunk_index, Ok(chunk_buf.len()))
+                                    (chunk_index, Err(()))
                                 }
                             }
                         } else {
-                            // No connection pool and chunk is not local - fill with zeros
                             tracing::warn!(
                                 "Chunk {} is on node {} but no connection pool available",
                                 chunk_index,
                                 target_node
                             );
-                            chunk_buf.fill(0);
-                            (chunk_index, Ok(chunk_buf.len()))
+                            (chunk_index, Err(()))
                         }
                     },
                     format!("benchfs_read_chunk_{}", chunk_index),
@@ -866,21 +927,50 @@ impl BenchFS {
         // Execute reads with bounded concurrency
         // buffer_unordered allows up to MAX_CONCURRENT_CHUNK_RPCS in-flight at once
         let chunk_results_handles: Vec<_> = stream::iter(chunk_futures)
-            .buffer_unordered(MAX_CONCURRENT_CHUNK_RPCS)
+            .buffer_unordered(crate::config::defaults::max_concurrent_chunk_rpcs())
             .collect()
             .await;
 
         // Sum up bytes read from all chunks
         let mut bytes_read = 0;
+        let mut failed_chunks = 0usize;
+        let mut first_failed: Option<u64> = None;
         for result in chunk_results_handles {
             let (chunk_index, read_result) =
                 result.map_err(|e| ApiError::Internal(format!("Chunk read task failed: {}", e)))?;
             match read_result {
                 Ok(len) => bytes_read += len,
-                Err(e) => {
-                    tracing::error!("Chunk {} read failed: {:?}", chunk_index, e);
+                Err(()) => {
+                    failed_chunks += 1;
+                    first_failed.get_or_insert(chunk_index);
                 }
             }
+        }
+
+        if failed_chunks > 0 {
+            // Aggregate visibility: count chunk-read failures across this
+            // process. Helps localise the source of ior-hard-read
+            // verification errors (was 288 per phase with the old silent
+            // zero-fill). Logs once every 32 failures.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FAIL_TOTAL: AtomicU64 = AtomicU64::new(0);
+            let prev = FAIL_TOTAL.fetch_add(failed_chunks as u64, Ordering::Relaxed);
+            let after = prev + failed_chunks as u64;
+            if (prev / 32) != (after / 32) {
+                tracing::error!(
+                    "benchfs_read: cumulative chunk-read failures = {} (this call: {}, first chunk_index {:?})",
+                    after,
+                    failed_chunks,
+                    first_failed
+                );
+            }
+            // Surface as an I/O error to IOR so the test reports a real
+            // failure instead of silently consuming zeros and reporting
+            // verification mismatches. Caller may retry.
+            return Err(ApiError::IoError(format!(
+                "{} chunk read(s) failed (first chunk {:?})",
+                failed_chunks, first_failed
+            )));
         }
 
         // Advance file position
@@ -950,7 +1040,12 @@ impl BenchFS {
                 // Calculate data slice for this chunk
                 let data_offset: usize = chunks.iter().take(idx).map(|(_, _, s)| *s as usize).sum();
                 let data_len = write_size as usize;
-                let chunk_data = data[data_offset..data_offset + data_len].to_vec();
+                // Avoid the per-chunk to_vec() memcpy of 4 MiB chunk_data — the
+                // caller's `data: &[u8]` lives for the whole function (we await
+                // all per-chunk futures before returning), so passing a raw
+                // pointer + len is sound.
+                let chunk_data_ptr = data.as_ptr() as usize + data_offset;
+                let chunk_data_len = data_len;
 
                 let file_path = file_meta.path.clone();
                 let chunk_key = format!("{}/{}", &file_path, chunk_index);
@@ -959,6 +1054,11 @@ impl BenchFS {
 
                 spawn_with_name(
                     async move {
+                        // SAFETY: caller's `data` slice outlives all spawned chunk futures
+                        // (benchfs_write awaits them all via buffer_unordered before returning).
+                        let chunk_data: &[u8] = unsafe {
+                            std::slice::from_raw_parts(chunk_data_ptr as *const u8, chunk_data_len)
+                        };
                         let fs = unsafe { &*fs_ptr };
                         if is_local {
                             // Write to local chunk store (requires chunk_store)
@@ -970,7 +1070,7 @@ impl BenchFS {
                                     &file_path,
                                     chunk_index,
                                     chunk_offset,
-                                    chunk_data.as_slice(),
+                                    chunk_data,
                                 )
                                 .await
                                 .map_err(|e| {
@@ -1005,7 +1105,7 @@ impl BenchFS {
                                     let request = WriteChunkByIdRequest::from_file_id(
                                         file_id,
                                         chunk_offset,
-                                        chunk_data.as_slice(),
+                                        chunk_data,
                                     );
 
                                     // RPC_TRANSFER_TIMING: Measure RPC write time (only when stats enabled)
@@ -1077,20 +1177,35 @@ impl BenchFS {
             })
             .collect::<Vec<_>>();
 
-        // Execute writes with bounded concurrency
-        // buffer_unordered allows up to MAX_CONCURRENT_CHUNK_RPCS in-flight at once
-        let write_results_handles: Vec<_> = stream::iter(chunk_write_futures)
-            .buffer_unordered(MAX_CONCURRENT_CHUNK_RPCS)
-            .collect()
-            .await;
-
-        // Check results and calculate total bytes written
-        tracing::trace!("Completed {} chunk writes", write_results_handles.len());
+        // Execute writes. `[rpc] sequential_chunk_rpcs = true` (in
+        // benchfs.toml) awaits each spawned task one at a time (no
+        // `buffer_unordered`) to isolate whether UCX's `am_send` hangs
+        // are triggered by concurrent chunk RPCs from a single
+        // benchfs_write call. Default keeps the bounded-concurrent
+        // buffer_unordered path that locusta needs.
+        let sequential = crate::runtime_config::RuntimeConfig::global()
+            .rpc
+            .sequential_chunk_rpcs;
         let mut bytes_written = 0;
-        for result in write_results_handles {
-            let chunk_result = result
-                .map_err(|e| ApiError::Internal(format!("Chunk write task failed: {}", e)))??;
-            bytes_written += chunk_result;
+        if sequential {
+            for jh in chunk_write_futures {
+                let r = jh
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("Chunk write task failed: {}", e)))??;
+                bytes_written += r;
+            }
+        } else {
+            // buffer_unordered allows up to MAX_CONCURRENT_CHUNK_RPCS in-flight at once
+            let write_results_handles: Vec<_> = stream::iter(chunk_write_futures)
+                .buffer_unordered(crate::config::defaults::max_concurrent_chunk_rpcs())
+                .collect()
+                .await;
+            tracing::trace!("Completed {} chunk writes", write_results_handles.len());
+            for result in write_results_handles {
+                let chunk_result = result
+                    .map_err(|e| ApiError::Internal(format!("Chunk write task failed: {}", e)))??;
+                bytes_written += chunk_result;
+            }
         }
 
         // Update file size if we wrote past the end
@@ -1117,8 +1232,61 @@ impl BenchFS {
     /// # Arguments
     /// * `handle` - File handle
     #[async_backtrace::framed]
+    /// Await every chunk-write task spawned by `benchfs_write` for this
+    /// handle. Returns the first error if any task failed; otherwise drops
+    /// all join handles and clears the pending list.
+    async fn drain_pending_writes(&self, handle: &FileHandle) -> ApiResult<()> {
+        let pending: Vec<_> = {
+            let mut p = handle.pending_writes.borrow_mut();
+            std::mem::take(&mut *p)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let n = pending.len();
+        let drain_start = std::time::Instant::now();
+        let mut first_err: Option<ApiError> = None;
+        for jh in pending {
+            match jh.await {
+                Ok(Ok(_bytes)) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        first_err = Some(ApiError::Internal(format!(
+                            "pending chunk write task failed: {}",
+                            join_err
+                        )));
+                    }
+                }
+            }
+        }
+        if crate::stats::is_stats_enabled() {
+            tracing::info!(
+                target: "api_drain",
+                kind = "drain_pending_writes",
+                count = n,
+                elapsed_us = drain_start.elapsed().as_micros() as u64,
+                "DRAIN_PENDING"
+            );
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     pub async fn benchfs_close(&self, handle: &FileHandle) -> ApiResult<()> {
         let _span = tracing::debug_span!("api_close", path = %handle.path).entered();
+
+        // Drain pipelined writes before metadata sync. benchfs_write spawns
+        // each chunk RPC and returns immediately so the client can pipeline
+        // many in-flight writes per file; close is where we materialise that
+        // the writes actually succeeded.
+        self.drain_pending_writes(handle).await?;
 
         use std::path::Path;
         let path_ref = Path::new(&handle.path);
@@ -1132,9 +1300,40 @@ impl BenchFS {
         // "cannot read from file". 160 simultaneous closes at large transfer
         // sizes can overwhelm the metadata server's 5s window, so we use a
         // longer timeout and retry once.
+        //
+        // Spawn-and-forget fast path for mdtest-hard at 2-phys: awaiting the
+        // metadata RPC serialised closes at ~7k/s/rank. IO500 phases are
+        // MPI-barriered between write and read, so eventual consistency is
+        // safe as long as the spawned task settles before the read phase
+        // starts. Gated on `BENCHFS_CLOSE_META_ASYNC=1` so the change is
+        // opt-in until full-scale verification.
+        let close_meta_async = std::env::var("BENCHFS_CLOSE_META_ASYNC")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if handle.flags.write {
             let metadata_node = self.get_metadata_node(&handle.path);
             let is_local = self.is_local_metadata(&handle.path);
+
+            if !is_local && close_meta_async {
+                // Fire-and-forget path. Capture only Clone-able state and
+                // spawn a task that retries up to once on transient errors.
+                if let Ok(file_meta) = self.metadata_manager.get_file_metadata(path_ref) {
+                    if let Some(pool) = self.connection_pool.clone() {
+                        let path_owned = handle.path.clone();
+                        let size = file_meta.size;
+                        let owner = metadata_node.clone();
+                        pluvio_runtime::spawn(async move {
+                            use crate::rpc::metadata_ops::MetadataUpdateRequest;
+                            if let Ok(client) = pool.get_or_connect(&owner).await {
+                                let req = MetadataUpdateRequest::new(path_owned).with_size(size);
+                                let _ = req.call(&*client).await;
+                            }
+                        });
+                    }
+                }
+                self.open_files.borrow_mut().remove(&handle.fd);
+                return Ok(());
+            }
 
             if !is_local {
                 if let Ok(file_meta) = self.metadata_manager.get_file_metadata(path_ref) {
@@ -1252,6 +1451,54 @@ impl BenchFS {
     pub async fn benchfs_unlink(&self, path: &str) -> ApiResult<()> {
         use std::path::Path;
         let path_ref = Path::new(path);
+
+        // Distributed-mode client path: when this node is not the metadata
+        // owner of `path`, the authoritative state lives on a peer
+        // benchfsd. Send `MetadataDeleteRequest` so the owner actually
+        // removes its metadata (and its local chunk-store chunks). Before
+        // this fix, client-side `benchfs_unlink` only checked its local
+        // (non-authoritative) `metadata_manager`, returned `NotFound`,
+        // and mdtest's `-r` phase silently counted the ENOENT as a
+        // successful unlink — producing the bogus 230 kIOPS delete
+        // throughput at io500 scale.
+        let metadata_node = self.get_metadata_node(path);
+        let is_local_meta = metadata_node == self.node_id;
+        if !is_local_meta {
+            let pool = self.connection_pool.as_ref().ok_or_else(|| {
+                ApiError::Internal(
+                    "distributed unlink requires a connection pool".to_string(),
+                )
+            })?;
+            let client = pool.get_or_connect(&metadata_node).await.map_err(|e| {
+                ApiError::Internal(format!(
+                    "Failed to connect to metadata owner {}: {:?}",
+                    metadata_node, e
+                ))
+            })?;
+            let request = MetadataDeleteRequest::delete_file(path.to_string());
+            let response = request.call(&*client).await.map_err(|e| {
+                ApiError::Internal(format!("MetadataDelete RPC failed: {:?}", e))
+            })?;
+
+            // Drop any stale local cache regardless of remote outcome so a
+            // re-create of the same path sees a clean slate.
+            let _ = self.metadata_manager.remove_file_metadata(path_ref);
+            self.chunk_cache.invalidate_path(path);
+
+            return if response.is_success() {
+                Ok(())
+            } else if response.status == -2 {
+                Err(ApiError::NotFound(path.to_string()))
+            } else {
+                Err(ApiError::Internal(format!(
+                    "Remote unlink failed with status {}",
+                    response.status
+                )))
+            };
+        }
+
+        // Local-owner path (server-side or single-node): authoritative
+        // state lives here, so process inline.
 
         // Get file metadata to get inode
         let file_meta = self
@@ -1401,6 +1648,10 @@ impl BenchFS {
         use futures::stream::{self, StreamExt};
         use std::path::Path;
 
+        // Drain pipelined writes first — without this, FsyncChunk could race
+        // an in-flight write_chunk_by_id and miss the latest bytes.
+        self.drain_pending_writes(handle).await?;
+
         let path_ref = Path::new(&handle.path);
 
         // Get file metadata to get chunk information
@@ -1497,7 +1748,7 @@ impl BenchFS {
 
         // Execute fsync operations with bounded concurrency
         let results: Vec<_> = stream::iter(fsync_futures)
-            .buffer_unordered(MAX_CONCURRENT_CHUNK_RPCS)
+            .buffer_unordered(crate::config::defaults::max_concurrent_chunk_rpcs())
             .collect()
             .await;
 
@@ -1649,17 +1900,178 @@ impl BenchFS {
         Err(ApiError::NotFound(old_path.to_string()))
     }
 
-    /// Read directory contents
+    /// Read directory contents (CHFS-style scatter readdir).
     ///
-    /// # Arguments
-    /// * `path` - Directory path
+    /// Fans out a Readdir RPC to every peer in the metadata ring (plus
+    /// the local scan), merges the results, and dedups by entry name.
+    /// The local node sees its own entries directly without an RPC.
     ///
-    /// # Returns
-    /// List of entry names in the directory
-    pub fn benchfs_readdir(&self, _path: &str) -> ApiResult<Vec<String>> {
-        tracing::debug!("readdir (dummy): path={}", _path);
-        // Dummy implementation: directories are meaningless in path-based KV design
-        Ok(Vec::new())
+    /// Returns the merged list of `(name, InodeType)` entries directly
+    /// under `path`. Names are not full paths.
+    #[async_backtrace::framed]
+    pub async fn benchfs_readdir(
+        &self,
+        path: &str,
+    ) -> ApiResult<Vec<(String, crate::metadata::InodeType, u64)>> {
+        use crate::rpc::readdir_ops::{READDIR_MAX_ENTRIES_PER_CALL, call_readdir_single};
+        use std::collections::HashMap;
+
+        tracing::debug!("benchfs_readdir: path={}", path);
+
+        // Normalize: strip trailing slash except for root.
+        let parent = if path.len() > 1 && path.ends_with('/') {
+            &path[..path.len() - 1]
+        } else {
+            path
+        };
+
+        let mut merged: HashMap<String, (crate::metadata::InodeType, u64)> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut add = |name: String, ty: crate::metadata::InodeType, size: u64| {
+            use crate::metadata::InodeType;
+            match merged.get(&name) {
+                Some((InodeType::Directory, _)) => {
+                    // Directory placeholder; upgrade to File/Symlink if a
+                    // real entry comes along. Otherwise keep dir.
+                    if !matches!(ty, InodeType::Directory) {
+                        merged.insert(name, (ty, size));
+                    }
+                }
+                Some(_) => { /* already have a real entry */ }
+                None => {
+                    order.push(name.clone());
+                    merged.insert(name, (ty, size));
+                }
+            }
+        };
+
+        // (1) Local scan — always runs, returns nothing if this node owns
+        // no entries for the path. Paginate until eod.
+        let mut local_offset: usize = 0;
+        loop {
+            let (chunk, truncated) = self.metadata_manager.list_local_entries_with_size(
+                parent,
+                local_offset,
+                READDIR_MAX_ENTRIES_PER_CALL as usize,
+            );
+            local_offset += chunk.len();
+            let exhausted = !truncated;
+            for (n, t, s) in chunk {
+                add(n, t, s);
+            }
+            if exhausted {
+                break;
+            }
+        }
+
+        // (2) Remote scan — fan out to every other node in the
+        // metadata_ring. Skip if no ring (standalone mode).
+        //
+        // CHFS-style central parent index: with
+        // `metadata.central_parent_index = true` the parent's owner has
+        // the full children list (mirrored by every create on every
+        // server), so we only need to query that one peer. With it off
+        // we fall back to the legacy fan-out.
+        let central = crate::runtime_config::RuntimeConfig::global()
+            .metadata
+            .central_parent_index;
+        if let (Some(ring), Some(pool)) = (&self.metadata_ring, &self.connection_pool) {
+            let peer_iter: Vec<String> = if central {
+                match ring.get_node(parent) {
+                    Some(owner) if owner != self.node_id => vec![owner],
+                    _ => Vec::new(), // owner is local, already scanned in (1)
+                }
+            } else {
+                ring.nodes()
+                    .iter()
+                    .filter(|p| *p != &self.node_id)
+                    .cloned()
+                    .collect()
+            };
+            for peer in peer_iter.iter() {
+                let client = match pool.get_or_connect(peer).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            "benchfs_readdir: skipping unreachable peer {}: {:?}",
+                            peer,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                eprintln!("[bfsread] peer={} parent={} starting", peer, parent);
+
+                let mut offset: u32 = 0;
+                loop {
+                    // Per-RPC timeout. Originally 30 s, raised to 120 s
+                    // after job 20645: mdtest-easy creates ~3 M file
+                    // metadata entries per server. The server's
+                    // `list_local_entries` scans all entries to filter by
+                    // prefix (HashMap iteration), which can take ≥30 s at
+                    // that scale. 120 s gives slow scans room while still
+                    // bounding a truly stuck peer.
+                    let t_rpc = std::time::Instant::now();
+                    let rpc_fut = Box::pin(call_readdir_single(
+                        &client,
+                        parent,
+                        offset,
+                        READDIR_MAX_ENTRIES_PER_CALL,
+                    ));
+                    let res =
+                        pluvio_timer::timeout(std::time::Duration::from_secs(120), rpc_fut).await;
+                    eprintln!(
+                        "[bfsread] peer={} parent={} offset={} rpc_us={}",
+                        peer,
+                        parent,
+                        offset,
+                        t_rpc.elapsed().as_micros()
+                    );
+                    let res = match res {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            tracing::warn!(
+                                "benchfs_readdir: peer {} timed out (30s); moving on",
+                                peer
+                            );
+                            break;
+                        }
+                    };
+                    match res {
+                        Ok((entries, header)) => {
+                            if !header.is_success() {
+                                tracing::warn!(
+                                    "benchfs_readdir: peer {} returned status {}",
+                                    peer,
+                                    header.status
+                                );
+                                break;
+                            }
+                            offset += entries.len() as u32;
+                            for e in entries {
+                                add(e.name, e.entry_type, e.size);
+                            }
+                            if header.is_eod() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("benchfs_readdir: peer {} RPC error: {:?}", peer, e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(String, crate::metadata::InodeType, u64)> =
+            Vec::with_capacity(order.len());
+        for name in order {
+            if let Some((ty, sz)) = merged.remove(&name) {
+                out.push((name, ty, sz));
+            }
+        }
+        Ok(out)
     }
 
     /// Truncate a file to a specified size

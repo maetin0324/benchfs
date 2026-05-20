@@ -7,7 +7,7 @@
 //!   Server: benchfs_perf server --registry-dir /shared/path --data-dir /local/data
 //!   Client: benchfs_perf client --registry-dir /shared/path --server-node server
 
-use benchfs::logging::{PerfettoGuard, init_with_perfetto};
+use benchfs::logging::{TraceGuard, init_with_chrome};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::AmRpc;
 use benchfs::rpc::connection::ConnectionPool;
@@ -220,7 +220,7 @@ fn main() {
             node_id,
         } => {
             let node_id = node_id.unwrap_or_else(|| "server".to_string());
-            let _guard = init_with_perfetto(&log_level, &output);
+            let _guard = init_with_chrome(&log_level, &output);
 
             tracing::info!("Starting BenchFS Performance Server");
             tracing::info!("Node ID: {}", node_id);
@@ -245,7 +245,7 @@ fn main() {
             timeout,
         } => {
             let node_id = node_id.unwrap_or_else(|| "client".to_string());
-            let _guard = init_with_perfetto(&log_level, &output);
+            let _guard = init_with_chrome(&log_level, &output);
 
             tracing::info!("Starting BenchFS Performance Client");
             tracing::info!("Node ID: {}", node_id);
@@ -275,7 +275,7 @@ fn run_server(
     registry_dir: &PathBuf,
     data_dir: &PathBuf,
     node_id: &str,
-    _perfetto_guard: PerfettoGuard,
+    _perfetto_guard: TraceGuard,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create directories
     std::fs::create_dir_all(registry_dir)?;
@@ -414,7 +414,7 @@ fn run_client(
     iterations: u32,
     block_size: usize,
     timeout: u64,
-    _perfetto_guard: PerfettoGuard,
+    _perfetto_guard: TraceGuard,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create registry directory if needed
     std::fs::create_dir_all(registry_dir)?;

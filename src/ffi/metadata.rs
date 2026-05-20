@@ -11,7 +11,8 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 
 use super::error::*;
-use super::runtime::{block_on_with_name, with_benchfs_ctx};
+use super::runtime::{block_on_with_name, with_benchfs_client_ctx};
+use crate::api::client::BenchFSClient;
 
 // C-compatible stat structure
 // This matches the basic fields of Unix struct stat
@@ -70,11 +71,11 @@ pub extern "C" fn benchfs_stat(
 
     tracing::debug!("benchfs_stat: path={:?}", path_str);
 
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on_with_name("stat", async move { fs_ref.benchfs_stat(path_str).await })
+            block_on_with_name("stat", async move { fs_ref.stat(path_str).await })
         }
     });
 
@@ -135,11 +136,11 @@ pub extern "C" fn benchfs_get_file_size(
 
     tracing::debug!("benchfs_get_file_size: path={:?}", path_str);
 
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on_with_name("stat", async move { fs_ref.benchfs_stat(path_str).await })
+            block_on_with_name("stat", async move { fs_ref.stat(path_str).await })
         }
     });
 
@@ -188,13 +189,13 @@ pub extern "C" fn benchfs_mkdir(
 
     tracing::debug!("benchfs_mkdir: path={:?}, mode={:#o}", path_str, mode);
 
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
             block_on_with_name("mkdir", async move {
                 fs_ref
-                    .benchfs_mkdir(path_str, mode)
+                    .mkdir(path_str, mode)
                     .await
                     .map_err(|e| e.to_string())
             })
@@ -234,7 +235,7 @@ pub extern "C" fn benchfs_rmdir(
 
     tracing::debug!("benchfs_rmdir: path={:?}", path_str);
 
-    let result = with_benchfs_ctx(|fs| fs.benchfs_rmdir(path_str).map_err(|e| e.to_string()));
+    let result = with_benchfs_client_ctx(|fs| fs.rmdir(path_str).map_err(|e| e.to_string()));
 
     result_to_error_code(result.and_then(|r| r))
 }
@@ -285,8 +286,8 @@ pub extern "C" fn benchfs_rename(
         newpath_str
     );
 
-    let result = with_benchfs_ctx(|fs| {
-        fs.benchfs_rename(oldpath_str, newpath_str)
+    let result = with_benchfs_client_ctx(|fs| {
+        fs.rename(oldpath_str, newpath_str)
             .map_err(|e| e.to_string())
     });
 
@@ -330,13 +331,13 @@ pub extern "C" fn benchfs_truncate(
 
     tracing::debug!("benchfs_truncate: path={:?}, size={}", path_str, size);
 
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
             block_on_with_name("truncate", async move {
                 fs_ref
-                    .benchfs_truncate(path_str, size as u64)
+                    .truncate(path_str, size as u64)
                     .await
                     .map_err(|e| e.to_string())
             })
@@ -379,11 +380,11 @@ pub extern "C" fn benchfs_access(
     tracing::debug!("benchfs_access: path={:?}", path_str);
 
     // Check if file exists
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const crate::api::file_ops::BenchFS;
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on_with_name("stat", async move { fs_ref.benchfs_stat(path_str).await })
+            block_on_with_name("stat", async move { fs_ref.stat(path_str).await })
         }
     });
 

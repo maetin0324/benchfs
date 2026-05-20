@@ -57,8 +57,20 @@ pub mod defaults {
     /// Maximum concurrent chunk RPCs per client operation
     /// This limits how many chunk read/write RPCs can be in-flight simultaneously
     /// to prevent overwhelming the server when transfer_size > chunk_size.
-    /// Default: 64 (NVMe drives thrive on high queue depth; increased from 16)
+    /// Default: 64 (NVMe drives thrive on high queue depth; increased from 16).
+    /// Override at runtime with `BENCHFS_MAX_CONCURRENT_CHUNK_RPCS`.
     pub const MAX_CONCURRENT_CHUNK_RPCS: usize = 64;
+
+    /// Read the effective concurrency limit from the runtime TOML
+    /// (`[rpc] max_concurrent_chunk_rpcs`). UCX backend hangs on the
+    /// AM/RNDV path at 16 clients × 16 chunks/transfer (= 256 sends in
+    /// flight to 8 servers); set this to 8 to bound the per-client
+    /// in-flight count below UCX's stall threshold.
+    pub fn max_concurrent_chunk_rpcs() -> usize {
+        crate::runtime_config::RuntimeConfig::global()
+            .rpc
+            .max_concurrent_chunk_rpcs
+    }
 
     // Stats/diagnostics
     /// Enable detailed timing statistics collection (default: false)

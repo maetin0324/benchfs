@@ -68,6 +68,169 @@ pub struct BenchfsChunk0Extension {
 /// Byte offset of [`BenchfsChunk0Extension`] within the chunk-0 MSIZE region.
 pub const EXT_OFFSET: u64 = 16;
 
+/// Inode-file v2 extension (32 bytes, little-endian). Persists fields the
+/// BenchFS RPC layer carries but `PosixMetadataHeader` does not: POSIX `mode`,
+/// inode type discriminator, the on-disk path length, and a schema version.
+///
+/// Lives at byte offset `EXT2_OFFSET = 32` inside the MSIZE region of every
+/// inode file (see `InodeStore`). For chunk-0 of regular data files this
+/// extension is **not** used (chunk data lives at offset 0 in the chunk
+/// tree). The split-inode layout (case Y of `PLAN_METADATA_PERSISTENCE.md`)
+/// stores `BenchfsInodeExtension2` exclusively in the parallel `inodes/`
+/// tree, leaving chunk files untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct BenchfsInodeExtension2 {
+    /// POSIX mode bits (e.g. `S_IFREG | 0o644`).
+    pub mode: u32,
+    /// 1 = regular file, 2 = directory, 3 = symlink. Mirrors `InodeType`.
+    pub inode_type: u8,
+    pub _padding0: u8,
+    /// UTF-8 byte length of the path stored at `PATH_OFFSET`. Must satisfy
+    /// `path_len as u64 <= MSIZE - PATH_OFFSET`.
+    pub path_len: u16,
+    /// Schema version, starts at 1.
+    pub version: u32,
+    pub _reserved: [u8; 20],
+}
+
+/// Byte offset of [`BenchfsInodeExtension2`] within the inode-file MSIZE region.
+pub const EXT2_OFFSET: u64 = 32;
+
+/// Byte offset where the inline path string begins inside the inode file.
+/// Bytes from this offset to `MSIZE - 1` carry the UTF-8 path padded with NULs.
+pub const PATH_OFFSET: u64 = 64;
+
+/// Maximum number of UTF-8 bytes a path can occupy in the inline region.
+pub const MAX_INLINE_PATH_BYTES: usize = (MSIZE - PATH_OFFSET) as usize;
+
+/// On-disk inode discriminator, mirrors `metadata::types::InodeType` for the
+/// disk schema. We avoid pulling the in-memory enum into `storage` to keep
+/// the module boundary clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDiskInodeType {
+    File = 1,
+    Directory = 2,
+    Symlink = 3,
+}
+
+impl OnDiskInodeType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::File),
+            2 => Some(Self::Directory),
+            3 => Some(Self::Symlink),
+            _ => None,
+        }
+    }
+}
+
+/// Decoded view of an on-disk inode file. Produced by [`decode_inode`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnDiskInode {
+    pub path: String,
+    pub inode_type: OnDiskInodeType,
+    pub mode: u32,
+    pub chunk_size: u64,
+    pub flags: u16,
+    /// Logical file size (regular files only; 0 for dirs/symlinks).
+    pub logical_size: u64,
+}
+
+impl BenchfsInodeExtension2 {
+    pub fn new(mode: u32, inode_type: OnDiskInodeType, path_len: u16) -> Self {
+        Self {
+            mode,
+            inode_type: inode_type as u8,
+            _padding0: 0,
+            path_len,
+            version: 1,
+            _reserved: [0; 20],
+        }
+    }
+
+    pub fn from_bytes_validated(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+        Self::read_from_bytes(&bytes[..std::mem::size_of::<Self>()]).ok()
+    }
+}
+
+/// Encode a full 4 KiB inode buffer ready for a single pwrite at offset 0.
+///
+/// Layout:
+/// - `0..16`: [`PosixMetadataHeader`]
+/// - `16..32`: [`BenchfsChunk0Extension`] (carries `logical_size`)
+/// - `32..64`: [`BenchfsInodeExtension2`] (mode, inode_type, path_len, version)
+/// - `64..MSIZE`: UTF-8 path bytes padded with NULs
+///
+/// Returns `None` if `path.len() > MAX_INLINE_PATH_BYTES`.
+pub fn encode_inode(
+    path: &str,
+    inode_type: OnDiskInodeType,
+    mode: u32,
+    chunk_size: u64,
+    logical_size: u64,
+    flags: u16,
+) -> Option<Vec<u8>> {
+    let path_bytes = path.as_bytes();
+    if path_bytes.len() > MAX_INLINE_PATH_BYTES {
+        return None;
+    }
+    let path_len = path_bytes.len() as u16;
+
+    let mut buf = vec![0u8; MSIZE as usize];
+
+    let header = PosixMetadataHeader::new(chunk_size, flags);
+    buf[..16].copy_from_slice(header.as_bytes());
+
+    let ext = BenchfsChunk0Extension::with_size(logical_size);
+    buf[EXT_OFFSET as usize..EXT_OFFSET as usize + 16].copy_from_slice(ext.as_bytes());
+
+    let ext2 = BenchfsInodeExtension2::new(mode, inode_type, path_len);
+    buf[EXT2_OFFSET as usize..EXT2_OFFSET as usize + 32].copy_from_slice(ext2.as_bytes());
+
+    let start = PATH_OFFSET as usize;
+    buf[start..start + path_bytes.len()].copy_from_slice(path_bytes);
+
+    Some(buf)
+}
+
+/// Decode a 4 KiB inode buffer. Returns `None` on any of:
+/// - buffer shorter than MSIZE,
+/// - `PosixMetadataHeader.msize` mismatch,
+/// - unknown `inode_type`,
+/// - `path_len` past the inline budget,
+/// - non-UTF-8 path bytes.
+pub fn decode_inode(buf: &[u8]) -> Option<OnDiskInode> {
+    if buf.len() < MSIZE as usize {
+        return None;
+    }
+    let header = PosixMetadataHeader::from_bytes_validated(&buf[..16])?;
+    let ext = BenchfsChunk0Extension::from_bytes_validated(&buf[EXT_OFFSET as usize..])?;
+    let ext2 = BenchfsInodeExtension2::from_bytes_validated(&buf[EXT2_OFFSET as usize..])?;
+
+    let inode_type = OnDiskInodeType::from_u8(ext2.inode_type)?;
+    let path_len = ext2.path_len as usize;
+    if path_len > MAX_INLINE_PATH_BYTES {
+        return None;
+    }
+    let start = PATH_OFFSET as usize;
+    let path = std::str::from_utf8(&buf[start..start + path_len])
+        .ok()?
+        .to_owned();
+
+    Some(OnDiskInode {
+        path,
+        inode_type,
+        mode: ext2.mode,
+        chunk_size: header.chunk_size,
+        flags: header.flags,
+        logical_size: ext.logical_size,
+    })
+}
+
 impl BenchfsChunk0Extension {
     pub fn zero() -> Self {
         Self {
@@ -162,5 +325,70 @@ mod tests {
     fn rejects_short_buffer() {
         let bytes = [0u8; 8];
         assert!(PosixMetadataHeader::from_bytes_validated(&bytes).is_none());
+    }
+
+    #[test]
+    fn ext2_struct_size_is_32() {
+        assert_eq!(std::mem::size_of::<BenchfsInodeExtension2>(), 32);
+        assert_eq!(EXT2_OFFSET, 32);
+        assert_eq!(PATH_OFFSET, 64);
+    }
+
+    #[test]
+    fn inode_round_trip_file() {
+        let buf = encode_inode(
+            "/foo/bar/baz.txt",
+            OnDiskInodeType::File,
+            0o100644,
+            4 * 1024 * 1024,
+            12345,
+            0,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), MSIZE as usize);
+        let decoded = decode_inode(&buf).unwrap();
+        assert_eq!(decoded.path, "/foo/bar/baz.txt");
+        assert_eq!(decoded.inode_type, OnDiskInodeType::File);
+        assert_eq!(decoded.mode, 0o100644);
+        assert_eq!(decoded.chunk_size, 4 * 1024 * 1024);
+        assert_eq!(decoded.logical_size, 12345);
+        assert_eq!(decoded.flags, 0);
+    }
+
+    #[test]
+    fn inode_round_trip_dir() {
+        let buf = encode_inode(
+            "/path/to/dir",
+            OnDiskInodeType::Directory,
+            0o040755,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let decoded = decode_inode(&buf).unwrap();
+        assert_eq!(decoded.inode_type, OnDiskInodeType::Directory);
+        assert_eq!(decoded.mode, 0o040755);
+    }
+
+    #[test]
+    fn inode_rejects_overlong_path() {
+        let long = "a".repeat(MAX_INLINE_PATH_BYTES + 1);
+        assert!(encode_inode(&long, OnDiskInodeType::File, 0o644, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn inode_decode_rejects_short_buffer() {
+        let buf = vec![0u8; 100];
+        assert!(decode_inode(&buf).is_none());
+    }
+
+    #[test]
+    fn inode_decode_rejects_bad_msize() {
+        let mut buf = encode_inode("/x", OnDiskInodeType::File, 0o644, 4096, 0, 0).unwrap();
+        // Corrupt msize field (offset 8..10).
+        buf[8] = 0;
+        buf[9] = 0;
+        assert!(decode_inode(&buf).is_none());
     }
 }

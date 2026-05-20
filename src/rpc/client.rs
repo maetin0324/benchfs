@@ -134,18 +134,6 @@ fn increment_retry_failure() {
     TOTAL_RETRY_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Default RPC timeout duration (30 seconds)
-const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
-
-/// Default retry count
-const DEFAULT_RPC_RETRY_COUNT: u32 = 3;
-
-/// Default initial retry delay (100ms)
-const DEFAULT_RPC_RETRY_DELAY_MS: u64 = 100;
-
-/// Default backoff multiplier
-const DEFAULT_RPC_RETRY_BACKOFF: f64 = 2.0;
-
 /// Retry configuration for RPC calls
 struct RetryConfig {
     max_retries: u32,
@@ -153,32 +141,22 @@ struct RetryConfig {
     backoff_multiplier: f64,
 }
 
-/// Get the RPC timeout from environment variable or use default
+/// Get the RPC timeout from the TOML runtime config.
 fn get_rpc_timeout() -> Duration {
-    std::env::var("BENCHFS_RPC_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(DEFAULT_RPC_TIMEOUT_SECS))
+    Duration::from_secs(
+        crate::runtime_config::RuntimeConfig::global()
+            .rpc
+            .timeout_secs,
+    )
 }
 
-/// Get retry configuration from environment variables
+/// Get retry configuration from the TOML runtime config.
 fn get_retry_config() -> RetryConfig {
+    let rc = &crate::runtime_config::RuntimeConfig::global().rpc;
     RetryConfig {
-        max_retries: std::env::var("BENCHFS_RPC_RETRY_COUNT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_RPC_RETRY_COUNT),
-        initial_delay: Duration::from_millis(
-            std::env::var("BENCHFS_RPC_RETRY_DELAY_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_RPC_RETRY_DELAY_MS),
-        ),
-        backoff_multiplier: std::env::var("BENCHFS_RPC_RETRY_BACKOFF")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_RPC_RETRY_BACKOFF),
+        max_retries: rc.max_retries,
+        initial_delay: Duration::from_millis(rc.retry_delay_ms),
+        backoff_multiplier: rc.retry_backoff as f64,
     }
 }
 
@@ -266,6 +244,15 @@ impl RpcClient {
     #[cfg(feature = "transport-locusta")]
     pub fn is_locusta(&self) -> bool {
         self.locusta.is_some()
+    }
+
+    /// Access the locusta backend if this client is locusta-backed.
+    /// Used by `readdir_ops::call_readdir_locusta` which needs to drop
+    /// to `transport.send_eager` directly to extract trailing entry
+    /// bytes that the AmRpc default decoder discards.
+    #[cfg(feature = "transport-locusta")]
+    pub fn locusta_backend(&self) -> Option<&LocustaBackend> {
+        self.locusta.as_ref()
     }
     #[cfg(not(feature = "transport-locusta"))]
     pub fn is_locusta(&self) -> bool {

@@ -741,7 +741,14 @@ impl AmRpc for MetadataDeleteRequest {
 
         // Delete based on entry type
         let response_header = if header.entry_type == 1 {
-            // Delete file
+            // Best-effort delete of this node's locally-owned chunks for
+            // the file. We do this **before** removing metadata so a
+            // concurrent reader sees `NotFound` rather than a metadata
+            // entry pointing at half-deleted chunk files. Chunks owned by
+            // other nodes are not touched here — see TODO in
+            // `BenchFS::benchfs_unlink` about fanning out chunk deletes
+            // via the data ring.
+            let _ = ctx.chunk_store.delete_file_chunks(&path_str).await;
             match ctx.metadata_manager.remove_file_metadata(path) {
                 Ok(()) => MetadataDeleteResponseHeader::success(),
                 Err(_e) => MetadataDeleteResponseHeader::error(-2), // ENOENT

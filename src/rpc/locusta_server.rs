@@ -91,9 +91,15 @@ impl LocustaServerDispatch {
     }
 
     /// Look up the handler for a request and return the handler's
-    /// future. Returns `None` if the request is malformed or no
-    /// handler is registered (in the latter case, `req` is dropped,
-    /// which sends an error response for roundtrip variants).
+    /// future. Returns `None` if the request is malformed, the request
+    /// was handled synchronously inline, or no handler is registered
+    /// (in the latter case, `req` is dropped, which sends an error
+    /// response for roundtrip variants).
+    ///
+    /// **Fast path**: `WriteChunkById::PutGrant` is sync (try_acquire +
+    /// grant, no .await) — dispatched inline without `Box::pin` or
+    /// `executor::spawn`. At ior-hard's ~327k RPCs/s aggregate this is
+    /// half of all per-RPC futures.
     pub fn dispatch(
         &self,
         req: Request<RegisteredFixedBuffer>,
@@ -116,7 +122,27 @@ impl LocustaServerDispatch {
                 return None;
             }
         };
+        // Copy body to owned bytes BEFORE consuming `req` below. `body`
+        // borrows from `req` via `small_req`, so any move of `req`
+        // invalidates `body`.
         let body_owned = body.to_vec();
+        // Sync fast path: PutGrant for chunk writes has no .await; handle
+        // inline so we save one Box::pin + executor::spawn per RPC.
+        let req = if rpc_id == crate::rpc::data_ops::RPC_WRITE_CHUNK_BY_ID {
+            match req {
+                Request::PutGrant(h) => {
+                    crate::rpc::locusta_handlers::handle_write_chunk_put_grant_sync(
+                        &self.ctx,
+                        &body_owned,
+                        h,
+                    );
+                    return None;
+                }
+                other => other,
+            }
+        } else {
+            req
+        };
         match self.handlers.get(&rpc_id) {
             Some(launcher) => Some(launcher(Rc::clone(&self.ctx), body_owned, req)),
             None => {
@@ -138,21 +164,19 @@ impl LocustaServerDispatch {
         let mut inner = transport.inner.borrow_mut();
         inner.tick();
         let mut count = 0usize;
+        let stats = crate::stats::is_stats_enabled();
         drain_server_requests(&mut *inner, |req| {
             if let Some(fut) = self.dispatch(req) {
-                // Capture timestamp at spawn-call site. The wrapper
-                // future records dispatch-to-first-poll latency on the
-                // very first poll — i.e. how long the future sat in the
-                // pluvio task queue before the executor picked it up.
-                // This is the key signal for diagnosing scheduler
-                // starvation; if it spikes alongside the client-side
-                // p99, the tail is in pluvio scheduling rather than in
-                // handler body work.
-                let t_spawn = std::time::Instant::now();
-                let wrapped: Pin<Box<dyn Future<Output = ()> + 'static>> =
-                    Box::pin(async move {
-                        let dispatch_lat_us = t_spawn.elapsed().as_micros() as u64;
-                        if crate::stats::is_stats_enabled() {
+                if stats {
+                    // Wrap the handler with a dispatch-latency probe so
+                    // we can see how long each future sat in the pluvio
+                    // task queue before the executor picked it up. The
+                    // wrapper costs one extra `Box::pin`/alloc per RPC,
+                    // so it's skipped entirely on the hot path.
+                    let t_spawn = std::time::Instant::now();
+                    let wrapped: Pin<Box<dyn Future<Output = ()> + 'static>> =
+                        Box::pin(async move {
+                            let dispatch_lat_us = t_spawn.elapsed().as_micros() as u64;
                             use std::sync::atomic::{AtomicU64, Ordering};
                             static N: AtomicU64 = AtomicU64::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -165,10 +189,17 @@ impl LocustaServerDispatch {
                                     "HANDLER_DISPATCH_LAT"
                                 );
                             }
-                        }
-                        fut.await;
-                    });
-                pluvio_runtime::executor::spawn(wrapped);
+                            fut.await;
+                        });
+                    pluvio_runtime::executor::spawn(wrapped);
+                } else {
+                    // Stats disabled: skip the dispatch-latency wrapper so
+                    // we save one `Box::pin` per RPC. ior-hard's 47008-byte
+                    // pattern issues ~320k RPCs/s aggregate at 10 phys
+                    // (job 20166 numbers), so this halves the per-RPC heap
+                    // allocs.
+                    pluvio_runtime::executor::spawn(fut);
+                }
                 count += 1;
             }
         });
@@ -176,15 +207,19 @@ impl LocustaServerDispatch {
     }
 
     /// Drain-only variant for use when a separate Reactor handles
-    /// `inner.tick()`. Skips the redundant tick so per-iteration cost
-    /// is just the drain + spawn loop.
-    pub fn drain_and_spawn(&self, transport: &LocustaTransport) {
+    /// `inner.tick()`. Returns the number of requests drained so the
+    /// caller's adaptive backoff loop can decide between busy-yield and
+    /// idle-sleep, just like `poll_once_spawn`.
+    pub fn drain_and_spawn(&self, transport: &LocustaTransport) -> usize {
         let mut inner = transport.inner.borrow_mut();
+        let mut count = 0usize;
         drain_server_requests(&mut *inner, |req| {
             if let Some(fut) = self.dispatch(req) {
                 pluvio_runtime::executor::spawn(fut);
+                count += 1;
             }
         });
+        count
     }
 
     /// Drain ready requests and drive each handler to completion

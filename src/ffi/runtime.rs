@@ -39,6 +39,7 @@
 //! └─────────────────────────────────────┘
 //! ```
 
+use crate::api::client::BenchFSClient;
 use crate::api::file_ops::BenchFS;
 use crate::rpc::connection::ConnectionPool;
 use crate::rpc::server::RpcServer;
@@ -58,7 +59,13 @@ thread_local! {
     /// This allows concurrent access from multiple MPI processes without conflicts.
     ///
     /// The context is set by `benchfs_init()` and cleared by `benchfs_finalize()`.
-    pub static BENCHFS_CTX: RefCell<Option<Rc<BenchFS>>> = RefCell::new(None);
+    ///
+    /// Holds [`BenchFSClient`] now (post the iter27 ior-hard-read refactor)
+    /// so the FFI surface cannot accidentally reach into the server-only
+    /// `MetadataManager`. The underlying `BenchFS` is still accessible via
+    /// `BenchFSClient::inner()` for the methods that haven't been
+    /// migrated yet.
+    pub static BENCHFS_CTX: RefCell<Option<Rc<BenchFSClient>>> = RefCell::new(None);
 }
 
 thread_local! {
@@ -107,8 +114,18 @@ pub fn set_runtime(runtime: Rc<Runtime>) {
 ///
 /// * `benchfs` - Shared reference to the BenchFS instance
 pub fn set_benchfs_ctx(benchfs: Rc<BenchFS>) {
+    let client = Rc::new(BenchFSClient::from_inner(benchfs));
     BENCHFS_CTX.with(|ctx| {
-        *ctx.borrow_mut() = Some(benchfs);
+        *ctx.borrow_mut() = Some(client);
+    });
+}
+
+/// Set the BenchFS client context directly (for callers that already hold
+/// a `BenchFSClient`). New code should prefer this over the legacy
+/// `set_benchfs_ctx`.
+pub fn set_benchfs_client_ctx(client: Rc<BenchFSClient>) {
+    BENCHFS_CTX.with(|ctx| {
+        *ctx.borrow_mut() = Some(client);
     });
 }
 
@@ -169,6 +186,11 @@ pub fn set_connection_pool(pool: Rc<ConnectionPool>) {
 /// phase, but we want the locusta client state to survive across
 /// phase boundaries so the server-side dest_id→QP mapping stays valid.
 pub fn get_benchfs_ctx_rc() -> Option<Rc<BenchFS>> {
+    BENCHFS_CTX.with(|ctx| ctx.borrow().as_ref().map(|c| Rc::clone(c.inner())))
+}
+
+/// Return a clone of the thread-local BenchFSClient Rc, if any.
+pub fn get_benchfs_client_ctx_rc() -> Option<Rc<BenchFSClient>> {
     BENCHFS_CTX.with(|ctx| ctx.borrow().as_ref().cloned())
 }
 
@@ -201,7 +223,21 @@ where
     BENCHFS_CTX.with(|ctx| {
         ctx.borrow()
             .as_ref()
-            .map(|fs| f(fs.as_ref()))
+            .map(|c| f(c.inner().as_ref()))
+            .ok_or_else(|| "BenchFS not initialized".to_string())
+    })
+}
+
+/// Like [`with_benchfs_ctx`] but hands the closure a `&BenchFSClient` so
+/// it cannot reach into server-only fields. New FFI code should use this.
+pub fn with_benchfs_client_ctx<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce(&BenchFSClient) -> R,
+{
+    BENCHFS_CTX.with(|ctx| {
+        ctx.borrow()
+            .as_ref()
+            .map(|c| f(c.as_ref()))
             .ok_or_else(|| "BenchFS not initialized".to_string())
     })
 }

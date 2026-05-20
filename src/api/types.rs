@@ -1,8 +1,20 @@
 /// API types for BenchFS filesystem operations
 use std::rc::Rc;
 
+/// Per-file deferred-write bookkeeping. `benchfs_write` pipelines RPCs by
+/// spawning each chunk write as a task and stashing its `JoinHandle` here
+/// instead of awaiting inline. `benchfs_close` / `benchfs_fsync` drains
+/// this list so the byte-count visible to callers stays consistent with
+/// what hit the wire by phase-end.
+///
+/// At ior-hard's 47 KiB pattern the previous code's RTT-serialized RPCs
+/// capped per-client throughput at `1/RTT ≈ 5k writes/s`. Pipelining many
+/// in-flight RPCs per client is the only way to break the per-client
+/// ceiling without an API change.
+pub type PendingWriteHandle = pluvio_runtime::task::JoinHandle<crate::api::types::ApiResult<usize>>;
+
 /// File handle for open files
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FileHandle {
     /// File descriptor (unique ID)
     pub fd: u64,
@@ -18,6 +30,11 @@ pub struct FileHandle {
 
     /// Open flags
     pub flags: OpenFlags,
+
+    /// In-flight chunk-write task handles spawned by `benchfs_write` but
+    /// not yet awaited. Drained on fsync / close. `Rc<RefCell<…>>` is
+    /// sound because the pluvio runtime is single-threaded.
+    pub(crate) pending_writes: Rc<std::cell::RefCell<Vec<PendingWriteHandle>>>,
 }
 
 /// Open flags (similar to POSIX)
@@ -203,6 +220,19 @@ impl FileStat {
     }
 }
 
+impl std::fmt::Debug for FileHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileHandle")
+            .field("fd", &self.fd)
+            .field("path", &self.path)
+            .field("inode", &self.inode)
+            .field("position", &*self.position.borrow())
+            .field("flags", &self.flags)
+            .field("pending_writes", &self.pending_writes.borrow().len())
+            .finish()
+    }
+}
+
 impl FileHandle {
     /// Create a new file handle
     pub fn new(fd: u64, path: String, inode: u64, flags: OpenFlags) -> Self {
@@ -212,6 +242,7 @@ impl FileHandle {
             inode,
             position: Rc::new(std::cell::RefCell::new(0)),
             flags,
+            pending_writes: Rc::new(std::cell::RefCell::new(Vec::new())),
         }
     }
 

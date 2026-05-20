@@ -108,20 +108,42 @@ impl IOUringBackend {
         };
 
         let write_len = data_len.min(fixed_buffer.len()) as u32;
+        let buf_index = fixed_buffer.index() as u16;
+        let buf_ptr = fixed_buffer.as_ptr();
 
-        // Write data using write_fixed with registered buffer (zero-copy DMA)
-        let (bytes_written_raw, _fixed_buffer) = dma_file
+        // Write data using write_fixed with registered buffer (zero-copy DMA).
+        // First submit consumes the FixedBuffer; we keep it alive but loop
+        // over `write_fixed_raw` if the kernel returns a short write so
+        // ior-hard's 47KB transfers don't leave silent gaps on disk.
+        let (first_n, _fixed_buffer) = dma_file
             .write_fixed(fixed_buffer, offset, write_len)
             .await
             .map_err(StorageError::IoError)?;
-
-        if bytes_written_raw < 0 {
+        if first_n < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
-                -bytes_written_raw,
+                -first_n,
             )));
         }
-
-        let bytes_written = data_len.min(bytes_written_raw as usize);
+        let mut total = first_n as usize;
+        while total < write_len as usize {
+            let cur_ptr = unsafe { buf_ptr.add(total) };
+            let cur_offset = offset + total as u64;
+            let remaining = write_len as usize - total;
+            let n = dma_file
+                .write_fixed_raw(cur_offset, cur_ptr, remaining as u32, buf_index)
+                .await
+                .map_err(StorageError::IoError)?;
+            if n > 0 {
+                total += n as usize;
+            } else if n == 0 {
+                return Err(StorageError::IoError(std::io::Error::other(
+                    "write_fixed_raw returned 0 on retry",
+                )));
+            } else {
+                return Err(StorageError::IoError(std::io::Error::from_raw_os_error(-n)));
+            }
+        }
+        let bytes_written = data_len.min(total);
 
         if let Some(start) = start {
             let elapsed = start.elapsed();
@@ -186,20 +208,40 @@ impl IOUringBackend {
         };
 
         let read_len = read_len.min(fixed_buffer.len()) as u32;
+        let buf_index = fixed_buffer.index() as u16;
+        let buf_ptr_mut = fixed_buffer.as_ptr() as *mut u8;
 
-        // Read data using read_fixed with registered buffer (zero-copy DMA)
-        let (bytes_read_raw, fixed_buffer) = dma_file
+        // Read data using read_fixed with registered buffer (zero-copy DMA).
+        // Loop on short reads via `read_fixed_raw` so the caller's buffer
+        // doesn't retain stale bytes past the kernel's short return (the
+        // root of 158k ior-hard-read verification failures pre-fix).
+        let (first_n, fixed_buffer) = dma_file
             .read_fixed(fixed_buffer, offset, read_len)
             .await
             .map_err(StorageError::IoError)?;
-
-        if bytes_read_raw < 0 {
+        if first_n < 0 {
             return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
-                -bytes_read_raw,
+                -first_n,
             )));
         }
-
-        let bytes_read = bytes_read_raw as usize;
+        let mut total = first_n as usize;
+        while total < read_len as usize {
+            let cur_ptr = unsafe { buf_ptr_mut.add(total) };
+            let cur_offset = offset + total as u64;
+            let remaining = read_len as usize - total;
+            let n = dma_file
+                .read_fixed_raw(cur_offset, cur_ptr, remaining as u32, buf_index)
+                .await
+                .map_err(StorageError::IoError)?;
+            if n > 0 {
+                total += n as usize;
+            } else if n == 0 {
+                break; // EOF
+            } else {
+                return Err(StorageError::IoError(std::io::Error::from_raw_os_error(-n)));
+            }
+        }
+        let bytes_read = total;
 
         if let Some(start) = start {
             let elapsed = start.elapsed();
@@ -228,7 +270,7 @@ impl IOUringBackend {
     /// allocator (i.e. acquired from `self.allocator`), and `buf_index` must
     /// be that buffer's slot index. The memory must remain valid until the
     /// returned future resolves.
-    #[async_backtrace::framed]
+    // async_backtrace removed from hot path; see chunk_store.rs note.
     pub async fn write_via_registered(
         &self,
         handle: FileHandle,
@@ -249,10 +291,61 @@ impl IOUringBackend {
         } else {
             None
         };
-        let bytes_written = dma_file
-            .write_fixed_raw(offset, ptr, len, buf_index)
-            .await
-            .map_err(StorageError::IoError)?;
+        // Retry on transient ENOMEM and partial writes. Kernel buffered-write
+        // path can return ENOMEM under burst load when filesystem mempools /
+        // page-cache allocations momentarily fail; the condition clears
+        // within ms. Without retry, ior-hard (1M+ concurrent 47KB writes)
+        // aborts the entire job — observed in jobs 18277 and 18290.
+        //
+        // Partial writes (Ok(n) with 0 < n < remaining) silently corrupted
+        // ior-hard-read (158k mismatches in job 20000): we used to return
+        // the short count and the caller treated it as success. Now we
+        // re-submit from `ptr + total` for the remaining bytes.
+        let mut total: u32 = 0;
+        let mut enomem_attempts: u32 = 0;
+        loop {
+            let remaining = len - total;
+            if remaining == 0 {
+                break;
+            }
+            let cur_ptr = unsafe { ptr.add(total as usize) };
+            let cur_offset = offset + total as u64;
+            match dma_file
+                .write_fixed_raw(cur_offset, cur_ptr, remaining, buf_index)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    total += n as u32;
+                    enomem_attempts = 0;
+                }
+                Ok(0) => {
+                    // io_uring write returning 0 with no error: treat as EIO.
+                    return Err(StorageError::IoError(std::io::Error::other(
+                        "write_fixed returned 0 with no error",
+                    )));
+                }
+                Ok(n) if -n == 12 && enomem_attempts < 5 => {
+                    pluvio_timer::Delay::new(std::time::Duration::from_millis(
+                        1u64 << enomem_attempts,
+                    ))
+                    .await;
+                    enomem_attempts += 1;
+                    continue;
+                }
+                Ok(n) => {
+                    return Err(StorageError::IoError(std::io::Error::from_raw_os_error(-n)));
+                }
+                Err(e) if e.raw_os_error() == Some(12) && enomem_attempts < 5 => {
+                    pluvio_timer::Delay::new(std::time::Duration::from_millis(
+                        1u64 << enomem_attempts,
+                    ))
+                    .await;
+                    enomem_attempts += 1;
+                    continue;
+                }
+                Err(e) => return Err(StorageError::IoError(e)),
+            }
+        }
         if let Some(start) = start {
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
@@ -268,17 +361,12 @@ impl IOUringBackend {
                 );
             }
         }
-        if bytes_written < 0 {
-            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
-                -bytes_written,
-            )));
-        }
-        Ok(bytes_written as usize)
+        Ok(total as usize)
     }
 
     /// Read from file directly into an externally-owned registered buffer.
     /// See [`write_via_registered`] for safety constraints.
-    #[async_backtrace::framed]
+    // async_backtrace removed from hot path; see chunk_store.rs note.
     pub async fn read_via_registered(
         &self,
         handle: FileHandle,
@@ -299,10 +387,32 @@ impl IOUringBackend {
         } else {
             None
         };
-        let bytes_read = dma_file
-            .read_fixed_raw(offset, ptr, len, buf_index)
-            .await
-            .map_err(StorageError::IoError)?;
+        // Loop until full read or EOF. Short reads can occur on regular
+        // files (kernel returns partial when crossing pinned-page
+        // boundaries under high concurrency); a single `Ok(short)` would
+        // leave the tail of the caller's buffer with stale data and
+        // corrupt verification on subsequent ior-hard-read.
+        let mut total: u32 = 0;
+        loop {
+            let remaining = len - total;
+            if remaining == 0 {
+                break;
+            }
+            let cur_ptr = unsafe { ptr.add(total as usize) };
+            let cur_offset = offset + total as u64;
+            let n = dma_file
+                .read_fixed_raw(cur_offset, cur_ptr, remaining, buf_index)
+                .await
+                .map_err(StorageError::IoError)?;
+            if n > 0 {
+                total += n as u32;
+            } else if n == 0 {
+                // EOF — caller's responsibility to detect short read.
+                break;
+            } else {
+                return Err(StorageError::IoError(std::io::Error::from_raw_os_error(-n)));
+            }
+        }
         if let Some(start) = start {
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
@@ -318,12 +428,7 @@ impl IOUringBackend {
                 );
             }
         }
-        if bytes_read < 0 {
-            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
-                -bytes_read,
-            )));
-        }
-        Ok(bytes_read as usize)
+        Ok(total as usize)
     }
 }
 

@@ -5,9 +5,10 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 
 use crate::metadata::MetadataManager;
 use crate::rpc::buffer_pool::{PathBufferLease, PathBufferPool};
+use crate::rpc::connection::ConnectionPool;
 use crate::rpc::file_id::FileIdRegistry;
-use crate::rpc::{RpcError, data_ops::*, metadata_ops::*};
-use crate::storage::{ChunkStore, IOUringChunkStore};
+use crate::rpc::{RpcError, metadata_ops::*};
+use crate::storage::{ChunkStore, IOUringChunkStore, InodeStore};
 
 /// RPC Handler context
 ///
@@ -17,6 +18,18 @@ pub struct RpcHandlerContext {
     pub metadata_manager: Rc<MetadataManager>,
     pub chunk_store: Rc<dyn ChunkStore>,
     pub allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+    /// Optional on-disk inode persistence. `None` (or
+    /// `InodeStore::is_disabled()`) means the metadata path stays
+    /// pure-in-memory — matches the pre-persistence baseline.
+    pub inode_store: Option<Rc<InodeStore>>,
+    /// Connection pool for sending server-to-server RPCs (e.g. the CHFS-style
+    /// central parent index DirIndexUpdate). `None` for bench contexts where
+    /// no peer connectivity is set up.
+    pub connection_pool: Option<Rc<ConnectionPool>>,
+    /// This node's identifier — used to compare against
+    /// `metadata_manager.get_owner_node()` to decide whether a DirIndexUpdate
+    /// stays local or fans out to a peer.
+    pub self_node_id: String,
     path_buffer_pool: Rc<PathBufferPool>,
     /// FileId to path mapping registry for compact RPC
     file_id_registry: Rc<FileIdRegistry>,
@@ -30,10 +43,14 @@ impl RpcHandlerContext {
         chunk_store: Rc<dyn ChunkStore>,
         allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
     ) -> Self {
+        let self_node_id = metadata_manager.self_node_id().to_string();
         Self {
             metadata_manager,
             chunk_store,
             allocator,
+            inode_store: None,
+            connection_pool: None,
+            self_node_id,
             path_buffer_pool: Rc::new(PathBufferPool::new(64)),
             file_id_registry: Rc::new(FileIdRegistry::with_capacity(1024)),
             shutdown_flag: RefCell::new(false),
@@ -47,14 +64,48 @@ impl RpcHandlerContext {
         allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
         file_id_registry: Rc<FileIdRegistry>,
     ) -> Self {
+        let self_node_id = metadata_manager.self_node_id().to_string();
         Self {
             metadata_manager,
             chunk_store,
             allocator,
+            inode_store: None,
+            connection_pool: None,
+            self_node_id,
             path_buffer_pool: Rc::new(PathBufferPool::new(64)),
             file_id_registry,
             shutdown_flag: RefCell::new(false),
         }
+    }
+
+    /// Create a context with persistence enabled.
+    pub fn with_inode_store(
+        metadata_manager: Rc<MetadataManager>,
+        chunk_store: Rc<dyn ChunkStore>,
+        allocator: Rc<pluvio_uring::allocator::FixedBufferAllocator>,
+        file_id_registry: Rc<FileIdRegistry>,
+        inode_store: Option<Rc<InodeStore>>,
+    ) -> Self {
+        let self_node_id = metadata_manager.self_node_id().to_string();
+        Self {
+            metadata_manager,
+            chunk_store,
+            allocator,
+            inode_store,
+            connection_pool: None,
+            self_node_id,
+            path_buffer_pool: Rc::new(PathBufferPool::new(64)),
+            file_id_registry,
+            shutdown_flag: RefCell::new(false),
+        }
+    }
+
+    /// Attach a connection pool for outbound server-to-server RPCs.
+    /// Used by the CHFS-style central parent index path to send
+    /// DirIndexUpdate to the parent's owner when it isn't local.
+    pub fn with_connection_pool(mut self, pool: Rc<ConnectionPool>) -> Self {
+        self.connection_pool = Some(pool);
+        self
     }
 
     /// Create a minimal context for benchmark (no storage/metadata)
@@ -80,6 +131,9 @@ impl RpcHandlerContext {
             metadata_manager,
             chunk_store,
             allocator,
+            inode_store: None,
+            connection_pool: None,
+            self_node_id: "bench".to_string(),
             path_buffer_pool: Rc::new(PathBufferPool::new(16)),
             file_id_registry: Rc::new(FileIdRegistry::new()),
             shutdown_flag: RefCell::new(false),
@@ -122,264 +176,6 @@ impl RpcHandlerContext {
     /// Get the shared FileIdRegistry reference
     pub fn file_id_registry_rc(&self) -> Rc<FileIdRegistry> {
         Rc::clone(&self.file_id_registry)
-    }
-}
-
-// ============================================================================
-// Data RPC Handlers
-// ============================================================================
-
-/// Response for ReadChunk that includes both header and data
-pub struct ReadChunkHandlerResponse {
-    pub header: ReadChunkResponseHeader,
-    pub data: Option<Vec<u8>>,
-}
-
-/// Handle ReadChunk RPC request
-///
-/// Reads chunk data from local storage and returns it to the client via RDMA.
-///
-/// **DEPRECATED**: This handler is deprecated. Use `ReadChunkByIdRequest::server_handler` instead.
-#[allow(deprecated)]
-#[async_backtrace::framed]
-pub async fn handle_read_chunk(
-    ctx: Rc<RpcHandlerContext>,
-    mut am_msg: AmMsg,
-) -> Result<(ReadChunkHandlerResponse, AmMsg), (RpcError, AmMsg)> {
-    // Parse request header
-    let header: ReadChunkRequestHeader = match am_msg
-        .header()
-        .get(..std::mem::size_of::<ReadChunkRequestHeader>())
-        .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-    {
-        Some(h) => h,
-        None => return Err((RpcError::InvalidHeader, am_msg)),
-    };
-
-    // Receive path from request data
-    let path = if header.path_len > 0 && am_msg.contains_data() {
-        let mut path_bytes = vec![0u8; header.path_len as usize];
-        if let Err(e) = am_msg
-            .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
-            .await
-        {
-            tracing::error!("Failed to receive path data: {:?}", e);
-            return Ok((
-                ReadChunkHandlerResponse {
-                    header: ReadChunkResponseHeader::error(-5), // EIO
-                    data: None,
-                },
-                am_msg,
-            ));
-        }
-
-        match String::from_utf8(path_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("Failed to decode path: {:?}", e);
-                return Ok((
-                    ReadChunkHandlerResponse {
-                        header: ReadChunkResponseHeader::error(-22), // EINVAL
-                        data: None,
-                    },
-                    am_msg,
-                ));
-            }
-        }
-    } else {
-        return Ok((
-            ReadChunkHandlerResponse {
-                header: ReadChunkResponseHeader::error(-22), // EINVAL
-                data: None,
-            },
-            am_msg,
-        ));
-    };
-
-    tracing::debug!(
-        "ReadChunk: path={}, chunk={}, offset={}, length={}",
-        path,
-        header.chunk_index,
-        header.offset,
-        header.length
-    );
-
-    // Read chunk from storage
-    match ctx
-        .chunk_store
-        .read_chunk(&path, header.chunk_index, header.offset, header.length)
-        .await
-    {
-        Ok(data) => {
-            let bytes_read = data.len() as u64;
-
-            tracing::debug!(
-                "Read {} bytes from storage (path={}, chunk={})",
-                bytes_read,
-                path,
-                header.chunk_index
-            );
-
-            Ok((
-                ReadChunkHandlerResponse {
-                    header: ReadChunkResponseHeader::success(bytes_read),
-                    data: Some(data),
-                },
-                am_msg,
-            ))
-        }
-        Err(e) => {
-            tracing::error!("Failed to read chunk: {:?}", e);
-            Ok((
-                ReadChunkHandlerResponse {
-                    header: ReadChunkResponseHeader::error(-2), // ENOENT
-                    data: None,
-                },
-                am_msg,
-            ))
-        }
-    }
-}
-
-/// Handle WriteChunk RPC request
-///
-/// Receives chunk data from the client via RDMA and writes it to local storage.
-/// Uses registered buffers for zero-copy DMA writes.
-///
-/// **DEPRECATED**: This handler is deprecated. Use `WriteChunkByIdRequest::server_handler` instead.
-#[allow(deprecated)]
-#[async_backtrace::framed]
-pub async fn handle_write_chunk(
-    ctx: Rc<RpcHandlerContext>,
-    mut am_msg: AmMsg,
-) -> Result<(WriteChunkResponseHeader, AmMsg), (RpcError, AmMsg)> {
-    // Parse request header
-    let header: WriteChunkRequestHeader = match am_msg
-        .header()
-        .get(..std::mem::size_of::<WriteChunkRequestHeader>())
-        .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
-    {
-        Some(h) => h,
-        None => return Err((RpcError::InvalidHeader, am_msg)),
-    };
-
-    // Receive path and data from client via RDMA-read
-    // Data section layout: [path][chunk_data]
-    if !am_msg.contains_data() {
-        tracing::error!("WriteChunk request contains no data");
-        return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
-    }
-
-    // Receive path first (small buffer)
-    let mut path_bytes = vec![0u8; header.path_len as usize];
-    if let Err(e) = am_msg
-        .recv_data_vectored(&[std::io::IoSliceMut::new(&mut path_bytes)])
-        .await
-    {
-        tracing::error!("Failed to receive path: {:?}", e);
-        return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
-    }
-
-    let path = match String::from_utf8(path_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Failed to decode path: {:?}", e);
-            return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
-        }
-    };
-
-    // Acquire a registered buffer for zero-copy DMA write
-    let mut fixed_buffer = ctx.allocator.acquire().await;
-    let data_len = header.length as usize;
-
-    // Ensure the data fits in the registered buffer
-    if data_len > fixed_buffer.len() {
-        tracing::error!(
-            "Data size {} exceeds registered buffer size {}",
-            data_len,
-            fixed_buffer.len()
-        );
-        return Ok((WriteChunkResponseHeader::error(-22), am_msg)); // EINVAL
-    }
-
-    // Receive chunk data directly into registered buffer
-    let buffer_slice = &mut fixed_buffer.as_mut_slice()[..data_len];
-    if let Err(e) = am_msg
-        .recv_data_vectored(&[std::io::IoSliceMut::new(buffer_slice)])
-        .await
-    {
-        tracing::error!("Failed to receive chunk data: {:?}", e);
-        return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
-    }
-
-    tracing::debug!(
-        "WriteChunk (zero-copy): path={}, chunk={}, offset={}, length={}",
-        path,
-        header.chunk_index,
-        header.offset,
-        header.length
-    );
-
-    // Check if chunk_store supports zero-copy write
-    // Try downcasting to IOUringChunkStore to use write_chunk_fixed
-    use crate::storage::chunk_store::IOUringChunkStore;
-    use std::any::Any;
-
-    let chunk_store_any = &*ctx.chunk_store as &dyn Any;
-    if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
-        // Use zero-copy write with registered buffer
-        match io_uring_store
-            .write_chunk_fixed(
-                &path,
-                header.chunk_index,
-                header.offset,
-                fixed_buffer,
-                data_len,
-            )
-            .await
-        {
-            Ok(bytes_written) => {
-                tracing::debug!(
-                    "Wrote {} bytes (zero-copy) to storage (path={}, chunk={})",
-                    bytes_written,
-                    path,
-                    header.chunk_index
-                );
-                return Ok((
-                    WriteChunkResponseHeader::success(bytes_written as u64),
-                    am_msg,
-                ));
-            }
-            Err(e) => {
-                tracing::error!("Failed to write chunk (zero-copy): {:?}", e);
-                return Ok((WriteChunkResponseHeader::error(-5), am_msg)); // EIO
-            }
-        }
-    }
-
-    // Fallback: copy to Vec<u8> and use normal write
-    let data = fixed_buffer.as_mut_slice()[..data_len].to_vec();
-    match ctx
-        .chunk_store
-        .write_chunk(&path, header.chunk_index, header.offset, &data)
-        .await
-    {
-        Ok(bytes_written) => {
-            tracing::debug!(
-                "Wrote {} bytes to storage (path={}, chunk={})",
-                bytes_written,
-                path,
-                header.chunk_index
-            );
-            Ok((
-                WriteChunkResponseHeader::success(bytes_written as u64),
-                am_msg,
-            ))
-        }
-        Err(e) => {
-            tracing::error!("Failed to write chunk: {:?}", e);
-            Ok((WriteChunkResponseHeader::error(-5), am_msg)) // EIO
-        }
     }
 }
 

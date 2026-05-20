@@ -379,6 +379,20 @@ impl RpcServer {
             );
         }
 
+        // Spawn Readdir handler
+        {
+            use crate::rpc::readdir_ops::ReaddirRequest;
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<ReaddirRequest, _, _>().await {
+                        tracing::error!("Readdir handler error: {:?}", e);
+                    }
+                },
+                "rpc_readdir_handler".to_string(),
+            );
+        }
+
         // Spawn FsyncChunk handler
         {
             use crate::rpc::data_ops::FsyncChunkRequest;

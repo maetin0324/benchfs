@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use rrrpc::relay::client::DmaBuffer;
 
-use super::runtime::with_benchfs_ctx;
+use super::runtime::with_benchfs_client_ctx;
 
 thread_local! {
     /// Registry of arena-backed buffers handed out to C code, keyed by the
@@ -33,15 +33,12 @@ thread_local! {
 /// # Safety
 /// `out_ptr` must be a valid pointer to a single `*mut u8` location.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn benchfs_alloc_io_buffer(
-    size: usize,
-    out_ptr: *mut *mut u8,
-) -> i32 {
+pub unsafe extern "C" fn benchfs_alloc_io_buffer(size: usize, out_ptr: *mut *mut u8) -> i32 {
     if out_ptr.is_null() || size == 0 {
         return -1;
     }
-    let result = with_benchfs_ctx(|fs| {
-        let pool = match fs.connection_pool_ref() {
+    let result = with_benchfs_client_ctx(|fs| {
+        let pool = match fs.connection_pool() {
             Some(p) => p,
             None => return -2i32,
         };
@@ -49,12 +46,15 @@ pub unsafe extern "C" fn benchfs_alloc_io_buffer(
             Some(t) => t,
             None => return -2i32,
         };
-        let mut dma_buf: rrrpc::relay::client::DmaBuffer = match transport.arena_alloc(size as u32) {
+        let mut dma_buf: rrrpc::relay::client::DmaBuffer = match transport.arena_alloc(size as u32)
+        {
             Some(b) => b,
             None => return -3i32,
         };
         let ptr = dma_buf.as_mut_slice().as_mut_ptr();
-        unsafe { *out_ptr = ptr; }
+        unsafe {
+            *out_ptr = ptr;
+        }
         IO_BUFFERS.with(|m| {
             m.borrow_mut().insert(ptr as usize, dma_buf);
         });
@@ -80,6 +80,23 @@ pub unsafe extern "C" fn benchfs_free_io_buffer(ptr: *mut u8) -> i32 {
     }
     let removed = IO_BUFFERS.with(|m| m.borrow_mut().remove(&(ptr as usize)).is_some());
     if removed { 0 } else { -1 }
+}
+
+/// Query whether `ptr` was returned by [`benchfs_alloc_io_buffer`].
+///
+/// Returns 1 if the pointer is a registered benchfs IO buffer, 0 otherwise.
+/// Exposed so the IOR `aligned_buffer_alloc` / `aligned_buffer_free`
+/// shim can decide whether to delegate freeing back to benchfs or fall
+/// back to its standard `free()` path.
+///
+/// # Safety
+/// `ptr` may be any value; no dereference is performed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn benchfs_is_io_buffer(ptr: *const u8) -> i32 {
+    if ptr.is_null() {
+        return 0;
+    }
+    if is_io_buffer_ptr(ptr) { 1 } else { 0 }
 }
 
 /// Look up a registered DmaBuffer by pointer. Returns the offset of the

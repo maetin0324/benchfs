@@ -56,6 +56,24 @@ impl RegisteredFixedBuffer {
     pub fn buf_index(&self) -> u16 {
         self.buf_index
     }
+
+    /// Shrink the buffer's reported length to `n` so the locusta RDMA WRITE
+    /// only transfers `n` bytes (not the full FixedBuffer capacity).
+    ///
+    /// **Critical correctness invariant**: when the server replies to a
+    /// `RoundtripGet`, `try_issue_dma_read_write` posts `mlx5::write_imm`
+    /// with `len = segment.len()`. If `segment.len()` exceeds the size the
+    /// client allocated for its receive buffer, the WRITE will trample
+    /// neighbouring DMA-arena allocations that belong to *other* concurrent
+    /// RPC requests — those requests then complete with garbage in their
+    /// recv slot. ior-hard's 47008-byte reads exposed this as ~0.3% data
+    /// verification errors (job 20115/20118).
+    pub fn shrink_to(&mut self, n: usize) {
+        debug_assert!(n <= self.len, "shrink_to({n}) > underlying {}", self.len);
+        if n < self.len {
+            self.len = n;
+        }
+    }
 }
 
 // The locusta `RdmaBuffer` trait demands `Send + 'static`. Pluvio's

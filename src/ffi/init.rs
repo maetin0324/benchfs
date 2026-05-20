@@ -50,14 +50,15 @@ mod dhat_profile {
     pub fn start_if_first() {
         let mut count = CTX_COUNT.lock().expect("CTX_COUNT poisoned");
         if *count == 0 {
-            // BENCHFS_DHAT_DIR — directory; we write `dhat-<pid>.json`.
-            // BENCHFS_DHAT — explicit full path; takes precedence.
+            // `[observability] dhat_path` — explicit full path; wins if set.
+            // `[observability] dhat_dir`  — directory; we write `dhat-<pid>.json`.
             // Fallback: CWD/dhat-<pid>.json.
             let pid = std::process::id();
-            let out = if let Ok(p) = std::env::var("BENCHFS_DHAT") {
-                p
-            } else if let Ok(dir) = std::env::var("BENCHFS_DHAT_DIR") {
-                let _ = std::fs::create_dir_all(&dir);
+            let obs = &crate::runtime_config::RuntimeConfig::global().observability;
+            let out = if let Some(p) = obs.dhat_path.as_deref() {
+                p.to_string()
+            } else if let Some(dir) = obs.dhat_dir.as_deref() {
+                let _ = std::fs::create_dir_all(dir);
                 format!("{dir}/dhat-{pid}.json")
             } else {
                 format!("dhat-benchfs-{pid}.json")
@@ -119,14 +120,18 @@ fn discover_data_nodes(registry_dir: &str) -> Result<Vec<String>, String> {
         ));
     }
 
-    // Check if expected node count is specified via environment variable
-    let expected_nodes: Option<usize> = std::env::var("BENCHFS_EXPECTED_NODES")
-        .ok()
-        .and_then(|s| s.parse().ok());
+    // Check if expected node count is specified via [cluster] expected_nodes.
+    let expected_nodes: Option<usize> = match crate::runtime_config::RuntimeConfig::global()
+        .cluster
+        .expected_nodes
+    {
+        0 => None,
+        n => Some(n),
+    };
 
     if let Some(expected) = expected_nodes {
         tracing::info!(
-            "BENCHFS_EXPECTED_NODES={}: Will wait for all {} nodes to register",
+            "cluster.expected_nodes={}: Will wait for all {} nodes to register",
             expected,
             expected
         );
@@ -386,14 +391,10 @@ pub extern "C" fn benchfs_init(
     };
     crate::logging::init_with_hostname("info");
 
-    // Honor ENABLE_STATS env var on the client (FFI) side so that
-    // RPC_CLIENT_TIMING and other stats-gated paths emit data.
-    // The server binary (benchfsd_mpi) sets this directly; the FFI
-    // client must read it from env (mpirun -x ENABLE_STATS).
-    if std::env::var("ENABLE_STATS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    // Honor [stats] enabled in benchfs.toml on the client (FFI) side so
+    // that RPC_CLIENT_TIMING and other stats-gated paths emit data.
+    // Same flag is read by benchfsd_mpi.
+    if crate::runtime_config::RuntimeConfig::global().stats.enabled {
         crate::stats::set_stats_enabled(true);
     }
 
@@ -455,9 +456,10 @@ pub extern "C" fn benchfs_init(
     // if TLS already holds a BenchFS instance, hand out a fresh Box
     // wrapping a clone of the existing Rc and skip the full re-init.
     let use_locusta_client = is_server == 0
-        && std::env::var("BENCHFS_TRANSPORT")
-            .map(|v| v.eq_ignore_ascii_case("locusta"))
-            .unwrap_or(false);
+        && crate::runtime_config::RuntimeConfig::global()
+            .transport
+            .backend
+            .eq_ignore_ascii_case("locusta");
     if use_locusta_client {
         if let Some(existing) = super::runtime::get_benchfs_ctx_rc() {
             tracing::info!(
@@ -634,7 +636,18 @@ pub extern "C" fn benchfs_init(
 
         // Create runtime. 65536 initial slots = enough headroom that the
         // Slab backing Vec never grows during a 1M-iter mdtest-hard run.
-        let runtime = Runtime::new(65536);
+        // Scheduling tuning is now in benchfs.toml ([scheduling] section)
+        // instead of BENCHFS_STATUS_CACHE_ITERS / BENCHFS_REACTOR_POLL_INTERVAL
+        // env vars. See runtime_config.rs.
+        let rc = crate::runtime_config::RuntimeConfig::global();
+        let runtime = Runtime::with_config(
+            65536,
+            pluvio_runtime::executor::SchedulingConfig {
+                status_cache_iterations: rc.scheduling.status_cache_iters,
+                reactor_poll_interval: rc.scheduling.reactor_poll_interval,
+                ..Default::default()
+            },
+        );
 
         // Set runtime in thread-local storage BEFORE any async operations
         set_runtime(runtime.clone());
@@ -670,12 +683,14 @@ pub extern "C" fn benchfs_init(
         // with no static peers. Every `get_or_connect(node)` will lazy-run
         // `LocustaTransport::add_peer(node, 30s)` before returning a
         // locusta-backed RpcClient. Falls through to UCX otherwise.
-        let use_locusta = std::env::var("BENCHFS_TRANSPORT")
-            .map(|v| v.eq_ignore_ascii_case("locusta"))
-            .unwrap_or(false);
+        // Transport selection now comes from benchfs.toml [transport]
+        // backend = "locusta" instead of BENCHFS_TRANSPORT env var.
+        let use_locusta = rc.transport.backend.eq_ignore_ascii_case("locusta");
         #[cfg(not(feature = "transport-locusta"))]
         if use_locusta {
-            set_error_message("BENCHFS_TRANSPORT=locusta requires the transport-locusta feature");
+            set_error_message(
+                "transport.backend=\"locusta\" requires the transport-locusta feature",
+            );
             return std::ptr::null_mut();
         }
         #[cfg(feature = "transport-locusta")]
@@ -683,20 +698,12 @@ pub extern "C" fn benchfs_init(
             if use_locusta {
                 use crate::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
                 use std::path::PathBuf;
-                let arena_size: u32 = std::env::var("BENCHFS_LOCUSTA_ARENA_SIZE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(8 * 1024 * 1024);
-                let ring_capacity: u32 = std::env::var("BENCHFS_LOCUSTA_RING_CAPACITY")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(128);
                 let cfg = LocustaConfig {
                     registry_dir: PathBuf::from(registry_dir_str).join("locusta_qp"),
                     local_node_id: node_id_str.to_string(),
                     peer_node_ids: Vec::new(),
-                    arena_size,
-                    ring_capacity,
+                    arena_size: rc.locusta.arena_size,
+                    ring_capacity: rc.locusta.ring_capacity,
                     ..LocustaConfig::default()
                 };
                 if let Err(e) = std::fs::create_dir_all(&cfg.registry_dir) {
@@ -713,23 +720,36 @@ pub extern "C" fn benchfs_init(
                             "FFI client: LocustaTransport ready, registry={}",
                             cfg.registry_dir.display()
                         );
-                        // Register a no-op "keepalive" reactor so the
-                        // pluvio executor's stuck-watchdog (1M iter
-                        // without made_progress) doesn't fire while
-                        // a long async RPC is in flight. The reactor
-                        // doesn't touch locusta state — tick happens
-                        // inside `WaitForResponse::poll` — but its
-                        // mere existence as a Running reactor sets
-                        // made_progress=true each iteration.
-                        struct KeepAliveReactor;
-                        impl pluvio_runtime::reactor::Reactor for KeepAliveReactor {
-                            fn poll(&self) {}
-                            fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
-                                pluvio_runtime::reactor::ReactorStatus::Running
+                        let transport_rc = Rc::new(t);
+                        if crate::rpc::transport_locusta::reactor_mode_enabled() {
+                            // Reactor mode: register the LocustaTransport
+                            // itself so the runtime ticks it directly.
+                            // `WaitForResponse::poll` skips its own tick.
+                            runtime.register_reactor("locusta", Rc::clone(&transport_rc));
+                            tracing::info!(
+                                "FFI client: registered LocustaTransport as pluvio Reactor (reactor mode)"
+                            );
+                        } else {
+                            // Legacy mode: register a no-op "keepalive"
+                            // reactor so the pluvio executor's stuck-
+                            // watchdog (1M iter without made_progress)
+                            // doesn't fire while a long async RPC is in
+                            // flight. The reactor doesn't touch locusta
+                            // state — tick happens inside
+                            // `WaitForResponse::poll`.
+                            struct KeepAliveReactor;
+                            impl pluvio_runtime::reactor::Reactor for KeepAliveReactor {
+                                fn poll(&self) {}
+                                fn status(&self) -> pluvio_runtime::reactor::ReactorStatus {
+                                    pluvio_runtime::reactor::ReactorStatus::Running
+                                }
                             }
+                            runtime.register_reactor(
+                                "locusta_keepalive",
+                                Rc::new(KeepAliveReactor),
+                            );
                         }
-                        runtime.register_reactor("locusta_keepalive", Rc::new(KeepAliveReactor));
-                        Some(Rc::new(t))
+                        Some(transport_rc)
                     }
                     Err(e) => {
                         set_error_message(&format!("Failed to init LocustaTransport: {:?}", e));
@@ -840,25 +860,77 @@ pub extern "C" fn benchfs_init(
         // server pays only the steady-state RPC cost (~10 ms RTT) instead of
         // first-connect cold-start (~1 s observed in job 16578). At 576 clients
         // × 36 servers, the lazy-connect burst eats the first 30-50 sec of any
-        // shared-file write phase. Toggle with BENCHFS_PREWARM_CONNECTIONS=0 to
-        // measure the unprewarmed baseline.
-        let prewarm = std::env::var("BENCHFS_PREWARM_CONNECTIONS")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        // shared-file write phase. Toggle with [prewarm] enabled = false
+        // in benchfs.toml to measure the unprewarmed baseline.
+        let prewarm = rc.prewarm.enabled;
         if prewarm && discovered_nodes.len() > 1 {
             tracing::info!(
                 "Pre-warming UCX endpoints to all {} data nodes",
                 discovered_nodes.len()
             );
             let pool_for_prewarm = connection_pool.clone();
-            let nodes_for_prewarm = discovered_nodes.clone();
-            let prewarm_start = std::time::Instant::now();
-            let _ = block_on_with_name("prewarm_connections", async move {
-                for node in nodes_for_prewarm.iter() {
-                    if let Err(e) = pool_for_prewarm.get_or_connect(node).await {
-                        tracing::warn!("Pre-warm: failed to connect to {}: {:?}", node, e);
-                    }
+            // Per-rank shuffled order: every client visits the server
+            // list in a different rotation so all 320 clients don't
+            // thundering-herd on `node_0` at t=0. Job 20212 saw 80-server
+            // 2× density fail this way — half the peers UDP-timed out
+            // during the prewarm burst. The rotation offset is derived
+            // from the client's own node_id_str so it's deterministic
+            // per process and zero overhead.
+            let rank_hash: u64 = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                node_id_str.hash(&mut h);
+                h.finish()
+            };
+            let mut nodes_for_prewarm = discovered_nodes.clone();
+            let n = nodes_for_prewarm.len();
+            if n > 1 {
+                let offset = (rank_hash as usize) % n;
+                nodes_for_prewarm.rotate_left(offset);
+            }
+            // Optional per-rank stagger: each rank waits
+            // `stagger_ms_per_rank × rank_id` ms before starting pre-warm.
+            // Spreads node_0 (metadata-pinned) fan-in so a 24-rank job
+            // doesn't slam 24 simultaneous UDP REQUESTs on one server
+            // (job 20489 hit this at 4 phys × ppn=6 = 24 ranks).
+            if rc.prewarm.stagger_ms_per_rank > 0 {
+                let rank_id_for_stagger: u64 = node_id_str
+                    .strip_prefix("node_")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                let wait_ms = rc.prewarm.stagger_ms_per_rank * rank_id_for_stagger;
+                if wait_ms > 0 {
+                    tracing::info!("Pre-warm stagger: sleeping {} ms before connect", wait_ms);
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
                 }
+            }
+            let prewarm_start = std::time::Instant::now();
+            // Parallel pre-warm via join_all so the locusta transport can
+            // process multiple UDP exchanges + RDMA QP setups concurrently.
+            // Sequential await with 80 peers was taking >>900s at 10 phys
+            // 2×S (job 20223/20236 hit walltime before writes started).
+            // Chunked pre-warm: bounded concurrency avoids the thundering
+            // herd at high ppn (80 ranks × 80 peers = 6400 simultaneous UDP
+            // exchanges overwhelmed locusta's single UDP recv loop at
+            // 10 phys × ppn≥4 — job 20364/20365 saw "udp exchange timeout"
+            // for ~30 peers each). [prewarm] concurrency in benchfs.toml
+            // controls this; set to >= peer_count to mimic join_all (lower
+            // values can serially block on a single 120 s timeout).
+            let chunk: usize = rc.prewarm.concurrency;
+            let _ = block_on_with_name("prewarm_connections", async move {
+                use futures::stream::{self, StreamExt};
+                let nodes = nodes_for_prewarm.clone();
+                stream::iter(nodes.into_iter().map(|node| {
+                    let pool = pool_for_prewarm.clone();
+                    async move {
+                        if let Err(e) = pool.get_or_connect(&node).await {
+                            tracing::warn!("Pre-warm: failed to connect to {}: {:?}", node, e);
+                        }
+                    }
+                }))
+                .buffer_unordered(chunk)
+                .collect::<Vec<()>>()
+                .await;
                 Ok::<(), crate::rpc::RpcError>(())
             });
             tracing::info!(
@@ -867,12 +939,18 @@ pub extern "C" fn benchfs_init(
             );
         }
 
-        // BISECT: restore 5/9 (fbb36a0) behavior where metadata is pinned to
-        // node_0. The 5/11 change to consistent-hash sharding correlated with
-        // a regression at ppn=16 b=16g shared (vanilla -w -r now hangs while
-        // the 5/9 baseline got 106 GiB/s on the same hardware). Try the
-        // hardcoded variant to confirm the cause.
-        let metadata_nodes = vec!["node_0".to_string()];
+        // Metadata distribution. Default = all discovered nodes (consistent
+        // hash sharding) so mdtest scales across the cluster. Set
+        // `[metadata] distributed = false` in benchfs.toml to pin to
+        // node_0 — a known workaround for an old ppn=16 b=16g shared
+        // hang (5/11) that has not re-appeared at ppn≤8 fpp. Pinning
+        // starves mdtest (320 clients × 1 server).
+        let metadata_distributed = rc.metadata.distributed;
+        let metadata_nodes = if metadata_distributed {
+            discovered_nodes.clone()
+        } else {
+            vec!["node_0".to_string()]
+        };
         let data_nodes = discovered_nodes;
 
         tracing::info!(
@@ -969,11 +1047,15 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     // Therefore, benchfs_finalize() should only clean up local resources,
     // not send shutdown RPCs to other nodes.
 
-    // Write retry statistics to CSV if BENCHFS_RETRY_STATS_OUTPUT is set
-    // The path can be either:
+    // Write retry statistics to CSV if `[observability] retry_stats_output`
+    // is set. The path can be either:
     // - A directory: stats will be written to <dir>/<node_id>.csv
     // - A file path: stats will be written to the specified file
-    if let Ok(stats_path) = std::env::var("BENCHFS_RETRY_STATS_OUTPUT") {
+    if let Some(stats_path) = crate::runtime_config::RuntimeConfig::global()
+        .observability
+        .retry_stats_output
+        .clone()
+    {
         let node_id = get_node_id().unwrap_or_else(|| "unknown".to_string());
 
         // Determine the actual file path
@@ -997,9 +1079,10 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     // Only drop the Box wrapper that C owns; the underlying Rc is
     // still held by the TLS BENCHFS_CTX and will be dropped on
     // process exit.
-    let use_locusta_client = std::env::var("BENCHFS_TRANSPORT")
-        .map(|v| v.eq_ignore_ascii_case("locusta"))
-        .unwrap_or(false)
+    let use_locusta_client = crate::runtime_config::RuntimeConfig::global()
+        .transport
+        .backend
+        .eq_ignore_ascii_case("locusta")
         && super::runtime::get_benchfs_ctx_rc().is_some();
 
     // Convert back to Rc<BenchFS> and drop one Rc clone. Other Rc

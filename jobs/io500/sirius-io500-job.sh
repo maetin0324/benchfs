@@ -47,6 +47,13 @@ NNODES=$(sort -u "${PBS_NODEFILE}" | wc -l)
 JOB_OUTPUT_DIR="${OUTPUT_DIR}/${JOB_START}-${JOBID}-${NNODES}n"
 JOB_BACKEND_DIR="${BACKEND_DIR}/$(basename -- "${JOB_OUTPUT_DIR}")"
 BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
+# Path to the external find driver built from
+# ior_integration/benchfs_backend (libbenchfs-linked). Auto-enables the
+# [find] phase via external-script when present.
+BENCHFS_PFIND_BIN="${BENCHFS_PFIND_BIN:-$(realpath "${SCRIPT_DIR}/../../ior_integration/benchfs_backend/bin/benchfs_pfind" 2>/dev/null)}"
+if [ -x "${BENCHFS_PFIND_BIN:-/nonexistent}" ]; then
+  IO500_FIND_RUN="${IO500_FIND_RUN:-TRUE}"
+fi
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
 SWEEP_DIR="${JOB_OUTPUT_DIR}/sweep"
 FINAL_DIR="${JOB_OUTPUT_DIR}/final"
@@ -172,7 +179,7 @@ export BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
 export BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
 
 cmd_mpirun_util=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self)
-cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH)
+cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH -x UCX_RCACHE_ENABLE -x UCX_MEMTYPE_CACHE -x UCX_TLS -x UCX_LOG_LEVEL -x UCX_RNDV_THRESH)
 
 # Optional UCX-only TCP fallback for debugging cross-node RDMA-related bugs.
 # Set FORCE_UCX_TCP=1 to force BenchFS's internal UCX context to TCP/SHM
@@ -265,6 +272,47 @@ start_benchfsd() {
   local server_log_dir="${BENCHFSD_LOG_BASE_DIR}/server_${config_id}"
   mkdir -p "${server_log_dir}"
   local config_file="${JOB_OUTPUT_DIR}/benchfs_${config_id}.toml"
+  # Backend selection: env or default to locusta (job 20603/20612 confirmed
+  # the toml needs [transport]; without it RuntimeConfig::default() set
+  # backend="" → UCX, and ior-hard hung on UCX shared-file path).
+  local benchfs_backend="${BENCHFS_BACKEND:-locusta}"
+  local benchfs_arena_size="${BENCHFS_LOCUSTA_ARENA_SIZE:-268435456}"
+  local benchfs_ring_capacity="${BENCHFS_LOCUSTA_RING_CAPACITY:-1024}"
+  local benchfs_recv_ring="${BENCHFS_LOCUSTA_RECV_RING_SIZE:-32768}"
+  local benchfs_send_buf="${BENCHFS_LOCUSTA_SEND_BUF_SIZE:-32768}"
+  local benchfs_max_inflight="${BENCHFS_LOCUSTA_MAX_INFLIGHT:-128}"
+  # Translate 0|1 env to toml bool. Empty/unset → true (default).
+  local benchfs_metadata_distributed="true"
+  if [ "${BENCHFS_METADATA_DISTRIBUTED:-1}" = "0" ]; then
+    benchfs_metadata_distributed="false"
+  fi
+  local benchfs_central_parent_index="true"
+  if [ "${BENCHFS_CENTRAL_PARENT_INDEX:-1}" = "0" ]; then
+    benchfs_central_parent_index="false"
+  fi
+  # Reactor-polling: env=1 (default) enables pluvio Reactor as sole driver
+  # of locusta inner.tick. +38% mdtest-stat, +22.8% mdtest-easy-write,
+  # +8.6% ior-hard-write. NEVER disable for production benchmark.
+  local benchfs_reactor_mode="true"
+  if [ "${BENCHFS_LOCUSTA_REACTOR:-1}" = "0" ]; then
+    benchfs_reactor_mode="false"
+  fi
+  local benchfs_skip_recv_copy="false"
+  if [ "${BENCHFS_SKIP_RECV_COPY:-0}" = "1" ]; then
+    benchfs_skip_recv_copy="true"
+  fi
+  local benchfs_sequential_chunk_rpcs="false"
+  if [ "${BENCHFS_SEQUENTIAL_CHUNK_RPCS:-0}" = "1" ]; then
+    benchfs_sequential_chunk_rpcs="true"
+  fi
+  local benchfs_disable_rdma="false"
+  if [ "${BENCHFS_DISABLE_RDMA:-0}" = "1" ]; then
+    benchfs_disable_rdma="true"
+  fi
+  local benchfs_stats_enabled="false"
+  if [ "${ENABLE_STATS:-0}" = "1" ]; then
+    benchfs_stats_enabled="true"
+  fi
 
   cat > "${config_file}" <<EOF
 [node]
@@ -287,9 +335,77 @@ registry_dir = "${BENCHFS_REGISTRY_DIR}"
 metadata_cache_entries = 10000
 chunk_cache_mb = 1024
 cache_ttl_secs = 0
+
+[transport]
+backend = "${benchfs_backend}"
+
+[locusta]
+arena_size = ${benchfs_arena_size}
+ring_capacity = ${benchfs_ring_capacity}
+recv_ring_size = ${benchfs_recv_ring}
+send_buf_size = ${benchfs_send_buf}
+max_inflight = ${benchfs_max_inflight}
+accept_interval_ms = ${BENCHFS_LOCUSTA_ACCEPT_INTERVAL_MS:-100}
+reactor_mode = ${benchfs_reactor_mode}
+dispatch_idle_sleep_us = ${BENCHFS_LOCUSTA_DISPATCH_SLEEP_US:-20}
+dispatch_idle_threshold = ${BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD:-16}
+mlx5_auto_spread = true
+skip_recv_copy = ${benchfs_skip_recv_copy}
+
+[iouring]
+queue_size = ${BENCHFS_IOURING_QUEUE_SIZE:-2048}
+submit_depth = ${BENCHFS_IOURING_SUBMIT_DEPTH:-512}
+sq_poll_ms = ${BENCHFS_IOURING_SQ_POLL_MS:-200}
+chunk_fd_cache_size = ${BENCHFS_CHUNK_FD_CACHE_SIZE:-0}
+submit_timeout_us = ${BENCHFS_IOURING_SUBMIT_TIMEOUT_US:-1000}
+complete_timeout_us = ${BENCHFS_IOURING_COMPLETE_TIMEOUT_US:-1000}
+
+[metadata]
+persist = "${BENCHFS_METADATA_PERSIST:-off}"
+flush_interval_ms = ${BENCHFS_METADATA_FLUSH_MS:-50}
+dirty_high_watermark = ${BENCHFS_METADATA_DIRTY_HWM:-16384}
+distributed = ${benchfs_metadata_distributed}
+central_parent_index = ${benchfs_central_parent_index}
+
+[prewarm]
+enabled = ${BENCHFS_PREWARM_ENABLED:-true}
+concurrency = ${BENCHFS_PREWARM_CONCURRENCY:-80}
+stagger_ms_per_rank = ${BENCHFS_PREWARM_STAGGER_MS:-0}
+
+[scheduling]
+reactor_poll_interval = ${BENCHFS_REACTOR_POLL_INTERVAL:-2}
+status_cache_iters = ${BENCHFS_STATUS_CACHE_ITERS:-100}
+
+[rpc]
+max_concurrent_chunk_rpcs = ${BENCHFS_MAX_CONCURRENT_CHUNK_RPCS:-16}
+sequential_chunk_rpcs = ${benchfs_sequential_chunk_rpcs}
+disable_rdma = ${benchfs_disable_rdma}
+force_rdma = false
+timeout_secs = ${BENCHFS_RPC_TIMEOUT:-600}
+max_retries = 0
+retry_delay_ms = 100
+retry_backoff = 2.0
+
+[cluster]
+expected_nodes = ${BENCHFS_EXPECTED_NODES:-0}
+
+[observability]
+chrome_tracing = false
+integrity_log = false
+integrity_dir = "/tmp"
+
+[stats]
+enabled = ${benchfs_stats_enabled}
+ucx_am_breakdown = false
 EOF
 
+  # Export so children (mpirun -x BENCHFS_CONFIG) inherit it. Without this
+  # both benchfsd_mpi and libbenchfs.so fell back to RuntimeConfig::default()
+  # (UCX backend), masking BENCHFS_TRANSPORT env entirely.
+  export BENCHFS_CONFIG="${config_file}"
+
   echo "==== Starting benchfsd config_id=${config_id} chunk=${chunk_bytes} bytes ===="
+  echo "==== BENCHFS_CONFIG=${config_file} backend=${benchfs_backend} ===="
 
   # NUMA-aware data_dir wrapper (one /scrN per local rank).
   local datadir_wrapper="${server_log_dir}/benchfsd_datadir_wrapper.sh"
@@ -300,14 +416,22 @@ EOF
 # the qsub-script's ulimit, so each benchfsd starts with the system soft
 # default. fd cache for chunk files needs ≥65k fds per server vnode.
 ulimit -n 1048576 2>/dev/null || ulimit -n 524288 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+echo "[wrapper] $(hostname) rank=${OMPI_COMM_WORLD_LOCAL_RANK:-0} fd_limit=$(ulimit -n)" >&2
 # Disable core dumps — when mdtest-hard crashes, multi-GB cores would land
 # on /home (Lustre) and risk filling space / disrupting SSH/Claude session.
 ulimit -c 0 2>/dev/null || true
 LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK:-0}
+# Use /scrN dirs that the PBS prologue actually created for this job.
+# (PBS chunks-per-host map to per-vnode /scrN; missing ones mean that
+# /scrN is owned by root with no write access on that host.)
+# If a host has only 1 of /scr{0..3} created, all local vnodes end up
+# piled on that single NVMe, producing 60× tail latency. The fix is at
+# the qsub layer: ensure each chunk maps to a distinct vnode/scrN, not
+# in the wrapper.
 LOCAL_SCRATCH_DIRS=()
 LOCAL_NUMA_NODES=()
 for n in 0 1 2 3; do
-  if [ -d "/scr${n}/${PBS_JOBID}" ]; then
+  if [ -d "/scr${n}/${PBS_JOBID}" ] && [ -w "/scr${n}/${PBS_JOBID}" ]; then
     LOCAL_SCRATCH_DIRS+=("/scr${n}/${PBS_JOBID}")
     LOCAL_NUMA_NODES+=("${n}")
   fi
@@ -316,6 +440,10 @@ if [ ${#LOCAL_SCRATCH_DIRS[@]} -gt 0 ]; then
   DIR_INDEX=$((LOCAL_RANK % ${#LOCAL_SCRATCH_DIRS[@]}))
   RANK_DATA_DIR="${LOCAL_SCRATCH_DIRS[$DIR_INDEX]}"
   RANK_NUMA="${LOCAL_NUMA_NODES[$DIR_INDEX]}"
+  # Warn if this host has fewer than 4 dirs (indicates load-imbalance risk)
+  if [ ${#LOCAL_SCRATCH_DIRS[@]} -lt 4 ]; then
+    echo "[wrapper] WARNING $(hostname) has only ${#LOCAL_SCRATCH_DIRS[@]} writable /scrN dirs: ${LOCAL_SCRATCH_DIRS[*]}" >&2
+  fi
 else
   IFS=',' read -ra SCRATCH_DIRS <<< "${BENCHFS_SCRATCH_DIRS}"
   DIR_INDEX=$((LOCAL_RANK % ${#SCRATCH_DIRS[@]}))
@@ -335,8 +463,13 @@ fi
 WRAPPER_EOF
   chmod +x "${datadir_wrapper}"
 
-  # 1 server per vnode (benchfsd uses local NVMe + bound to NUMA).
-  local server_np=$VNODES
+  # Server-rank density per vnode. Default 1 (one server rank per vnode,
+  # NUMA-bound to local NVMe). For ior-hard's single-thread handler ceiling
+  # (~85µs per 47KB op limits per-server to ~0.5 GB/s) increasing to 2 can
+  # double per-host throughput; multiple ranks share the same /scr dir but
+  # different node_ids in the chunk hash so chunk files don't collide.
+  local server_ranks_per_vnode="${BENCHFS_SERVER_RANKS_PER_VNODE:-1}"
+  local server_np=$((VNODES * server_ranks_per_vnode))
   local cmd=(
     "${cmd_mpirun_common[@]}"
     -np "$server_np"
@@ -345,6 +478,7 @@ WRAPPER_EOF
     -x RUST_LOG="${RUST_LOG_S}"
     -x RUST_BACKTRACE
     -x PBS_JOBID
+    -x BENCHFS_CONFIG
     -x BENCHFS_SCRATCH_DIRS="${BENCHFS_SCRATCH_DIRS_CSV}"
     -x BENCHFS_INNER_BINARY
     -x BENCHFS_RPC_TIMEOUT
@@ -356,15 +490,23 @@ WRAPPER_EOF
     -x PLUVIO_URING_ALWAYS_POLL
     -x BENCHFS_CHUNK_FD_CACHE_SIZE
     -x BENCHFS_CHUNK_LAYOUT
+    -x BENCHFS_CHUNK_MMAP_WRITE
     -x BENCHFS_LOCUSTA_ARENA_SIZE
     -x BENCHFS_LOCUSTA_RING_CAPACITY
     -x BENCHFS_LOCUSTA_RECV_RING_SIZE
     -x BENCHFS_LOCUSTA_SEND_BUF_SIZE
+    -x BENCHFS_LOCUSTA_MAX_INFLIGHT
     -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
     -x LOCUSTA_DAEMON_EVENT_BUDGET
     -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
     -x BENCHFS_TRANSPORT
+    -x BENCHFS_METADATA_DISTRIBUTED
+    -x BENCHFS_CENTRAL_PARENT_INDEX
+    -x BENCHFS_EXPECTED_NODES="$((VNODES * ${BENCHFS_SERVER_RANKS_PER_VNODE:-1}))"
     -x ENABLE_STATS
+    -x BENCHFS_RPC_PROFILE
+    -x BENCHFS_FORCE_PUT_WRITES
+    -x BENCHFS_WRITE_EAGER_THRESHOLD
     "${datadir_wrapper}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -410,11 +552,11 @@ write_ini() {
   if [ "${enable_hard}" = "1" ]; then
     hard_run="TRUE"
   fi
-  # mdtest-hard is currently unstable (client-side heap corruption with
-  # 100k+ tiny file creates per phase). Keep mdtest-easy on and gate the
-  # hard variant separately so the easy phases still produce results.
+  # mdtest-hard heap corruption was fixed 2026-05-14 (pluvio_timer::Delay
+  # in benchfs_close). Default now enabled; set SKIP_MDTEST_HARD=1 to
+  # disable for legacy debugging only.
   local mdtest_hard_run="FALSE"
-  if [ "${enable_mdtest}" = "1" ] && [ "${SKIP_MDTEST_HARD:-1}" != "1" ]; then
+  if [ "${enable_mdtest}" = "1" ] && [ "${SKIP_MDTEST_HARD:-0}" != "1" ]; then
     mdtest_hard_run="TRUE"
   fi
 
@@ -426,6 +568,13 @@ write_ini() {
   if [ "${SKIP_IOR:-0}" = "1" ]; then
     ior_easy_run="FALSE"
     ior_hard_run="FALSE"
+  fi
+  # SKIP_IOR_HARD_READ=1 keeps ior-hard-write but disables ior-hard-read.
+  # Workaround for the ior-hard-read CQE error / verification instability
+  # at ppn=8 (see task #73). Run it independently when investigating.
+  local ior_hard_read_run="${ior_hard_run}"
+  if [ "${SKIP_IOR_HARD_READ:-0}" = "1" ]; then
+    ior_hard_read_run="FALSE"
   fi
 
   # The api line also carries BENCHFS-specific aiori options
@@ -489,12 +638,20 @@ run = ${mdtest_hard_run}
 run = ${mdtest_hard_run}
 [find]
 run = ${IO500_FIND_RUN:-FALSE}
+external-script = ${BENCHFS_PFIND_BIN:-}
+# benchfs_pfind is MPI-aware; when BENCHFS_PFIND_NPROC>1, prefix with
+# mpirun. Default empty → singleton (MPI_Init returns size=1) — avoids
+# the nested-mpirun hang in job 20536 where 32 pfind ranks × 40 server
+# peers = 1280 lazy add_peer handshakes against servers already serving
+# the io500 clients.
+external-mpi-args = ${BENCHFS_PFIND_MPI_ARGS:-}
+external-extra-args = ${BENCHFS_PFIND_EXTRA:-}
 [ior-easy-read]
 run = ${ior_easy_run}
 [mdtest-easy-stat]
 run = ${mdtest_run}
 [ior-hard-read]
-run = ${ior_hard_run}
+run = ${ior_hard_read_run}
 [mdtest-hard-stat]
 run = ${mdtest_hard_run}
 [mdtest-easy-delete]
@@ -504,7 +661,7 @@ run = ${mdtest_hard_run}
 [mdtest-hard-delete]
 run = ${mdtest_hard_run}
 [ior-rnd4K-easy-read]
-run = FALSE
+run = ${IO500_RND4K_RUN:-FALSE}
 EOF
 }
 
@@ -547,18 +704,41 @@ run_io500() {
     --oversubscribe
     -x RUST_LOG="${RUST_LOG_C}"
     -x RUST_BACKTRACE
-    -x BENCHFS_EXPECTED_NODES="${VNODES}"
+    -x BENCHFS_CONFIG
+    -x BENCHFS_EXPECTED_NODES="$((VNODES * ${BENCHFS_SERVER_RANKS_PER_VNODE:-1}))"
     -x BENCHFS_TRANSPORT
+    -x BENCHFS_METADATA_DISTRIBUTED
+    -x BENCHFS_CENTRAL_PARENT_INDEX
     -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
     -x LOCUSTA_DAEMON_EVENT_BUDGET
     -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
     -x BENCHFS_LOCUSTA_ARENA_SIZE
     -x BENCHFS_LOCUSTA_RING_CAPACITY
+    -x BENCHFS_LOCUSTA_MAX_INFLIGHT
+    -x BENCHFS_LOCUSTA_RECV_RING_SIZE
+    -x BENCHFS_LOCUSTA_SEND_BUF_SIZE
     -x BENCHFS_RPC_TIMEOUT
     -x BENCHFS_PREWARM_CONNECTIONS
+    -x BENCHFS_PREWARM_CONCURRENCY
+    -x BENCHFS_STATUS_CACHE_ITERS
+    -x BENCHFS_REACTOR_POLL_INTERVAL
+    -x BENCHFS_LOCUSTA_ACCEPT_INTERVAL_MS
+    -x BENCHFS_UCX_AM_BREAKDOWN
+    -x BENCHFS_MAX_CONCURRENT_CHUNK_RPCS
+    -x BENCHFS_DISABLE_RDMA
+    -x BENCHFS_SEQUENTIAL_CHUNK_RPCS
     -x ENABLE_STATS
     -x BENCHFS_SKIP_RECV_COPY
+    -x BENCHFS_CLOSE_META_ASYNC
+    -x BENCHFS_OPEN_META_ASYNC
+    -x BENCHFS_RPC_PROFILE
+    -x BENCHFS_FORCE_PUT_WRITES
+    -x BENCHFS_WRITE_EAGER_THRESHOLD
     -x BENCHFS_DHAT_DIR="${BENCHFS_DHAT_DIR:-${out_dir}/dhat}"
+    # benchfs_pfind (io500 external-script for the find phase) inherits
+    # rank 0's env via popen and needs the registry path to bootstrap a
+    # fresh locusta client. Skipped silently when the binary isn't built.
+    -x BENCHFS_REGISTRY_DIR="${BENCHFS_REGISTRY_DIR}"
     "${asan_args[@]}"
     "${IO500_DIR}/io500"
     "${ini}"
@@ -575,7 +755,7 @@ run_io500() {
     default_stonewall="${FINAL_STONEWALL}"
   fi
   local stonewall_for_timeout="${IO500_STONEWALL_FOR_TIMEOUT:-${default_stonewall}}"
-  local timeout_s=$(( stonewall_for_timeout > 0 ? stonewall_for_timeout * 8 + 600 : 1800 ))
+  local timeout_s=$(( stonewall_for_timeout > 0 ? stonewall_for_timeout * 12 + 600 : 1800 ))
   timeout --signal=TERM --kill-after=30 "${timeout_s}" \
     "${cmd[@]}" > "${out_dir}/io500_stdout.log" 2> "${out_dir}/io500_stderr.log" || true
 }

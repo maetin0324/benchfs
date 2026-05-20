@@ -16,7 +16,7 @@
 
 use benchfs::cache::CachePolicy;
 use benchfs::config::ServerConfig;
-use benchfs::logging::{TraceGuard, init_with_chrome, init_with_perfetto};
+use benchfs::logging::{TraceGuard, init_with_chrome};
 use benchfs::metadata::MetadataManager;
 use benchfs::rpc::connection::ConnectionPool;
 use benchfs::rpc::handlers::RpcHandlerContext;
@@ -96,21 +96,15 @@ fn init_locusta_runtime(
         .map(|r| format!("node_{}", r))
         .collect();
 
-    let arena_size: u32 = std::env::var("BENCHFS_LOCUSTA_ARENA_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8 * 1024 * 1024);
-    let ring_capacity: u32 = std::env::var("BENCHFS_LOCUSTA_RING_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128);
+    // Tuning from [locusta] section in benchfs.toml; see runtime_config.rs.
+    let rc = benchfs::runtime_config::RuntimeConfig::global();
     let cfg = LocustaConfig {
         registry_dir: PathBuf::from(registry_dir).join("locusta_qp"),
         local_node_id: node_id.to_string(),
         peer_node_ids,
         external_server_allocator: Some(Rc::clone(&handler_context.allocator)),
-        arena_size,
-        ring_capacity,
+        arena_size: rc.locusta.arena_size,
+        ring_capacity: rc.locusta.ring_capacity,
         ..LocustaConfig::default()
     };
     std::fs::create_dir_all(&cfg.registry_dir)?;
@@ -134,6 +128,8 @@ fn init_locusta_runtime(
     dispatch.register::<MetadataUpdateRequest>();
     dispatch.register::<WriteChunkByIdRequest<'_>>();
     dispatch.register::<ReadChunkByIdRequest<'_>>();
+    dispatch.register::<benchfs::rpc::readdir_ops::ReaddirRequest>();
+    dispatch.register::<benchfs::rpc::dir_index_ops::DirIndexUpdateRequest>();
 
     Ok(LocustaRuntimeState {
         transport,
@@ -179,6 +175,62 @@ impl ServerState {
 
     fn is_primary(&self) -> bool {
         self.mpi_rank == 0
+    }
+}
+
+fn dump_kernel_state() {
+    // RLIMIT_MEMLOCK — relevant to io_uring registered buffers (page pin).
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) == 0 {
+            tracing::info!(
+                target: "kernel_state",
+                rlim_cur = lim.rlim_cur,
+                rlim_max = lim.rlim_max,
+                "RLIMIT_MEMLOCK"
+            );
+        }
+    }
+
+    // /proc/meminfo subset — page allocation pressure indicators.
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines().filter(|l| {
+            l.starts_with("MemTotal:")
+                || l.starts_with("MemAvailable:")
+                || l.starts_with("MemFree:")
+                || l.starts_with("Mlocked:")
+                || l.starts_with("Unevictable:")
+                || l.starts_with("Slab:")
+                || l.starts_with("SReclaimable:")
+                || l.starts_with("SUnreclaim:")
+                || l.starts_with("Cached:")
+        }) {
+            tracing::info!(target: "kernel_state", "meminfo: {}", line.trim());
+        }
+    }
+
+    // cgroup v2 memory limits + current usage, if we're in one.
+    for key in [
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory.high",
+        "/sys/fs/cgroup/memory.events",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(key) {
+            tracing::info!(target: "kernel_state", "{}: {}", key, s.trim().replace('\n', " "));
+        }
+    }
+
+    // /proc/self/limits — full per-process resource limits dump.
+    if let Ok(s) = std::fs::read_to_string("/proc/self/limits") {
+        for line in s.lines().filter(|l| {
+            l.contains("locked memory")
+                || l.contains("open files")
+                || l.contains("address space")
+                || l.contains("pending signals")
+        }) {
+            tracing::info!(target: "kernel_state", "limits: {}", line.trim());
+        }
     }
 }
 
@@ -291,11 +343,12 @@ fn main() {
         "benchfs.toml"
     };
 
-    // Enable detailed timing statistics if requested (CLI flag or env var)
+    // Enable detailed timing statistics if requested (CLI flag or
+    // benchfs.toml [stats] enabled = true). CLI flag wins if set.
     if !enable_stats
-        && std::env::var("ENABLE_STATS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        && benchfs::runtime_config::RuntimeConfig::global()
+            .stats
+            .enabled
     {
         enable_stats = true;
     }
@@ -354,6 +407,11 @@ fn main() {
     tracing::info!("Data directory: {}", config.node.data_dir.display());
     tracing::info!("Registry directory: {}", registry_dir.display());
 
+    // Dump kernel state relevant to io_uring ENOMEM diagnostics
+    // (RLIMIT_MEMLOCK, MemAvailable, Slab, cgroup memory.*). These do not
+    // change at runtime, so a single emission at startup is enough.
+    dump_kernel_state();
+
     // Create data directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&config.node.data_dir) {
         eprintln!("Rank {}: Failed to create data directory: {}", mpi_rank, e);
@@ -368,6 +426,32 @@ fn main() {
         registry_dir,
         stats_output.clone(),
     ));
+
+    // Install SIGTERM / SIGINT handler so the graceful-shutdown loop
+    // (which runs `flush_all_sync` for the OnFinalize metadata policy)
+    // gets a chance to execute before the process dies. Without this the
+    // io500 wrapper's `pkill -TERM benchfsd_mpi` killed the process
+    // before any `running.store(false)` callback could fire.
+    //
+    // Using `libc::signal` keeps us in already-pulled dependencies (no
+    // signal-hook). The handler is `extern "C"`, performs an async-
+    // signal-safe atomic store on a `OnceLock<Arc<AtomicBool>>`, and
+    // returns. The runtime loop polls `state.is_running()` and runs the
+    // graceful path.
+    {
+        use std::sync::OnceLock;
+        static SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+        extern "C" fn handle_signal(_sig: libc::c_int) {
+            if let Some(flag) = SHUTDOWN_FLAG.get() {
+                flag.store(false, Ordering::Release);
+            }
+        }
+        let _ = SHUTDOWN_FLAG.set(Arc::clone(&state.running));
+        unsafe {
+            libc::signal(libc::SIGTERM, handle_signal as *const () as usize);
+            libc::signal(libc::SIGINT, handle_signal as *const () as usize);
+        }
+    }
 
     // Log stats output configuration
     if let Some(ref stats_path) = stats_output {
@@ -401,11 +485,16 @@ fn run_server(
         .to_str()
         .ok_or("Registry directory path is not valid UTF-8")?;
 
-    // Create pluvio runtime with optional Perfetto task tracking
-    // Tuned for high-throughput I/O: larger batch size and more frequent reactor polling
+    // Create pluvio runtime with optional Perfetto task tracking.
+    // Scheduling tuning comes from [scheduling] in benchfs.toml.
+    // task_batch_size stays hard-coded at 64 (no production reason to
+    // change it on the server); reactor_poll_interval and
+    // status_cache_iters are user-tunable via the TOML config.
+    let rc_sched = benchfs::runtime_config::RuntimeConfig::global();
     let scheduling_config = SchedulingConfig {
-        task_batch_size: 64,      // Increased from 16 for better throughput
-        reactor_poll_interval: 2, // Reduced from 8 for lower io_uring latency
+        task_batch_size: 64,
+        reactor_poll_interval: rc_sched.scheduling.reactor_poll_interval,
+        status_cache_iterations: rc_sched.scheduling.status_cache_iters,
         enable_perfetto_tracks,
         ..Default::default()
     };
@@ -446,6 +535,29 @@ fn run_server(
         cache_policy,
     ));
 
+    // CHFS-style central parent index: populate the metadata ring with all
+    // peer node_ids so handlers can compute `get_owner_node(parent_path)`
+    // and route `DirIndexUpdate` to the right peer. Without this, the ring
+    // only contains self_node_id (added in `MetadataManager::with_cache_policy`)
+    // and all writes appear to be local. Expected_nodes comes from
+    // `[cluster] expected_nodes` in benchfs.toml; 0 means "single node".
+    let expected_nodes: usize = benchfs::runtime_config::RuntimeConfig::global()
+        .cluster
+        .expected_nodes
+        .max(1);
+    if expected_nodes > 1 {
+        for i in 0..expected_nodes {
+            let peer = format!("node_{}", i);
+            if peer != node_id {
+                metadata_manager.add_node(peer);
+            }
+        }
+        tracing::info!(
+            "Metadata ring populated with {} peers (incl self)",
+            expected_nodes
+        );
+    }
+
     // Create chunk store based on configuration
     let chunk_store_dir = config.node.data_dir.join("chunks");
     if let Err(e) = std::fs::create_dir_all(&chunk_store_dir) {
@@ -467,19 +579,18 @@ fn run_server(
             // sees up to 16 clients × 64 in-flight per client (MAX_CONCURRENT_CHUNK_RPCS)
             // = 1024 concurrent WriteChunk RPCs. queue_size=512 was the cap that exhausted
             // and caused 30s WriteChunk timeouts during io500 ior-easy.
-            // Override via BENCHFS_IOURING_QUEUE_SIZE / BENCHFS_IOURING_SUBMIT_DEPTH.
+            // Override via benchfs.toml [iouring].
+            let rc_iouring = benchfs::runtime_config::RuntimeConfig::global();
             let chunk_size = config.storage.chunk_size;
             let base_chunk_size: usize = 4 * 1024 * 1024; // 4 MiB baseline
             let chunk_multiplier = (base_chunk_size / chunk_size).max(1) as u32;
-            let queue_size = std::env::var("BENCHFS_IOURING_QUEUE_SIZE")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(2048)
+            let queue_size = rc_iouring
+                .iouring
+                .queue_size
                 .saturating_mul(chunk_multiplier);
-            let submit_depth = std::env::var("BENCHFS_IOURING_SUBMIT_DEPTH")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(512)
+            let submit_depth = rc_iouring
+                .iouring
+                .submit_depth
                 .saturating_mul(chunk_multiplier)
                 .min(queue_size);
 
@@ -488,15 +599,10 @@ fn run_server(
             // SQEs can sit in the in-memory submission queue for up to
             // `wait_submit_timeout` before being flushed via `io_uring_enter`.
             // At low/medium load this caps server-side write concurrency.
-            // Default kept at 1 ms for safety; override via env to probe.
-            let submit_timeout_us = std::env::var("BENCHFS_IOURING_SUBMIT_TIMEOUT_US")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1000);
-            let complete_timeout_us = std::env::var("BENCHFS_IOURING_COMPLETE_TIMEOUT_US")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1000);
+            // Override via `[iouring] submit_timeout_us` /
+            // `complete_timeout_us` in benchfs.toml.
+            let submit_timeout_us = rc_iouring.iouring.submit_timeout_us;
+            let complete_timeout_us = rc_iouring.iouring.complete_timeout_us;
 
             tracing::info!(
                 "Configuring io_uring: buffer_size={} bytes ({} MiB), queue_size={}, submit_depth={}, submit_timeout_us={}, complete_timeout_us={}, memory={}GiB",
@@ -508,9 +614,11 @@ fn run_server(
                 complete_timeout_us,
                 (queue_size as usize * chunk_size) / (1024 * 1024 * 1024)
             );
-            let sq_poll_idle_ms: Option<u32> = std::env::var("BENCHFS_IOURING_SQ_POLL_MS")
-                .ok()
-                .and_then(|v| v.parse().ok());
+            // sq_poll_ms in TOML: 0 → disabled, >0 → SQPOLL idle ms.
+            let sq_poll_idle_ms: Option<u32> = match rc_iouring.iouring.sq_poll_ms {
+                0 => None,
+                n => Some(n as u32),
+            };
             let mut builder = IoUringReactor::builder()
                 .queue_size(queue_size)
                 .buffer_size(chunk_size)
@@ -609,23 +717,71 @@ fn run_server(
         }
     };
 
+    // Build the persistent inode store if `[metadata].persist` is set
+    // to anything other than "off". Lives under <data_dir>/inodes/.
+    let inode_store: Option<Rc<benchfs::storage::InodeStore>> = {
+        let rt_cfg = benchfs::runtime_config::RuntimeConfig::global();
+        let persist = rt_cfg.metadata.persist.to_lowercase();
+        let policy = match persist.as_str() {
+            "off" | "" => benchfs::storage::FlushPolicy::Off,
+            "writethrough" | "write-through" | "wt" => benchfs::storage::FlushPolicy::WriteThrough,
+            "writeback" | "write-back" | "wb" => benchfs::storage::FlushPolicy::WriteBack,
+            "onfinalize" | "on-finalize" | "finalize" => benchfs::storage::FlushPolicy::OnFinalize,
+            other => {
+                eprintln!(
+                    "[benchfsd_mpi] unknown [metadata].persist={:?}, defaulting to off",
+                    other
+                );
+                benchfs::storage::FlushPolicy::Off
+            }
+        };
+        if policy == benchfs::storage::FlushPolicy::Off {
+            None
+        } else {
+            match benchfs::storage::InodeStore::new(
+                &config.node.data_dir,
+                config.storage.chunk_size as u64,
+                policy,
+            ) {
+                Ok(s) => {
+                    eprintln!(
+                        "[benchfsd_mpi] inode_store enabled: policy={:?} base={}/inodes",
+                        policy,
+                        config.node.data_dir.display()
+                    );
+                    Some(Rc::new(s))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[benchfsd_mpi] failed to init inode_store ({}); persistence disabled",
+                        e
+                    );
+                    None
+                }
+            }
+        }
+    };
+
     // Create RPC handler context
-    let handler_context = Rc::new(RpcHandlerContext::new(
+    let handler_context = Rc::new(RpcHandlerContext::with_inode_store(
         metadata_manager.clone(),
         chunk_store,
         allocator,
+        Rc::new(benchfs::rpc::file_id::FileIdRegistry::with_capacity(1024)),
+        inode_store,
     ));
 
     // Create RPC server
     let rpc_server = Rc::new(RpcServer::new(worker.clone(), handler_context.clone()));
 
-    // BENCHFS_TRANSPORT=locusta swaps the connection pool for a
+    // [transport] backend = "locusta" swaps the connection pool for a
     // locusta-backed one *and* fires up the server-side dispatch loop.
     // All other state (chunk store, metadata manager, RpcHandlerContext)
     // is reused as-is — the only difference is the wire mechanism.
-    let use_locusta = std::env::var("BENCHFS_TRANSPORT")
-        .map(|v| v.eq_ignore_ascii_case("locusta"))
-        .unwrap_or(false);
+    let use_locusta = benchfs::runtime_config::RuntimeConfig::global()
+        .transport
+        .backend
+        .eq_ignore_ascii_case("locusta");
 
     #[cfg(feature = "transport-locusta")]
     let locusta_state = if use_locusta {
@@ -705,6 +861,28 @@ fn run_server(
             // implementation handles this rate fine).
             let dispatch = Rc::clone(&locusta_state.as_ref().unwrap().dispatch);
             let transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
+
+            // Register the LocustaTransport as a pluvio Reactor when
+            // BENCHFS_LOCUSTA_REACTOR=1. This makes the runtime call
+            // `transport.poll()` (= `inner.tick()`) every
+            // `reactor_poll_interval` runtime iterations. The dispatch
+            // task above is conditioned on this flag too: in reactor
+            // mode it uses `drain_and_spawn` (no tick), in legacy mode
+            // it uses `poll_once_spawn` (tick + drain).
+            if benchfs::rpc::transport_locusta::reactor_mode_enabled() {
+                use pluvio_runtime::executor::get_runtime;
+                if let Some(rt) = get_runtime() {
+                    rt.register_reactor("locusta", Rc::clone(&transport));
+                    tracing::info!(
+                        "Registered LocustaTransport as pluvio Reactor (reactor mode)"
+                    );
+                } else {
+                    tracing::warn!(
+                        "BENCHFS_LOCUSTA_REACTOR=1 but no thread-local runtime; reactor not registered"
+                    );
+                }
+            }
+
             pluvio_runtime::spawn_with_name(
                 async move {
                     tracing::info!(
@@ -719,31 +897,106 @@ fn run_server(
                     // idle for a few iterations, fall back to a short
                     // sleep so this task doesn't starve other work.
                     //
-                    // Tuning knobs:
-                    //   BENCHFS_LOCUSTA_DISPATCH_SLEEP_US — idle sleep (default 20us)
-                    //   BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD — empty polls
-                    //     before sleeping (default 16)
-                    let idle_sleep_us: u64 = std::env::var("BENCHFS_LOCUSTA_DISPATCH_SLEEP_US")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(20);
-                    let idle_threshold: u32 =
-                        std::env::var("BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(16);
+                    // Tuning knobs in benchfs.toml [locusta]:
+                    //   dispatch_idle_sleep_us  (default 20)
+                    //   dispatch_idle_threshold (default 16)
+                    let rc_locusta =
+                        &benchfs::runtime_config::RuntimeConfig::global().locusta;
+                    let idle_sleep_us: u64 = rc_locusta.dispatch_idle_sleep_us;
+                    let idle_threshold: u32 = rc_locusta.dispatch_idle_threshold;
+                    // BENCHFS_LOCUSTA_REACTOR=1 — when on, the pluvio
+                    // Reactor (registered below) is the sole driver of
+                    // `inner.tick()`. The dispatch task only drains and
+                    // spawns; this removes the try_borrow_mut race that
+                    // killed earlier attempts (jobs 17035/17038).
+                    let reactor_mode =
+                        benchfs::rpc::transport_locusta::reactor_mode_enabled();
+                    if reactor_mode {
+                        tracing::info!(
+                            "locusta dispatch in reactor mode: drain-only (tick handled by registered Reactor)"
+                        );
+                    }
                     let mut iter: u64 = 0;
                     let mut empty_polls: u32 = 0;
+                    // Hang-detection counters.
+                    let mut total_drained: u64 = 0;
+                    let mut last_progress_at = std::time::Instant::now();
+                    let mut last_seen_total: u64 = 0;
+                    let stall_warn = std::time::Duration::from_secs(10);
+                    let mut next_stall_warn_at = last_progress_at + stall_warn;
+                    // Periodic WriteChunkById Put pipeline counter dump.
+                    // Reveals which stage is the choke point during hangs:
+                    //   received → granted → ready → replied
+                    // If granted == ready ≪ replied, server is stuck on
+                    // chunk_store. If received ≫ granted, allocator is
+                    // throttling. Etc.
+                    let mut next_pipeline_dump_at =
+                        last_progress_at + std::time::Duration::from_secs(5);
                     loop {
-                        let drained = dispatch.poll_once_spawn(&transport);
+                        let drained = if reactor_mode {
+                            // Drain only — Reactor handles inner.tick().
+                            dispatch.drain_and_spawn(&transport)
+                        } else {
+                            dispatch.poll_once_spawn(&transport)
+                        };
                         iter = iter.wrapping_add(1);
+                        if drained > 0 {
+                            total_drained = total_drained.saturating_add(drained as u64);
+                            last_progress_at = std::time::Instant::now();
+                            next_stall_warn_at = last_progress_at + stall_warn;
+                        }
                         if iter == 1 || iter % 1_000_000 == 0 {
                             tracing::info!(
-                                "locusta dispatch drain heartbeat iter={} (idle_threshold={}, idle_sleep_us={})",
+                                "locusta dispatch drain heartbeat iter={} total_drained={} (idle_threshold={}, idle_sleep_us={})",
                                 iter,
+                                total_drained,
                                 idle_threshold,
                                 idle_sleep_us
                             );
+                        }
+                        let now = std::time::Instant::now();
+                        if now >= next_stall_warn_at && total_drained > 0 {
+                            let stalled_secs = now.duration_since(last_progress_at).as_secs();
+                            let delta = total_drained.saturating_sub(last_seen_total);
+                            tracing::warn!(
+                                "locusta dispatch STALL: no drained requests for {}s (iter={}, total_drained={}, since_last_warn={})",
+                                stalled_secs,
+                                iter,
+                                total_drained,
+                                delta
+                            );
+                            last_seen_total = total_drained;
+                            next_stall_warn_at = now + stall_warn;
+                        }
+                        if now >= next_pipeline_dump_at {
+                            use std::sync::atomic::Ordering;
+                            let received = benchfs::rpc::locusta_handlers::WCB_PUT_RECEIVED
+                                .load(Ordering::Relaxed);
+                            let granted = benchfs::rpc::locusta_handlers::WCB_PUT_GRANTED
+                                .load(Ordering::Relaxed);
+                            let grant_rej = benchfs::rpc::locusta_handlers::WCB_PUT_GRANT_REJECTED
+                                .load(Ordering::Relaxed);
+                            let ready = benchfs::rpc::locusta_handlers::WCB_PUT_READY
+                                .load(Ordering::Relaxed);
+                            let replied = benchfs::rpc::locusta_handlers::WCB_PUT_REPLIED
+                                .load(Ordering::Relaxed);
+                            let pending_grant = received.saturating_sub(granted + grant_rej);
+                            let pending_write = granted.saturating_sub(ready);
+                            let pending_reply = ready.saturating_sub(replied);
+                            tracing::info!(
+                                target: "wcb_put_pipeline",
+                                received = received,
+                                granted = granted,
+                                grant_rejected = grant_rej,
+                                ready = ready,
+                                replied = replied,
+                                pending_grant = pending_grant,
+                                pending_write = pending_write,
+                                pending_reply = pending_reply,
+                                "WCB_PUT_PIPELINE"
+                            );
+                            next_pipeline_dump_at =
+                                now + std::time::Duration::from_secs(5);
                         }
                         if drained > 0 {
                             empty_polls = 0;
@@ -775,7 +1028,16 @@ fn run_server(
             pluvio_runtime::spawn_with_name(
                 async move {
                     tracing::info!("Starting locusta client_accept loop");
-                    let scan_interval = std::time::Duration::from_millis(100);
+                    // Drains incoming UDP REQUEST packets every
+                    // [locusta] accept_interval_ms ms. Default 100ms
+                    // gates accept throughput at ~256/100ms = 2560 peers/s
+                    // per server. At 10 phys × ppn=4 (3200 conn fan-in),
+                    // 100ms ticks combined with 32 peer-process-per-host
+                    // means bursts dropped (job 20364/20365 udp timeouts).
+                    let scan_ms = benchfs::runtime_config::RuntimeConfig::global()
+                        .locusta
+                        .accept_interval_ms;
+                    let scan_interval = std::time::Duration::from_millis(scan_ms);
                     let per_peer_timeout = std::time::Duration::from_secs(10);
                     let mut iter: u64 = 0;
                     loop {
@@ -1046,6 +1308,40 @@ fn run_server(
                 // ========== Graceful Shutdown Sequence ==========
                 tracing::info!("Initiating graceful shutdown...");
 
+                // Step 0: OnFinalize metadata flush. The run paid no
+                // per-RPC disk cost for `persist=onfinalize`; do the
+                // single batched write now, before the runtime is torn
+                // down. Off/WriteThrough/WriteBack flush_all_sync is a
+                // cheap no-op (Off: returns 0 immediately; the others
+                // already wrote during the run, so re-writing here is
+                // also fine and idempotent for our schema).
+                {
+                    let ctx = rpc_server_clone.handler_context();
+                    if let Some(store) = ctx.inode_store.as_ref() {
+                        let policy = store.policy();
+                        if policy != benchfs::storage::FlushPolicy::Off {
+                            let t0 = std::time::Instant::now();
+                            let files = ctx.metadata_manager.snapshot_local_files();
+                            let dirs = ctx.metadata_manager.snapshot_local_dirs();
+                            let snapshot_us = t0.elapsed().as_micros();
+                            let t1 = std::time::Instant::now();
+                            let (fw, dw, fe, de) = store.flush_all_sync(&files, &dirs);
+                            tracing::info!(
+                                "[benchfsd_mpi] flush_all_sync policy={:?} snapshot_us={} flush_us={} files={}/{} dirs={}/{} ferr={} derr={}",
+                                policy,
+                                snapshot_us,
+                                t1.elapsed().as_micros(),
+                                fw,
+                                files.len(),
+                                dw,
+                                dirs.len(),
+                                fe,
+                                de,
+                            );
+                        }
+                    }
+                }
+
                 // Step 1: Set shutdown flag on handler context
                 rpc_server_clone.handler_context().set_shutdown_flag();
 
@@ -1109,23 +1405,14 @@ fn run_server(
 /// Setup logging with optional trace output
 ///
 /// Trace format is determined by environment variables:
-/// - ENABLE_PERFETTO=1: Use Perfetto format (.pftrace) with task-level tracks
-/// - ENABLE_CHROME=1: Use Chrome trace format (.json)
-/// - Neither set: No tracing (console logging only)
-///
-/// If `trace_output` is Some and a trace format is enabled, the trace file
-/// will be flushed when the returned guard is dropped.
+/// - ENABLE_CHROME=1 + trace_output set: emit Chrome trace JSON.
+/// - Otherwise: console logging only.
 fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> Option<TraceGuard> {
-    // Check which trace format to use
-    let enable_perfetto = std::env::var("ENABLE_PERFETTO")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let enable_chrome = std::env::var("ENABLE_CHROME")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
+    let enable_chrome = benchfs::runtime_config::RuntimeConfig::global()
+        .observability
+        .chrome_tracing;
 
-    if let Some(trace_path) = trace_output {
-        // Create parent directory if needed
+    if let (Some(trace_path), true) = (trace_output, enable_chrome) {
         if let Some(parent) = trace_path.parent() {
             if !parent.exists() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -1136,27 +1423,9 @@ fn setup_logging(level: &str, trace_output: Option<&PathBuf>, mpi_rank: i32) -> 
                 }
             }
         }
-
-        if enable_perfetto {
-            let guard = init_with_perfetto(level, trace_path);
-            tracing::info!(
-                "Perfetto tracing enabled (task-level tracks), output: {}",
-                trace_path.display()
-            );
-            Some(guard)
-        } else if enable_chrome {
-            let guard = init_with_chrome(level, trace_path);
-            tracing::info!("Chrome tracing enabled, output: {}", trace_path.display());
-            Some(guard)
-        } else {
-            // Trace output path given but no format enabled - default to Perfetto
-            let guard = init_with_perfetto(level, trace_path);
-            tracing::info!(
-                "Perfetto tracing enabled (default), output: {}",
-                trace_path.display()
-            );
-            Some(guard)
-        }
+        let guard = init_with_chrome(level, trace_path);
+        tracing::info!("Chrome tracing enabled, output: {}", trace_path.display());
+        Some(guard)
     } else {
         benchfs::logging::init_with_hostname(level);
         None

@@ -62,8 +62,8 @@ use std::os::raw::c_char;
 use std::slice;
 
 use super::error::*;
-use super::runtime::{block_on_with_name, with_benchfs_ctx};
-use crate::api::file_ops::BenchFS;
+use super::runtime::{block_on_with_name, with_benchfs_client_ctx};
+use crate::api::client::BenchFSClient;
 use crate::api::types::{FileHandle, OpenFlags};
 
 /// Opaque file handle type for C code
@@ -227,14 +227,16 @@ pub extern "C" fn benchfs_create(
     let mut open_flags = c_flags_to_open_flags(flags);
     open_flags.create = true; // Ensure create flag is set
 
-    // Open file using thread-local context
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const BenchFS;
+    // Open file using thread-local context. Goes through `BenchFSClient`
+    // so this code path cannot touch the server-only metadata manager.
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on_with_name("create", async move {
-                fs_ref.benchfs_open(path_str, open_flags).await
-            })
+            block_on_with_name(
+                "create",
+                async move { fs_ref.open(path_str, open_flags).await },
+            )
         }
     });
 
@@ -278,13 +280,14 @@ pub extern "C" fn benchfs_open(
 
     let open_flags = c_flags_to_open_flags(flags);
 
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const BenchFS;
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
-            block_on_with_name("open", async move {
-                fs_ref.benchfs_open(path_str, open_flags).await
-            })
+            block_on_with_name(
+                "open",
+                async move { fs_ref.open(path_str, open_flags).await },
+            )
         }
     });
 
@@ -348,21 +351,19 @@ pub extern "C" fn benchfs_write(
 
         // Execute async write synchronously
         // We need to work around the lifetime issue by using raw pointers
-        let result = with_benchfs_ctx(|fs| {
-            // Get raw pointer to BenchFS (unsafe but necessary for FFI)
-            let fs_ptr = fs as *const BenchFS;
-
-            // Execute block_on with the pointer
+        let result = with_benchfs_client_ctx(|fs| {
+            let fs_ptr = fs as *const BenchFSClient;
             let fs_ref = &*fs_ptr;
 
             // Seek to the specified offset before writing
-            if let Err(e) = fs_ref.benchfs_seek(&handle_clone, offset, 0) {
+            if let Err(e) = fs_ref.seek(&handle_clone, offset, 0) {
                 return Err(format!("Seek failed: {:?}", e));
             }
 
-            block_on_with_name("write", async move {
-                fs_ref.benchfs_write(&handle_clone, buf).await
-            })
+            block_on_with_name(
+                "write",
+                async move { fs_ref.write(&handle_clone, buf).await },
+            )
             .map_err(|e| e.to_string())
         });
 
@@ -427,20 +428,17 @@ pub extern "C" fn benchfs_read(
 
         // Execute async read synchronously
         // We need to work around the lifetime issue by using raw pointers
-        let result = with_benchfs_ctx(|fs| {
-            // Get raw pointer to BenchFS
-            let fs_ptr = fs as *const BenchFS;
-
+        let result = with_benchfs_client_ctx(|fs| {
+            let fs_ptr = fs as *const BenchFSClient;
             let fs_ref = &*fs_ptr;
 
             // Seek to the specified offset before reading
-            if let Err(e) = fs_ref.benchfs_seek(&handle_clone, offset, 0) {
+            if let Err(e) = fs_ref.seek(&handle_clone, offset, 0) {
                 return Err(format!("Seek failed: {:?}", e));
             }
 
-            let n = block_on_with_name("read", async move {
-                fs_ref.benchfs_read(&handle_clone, buf).await
-            });
+            let n =
+                block_on_with_name("read", async move { fs_ref.read(&handle_clone, buf).await });
 
             match n {
                 Ok(bytes_read) => Ok(bytes_read),
@@ -489,10 +487,10 @@ pub extern "C" fn benchfs_close(file: *mut benchfs_file_t) -> i32 {
 
         tracing::debug!("benchfs_close: path={:?}", handle.path);
 
-        let result = with_benchfs_ctx(|fs| {
-            let fs_ptr = fs as *const BenchFS;
+        let result = with_benchfs_client_ctx(|fs| {
+            let fs_ptr = fs as *const BenchFSClient;
             let fs_ref = &*fs_ptr;
-            block_on_with_name("close", async move { fs_ref.benchfs_close(handle).await })
+            block_on_with_name("close", async move { fs_ref.close(handle).await })
                 .map_err(|e| e.to_string())
         });
 
@@ -518,14 +516,11 @@ pub extern "C" fn benchfs_fsync(file: *mut benchfs_file_t) -> i32 {
 
         tracing::debug!("benchfs_fsync: path={:?}", handle.path);
 
-        let result = with_benchfs_ctx(|fs| {
-            let fs_ptr = fs as *const BenchFS;
+        let result = with_benchfs_client_ctx(|fs| {
+            let fs_ptr = fs as *const BenchFSClient;
             let fs_ref = &*fs_ptr;
             block_on_with_name("fsync", async move {
-                fs_ref
-                    .benchfs_fsync(handle)
-                    .await
-                    .map_err(|e| e.to_string())
+                fs_ref.fsync(handle).await.map_err(|e| e.to_string())
             })
         });
 
@@ -553,15 +548,12 @@ pub extern "C" fn benchfs_remove(
 
     tracing::debug!("benchfs_remove: path={:?}", path_str);
 
-    let result = with_benchfs_ctx(|fs| {
-        let fs_ptr = fs as *const BenchFS;
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
         unsafe {
             let fs_ref = &*fs_ptr;
             block_on_with_name("remove", async move {
-                fs_ref
-                    .benchfs_unlink(path_str)
-                    .await
-                    .map_err(|e| e.to_string())
+                fs_ref.unlink(path_str).await.map_err(|e| e.to_string())
             })
         }
     });
@@ -595,9 +587,8 @@ pub extern "C" fn benchfs_lseek(file: *mut benchfs_file_t, offset: i64, whence: 
             whence
         );
 
-        let result = with_benchfs_ctx(|fs| {
-            fs.benchfs_seek(handle, offset, whence)
-                .map_err(|e| e.to_string())
+        let result = with_benchfs_client_ctx(|fs| {
+            fs.seek(handle, offset, whence).map_err(|e| e.to_string())
         });
 
         match result {
@@ -612,4 +603,101 @@ pub extern "C" fn benchfs_lseek(file: *mut benchfs_file_t, offset: i64, whence: 
             }
         }
     }
+}
+
+// ============================================================================
+// readdir
+// ============================================================================
+
+/// Filler callback invoked for each directory entry during `benchfs_readdir`.
+///
+/// `arg` is the opaque pointer passed by the caller.
+/// `name` is a NUL-terminated UTF-8 string (the basename, not the full path).
+/// `entry_type` is one of: 0=file, 1=directory, 2=symlink.
+/// `size` is the file size in bytes (readdirplus: 0 for directories,
+/// symlinks, or when size is unknown). Callers that want POSIX find
+/// `-size` semantics can use this directly without a separate stat RPC.
+///
+/// Return 0 to continue, non-zero to stop iteration early (e.g. when the
+/// caller's buffer is full).
+#[allow(non_camel_case_types)]
+pub type benchfs_readdir_filler = Option<
+    extern "C" fn(
+        arg: *mut std::ffi::c_void,
+        name: *const c_char,
+        entry_type: i32,
+        size: u64,
+    ) -> i32,
+>;
+
+/// Iterate over the entries of `path`, invoking `filler` for each one.
+///
+/// CHFS-style scatter readdir: fans out an RPC to every node in the
+/// metadata ring, then merges and dedups the results before invoking
+/// `filler` once per unique name.
+///
+/// Returns the number of entries delivered to the filler on success
+/// (clamped to i32::MAX), or a negative `BENCHFS_E*` code on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn benchfs_readdir(
+    _ctx: *mut super::init::benchfs_context_t,
+    path: *const c_char,
+    filler: benchfs_readdir_filler,
+    arg: *mut std::ffi::c_void,
+) -> i32 {
+    let filler = match filler {
+        Some(f) => f,
+        None => {
+            set_error_message("filler callback must not be null");
+            return BENCHFS_EINVAL;
+        }
+    };
+    let path_str = match validate_c_str(path, "path") {
+        Some(s) => s,
+        None => return BENCHFS_EINVAL,
+    };
+
+    tracing::debug!("benchfs_readdir: path={:?}", path_str);
+
+    let result = with_benchfs_client_ctx(|fs| {
+        let fs_ptr = fs as *const BenchFSClient;
+        unsafe {
+            let fs_ref = &*fs_ptr;
+            block_on_with_name("readdir", async move {
+                fs_ref.readdir(path_str).await.map_err(|e| e.to_string())
+            })
+        }
+    });
+
+    let entries = match result {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(e)) => {
+            set_error_message(&e);
+            return BENCHFS_ERROR;
+        }
+        Err(e) => {
+            set_error_message(&e);
+            return BENCHFS_ERROR;
+        }
+    };
+
+    use crate::metadata::InodeType;
+    let mut count: i32 = 0;
+    for (name, ty, size) in &entries {
+        let cname = match std::ffi::CString::new(name.as_str()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let ty_code: i32 = match ty {
+            InodeType::File => 0,
+            InodeType::Directory => 1,
+            InodeType::Symlink => 2,
+        };
+        let rc = filler(arg, cname.as_ptr(), ty_code, *size);
+        count = count.saturating_add(1);
+        if rc != 0 {
+            break;
+        }
+    }
+    count
 }
