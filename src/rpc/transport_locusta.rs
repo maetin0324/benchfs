@@ -122,6 +122,12 @@ pub struct LocustaInner {
     /// out forever. We don't re-run `prepare_*` / `connect_*` on
     /// retransmits — those mutate locusta slabs and would blow up.
     pub cached_responses: HashMap<NodeId, (SocketAddrV4, [u8; PACKET_SIZE])>,
+    /// Per-peer count of duplicate REQUESTs we've received after
+    /// already being connected. Used by `accept_request_inline` to
+    /// detect "the peer reset its state" — when this hits a threshold
+    /// (currently 5) we drop the old dest_id and run a fresh
+    /// handshake. Cleared when a fresh handshake completes.
+    pub peer_request_retries: HashMap<NodeId, u32>,
 }
 
 impl LocustaInner {
@@ -496,14 +502,51 @@ impl LocustaInner {
         if peer == self.local_node_id {
             return Ok(());
         }
-        if self.node_to_dest.contains_key(&peer) {
-            // Already-connected: retransmit cached RESPONSE.
-            if let Some((addr, bytes)) = self.cached_responses.get(&peer).cloned() {
-                if let Err(e) = self.udp_socket.send_to(&bytes, addr) {
-                    tracing::warn!("re-send to {peer} failed: {e}");
+        // Reset-aware: the REQUEST carries the client's freshly-built
+        // relay/server QPNs. Compare against the cached RESPONSE's
+        // implied "what we last connected to". If the client's QPNs
+        // differ from the values we previously connected to, it has
+        // reset its state and we MUST allocate a new dest_id (leaks
+        // the old slot but lets the peer recover from a wedged QP).
+        if let Some(&old_dest) = self.node_to_dest.get(&peer) {
+            let cached_request_match = self
+                .cached_responses
+                .get(&peer)
+                .map(|(_, _)| true)
+                .unwrap_or(false);
+            // We can't directly compare against the old client QPN
+            // (it was never stored), so use a simpler heuristic:
+            // re-resend cached RESPONSE; if the client is in the same
+            // state it acks and moves on. If we see N retransmits
+            // from this peer in a row, assume reset and allocate new
+            // dest_id below.
+            let retry_count = self
+                .peer_request_retries
+                .entry(peer.clone())
+                .or_insert(0);
+            *retry_count += 1;
+            let retries = *retry_count;
+            if retries < 5 && cached_request_match {
+                // Probably just a lost RESPONSE; resend the cached
+                // one and let the existing dest_id stand.
+                if let Some((addr, bytes)) = self.cached_responses.get(&peer).cloned() {
+                    if let Err(e) = self.udp_socket.send_to(&bytes, addr) {
+                        tracing::warn!("re-send to {peer} failed: {e}");
+                    }
                 }
+                return Ok(());
             }
-            return Ok(());
+            // 5+ retransmits despite our resent RESPONSE → assume the
+            // client reset itself. Drop the old dest_id mapping and
+            // fall through to allocate a fresh one. The old QP slots
+            // on server/daemon leak until process exit.
+            tracing::warn!(
+                "peer {peer} request retried {retries}× through cached RESPONSE — \
+                 treating as peer-reset, reallocating dest_id (old={old_dest})"
+            );
+            self.node_to_dest.remove(&peer);
+            self.cached_responses.remove(&peer);
+            self.peer_request_retries.remove(&peer);
         }
 
         let dest_id = self.next_dest_id;
@@ -1003,6 +1046,7 @@ impl LocustaTransport {
             local_udp_addr,
             peer_udp_addrs: HashMap::new(),
             cached_responses: HashMap::new(),
+            peer_request_retries: HashMap::new(),
         };
         let inner = Rc::new(RefCell::new(inner));
 
@@ -1029,6 +1073,40 @@ impl LocustaTransport {
         let deadline = Instant::now() + timeout;
         let mut inner = self.inner.borrow_mut();
         inner.add_peer_blocking(peer, deadline)
+    }
+
+    /// Forget all client-side state for `peer` so the next RPC has to
+    /// re-issue the full handshake. Used by `call_locusta` when a peer
+    /// goes silent (no completion for ≥30 s) — the underlying RC QP is
+    /// probably wedged, and a fresh dest_id + fresh QP gives us a way
+    /// out without restarting the entire process.
+    ///
+    /// Caveats:
+    /// * Old QP slots on `server` / `daemon` are NOT released — they
+    ///   leak until the process exits. Short-lived IO500 phases tolerate
+    ///   this.
+    /// * The next `add_peer(peer, ...)` will allocate a fresh dest_id
+    ///   and run the UDP exchange again. If the server still
+    ///   remembers the old QP, the new REQUEST is treated as a
+    ///   retransmit and the server replies with its cached
+    ///   (old-QP) RESPONSE — we then fail to set up the new QP.
+    ///   To handle that, server side `accept_request_inline` was
+    ///   extended (separate edit) to recognise "node_id already
+    ///   present" + fresh REQUEST as a peer-reset request.
+    pub fn reset_peer(&self, peer: &NodeId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let had = inner.node_to_dest.remove(peer).is_some();
+        if had {
+            inner.peer_udp_addrs.remove(peer);
+            inner.cached_responses.remove(peer);
+            inner.peer_request_retries.remove(peer);
+            tracing::warn!(
+                target: "rpc_peer_reset",
+                peer = %peer,
+                "client reset peer state — next RPC will re-handshake"
+            );
+        }
+        had
     }
 
     /// Scan `registry_dir` for peer files belonging to nodes not yet

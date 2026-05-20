@@ -155,8 +155,26 @@ pub trait LocustaCallable: AmRpc {
                             resp_opt = Some(r);
                             break;
                         }
+                        Ok(Err(RpcError::ConnectionError(ref msg)))
+                            if msg.contains("unknown peer node") =>
+                        {
+                            // Peer not in node_to_dest (perhaps we just
+                            // reset it). Re-handshake and try again.
+                            tracing::warn!(
+                                target: "rpc_eager_retry",
+                                peer = %peer_id,
+                                rpc_id = Self::rpc_id(),
+                                attempt = attempt,
+                                "peer absent, running add_peer"
+                            );
+                            if let Err(e2) = transport
+                                .add_peer(&peer_id, std::time::Duration::from_secs(60))
+                            {
+                                last_err = Some(e2);
+                            }
+                        }
                         Ok(Err(e)) => {
-                            // Non-timeout transport error — don't retry.
+                            // Other transport error — don't retry.
                             return Err(e);
                         }
                         Err(_) => {
@@ -165,8 +183,14 @@ pub trait LocustaCallable: AmRpc {
                                 peer = %peer_id,
                                 rpc_id = Self::rpc_id(),
                                 attempt = attempt,
-                                "eager RPC timed out, retrying"
+                                "eager RPC timed out — resetting peer"
                             );
+                            // Drop client-side state for this peer so
+                            // the next send_eager fails fast with
+                            // ConnectionError("unknown peer"), which
+                            // the branch above will trigger
+                            // add_peer to re-handshake.
+                            transport.reset_peer(&peer_id);
                             last_err = Some(RpcError::TransportError(format!(
                                 "eager timeout after 30s (attempt {attempt})"
                             )));
