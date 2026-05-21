@@ -115,3 +115,53 @@ pub fn read_peer_qp(
         backoff = std::cmp::min(backoff * 2, max_backoff);
     }
 }
+
+/// Publish a 0-byte ACK at `{registry_dir}/locusta_qp/{owner}__{peer}.ack`
+/// to signal that `owner` has completed `connect_peer`/`connect_destination`
+/// against `peer`'s QPs. Without this barrier the peer may post an RDMA
+/// send before our QP transitions to RTS, producing `IBV_WC_RNR_RETRY_EXC`
+/// errors (visible upstream as `peer absent` retries).
+pub fn publish_ack(registry_dir: &Path, owner: &str, peer: &str) -> io::Result<()> {
+    let d = dir(registry_dir);
+    std::fs::create_dir_all(&d)?;
+    let final_path = d.join(format!("{owner}__{peer}.ack"));
+    let tmp_path = d.join(format!(
+        ".{owner}__{peer}.ack.tmp.{}",
+        std::process::id()
+    ));
+    std::fs::write(&tmp_path, b"ok")?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    Ok(())
+}
+
+/// Block until peer publishes its ACK file (`peer__self.ack`), confirming
+/// the peer has finished connecting to our QPs and is ready to receive
+/// RDMA traffic.
+pub fn wait_peer_ack(
+    registry_dir: &Path,
+    owner: &str,
+    peer: &str,
+    deadline: Instant,
+) -> io::Result<()> {
+    let path = dir(registry_dir).join(format!("{owner}__{peer}.ack"));
+    let mut backoff = Duration::from_millis(20);
+    let max_backoff = Duration::from_millis(500);
+    loop {
+        match std::fs::metadata(&path) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "registry ack {} not visible before deadline",
+                    path.display()
+                ),
+            ));
+        }
+        std::thread::sleep(backoff);
+        backoff = std::cmp::min(backoff * 2, max_backoff);
+    }
+}

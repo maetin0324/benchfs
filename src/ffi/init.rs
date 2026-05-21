@@ -699,7 +699,7 @@ pub extern "C" fn benchfs_init(
                 use crate::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
                 use std::path::PathBuf;
                 let cfg = LocustaConfig {
-                    registry_dir: PathBuf::from(registry_dir_str).join("locusta_qp"),
+                    registry_dir: PathBuf::from(registry_dir_str),
                     local_node_id: node_id_str.to_string(),
                     peer_node_ids: Vec::new(),
                     arena_size: rc.locusta.arena_size,
@@ -744,10 +744,8 @@ pub extern "C" fn benchfs_init(
                                     pluvio_runtime::reactor::ReactorStatus::Running
                                 }
                             }
-                            runtime.register_reactor(
-                                "locusta_keepalive",
-                                Rc::new(KeepAliveReactor),
-                            );
+                            runtime
+                                .register_reactor("locusta_keepalive", Rc::new(KeepAliveReactor));
                         }
                         Some(transport_rc)
                     }

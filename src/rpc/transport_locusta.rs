@@ -128,13 +128,100 @@ pub struct LocustaInner {
     /// (currently 5) we drop the old dest_id and run a fresh
     /// handshake. Cleared when a fresh handshake completes.
     pub peer_request_retries: HashMap<NodeId, u32>,
+    /// Throttle counter for the registry-mode peer discovery scan
+    /// performed inside `tick()`. Incremented every tick; the actual
+    /// directory walk runs once per `REGISTRY_SCAN_TICK_INTERVAL`.
+    pub registry_scan_counter: u32,
 }
 
 impl LocustaInner {
     /// Pump the polling state machines. Called both from the async wait
     /// futures and (in Phase 1c) from a registered Reactor.
+    /// Registry-mode peer discovery cadence: walk the registry once per
+    /// 100 ticks (~10 ms at the default reactor pace) to spot peers that
+    /// initiated a handshake against us. Cheap (readdir of a small dir
+    /// on Lustre) and amortised across many ticks.
+    const REGISTRY_SCAN_TICK_INTERVAL: u32 = 100;
+
+    /// Scan `{registry_dir}/locusta_qp/` for slots of the form
+    /// `{peer}__{self}.qp` whose `peer` we have not yet connected to,
+    /// then run `add_peer_blocking(peer)` against each one. This is the
+    /// server-side counterpart to a client's `add_peer(server)` call:
+    /// without it the client's `read_peer_qp` would never see our slot
+    /// because nothing ever drove `add_peer` on our end.
+    fn discover_registry_peers(&mut self) {
+        if std::env::var("BENCHFS_LOCUSTA_HANDSHAKE").as_deref() != Ok("registry") {
+            return;
+        }
+        let dir = self.registry_dir.join("locusta_qp");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let suffix = format!("__{}.qp", self.local_node_id);
+        // Process at most ONE peer per tick to bound the worst-case
+        // blocking time. iter105 processed the entire pending set in a
+        // single tick (~400 peers × 100ms of registry I/O ≈ 40s frozen
+        // reactor) and crushed ior-easy-write to 1.7 GiB/s. With one peer
+        // per tick at ~100 Hz cadence, 400 peers complete in 4s of
+        // amortised setup — short enough that the io500 stonewall window
+        // is not affected after warm-up.
+        let mut chosen: Option<String> = None;
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if name.starts_with('.') || !name.ends_with(&suffix) {
+                continue;
+            }
+            let owner = &name[..name.len() - suffix.len()];
+            if owner.is_empty() || owner == self.local_node_id {
+                continue;
+            }
+            if self.node_to_dest.contains_key(owner) {
+                continue;
+            }
+            chosen = Some(owner.to_string());
+            break;
+        }
+        if let Some(peer) = chosen {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            match self.add_peer_blocking(&peer, deadline) {
+                Ok(dest_id) => {
+                    tracing::info!(
+                        target: "rpc_registry_discover",
+                        peer = %peer,
+                        dest_id,
+                        "accepted registry-initiated peer"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "rpc_registry_discover",
+                        peer = %peer,
+                        error = ?e,
+                        "registry-accept failed"
+                    );
+                }
+            }
+        }
+    }
+
     pub fn tick(&mut self) {
         let t0 = std::time::Instant::now();
+        // Registry-mode discover (one peer per call) runs every
+        // REGISTRY_SCAN_TICK_INTERVAL ticks. In iter108 the original
+        // unbounded variant froze the reactor for ~40s. With one peer
+        // per scan and a short 5s per-handshake deadline, the worst
+        // case is a single tick blocked for ~5s — undesirable but
+        // recoverable, and only during the warm-up phase before the
+        // mesh is complete.
+        self.registry_scan_counter = self.registry_scan_counter.wrapping_add(1);
+        if self.registry_scan_counter % Self::REGISTRY_SCAN_TICK_INTERVAL == 0 {
+            self.discover_registry_peers();
+        }
         self.daemon.poll_client_requests();
         let t1 = t0.elapsed().as_micros() as u64;
         self.daemon.process_pending_dma_writes();
@@ -237,10 +324,16 @@ impl LocustaInner {
 
         // Design C: registry-based rendezvous. Opt-in via env to keep UDP
         // path as fallback while we validate scale behavior.
-        if matches!(
-            std::env::var("BENCHFS_LOCUSTA_HANDSHAKE").as_deref(),
-            Ok("registry")
-        ) {
+        let hs_env = std::env::var("BENCHFS_LOCUSTA_HANDSHAKE").unwrap_or_default();
+        let use_registry = hs_env == "registry";
+        tracing::warn!(
+            target: "rpc_handshake_mode",
+            peer = %peer,
+            env_value = %hs_env,
+            use_registry,
+            "add_peer_blocking handshake mode"
+        );
+        if use_registry {
             crate::rpc::registry_handshake::publish_local_qp(
                 &self.registry_dir,
                 &self.local_node_id,
@@ -280,6 +373,43 @@ impl LocustaInner {
                         "daemon.connect_destination({dest_id}, registry): {e:?}"
                     ))
                 })?;
+            // Phase 2: ACK barrier (publish only, optional wait). We
+            // always publish our ACK so peers can detect that *we* have
+            // connected, but waiting on theirs is gated behind
+            // `BENCHFS_LOCUSTA_WAIT_PEER_ACK=1` because in a 400-client
+            // prewarm pile-up the peer typically completes its own
+            // connect tens of seconds after ours (client side is
+            // sequential across 40 servers), and a strict wait inside
+            // the server's tick-bound discover loop drains the 5s
+            // deadline and fails the handshake (iter109 224 such
+            // failures). Skipping the wait is safe because no RPC is
+            // posted between handshake and the io500 stonewall warm-
+            // up (~seconds), and by then both sides' QPs are RTR/RTS.
+            crate::rpc::registry_handshake::publish_ack(
+                &self.registry_dir,
+                &self.local_node_id,
+                peer,
+            )
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "registry publish_ack({}__->{peer}): {e}",
+                    self.local_node_id
+                ))
+            })?;
+            if std::env::var("BENCHFS_LOCUSTA_WAIT_PEER_ACK").as_deref() == Ok("1") {
+                crate::rpc::registry_handshake::wait_peer_ack(
+                    &self.registry_dir,
+                    peer,
+                    &self.local_node_id,
+                    deadline,
+                )
+                .map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "registry wait_peer_ack({peer}__->{}): {e}",
+                        self.local_node_id
+                    ))
+                })?;
+            }
             self.node_to_dest.insert(peer.to_string(), dest_id);
             tracing::debug!(
                 target: "rpc_registry_handshake",
@@ -1083,6 +1213,7 @@ impl LocustaTransport {
             server,
             server_buffer_allocator,
             _server_buffer_mrs: server_buffer_mrs,
+            registry_scan_counter: 0,
             node_to_dest: HashMap::new(),
             channel_base_ptr: shm_base,
             channel_layout_total: layout.total_size,
@@ -1103,12 +1234,32 @@ impl LocustaTransport {
         let inner = Rc::new(RefCell::new(inner));
 
         // ------ Per-peer QP exchange (sequential; each peer gets a dest_id) ------
-        let deadline = Instant::now() + Duration::from_secs(cfg.exchange_timeout_secs);
-        {
+        // `BENCHFS_LOCUSTA_EXCHANGE_TIMEOUT_SECS` env overrides the config so
+        // a server pre-warming against `ior_client_0..N-1` can wait for the
+        // io500 mpirun child to start (registry-mode handshake is symmetric
+        // and the client publishes its slot once it boots).
+        let timeout_secs = std::env::var("BENCHFS_LOCUSTA_EXCHANGE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(cfg.exchange_timeout_secs);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        // `BENCHFS_LOCUSTA_DEFER_HANDSHAKE=1` skips the sync prewarm in init.
+        // Callers are then responsible for calling `add_peer` per peer
+        // later, after `register_self` has published their address (so the
+        // job script's `check_server_ready` barrier passes and io500 clients
+        // can start, ending the server-vs-client deadlock seen in iter108).
+        let defer = std::env::var("BENCHFS_LOCUSTA_DEFER_HANDSHAKE").as_deref() == Ok("1");
+        if !defer {
             let mut inner_mut = inner.borrow_mut();
             for peer in &cfg.peer_node_ids {
                 inner_mut.add_peer_blocking(peer, deadline)?;
             }
+        } else {
+            tracing::warn!(
+                target: "rpc_handshake_mode",
+                "BENCHFS_LOCUSTA_DEFER_HANDSHAKE=1 — skipping init-time prewarm; \
+                 caller must invoke add_peer per peer after register_self"
+            );
         }
         Ok(Self { inner })
     }

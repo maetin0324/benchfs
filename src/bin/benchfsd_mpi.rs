@@ -88,9 +88,13 @@ fn init_locusta_runtime(
     };
     use benchfs::rpc::transport_locusta::{LocustaConfig, LocustaTransport};
 
-    // Peer list: every other MPI rank gets a `node_<rank>` id. The
-    // locusta file-based QP exchange is symmetric so all ranks build
-    // the same view.
+    // Peer list: only other servers (`node_<rank>`). io500 clients
+    // (`ior_client_*`) are NOT prewarmed here — that would deadlock the
+    // job script's `check_server_ready` barrier (server init blocks
+    // waiting for clients that are themselves blocked waiting for
+    // `node_*.addr` to appear). Instead, clients call `add_peer(server)`
+    // on connect, and the server's `discover_registry_peers` (one peer
+    // per tick) handshakes back asynchronously.
     let peer_node_ids: Vec<String> = (0..mpi_size)
         .filter(|&r| r != mpi_rank)
         .map(|r| format!("node_{}", r))
@@ -99,7 +103,7 @@ fn init_locusta_runtime(
     // Tuning from [locusta] section in benchfs.toml; see runtime_config.rs.
     let rc = benchfs::runtime_config::RuntimeConfig::global();
     let cfg = LocustaConfig {
-        registry_dir: PathBuf::from(registry_dir).join("locusta_qp"),
+        registry_dir: PathBuf::from(registry_dir),
         local_node_id: node_id.to_string(),
         peer_node_ids,
         external_server_allocator: Some(Rc::clone(&handler_context.allocator)),
@@ -873,9 +877,7 @@ fn run_server(
                 use pluvio_runtime::executor::get_runtime;
                 if let Some(rt) = get_runtime() {
                     rt.register_reactor("locusta", Rc::clone(&transport));
-                    tracing::info!(
-                        "Registered LocustaTransport as pluvio Reactor (reactor mode)"
-                    );
+                    tracing::info!("Registered LocustaTransport as pluvio Reactor (reactor mode)");
                 } else {
                     tracing::warn!(
                         "BENCHFS_LOCUSTA_REACTOR=1 but no thread-local runtime; reactor not registered"
@@ -900,8 +902,7 @@ fn run_server(
                     // Tuning knobs in benchfs.toml [locusta]:
                     //   dispatch_idle_sleep_us  (default 20)
                     //   dispatch_idle_threshold (default 16)
-                    let rc_locusta =
-                        &benchfs::runtime_config::RuntimeConfig::global().locusta;
+                    let rc_locusta = &benchfs::runtime_config::RuntimeConfig::global().locusta;
                     let idle_sleep_us: u64 = rc_locusta.dispatch_idle_sleep_us;
                     let idle_threshold: u32 = rc_locusta.dispatch_idle_threshold;
                     // BENCHFS_LOCUSTA_REACTOR=1 — when on, the pluvio
@@ -909,8 +910,7 @@ fn run_server(
                     // `inner.tick()`. The dispatch task only drains and
                     // spawns; this removes the try_borrow_mut race that
                     // killed earlier attempts (jobs 17035/17038).
-                    let reactor_mode =
-                        benchfs::rpc::transport_locusta::reactor_mode_enabled();
+                    let reactor_mode = benchfs::rpc::transport_locusta::reactor_mode_enabled();
                     if reactor_mode {
                         tracing::info!(
                             "locusta dispatch in reactor mode: drain-only (tick handled by registered Reactor)"
@@ -995,8 +995,7 @@ fn run_server(
                                 pending_reply = pending_reply,
                                 "WCB_PUT_PIPELINE"
                             );
-                            next_pipeline_dump_at =
-                                now + std::time::Duration::from_secs(5);
+                            next_pipeline_dump_at = now + std::time::Duration::from_secs(5);
                         }
                         if drained > 0 {
                             empty_polls = 0;
