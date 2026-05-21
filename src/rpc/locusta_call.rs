@@ -167,8 +167,8 @@ pub trait LocustaCallable: AmRpc {
                                 attempt = attempt,
                                 "peer absent, running add_peer"
                             );
-                            if let Err(e2) = transport
-                                .add_peer(&peer_id, std::time::Duration::from_secs(60))
+                            if let Err(e2) =
+                                transport.add_peer(&peer_id, std::time::Duration::from_secs(60))
                             {
                                 last_err = Some(e2);
                             }
@@ -178,19 +178,43 @@ pub trait LocustaCallable: AmRpc {
                             return Err(e);
                         }
                         Err(_) => {
-                            tracing::warn!(
-                                target: "rpc_eager_retry",
-                                peer = %peer_id,
-                                rpc_id = Self::rpc_id(),
-                                attempt = attempt,
-                                "eager RPC timed out — resetting peer"
-                            );
-                            // Drop client-side state for this peer so
-                            // the next send_eager fails fast with
-                            // ConnectionError("unknown peer"), which
-                            // the branch above will trigger
-                            // add_peer to re-handshake.
-                            transport.reset_peer(&peer_id);
+                            // In UDP mode we reset and re-handshake on
+                            // timeout — locusta's add_peer is symmetric
+                            // so both sides allocate fresh dest_ids. In
+                            // registry mode the client side resets but
+                            // the server's `node_to_dest` keeps the
+                            // stale entry (discover skips re-handshake
+                            // for known peers), so the new client QPs
+                            // never get connected on the server side
+                            // and every subsequent RPC fails. Skip the
+                            // reset in registry mode to avoid that
+                            // desync — the retry below will hit the
+                            // same wedged QP and eventually exhaust,
+                            // but at least we don't corrupt server
+                            // state for healthy peers nearby.
+                            let registry_mode =
+                                crate::runtime_config::RuntimeConfig::global()
+                                    .locusta
+                                    .handshake_mode
+                                    == "registry";
+                            if registry_mode {
+                                tracing::warn!(
+                                    target: "rpc_eager_retry",
+                                    peer = %peer_id,
+                                    rpc_id = Self::rpc_id(),
+                                    attempt = attempt,
+                                    "eager RPC timed out — registry mode, skipping reset"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    target: "rpc_eager_retry",
+                                    peer = %peer_id,
+                                    rpc_id = Self::rpc_id(),
+                                    attempt = attempt,
+                                    "eager RPC timed out — resetting peer"
+                                );
+                                transport.reset_peer(&peer_id);
+                            }
                             last_err = Some(RpcError::TransportError(format!(
                                 "eager timeout after 30s (attempt {attempt})"
                             )));
@@ -199,9 +223,11 @@ pub trait LocustaCallable: AmRpc {
                 }
                 let resp = match resp_opt {
                     Some(r) => r,
-                    None => return Err(last_err.unwrap_or_else(|| {
-                        RpcError::TransportError("eager retry exhausted".to_string())
-                    })),
+                    None => {
+                        return Err(last_err.unwrap_or_else(|| {
+                            RpcError::TransportError("eager retry exhausted".to_string())
+                        }));
+                    }
                 };
                 let send_wait_us = t_send.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
                 let t_decode = if profile {
@@ -214,21 +240,13 @@ pub trait LocustaCallable: AmRpc {
                     let decode_us = t_decode
                         .map(|t| t.elapsed().as_micros() as u64)
                         .unwrap_or(0);
-                    let total_us = t_total
-                        .map(|t| t.elapsed().as_micros() as u64)
-                        .unwrap_or(0);
+                    let total_us = t_total.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
                     // We can't easily separate send vs wait without
                     // changing the transport; record the combined
                     // send+wait window as `send_wait_us` for now and
                     // leave wait=0 — at this layer that combined value
                     // already dominates and is the headline number.
-                    crate::rpc::perf_breakdown::cli_record(
-                        0,
-                        send_wait_us,
-                        0,
-                        decode_us,
-                        total_us,
-                    );
+                    crate::rpc::perf_breakdown::cli_record(0, send_wait_us, 0, decode_us, total_us);
                 }
                 r
             }
