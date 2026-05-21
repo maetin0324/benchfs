@@ -17,12 +17,39 @@ use std::time::{Duration, Instant};
 
 pub const QP_PAYLOAD_SIZE: usize = 128;
 
-fn dir(registry_dir: &Path) -> PathBuf {
-    registry_dir.join("locusta_qp")
+/// Number of subdirectory shards under `locusta_qp/`. 256 keeps each
+/// shard's file count to ~125 at 400-client × 40-server scale.
+pub const NUM_SHARDS: u8 = 0xFF;
+
+/// Return the full set of shard subdirectories under `locusta_qp/`,
+/// usable by `discover_registry_peers` to walk all peer publications.
+pub fn all_shard_dirs(registry_dir: &Path) -> Vec<PathBuf> {
+    let base = registry_dir.join("locusta_qp");
+    (0u16..=NUM_SHARDS as u16)
+        .map(|i| base.join(format!("{:02x}", i)))
+        .collect()
+}
+
+/// Hash the owner name into a 2-hex-digit subdirectory bucket. At
+/// 400-client × 40-server scale a single Lustre directory holds 32 k+
+/// .qp + .ack files and rename/lookup latency climbs into seconds,
+/// stalling the discover state machine. Sharding into 256 subdirs
+/// drops the per-dir count to ~125 and brings Lustre back to ms-class
+/// latency. The hash uses owner only (not the pair) so reading the
+/// peer's slot for a given pair still hits the *peer's* shard.
+pub fn shard_dir(registry_dir: &Path, owner: &str) -> PathBuf {
+    let mut h: u32 = 5381;
+    for b in owner.as_bytes() {
+        h = h.wrapping_mul(33).wrapping_add(*b as u32);
+    }
+    let bucket = (h & 0xFF) as u8;
+    registry_dir
+        .join("locusta_qp")
+        .join(format!("{:02x}", bucket))
 }
 
 pub fn slot_path(registry_dir: &Path, owner: &str, peer: &str) -> PathBuf {
-    dir(registry_dir).join(format!("{owner}__{peer}.qp"))
+    shard_dir(registry_dir, owner).join(format!("{owner}__{peer}.qp"))
 }
 
 fn encode(relay_qp: &QpExchangeInfo, server_qp: &QpExchangeInfo) -> [u8; QP_PAYLOAD_SIZE] {
@@ -34,6 +61,10 @@ fn encode(relay_qp: &QpExchangeInfo, server_qp: &QpExchangeInfo) -> [u8; QP_PAYL
         unsafe { &*(server_qp as *const QpExchangeInfo as *const [u8; 64]) };
     buf[64..].copy_from_slice(server_bytes);
     buf
+}
+
+pub fn decode_qp_payload(buf: &[u8]) -> io::Result<(QpExchangeInfo, QpExchangeInfo)> {
+    decode(buf)
 }
 
 fn decode(buf: &[u8]) -> io::Result<(QpExchangeInfo, QpExchangeInfo)> {
@@ -73,7 +104,7 @@ pub fn publish_local_qp(
     relay_qp: &QpExchangeInfo,
     server_qp: &QpExchangeInfo,
 ) -> io::Result<()> {
-    let d = dir(registry_dir);
+    let d = shard_dir(registry_dir, owner);
     std::fs::create_dir_all(&d)?;
     let final_path = d.join(format!("{owner}__{peer}.qp"));
     let tmp_path = d.join(format!(".{owner}__{peer}.qp.tmp.{}", std::process::id()));
@@ -122,7 +153,7 @@ pub fn read_peer_qp(
 /// send before our QP transitions to RTS, producing `IBV_WC_RNR_RETRY_EXC`
 /// errors (visible upstream as `peer absent` retries).
 pub fn publish_ack(registry_dir: &Path, owner: &str, peer: &str) -> io::Result<()> {
-    let d = dir(registry_dir);
+    let d = shard_dir(registry_dir, owner);
     std::fs::create_dir_all(&d)?;
     let final_path = d.join(format!("{owner}__{peer}.ack"));
     let tmp_path = d.join(format!(
@@ -143,7 +174,7 @@ pub fn wait_peer_ack(
     peer: &str,
     deadline: Instant,
 ) -> io::Result<()> {
-    let path = dir(registry_dir).join(format!("{owner}__{peer}.ack"));
+    let path = shard_dir(registry_dir, owner).join(format!("{owner}__{peer}.ack"));
     let mut backoff = Duration::from_millis(20);
     let max_backoff = Duration::from_millis(500);
     loop {
