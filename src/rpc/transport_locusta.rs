@@ -235,6 +235,61 @@ impl LocustaInner {
                 RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
             })?;
 
+        // Design C: registry-based rendezvous. Opt-in via env to keep UDP
+        // path as fallback while we validate scale behavior.
+        if matches!(
+            std::env::var("BENCHFS_LOCUSTA_HANDSHAKE").as_deref(),
+            Ok("registry")
+        ) {
+            crate::rpc::registry_handshake::publish_local_qp(
+                &self.registry_dir,
+                &self.local_node_id,
+                peer,
+                &relay_local,
+                &server_local,
+            )
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "registry publish_local_qp({}_->{peer}): {e}",
+                    self.local_node_id
+                ))
+            })?;
+            let (peer_relay, peer_server) = crate::rpc::registry_handshake::read_peer_qp(
+                &self.registry_dir,
+                peer,
+                &self.local_node_id,
+                deadline,
+            )
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "registry read_peer_qp({peer}__->{}): {e}",
+                    self.local_node_id
+                ))
+            })?;
+            self.server
+                .connect_peer(dest_id, &peer_relay)
+                .map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "server.connect_peer({dest_id}, registry): {e:?}"
+                    ))
+                })?;
+            self.daemon
+                .connect_destination(dest_id, &peer_server)
+                .map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "daemon.connect_destination({dest_id}, registry): {e:?}"
+                    ))
+                })?;
+            self.node_to_dest.insert(peer.to_string(), dest_id);
+            tracing::debug!(
+                target: "rpc_registry_handshake",
+                peer = %peer,
+                dest_id,
+                "registry handshake complete"
+            );
+            return Ok(dest_id);
+        }
+
         let peer_addr = self.resolve_peer_udp_addr(peer, deadline)?;
 
         let request = ExchangePacket {
@@ -520,10 +575,7 @@ impl LocustaInner {
             // state it acks and moves on. If we see N retransmits
             // from this peer in a row, assume reset and allocate new
             // dest_id below.
-            let retry_count = self
-                .peer_request_retries
-                .entry(peer.clone())
-                .or_insert(0);
+            let retry_count = self.peer_request_retries.entry(peer.clone()).or_insert(0);
             *retry_count += 1;
             let retries = *retry_count;
             if retries < 5 && cached_request_match {

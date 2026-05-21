@@ -28,6 +28,8 @@ pub mod metadata_ops;
 #[cfg(feature = "transport-locusta")]
 pub mod perf_breakdown;
 pub mod readdir_ops;
+#[cfg(feature = "transport-locusta")]
+pub mod registry_handshake;
 pub mod server;
 pub mod transport;
 #[cfg(feature = "transport-locusta")]
