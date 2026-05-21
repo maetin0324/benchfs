@@ -301,6 +301,37 @@ start_benchfsd() {
   if [ "${BENCHFS_SKIP_RECV_COPY:-0}" = "1" ]; then
     benchfs_skip_recv_copy="true"
   fi
+  # [locusta] handshake_mode / wait_peer_ack_strict / defer_init_prewarm
+  # are surfaced as TOML keys (was env BENCHFS_LOCUSTA_HANDSHAKE etc.).
+  local benchfs_handshake_mode="${BENCHFS_LOCUSTA_HANDSHAKE:-udp}"
+  local benchfs_exchange_timeout_secs="${BENCHFS_LOCUSTA_EXCHANGE_TIMEOUT_SECS:-300}"
+  local benchfs_wait_peer_ack_strict="false"
+  if [ "${BENCHFS_LOCUSTA_WAIT_PEER_ACK:-0}" = "1" ]; then
+    benchfs_wait_peer_ack_strict="true"
+  fi
+  local benchfs_defer_init_prewarm="false"
+  if [ "${BENCHFS_LOCUSTA_DEFER_HANDSHAKE:-0}" = "1" ]; then
+    benchfs_defer_init_prewarm="true"
+  fi
+  # [rpc] profile / force_put_writes  and [api] open/close_meta_async —
+  # these used to be env BENCHFS_RPC_PROFILE / BENCHFS_FORCE_PUT_WRITES
+  # / BENCHFS_OPEN_META_ASYNC / BENCHFS_CLOSE_META_ASYNC.
+  local benchfs_rpc_profile="false"
+  if [ "${BENCHFS_RPC_PROFILE:-0}" = "1" ]; then
+    benchfs_rpc_profile="true"
+  fi
+  local benchfs_force_put_writes="false"
+  if [ "${BENCHFS_FORCE_PUT_WRITES:-0}" = "1" ]; then
+    benchfs_force_put_writes="true"
+  fi
+  local benchfs_open_meta_async="false"
+  if [ "${BENCHFS_OPEN_META_ASYNC:-0}" = "1" ]; then
+    benchfs_open_meta_async="true"
+  fi
+  local benchfs_close_meta_async="false"
+  if [ "${BENCHFS_CLOSE_META_ASYNC:-0}" = "1" ]; then
+    benchfs_close_meta_async="true"
+  fi
   local benchfs_sequential_chunk_rpcs="false"
   if [ "${BENCHFS_SEQUENTIAL_CHUNK_RPCS:-0}" = "1" ]; then
     benchfs_sequential_chunk_rpcs="true"
@@ -351,6 +382,10 @@ dispatch_idle_sleep_us = ${BENCHFS_LOCUSTA_DISPATCH_SLEEP_US:-20}
 dispatch_idle_threshold = ${BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD:-16}
 mlx5_auto_spread = true
 skip_recv_copy = ${benchfs_skip_recv_copy}
+handshake_mode = "${benchfs_handshake_mode}"
+exchange_timeout_secs = ${benchfs_exchange_timeout_secs}
+wait_peer_ack_strict = ${benchfs_wait_peer_ack_strict}
+defer_init_prewarm = ${benchfs_defer_init_prewarm}
 
 [iouring]
 queue_size = ${BENCHFS_IOURING_QUEUE_SIZE:-2048}
@@ -385,6 +420,14 @@ timeout_secs = ${BENCHFS_RPC_TIMEOUT:-600}
 max_retries = 0
 retry_delay_ms = 100
 retry_backoff = 2.0
+profile = ${benchfs_rpc_profile}
+force_put_writes = ${benchfs_force_put_writes}
+write_eager_threshold = ${BENCHFS_WRITE_EAGER_THRESHOLD:-16384}
+add_peer_timeout_secs = ${BENCHFS_ADD_PEER_TIMEOUT_SECS:-300}
+
+[api]
+open_meta_async = ${benchfs_open_meta_async}
+close_meta_async = ${benchfs_close_meta_async}
 
 [cluster]
 expected_nodes = ${BENCHFS_EXPECTED_NODES:-0}
@@ -481,35 +524,9 @@ WRAPPER_EOF
     -x BENCHFS_CONFIG
     -x BENCHFS_SCRATCH_DIRS="${BENCHFS_SCRATCH_DIRS_CSV}"
     -x BENCHFS_INNER_BINARY
-    -x BENCHFS_RPC_TIMEOUT
-    -x BENCHFS_IOURING_QUEUE_SIZE
-    -x BENCHFS_IOURING_SUBMIT_DEPTH
-    -x BENCHFS_IOURING_SUBMIT_TIMEOUT_US
-    -x BENCHFS_IOURING_COMPLETE_TIMEOUT_US
-    -x BENCHFS_IOURING_SQ_POLL_MS
     -x PLUVIO_URING_ALWAYS_POLL
-    -x BENCHFS_CHUNK_FD_CACHE_SIZE
-    -x BENCHFS_CHUNK_LAYOUT
-    -x BENCHFS_CHUNK_MMAP_WRITE
-    -x BENCHFS_LOCUSTA_ARENA_SIZE
-    -x BENCHFS_LOCUSTA_RING_CAPACITY
-    -x BENCHFS_LOCUSTA_RECV_RING_SIZE
-    -x BENCHFS_LOCUSTA_SEND_BUF_SIZE
-    -x BENCHFS_LOCUSTA_MAX_INFLIGHT
-    -x BENCHFS_LOCUSTA_HANDSHAKE
-    -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
     -x LOCUSTA_DAEMON_EVENT_BUDGET
-    -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
-    -x BENCHFS_TRANSPORT
-    -x BENCHFS_METADATA_DISTRIBUTED
-    -x BENCHFS_CENTRAL_PARENT_INDEX
     -x BENCHFS_EXPECTED_NODES="$((VNODES * ${BENCHFS_SERVER_RANKS_PER_VNODE:-1}))"
-    -x BENCHFS_IOR_CLIENT_COUNT="$((VNODES * BEST_PPN))"
-    -x BENCHFS_LOCUSTA_EXCHANGE_TIMEOUT_SECS="${BENCHFS_LOCUSTA_EXCHANGE_TIMEOUT_SECS:-600}"
-    -x ENABLE_STATS
-    -x BENCHFS_RPC_PROFILE
-    -x BENCHFS_FORCE_PUT_WRITES
-    -x BENCHFS_WRITE_EAGER_THRESHOLD
     "${datadir_wrapper}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -709,35 +726,9 @@ run_io500() {
     -x RUST_BACKTRACE
     -x BENCHFS_CONFIG
     -x BENCHFS_EXPECTED_NODES="$((VNODES * ${BENCHFS_SERVER_RANKS_PER_VNODE:-1}))"
-    -x BENCHFS_TRANSPORT
-    -x BENCHFS_METADATA_DISTRIBUTED
-    -x BENCHFS_CENTRAL_PARENT_INDEX
-    -x BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
+    -x PLUVIO_URING_ALWAYS_POLL
     -x LOCUSTA_DAEMON_EVENT_BUDGET
-    -x BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
-    -x BENCHFS_LOCUSTA_ARENA_SIZE
-    -x BENCHFS_LOCUSTA_RING_CAPACITY
-    -x BENCHFS_LOCUSTA_MAX_INFLIGHT
-    -x BENCHFS_LOCUSTA_HANDSHAKE
-    -x BENCHFS_LOCUSTA_RECV_RING_SIZE
-    -x BENCHFS_LOCUSTA_SEND_BUF_SIZE
-    -x BENCHFS_RPC_TIMEOUT
-    -x BENCHFS_PREWARM_CONNECTIONS
-    -x BENCHFS_PREWARM_CONCURRENCY
-    -x BENCHFS_STATUS_CACHE_ITERS
-    -x BENCHFS_REACTOR_POLL_INTERVAL
-    -x BENCHFS_LOCUSTA_ACCEPT_INTERVAL_MS
     -x BENCHFS_UCX_AM_BREAKDOWN
-    -x BENCHFS_MAX_CONCURRENT_CHUNK_RPCS
-    -x BENCHFS_DISABLE_RDMA
-    -x BENCHFS_SEQUENTIAL_CHUNK_RPCS
-    -x ENABLE_STATS
-    -x BENCHFS_SKIP_RECV_COPY
-    -x BENCHFS_CLOSE_META_ASYNC
-    -x BENCHFS_OPEN_META_ASYNC
-    -x BENCHFS_RPC_PROFILE
-    -x BENCHFS_FORCE_PUT_WRITES
-    -x BENCHFS_WRITE_EAGER_THRESHOLD
     -x BENCHFS_DHAT_DIR="${BENCHFS_DHAT_DIR:-${out_dir}/dhat}"
     # benchfs_pfind (io500 external-script for the find phase) inherits
     # rank 0's env via popen and needs the registry path to bootstrap a

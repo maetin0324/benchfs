@@ -457,10 +457,7 @@ impl BenchFS {
                     .map_err(|e| ApiError::Internal(format!("Failed to create file: {:?}", e)))?;
 
                 0 // Dummy inode
-            } else if std::env::var("BENCHFS_OPEN_META_ASYNC")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
+            } else if crate::runtime_config::RuntimeConfig::global().api.open_meta_async {
                 // Fire-and-forget remote MetadataCreateFile to hide the
                 // open RTT. mdtest-hard sits on the critical path of
                 // 2 sync RTTs (open + write) → ~886 µs/op observed at
@@ -473,10 +470,7 @@ impl BenchFS {
                 // We pre-populate the local cache so any subsequent
                 // operations on this fd see an existing metadata entry.
                 let file_meta = FileMetadata::new(path.to_string(), 0);
-                if let Err(e) = self
-                    .metadata_manager
-                    .store_file_metadata(file_meta)
-                {
+                if let Err(e) = self.metadata_manager.store_file_metadata(file_meta) {
                     tracing::warn!(
                         "Failed to pre-cache async-open metadata for {}: {:?}",
                         path,
@@ -488,8 +482,7 @@ impl BenchFS {
                     let owner = metadata_node.clone();
                     pluvio_runtime::spawn(async move {
                         if let Ok(client) = pool.get_or_connect(&owner).await {
-                            let req =
-                                MetadataCreateFileRequest::new(path_owned, 0, 0o644);
+                            let req = MetadataCreateFileRequest::new(path_owned, 0, 0o644);
                             let _ = req.call(&*client).await;
                         }
                     });
@@ -1307,9 +1300,7 @@ impl BenchFS {
         // safe as long as the spawned task settles before the read phase
         // starts. Gated on `BENCHFS_CLOSE_META_ASYNC=1` so the change is
         // opt-in until full-scale verification.
-        let close_meta_async = std::env::var("BENCHFS_CLOSE_META_ASYNC")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let close_meta_async = crate::runtime_config::RuntimeConfig::global().api.close_meta_async;
         if handle.flags.write {
             let metadata_node = self.get_metadata_node(&handle.path);
             let is_local = self.is_local_metadata(&handle.path);
@@ -1465,9 +1456,7 @@ impl BenchFS {
         let is_local_meta = metadata_node == self.node_id;
         if !is_local_meta {
             let pool = self.connection_pool.as_ref().ok_or_else(|| {
-                ApiError::Internal(
-                    "distributed unlink requires a connection pool".to_string(),
-                )
+                ApiError::Internal("distributed unlink requires a connection pool".to_string())
             })?;
             let client = pool.get_or_connect(&metadata_node).await.map_err(|e| {
                 ApiError::Internal(format!(
@@ -1476,9 +1465,10 @@ impl BenchFS {
                 ))
             })?;
             let request = MetadataDeleteRequest::delete_file(path.to_string());
-            let response = request.call(&*client).await.map_err(|e| {
-                ApiError::Internal(format!("MetadataDelete RPC failed: {:?}", e))
-            })?;
+            let response = request
+                .call(&*client)
+                .await
+                .map_err(|e| ApiError::Internal(format!("MetadataDelete RPC failed: {:?}", e)))?;
 
             // Drop any stale local cache regardless of remote outcome so a
             // re-create of the same path sees a clean slate.

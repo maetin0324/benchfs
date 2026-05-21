@@ -186,8 +186,17 @@ impl ConnectionPool {
                     node_id = node_id,
                     "locusta: peer not yet connected, running add_peer handshake"
                 );
+                // Registry mode uses async add_peer so the reactor
+                // stays responsive during Lustre polling. UDP mode
+                // falls back to sync inside add_peer_async itself.
+                let add_peer_timeout = std::time::Duration::from_secs(
+                    crate::runtime_config::RuntimeConfig::global()
+                        .rpc
+                        .add_peer_timeout_secs,
+                );
                 transport
-                    .add_peer(&peer_node_id, std::time::Duration::from_secs(120))
+                    .add_peer_async(&peer_node_id, add_peer_timeout)
+                    .await
                     .map_err(|e| {
                         RpcError::ConnectionError(format!(
                             "locusta add_peer({node_id}) failed: {e:?}"

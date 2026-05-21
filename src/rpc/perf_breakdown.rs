@@ -14,7 +14,7 @@ use std::time::Instant;
 /// Read once at first access; subsequent calls hit the cached value.
 fn profile_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("BENCHFS_RPC_PROFILE").as_deref() == Ok("1"))
+    *FLAG.get_or_init(|| crate::runtime_config::RuntimeConfig::global().rpc.profile)
 }
 
 thread_local! {

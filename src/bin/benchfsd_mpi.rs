@@ -123,6 +123,22 @@ fn init_locusta_runtime(
         cfg.peer_node_ids.len()
     );
 
+    // Registry mode: spawn the server-side discover task that accepts
+    // dynamic client handshakes (`ior_client_*`) via the async
+    // state machine. The task yields the reactor between Lustre
+    // scans/polls so the locusta tick keeps polling RDMA CQs.
+    if rc.locusta.handshake_mode == "registry" {
+        let t = Rc::clone(&transport);
+        pluvio_runtime::spawn_with_name(
+            async move {
+                t.server_discover_task().await;
+                Ok::<(), std::io::Error>(())
+            },
+            "locusta_server_discover".to_string(),
+        );
+        tracing::info!("Spawned locusta server discover task (registry handshake)");
+    }
+
     // Register every supported RPC's `LocustaServerHandler`.
     let mut dispatch = LocustaServerDispatch::new(handler_context);
     dispatch.register::<MetadataLookupRequest>();

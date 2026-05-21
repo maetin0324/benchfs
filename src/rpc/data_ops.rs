@@ -815,13 +815,9 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
         // localised it to cross-chunk fragments at 32 KiB + 14 KiB).
         // Default threshold 16 KiB pushes ior-hard's fragments through
         // RoundtripPut while keeping mdtest-hard on eager.
-        let force_put = std::env::var("BENCHFS_FORCE_PUT_WRITES")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let eager_threshold: u64 = std::env::var("BENCHFS_WRITE_EAGER_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(16384);
+        let rc_rpc = &crate::runtime_config::RuntimeConfig::global().rpc;
+        let force_put = rc_rpc.force_put_writes;
+        let eager_threshold: u64 = rc_rpc.write_eager_threshold;
         if !force_put && (self.data.len() as u64) < eager_threshold {
             AmRpcCallType::None
         } else {

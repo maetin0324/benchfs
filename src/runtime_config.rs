@@ -71,6 +71,28 @@ pub struct RuntimeConfig {
     pub cluster: ClusterConfig,
     pub observability: ObservabilityConfig,
     pub storage: StorageConfig,
+    pub api: ApiConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiConfig {
+    /// Run `MetadataCreateFile` as a fire-and-forget spawn during
+    /// `benchfs_open(O_CREAT)` instead of awaiting it inline. Was env
+    /// `BENCHFS_OPEN_META_ASYNC=1`.
+    pub open_meta_async: bool,
+    /// Same idea for `benchfs_close` (`MetadataUpdate` for size). Was
+    /// env `BENCHFS_CLOSE_META_ASYNC=1`.
+    pub close_meta_async: bool,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            open_meta_async: false,
+            close_meta_async: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +151,27 @@ pub struct LocustaTuning {
     /// directly into the registered IO buffer (zero-copy). Disable to
     /// fall back to the legacy memcpy path for diagnostics.
     pub skip_recv_copy: bool,
+    /// Handshake transport. "udp" (default, legacy file+UDP exchange)
+    /// or "registry" (Design C: file-based rendezvous, async-friendly,
+    /// scales to 400+ clients without UDP packet drops).
+    pub handshake_mode: String,
+    /// Per-peer handshake deadline in seconds (registry & UDP). The
+    /// init-time prewarm loop fails the whole transport if any peer
+    /// can't be reached within this; runtime `add_peer` uses
+    /// the env-callsite-supplied timeout instead.
+    pub exchange_timeout_secs: u64,
+    /// Strict mode for `wait_peer_ack` in registry handshake. Default
+    /// false = best-effort 10 s polling that logs a WARN and proceeds.
+    /// True = fail the handshake if peer ACK is missing by the
+    /// handshake deadline. Strict was the original behaviour but
+    /// 400-client prewarm pile-up overshoots the per-call deadline so
+    /// the best-effort default is recommended.
+    pub wait_peer_ack_strict: bool,
+    /// Skip the init-time sequential prewarm in `LocustaTransport::init`.
+    /// Used by registry mode where the server-side discover task takes
+    /// over per-peer handshake once `register_self` has published the
+    /// address (avoids the chicken-and-egg deadlock from iter108).
+    pub defer_init_prewarm: bool,
 }
 
 impl Default for LocustaTuning {
@@ -156,6 +199,10 @@ impl Default for LocustaTuning {
             // data, which only makes sense for the network-only upper-
             // bound experiment.
             skip_recv_copy: false,
+            handshake_mode: "udp".to_string(),
+            exchange_timeout_secs: 120,
+            wait_peer_ack_strict: false,
+            defer_init_prewarm: false,
         }
     }
 }
@@ -256,6 +303,22 @@ pub struct RpcTuning {
     pub retry_delay_ms: u64,
     /// Multiplier applied to `retry_delay_ms` per attempt.
     pub retry_backoff: f32,
+    /// Enables per-RPC perf-breakdown logging (was env
+    /// `BENCHFS_RPC_PROFILE=1`). Reads once at startup.
+    pub profile: bool,
+    /// Force every chunk write to take the RDMA Put path even for tiny
+    /// payloads. Was env `BENCHFS_FORCE_PUT_WRITES=1`.
+    pub force_put_writes: bool,
+    /// Payload size (bytes) below which writes go via the eager path
+    /// instead of the RDMA grant flow. 0 disables the eager path
+    /// entirely (always Put). Was env `BENCHFS_WRITE_EAGER_THRESHOLD`.
+    pub write_eager_threshold: u64,
+    /// Timeout in seconds for `ConnectionPool::get_or_connect` to
+    /// finish the locusta handshake against a previously-unknown
+    /// peer. Default 300 s — at ppn=20 (800 clients × 40 servers =
+    /// 32 k pre-warm handshakes) the previous hard-coded 120 s
+    /// occasionally tripped on the last few late-arriving clients.
+    pub add_peer_timeout_secs: u64,
 }
 
 impl Default for RpcTuning {
@@ -269,6 +332,10 @@ impl Default for RpcTuning {
             max_retries: 0,
             retry_delay_ms: 100,
             retry_backoff: 2.0,
+            profile: false,
+            force_put_writes: false,
+            write_eager_threshold: 65536,
+            add_peer_timeout_secs: 300,
         }
     }
 }
