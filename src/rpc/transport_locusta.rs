@@ -132,6 +132,18 @@ pub struct LocustaInner {
     /// performed inside `tick()`. Incremented every tick; the actual
     /// directory walk runs once per `REGISTRY_SCAN_TICK_INTERVAL`.
     pub registry_scan_counter: u32,
+    /// UDP accept-path instrumentation (sums of µs spent in each
+    /// phase). Used by the periodic dump in `udp_accept_stats_dump`
+    /// to actually measure where server-side handshake time goes
+    /// rather than guess.
+    pub udp_stats_recvs: u64,
+    pub udp_stats_accepts: u64,
+    pub udp_stats_resend_cached: u64,
+    pub udp_stats_prepare_us: u64,
+    pub udp_stats_connect_us: u64,
+    pub udp_stats_send_resp_us: u64,
+    pub udp_stats_total_us: u64,
+    pub udp_stats_max_total_us: u64,
     /// Server-side registry-handshake state machine. Each tick advances
     /// at most `MAX_DISCOVERY_STEPS_PER_TICK` entries by one step, so
     /// blocking inside the tick is bounded even when individual Lustre
@@ -730,17 +742,26 @@ impl LocustaInner {
         };
         let request_bytes = request.encode();
 
-        // Per-attempt UDP recv timeout. Starts at 500 ms (matches
-        // typical UDP round-trip + server QP setup) and grows
-        // exponentially after each retransmit, capped at 8 s. At
-        // 10 phys × ppn=8 = 6400 inbound REQUESTs per server, a
-        // fixed 500 ms retransmit makes 80 clients send 12 800
-        // pkt/s into a single server that can only drain ~100-1000
-        // QP-setups/s, so the kernel UDP rcvbuf overflows and the
-        // storm self-amplifies (job 20492-class). Exponential
-        // backoff caps the steady-state ingress while still letting
-        // a single dropped packet recover in ≤1 s.
-        let initial_recv_timeout = Duration::from_millis(500);
+        // Per-attempt UDP recv timeout. Sized to absorb the full
+        // burst-drain window of one server.
+        //
+        // Drain math (iter170, ppn=20, 10 phys = 800 clients × 40
+        // servers = 32 000 handshakes evenly split = **800 REQUESTs
+        // per server proc** at t=0):
+        //   per-accept fast-path cost (pre_alloc pool hit) ≈ 1.3 ms
+        //   (measured `avg_total_us=1300`, mostly `avg_connect_us`)
+        //   ⇒ 800 × 1.3 ms ≈ 1040 ms to drain one server's burst
+        //
+        // The previous 500 ms initial timeout was sized for the
+        // 6400-client ppn=8 mesh (80 incoming/server × 1.3 ms ≈
+        // 100 ms). At ppn=20 it's half the drain window, so the
+        // tail clients always retransmit before the server reaches
+        // them — the retransmits pile into the same socket and the
+        // storm self-amplifies (iter170 observed 2390 Pre-warm
+        // timeouts = ~7.5 % of all handshakes). 3 s gives a 3× margin
+        // over the measured drain plus headroom for occasional
+        // 50 ms slow accepts (when slot-pool misses to slow path).
+        let initial_recv_timeout = Duration::from_millis(3000);
         const MAX_RECV_TIMEOUT: Duration = Duration::from_secs(8);
         self.udp_socket
             .set_read_timeout(Some(initial_recv_timeout))
@@ -912,6 +933,7 @@ impl LocustaInner {
             }
         };
 
+        self.udp_stats_recvs = self.udp_stats_recvs.saturating_add(1);
         let pkt = ExchangePacket::decode(&buf[..n])
             .map_err(|e| RpcError::ConnectionError(format!("decode request: {e}")))?;
         let from_v4 = match from {
@@ -983,6 +1005,7 @@ impl LocustaInner {
         request: ExchangePacket,
         from_v4: SocketAddrV4,
     ) -> Result<(), RpcError> {
+        let t_enter = std::time::Instant::now();
         let peer = request.node_id.clone();
         if peer == self.local_node_id {
             return Ok(());
@@ -1016,6 +1039,7 @@ impl LocustaInner {
                         tracing::warn!("re-send to {peer} failed: {e}");
                     }
                 }
+                self.udp_stats_resend_cached += 1;
                 return Ok(());
             }
             // 5+ retransmits despite our resent RESPONSE → assume the
@@ -1031,37 +1055,69 @@ impl LocustaInner {
             self.peer_request_retries.remove(&peer);
         }
 
-        let dest_id = self.next_dest_id;
-        self.next_dest_id = self
-            .next_dest_id
-            .checked_add(1)
-            .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
-
         // Tuning comes from [locusta] section in benchfs.toml.
         let rc = crate::runtime_config::RuntimeConfig::global();
         let recv_ring_size = rc.locusta.recv_ring_size;
         let send_buf_size = rc.locusta.send_buf_size;
         let max_inflight = rc.locusta.max_inflight;
-        let server_local = self
-            .server
-            .prepare_peer(
-                dest_id,
-                recv_ring_size,
-                send_buf_size,
-                512,
-                max_inflight,
-                &self.qp_config,
-            )
-            .map_err(|e| {
-                RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
-            })?;
-        let relay_local = self
-            .daemon
-            .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
-            .map_err(|e| {
-                RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
-            })?;
+        // Try the pre-allocated peer pool first. If a slot is available
+        // we skip 3-5 ibv_reg_mr calls (~57-145 ms measured in
+        // iter135), drastically cutting per-accept time and letting
+        // the server keep up with 800-client bursts.
+        let t_prep_start = std::time::Instant::now();
+        let (dest_id, server_local, relay_local) = match (
+            self.server.try_claim_pre_allocated_peer(),
+            self.daemon.try_claim_pre_allocated_destination(),
+        ) {
+            (Some((sid, server_local)), Some((did, relay_local))) if sid == did => {
+                (sid, server_local, relay_local)
+            }
+            (server_slot, daemon_slot) => {
+                // Pool empty or ids out of sync — fall back to the
+                // slow path. Re-push any partially claimed slot so we
+                // don't leak it.
+                if let Some((sid, info)) = server_slot {
+                    self.server.pre_allocated_peer_ids.push_front(sid);
+                    self.server.pre_allocated_local_info.insert(sid, info);
+                }
+                if let Some((did, info)) = daemon_slot {
+                    self.daemon.pre_allocated_dest_ids.push_front(did);
+                    self.daemon.pre_allocated_dest_info.insert(did, info);
+                }
+                let dest_id = self.next_dest_id;
+                self.next_dest_id = self.next_dest_id.checked_add(1).ok_or_else(|| {
+                    RpcError::ConnectionError("dest_id space exhausted".to_string())
+                })?;
+                let server_local = self
+                    .server
+                    .prepare_peer(
+                        dest_id,
+                        recv_ring_size,
+                        send_buf_size,
+                        512,
+                        max_inflight,
+                        &self.qp_config,
+                    )
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "server.prepare_peer({dest_id}): {e:?}"
+                        ))
+                    })?;
+                let relay_local = self
+                    .daemon
+                    .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "daemon.prepare_destination({dest_id}): {e:?}"
+                        ))
+                    })?;
+                (dest_id, server_local, relay_local)
+            }
+        };
+        let prep_us = t_prep_start.elapsed().as_micros() as u64;
+        self.udp_stats_prepare_us = self.udp_stats_prepare_us.saturating_add(prep_us);
 
+        let t_connect_start = std::time::Instant::now();
         self.server
             .connect_peer(dest_id, &request.relay_qp)
             .map_err(|e| {
@@ -1072,6 +1128,8 @@ impl LocustaInner {
             .map_err(|e| {
                 RpcError::ConnectionError(format!("daemon.connect_destination({dest_id}): {e:?}"))
             })?;
+        let connect_us = t_connect_start.elapsed().as_micros() as u64;
+        self.udp_stats_connect_us = self.udp_stats_connect_us.saturating_add(connect_us);
 
         let response = ExchangePacket {
             msg_type: MSG_RESPONSE,
@@ -1080,14 +1138,68 @@ impl LocustaInner {
             node_id: self.local_node_id.clone(),
         };
         let response_bytes = response.encode();
-        self.udp_socket
-            .send_to(&response_bytes, from_v4)
+        let t_send_start = std::time::Instant::now();
+        let send_res = self.udp_socket
+            .send_to(&response_bytes, from_v4);
+        let send_us = t_send_start.elapsed().as_micros() as u64;
+        self.udp_stats_send_resp_us = self.udp_stats_send_resp_us.saturating_add(send_us);
+        send_res
             .map_err(|e| RpcError::ConnectionError(format!("send_to({from_v4}, response): {e}")))?;
 
         self.node_to_dest.insert(peer.clone(), dest_id);
         self.cached_responses
             .insert(peer, (from_v4, response_bytes));
+        let total_us = t_enter.elapsed().as_micros() as u64;
+        self.udp_stats_accepts = self.udp_stats_accepts.saturating_add(1);
+        self.udp_stats_total_us = self.udp_stats_total_us.saturating_add(total_us);
+        if total_us > self.udp_stats_max_total_us {
+            self.udp_stats_max_total_us = total_us;
+        }
         Ok(())
+    }
+
+    /// Periodic dump of UDP accept-path stats (every ~5 s). Writes
+    /// a single `WARN target=udp_accept_stats` line with averages so
+    /// we can actually measure where server-side handshake time goes
+    /// instead of guessing parameters.
+    pub fn maybe_dump_udp_accept_stats(&self) {
+        let accepts = self.udp_stats_accepts;
+        let recvs = self.udp_stats_recvs;
+        if accepts == 0 && recvs == 0 {
+            return;
+        }
+        let avg_total_us = if accepts > 0 {
+            self.udp_stats_total_us / accepts
+        } else {
+            0
+        };
+        let avg_prep_us = if accepts > 0 {
+            self.udp_stats_prepare_us / accepts
+        } else {
+            0
+        };
+        let avg_connect_us = if accepts > 0 {
+            self.udp_stats_connect_us / accepts
+        } else {
+            0
+        };
+        let avg_send_us = if accepts > 0 {
+            self.udp_stats_send_resp_us / accepts
+        } else {
+            0
+        };
+        tracing::warn!(
+            target: "udp_accept_stats",
+            recvs,
+            accepts,
+            resend_cached = self.udp_stats_resend_cached,
+            avg_total_us,
+            avg_prep_us,
+            avg_connect_us,
+            avg_send_us,
+            max_total_us = self.udp_stats_max_total_us,
+            "udp accept timing summary"
+        );
     }
 
     /// Returns true once the response for `completion_id` is ready.
@@ -1156,6 +1268,20 @@ pub struct LocustaConfig {
     /// locusta server share one set of pinned buffers, enabling
     /// zero-copy `network ↔ io_uring`.
     pub external_server_allocator: Option<Rc<FixedBufferAllocator>>,
+    /// Override the global `[locusta] pre_allocated_peer_count` for
+    /// this transport instance. `None` means use the config-level
+    /// value (server default). `Some(0)` disables pre-allocation,
+    /// required on the **client side** where the global config gives
+    /// the server-side count but each client process would otherwise
+    /// pin `N × 96 MB` (= 9.6 GB at N=100) of memory for slots that
+    /// never get used — clients connect, they don't accept. At ppn=20
+    /// (80 client procs/host × 9.6 GB = 768 GB locked memory) this
+    /// busts the per-host physical-RAM budget and triggers OOM-killer
+    /// (observed iter141..iter167: rank death on first init, vnode 3
+    /// dies first because PBS/numactl maps higher-numbered ranks to
+    /// later NUMA nodes which fill last as the kernel runs out of
+    /// pinnable pages).
+    pub pre_allocated_peer_count_override: Option<u16>,
 }
 
 impl Default for LocustaConfig {
@@ -1173,6 +1299,7 @@ impl Default for LocustaConfig {
             server_buf_slots: 4,
             server_buf_size: 4 * 1024 * 1024,
             external_server_allocator: None,
+            pre_allocated_peer_count_override: None,
         }
     }
 }
@@ -1497,12 +1624,21 @@ impl LocustaTransport {
         // connect to us via this socket for the QP-info handshake,
         // replacing the previous Lustre file-polling protocol that
         // doesn't scale on Sirius (job 18060 hit 4213 read timeouts).
+        //
+        // NOTE: Bind here, but **publish the addr only after
+        // `pre_allocate_peers` finishes** (see `delayed_publish` block
+        // below the pre_alloc loop). Iter170-172 hit a Pre-warm storm
+        // because clients saw the server's UDP addr **before** the
+        // server had finished its 30-60 sec pre_alloc, sent REQUESTs
+        // that overflowed the kernel UDP recv buffer, and the
+        // exponential retransmits kept the queue saturated even after
+        // the server became ready. Holding back the publish until the
+        // accept-side pool exists eliminates that pre-ready REQUEST
+        // burst entirely.
         let (udp_socket, local_udp_addr) = udp_handshake::bind_udp_socket()
             .map_err(|e| RpcError::ConnectionError(format!("bind udp socket: {e}")))?;
-        udp_handshake::publish_udp_addr(&cfg.registry_dir, &cfg.local_node_id, local_udp_addr)
-            .map_err(|e| RpcError::ConnectionError(format!("publish_udp_addr: {e}")))?;
         tracing::info!(
-            "locusta UDP control-plane: {} → {}",
+            "locusta UDP control-plane bound: {} → {} (publish deferred until pre_alloc done)",
             cfg.local_node_id,
             local_udp_addr
         );
@@ -1514,6 +1650,14 @@ impl LocustaTransport {
             server_buffer_allocator,
             _server_buffer_mrs: server_buffer_mrs,
             registry_scan_counter: 0,
+            udp_stats_recvs: 0,
+            udp_stats_accepts: 0,
+            udp_stats_resend_cached: 0,
+            udp_stats_prepare_us: 0,
+            udp_stats_connect_us: 0,
+            udp_stats_send_resp_us: 0,
+            udp_stats_total_us: 0,
+            udp_stats_max_total_us: 0,
             pending_discoveries: Vec::new(),
             node_to_dest: HashMap::new(),
             channel_base_ptr: shm_base,
@@ -1551,6 +1695,79 @@ impl LocustaTransport {
         // address (so the job script's `check_server_ready` barrier
         // passes and io500 clients can start, ending the chicken-and-
         // egg deadlock seen in iter108).
+        // Pre-allocate `pre_allocated_peer_count` peer/destination
+        // slots so subsequent accepts don't pay the ~57-145 ms
+        // ibv_reg_mr × 3-5 cost on the hot path. Done BEFORE the
+        // init-time prewarm so the server-server handshake bursts
+        // (40 × 39 inbound REQUESTs at once) also benefit from the
+        // pool instead of going through the slow path.
+        // Per-instance override (client passes Some(0) so it skips
+        // the 9.6 GB/process pre-allocation — see field doc on
+        // LocustaConfig::pre_allocated_peer_count_override for why
+        // this is critical at ppn≥10).
+        let pre_alloc_count = cfg
+            .pre_allocated_peer_count_override
+            .unwrap_or(rc_locusta.pre_allocated_peer_count);
+        if pre_alloc_count > 0 {
+            let mut inner_mut = inner.borrow_mut();
+            let start_id = inner_mut.next_dest_id;
+            let recv_ring_size = rc_locusta.recv_ring_size;
+            let send_buf_size = rc_locusta.send_buf_size;
+            let max_inflight = rc_locusta.max_inflight;
+            let qp_config = inner_mut.qp_config.clone();
+            let t0 = std::time::Instant::now();
+            inner_mut
+                .server
+                .pre_allocate_peers(
+                    start_id,
+                    pre_alloc_count,
+                    recv_ring_size,
+                    send_buf_size,
+                    512,
+                    max_inflight,
+                    &qp_config,
+                )
+                .map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "server.pre_allocate_peers({pre_alloc_count}): {e}"
+                    ))
+                })?;
+            inner_mut
+                .daemon
+                .pre_allocate_destinations(
+                    start_id,
+                    pre_alloc_count,
+                    recv_ring_size,
+                    send_buf_size,
+                    &qp_config,
+                )
+                .map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "daemon.pre_allocate_destinations({pre_alloc_count}): {e}"
+                    ))
+                })?;
+            inner_mut.next_dest_id = start_id.saturating_add(pre_alloc_count);
+            tracing::warn!(
+                target: "udp_accept_stats",
+                pre_alloc_count,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "pre-allocated peer/destination slots"
+            );
+        }
+
+        // Now publish the UDP addr — server is ready to accept REQUESTs
+        // (pool primed, accept loop will hit fast path immediately). This
+        // is the key ordering fix vs the pre-iter183 design that wrote
+        // the addr early and forced clients into a retransmit storm
+        // against a server still busy in `pre_allocate_peers`.
+        udp_handshake::publish_udp_addr(&cfg.registry_dir, &cfg.local_node_id, local_udp_addr)
+            .map_err(|e| RpcError::ConnectionError(format!("publish_udp_addr: {e}")))?;
+        tracing::info!(
+            "locusta UDP addr published post-prealloc: {} → {}",
+            cfg.local_node_id,
+            local_udp_addr
+        );
+
         if !rc_locusta.defer_init_prewarm {
             let mut inner_mut = inner.borrow_mut();
             for peer in &cfg.peer_node_ids {
@@ -1578,6 +1795,153 @@ impl LocustaTransport {
         let deadline = Instant::now() + timeout;
         let mut inner = self.inner.borrow_mut();
         inner.add_peer_blocking(peer, deadline)
+    }
+
+    /// Server-server QP exchange via MPI_Allgather. Bypasses the
+    /// file-based registry (and its Lustre overhead) for the small
+    /// set of peers known at startup. The collective layout is:
+    ///
+    /// - Each rank packs `mpi_size` slots of 128 bytes (relay_qp 64 +
+    ///   server_qp 64). The slot at index `peer` holds the local QPs
+    ///   prepared for talking to `peer`; the slot at index `mpi_rank`
+    ///   itself is zeroed.
+    /// - `all_gather_into` collects every rank's send buffer into a
+    ///   single `mpi_size² · 128`-byte recv buffer.
+    /// - To connect to peer `P`, this rank reads `recvbuf[P][mpi_rank]`
+    ///   — peer P's local QPs that it prepared specifically for us.
+    ///
+    /// Caller is responsible for skipping the init-time file prewarm
+    /// (set `[locusta] defer_init_prewarm = true` or use the
+    /// `mpi_server_mesh` flag in benchfsd_mpi).
+    #[cfg(feature = "mpi-support")]
+    pub fn mpi_handshake_servers<C>(
+        &self,
+        world: &C,
+        mpi_rank: i32,
+        mpi_size: i32,
+        peer_name: impl Fn(i32) -> String,
+    ) -> Result<(), RpcError>
+    where
+        C: mpi::topology::Communicator,
+    {
+        use mpi::traits::CommunicatorCollectives;
+        use rrrpc::wire::QpExchangeInfo;
+
+        const SLOT_BYTES: usize = 128; // relay (64) + server (64)
+        let n = mpi_size as usize;
+        let me = mpi_rank as usize;
+
+        let rc = crate::runtime_config::RuntimeConfig::global();
+        let recv_ring_size = rc.locusta.recv_ring_size;
+        let send_buf_size = rc.locusta.send_buf_size;
+        let max_inflight = rc.locusta.max_inflight;
+
+        // ---- Phase 1: prepare local QPs for each peer (skip self) ----
+        let mut sendbuf: Vec<u8> = vec![0u8; n * SLOT_BYTES];
+        let mut dest_ids: Vec<u16> = vec![0u16; n];
+        {
+            let mut inner = self.inner.borrow_mut();
+            for peer in 0..n {
+                if peer == me {
+                    continue;
+                }
+                let dest_id = inner.next_dest_id;
+                inner.next_dest_id = inner.next_dest_id.checked_add(1).ok_or_else(|| {
+                    RpcError::ConnectionError("dest_id space exhausted".to_string())
+                })?;
+                dest_ids[peer] = dest_id;
+                let qp_config = inner.qp_config.clone();
+                let server_local = inner
+                    .server
+                    .prepare_peer(
+                        dest_id,
+                        recv_ring_size,
+                        send_buf_size,
+                        512,
+                        max_inflight,
+                        &qp_config,
+                    )
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "server.prepare_peer({dest_id}, mpi): {e:?}"
+                        ))
+                    })?;
+                let relay_local = inner
+                    .daemon
+                    .prepare_destination(dest_id, recv_ring_size, send_buf_size, &qp_config)
+                    .map_err(|e| {
+                        RpcError::ConnectionError(format!(
+                            "daemon.prepare_destination({dest_id}, mpi): {e:?}"
+                        ))
+                    })?;
+                // Pack [relay (64) | server (64)] at slot `peer`.
+                let off = peer * SLOT_BYTES;
+                unsafe {
+                    let r: &[u8; 64] =
+                        &*(&relay_local as *const QpExchangeInfo as *const [u8; 64]);
+                    let s: &[u8; 64] =
+                        &*(&server_local as *const QpExchangeInfo as *const [u8; 64]);
+                    sendbuf[off..off + 64].copy_from_slice(r);
+                    sendbuf[off + 64..off + 128].copy_from_slice(s);
+                }
+            }
+        }
+
+        // ---- Phase 2: MPI_Allgather ----
+        let mut recvbuf: Vec<u8> = vec![0u8; n * n * SLOT_BYTES];
+        world.all_gather_into(&sendbuf[..], &mut recvbuf[..]);
+
+        // ---- Phase 3: connect to each peer's QPs (skip self) ----
+        let mut inner = self.inner.borrow_mut();
+        for peer in 0..n {
+            if peer == me {
+                continue;
+            }
+            // peer's send slot for me lives at recvbuf[peer][me].
+            let off = (peer * n + me) * SLOT_BYTES;
+            let peer_relay: QpExchangeInfo = unsafe {
+                let mut q: QpExchangeInfo = std::mem::zeroed();
+                std::ptr::copy_nonoverlapping(
+                    recvbuf[off..off + 64].as_ptr(),
+                    &mut q as *mut QpExchangeInfo as *mut u8,
+                    64,
+                );
+                q
+            };
+            let peer_server: QpExchangeInfo = unsafe {
+                let mut q: QpExchangeInfo = std::mem::zeroed();
+                std::ptr::copy_nonoverlapping(
+                    recvbuf[off + 64..off + 128].as_ptr(),
+                    &mut q as *mut QpExchangeInfo as *mut u8,
+                    64,
+                );
+                q
+            };
+            let dest_id = dest_ids[peer];
+            inner.server.connect_peer(dest_id, &peer_relay).map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "server.connect_peer({dest_id}, mpi peer={peer}): {e:?}"
+                ))
+            })?;
+            inner
+                .daemon
+                .connect_destination(dest_id, &peer_server)
+                .map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "daemon.connect_destination({dest_id}, mpi peer={peer}): {e:?}"
+                    ))
+                })?;
+            let peer_id = peer_name(peer as i32);
+            inner.node_to_dest.insert(peer_id, dest_id);
+        }
+        tracing::info!(
+            target: "rpc_handshake_mode",
+            mpi_rank,
+            mpi_size,
+            peers_connected = n - 1,
+            "MPI_Allgather server-mesh handshake complete"
+        );
+        Ok(())
     }
 
     /// Async variant of `add_peer` that yields the reactor between
@@ -1861,6 +2225,13 @@ impl LocustaTransport {
         }
     }
 
+    /// Public wrapper to dump the UDP accept stats. Borrow is short-lived.
+    pub fn dump_udp_accept_stats(&self) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.maybe_dump_udp_accept_stats();
+        }
+    }
+
     /// Best-effort lookup of an existing dest_id (read-only borrow that
     /// stays out of the way of in-flight handshakes). Returns `None` if
     /// the peer isn't connected yet.
@@ -1927,21 +2298,22 @@ impl LocustaTransport {
         // initial REQUEST burst doesn't get split across multiple
         // 100 ms sleep cycles); subsequent calls in the same drain go
         // non-blocking so we exit as soon as the queue empties.
+        //
+        // ppn=20 tuning (iter132): the previous MAX_PER_TICK=256
+        // held inner.borrow_mut() for the entire 256-accept loop, and
+        // each `handle_one_udp_request` does QP prepare/connect at
+        // ~30-50 ms, totalling ~10 s of reactor blocking. That stalls
+        // the locusta dispatch task (memory `iter130 dispatch STALL
+        // 10s`) and starves client RPC processing during prewarm. We
+        // now cap at 16 per call and pair this with the async drain
+        // helper (`drain_pending_peers_async`) which awaits between
+        // sub-batches; the caller's scan_interval is also dropped to
+        // 10 ms to keep aggregate accept throughput at the same
+        // 1.6 kpeers/s while bounding tick stall to ~160 ms.
+        const MAX_PER_TICK: usize = 16;
         let mut added = Vec::new();
-        // Drain aggressively — at io500 4 phys × ppn=8 = 128 clients
-        // each prewarming to 16 servers, every server has to accept
-        // ~128 REQUESTs in a short burst. Old 32-per-tick × 100 ms
-        // scan-interval ≈ 320/s wasn't keeping up; bump to 256 so the
-        // burst clears in one tick.
-        const MAX_PER_TICK: usize = 256;
         let mut first = true;
         for _ in 0..MAX_PER_TICK {
-            // First recv uses a 2 ms timeout (catches a packet that
-            // arrived just before we entered this tick); subsequent
-            // recvs use 1 µs (effectively non-blocking, the kernel
-            // returns EAGAIN immediately when the queue is empty).
-            // `set_read_timeout` rejects `Duration::ZERO`, so we use
-            // 1 µs as the floor.
             let recv_timeout = if first {
                 Duration::from_millis(2)
             } else {
@@ -1964,6 +2336,51 @@ impl LocustaTransport {
         Ok(added)
     }
 
+    /// Async variant of `try_accept_pending_peers` that yields the
+    /// reactor between every accept so other tasks (locusta dispatch,
+    /// client RPCs) can interleave during the prewarm burst. Caps each
+    /// invocation at `max_per_call` accepts to keep wall-time bounded
+    /// even when the kernel UDP queue is huge.
+    pub async fn try_accept_pending_peers_async(
+        &self,
+        _per_peer_timeout: Duration,
+        max_per_call: usize,
+    ) -> Result<Vec<NodeId>, RpcError> {
+        let mut added = Vec::new();
+        let mut first = true;
+        for i in 0..max_per_call {
+            let recv_timeout = if first {
+                Duration::from_millis(2)
+            } else {
+                Duration::from_micros(1)
+            };
+            let res = {
+                let mut inner = self.inner.borrow_mut();
+                inner.handle_one_udp_request(recv_timeout)
+            };
+            match res {
+                Ok(Some(peer)) => {
+                    tracing::info!("udp accept: handshaked new peer {peer}");
+                    added.push(peer);
+                    first = false;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("udp accept error: {e:?}");
+                    break;
+                }
+            }
+            // Yield every 4 accepts so the reactor can drain other
+            // tasks (locusta tick, client RPC dispatch). 4 was chosen
+            // so per-accept Lustre / QP setup work (~30 ms × 4 =
+            // 120 ms) stays under the io500 200 ms heartbeat budget.
+            if i % 4 == 3 {
+                pluvio_timer::sleep(Duration::from_micros(10)).await;
+            }
+        }
+        Ok(added)
+    }
+
     fn lookup_dest(&self, dest: &NodeId) -> Result<u16, RpcError> {
         self.inner
             .borrow()
@@ -1978,12 +2395,92 @@ impl LocustaTransport {
         self.inner.borrow().node_to_dest.contains_key(peer)
     }
 
+    /// Standalone-daemon mode (POC, iter191+):
+    ///
+    /// Expose this transport's relay daemon to LOCAL processes via a
+    /// POSIX shared-memory control ring. Co-resident clients (the
+    /// `libbenchfs.so` loaded by IOR) can then call `Client::connect`
+    /// against `shm_name` and route their RPCs through this daemon's
+    /// already-warm QPs to the remote peers — eliminating the
+    /// per-process `ibv_reg_mr × N peers` cost that was making ppn=20
+    /// scale fragile (see iter141..iter190 server-side SIGKILLs).
+    ///
+    /// Capacity must be a power of two; 64 is enough for connect /
+    /// disconnect bursts even at ppn=20 (clients reuse the channel
+    /// for the lifetime of the IOR phase).
+    ///
+    /// Idempotent w.r.t. stale SHM left from a crashed prior daemon
+    /// — `create_control_ring_shm` unlinks before creating.
+    ///
+    /// Returns the held SHM fd + base + size so the caller keeps the
+    /// region alive for the daemon's lifetime.
+    pub fn expose_daemon_control_ring(
+        &self,
+        shm_name: &str,
+        capacity: u32,
+    ) -> Result<(std::os::fd::OwnedFd, *mut u8, usize), RpcError> {
+        use rrrpc::relay::control_ring::ControlRingConsumer;
+        use rrrpc::relay::protocol::{ControlRingHeader, ControlSlot};
+        use rrrpc::relay::shm::create_control_ring_shm;
+
+        let (fd, base, size) = create_control_ring_shm(shm_name, capacity).map_err(|e| {
+            RpcError::ConnectionError(format!(
+                "create_control_ring_shm({shm_name}, {capacity}): {e}"
+            ))
+        })?;
+
+        // The control_ring layout is `header | slots[capacity]` and the
+        // ControlRingConsumer takes raw pointers to those — see
+        // `rrrpc::relay::control_ring::ControlRingConsumer::new`.
+        let header_ptr = base as *const ControlRingHeader;
+        let slots_ptr = unsafe {
+            base.add(std::mem::size_of::<ControlRingHeader>()) as *mut ControlSlot
+        };
+        let consumer = unsafe { ControlRingConsumer::new(header_ptr, slots_ptr) };
+
+        let mut inner = self.inner.borrow_mut();
+        inner.daemon.control_ring = Some(consumer);
+        tracing::info!(
+            "locusta: exposed daemon control_ring at {} (capacity={})",
+            shm_name,
+            capacity
+        );
+        Ok((fd, base, size))
+    }
+
     /// Async future that polls `LocustaInner` until the response for
     /// `completion_id` is available, then yields it.
-    async fn wait_for(&self, completion_id: u64) -> Result<Response, RpcError> {
+    ///
+    /// Includes a per-RPC wall-clock timeout (config
+    /// `locusta.rpc_wait_timeout_secs`, default 120 s). When a
+    /// peer's RC QP wedges (host went DOWN mid-run, mlx5 returns
+    /// `IBV_WC_RETRY_EXC_ERR` but the recovery path is unimplemented
+    /// in `lib/locusta/mlx5/src/qp/mod.rs:983`), this prevents the
+    /// future from hanging until PBS walltime — instead, the call
+    /// returns `RpcError::TransportError("locusta wait timeout …")`
+    /// so the upper layer (IOR / mdtest) sees the failure on this
+    /// file and can move on.
+    ///
+    /// `dest_node` is captured for diagnostics so the timeout log
+    /// identifies which peer was unresponsive.
+    async fn wait_for(
+        &self,
+        completion_id: u64,
+        dest_node: NodeId,
+    ) -> Result<Response, RpcError> {
+        let timeout_secs = crate::runtime_config::RuntimeConfig::global()
+            .locusta
+            .rpc_wait_timeout_secs;
+        let deadline = if timeout_secs == 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + Duration::from_secs(timeout_secs))
+        };
         WaitForResponse {
             inner: Rc::clone(&self.inner),
             completion_id,
+            dest_node,
+            deadline,
         }
         .await
     }
@@ -2027,7 +2524,7 @@ impl LocustaTransport {
             inner.inflight.insert(id, fut);
             id
         };
-        let response = self.wait_for(completion_id).await?;
+        let response = self.wait_for(completion_id, dest.clone()).await?;
         let dma_len = match &response {
             rrrpc::relay::client::Response::DmaAndSmallRes { dma_len, .. } => *dma_len as usize,
             rrrpc::relay::client::Response::SmallRes { .. } => 0,
@@ -2073,7 +2570,7 @@ impl LocustaTransport {
             inner.inflight.insert(id, fut);
             id
         };
-        let response = self.wait_for(completion_id).await?;
+        let response = self.wait_for(completion_id, dest.clone()).await?;
         let header_bytes = {
             let inner = self.inner.borrow();
             copy_small_res_data(&inner, response.small_res_data())
@@ -2085,6 +2582,14 @@ impl LocustaTransport {
 struct WaitForResponse {
     inner: Rc<RefCell<LocustaInner>>,
     completion_id: u64,
+    /// Peer this RPC targets — only used in the timeout diagnostic
+    /// so the log line identifies which dead host caused the wedge.
+    dest_node: NodeId,
+    /// `Instant` at which `poll` should bail out with a timeout
+    /// error. `None` means timeout is disabled (legacy hang-forever
+    /// behaviour). Set by `LocustaTransport::wait_for` from
+    /// `locusta.rpc_wait_timeout_secs`.
+    deadline: Option<std::time::Instant>,
 }
 
 thread_local! {
@@ -2172,6 +2677,33 @@ impl std::future::Future for WaitForResponse {
         if let Some(now) = now_for_gap {
             LAST_WAIT_FOR_PENDING.with(|c| c.set(Some(now)));
             WAIT_FOR_POLL_COUNT.with(|c| c.set(c.get() + 1));
+        }
+        // Per-RPC wall-clock timeout. When a peer's RC QP has wedged
+        // (mlx5 reports `IBV_WC_RETRY_EXC_ERR` server-side but the
+        // client's local QP is healthy and just waiting for a reply
+        // that will never arrive — see `lib/locusta/mlx5/src/qp/
+        // mod.rs:977-984`), the in-flight `ResponseFuture` would
+        // otherwise hang until PBS walltime. Drop the entry from
+        // `inflight` (the underlying locusta slot leaks until process
+        // exit, but iter154's hang showed this is preferable to
+        // wedging every subsequent RPC), then return a transport
+        // error so the upper layer (IOR / mdtest) can fail-fast on
+        // this file and continue with the next one.
+        if let Some(deadline) = self.deadline
+            && std::time::Instant::now() >= deadline
+        {
+            let cid = self.completion_id;
+            inner.inflight.remove(&cid);
+            tracing::warn!(
+                target: "rpc_wait_timeout",
+                peer = %self.dest_node,
+                completion_id = cid,
+                "locusta wait_for timed out — abandoning RPC (peer likely dead)"
+            );
+            return std::task::Poll::Ready(Err(RpcError::TransportError(format!(
+                "locusta wait timeout for peer {}",
+                self.dest_node
+            ))));
         }
         cx.waker().wake_by_ref();
         std::task::Poll::Pending
@@ -2366,7 +2898,7 @@ impl RpcTransport for LocustaTransport {
                 inner.inflight.insert(id, fut);
                 id
             };
-            let response = self.wait_for(completion_id).await?;
+            let response = self.wait_for(completion_id, dest.clone()).await?;
             let header_bytes = {
                 let inner = self.inner.borrow();
                 copy_small_res_data(&inner, response.small_res_data())
@@ -2415,7 +2947,7 @@ impl RpcTransport for LocustaTransport {
                 id
             };
             let t_submit = t0.elapsed().as_micros() as u64;
-            let response = self.wait_for(completion_id).await?;
+            let response = self.wait_for(completion_id, dest.clone()).await?;
             let t_wait = t0.elapsed().as_micros() as u64;
             drop(dma_buf);
 
@@ -2483,7 +3015,7 @@ impl RpcTransport for LocustaTransport {
                 id
             };
             let t_submit = t0.elapsed().as_micros() as u64;
-            let response = self.wait_for(completion_id).await?;
+            let response = self.wait_for(completion_id, dest.clone()).await?;
             let t_wait = t0.elapsed().as_micros() as u64;
             let dma_len = match &response {
                 rrrpc::relay::client::Response::DmaAndSmallRes { dma_len, .. } => *dma_len as usize,

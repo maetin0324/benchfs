@@ -633,6 +633,11 @@ pub extern "C" fn benchfs_init(
             node_id_str,
             registry_dir_str
         );
+        // ppn=20 SIGKILL hunt — emit progress at WARN level so it's
+        // visible without RUST_LOG=info. Each marker records the
+        // node_id (= rank id like `ior_client_64`) so we can pinpoint
+        // which init stage the dying rank reached before death.
+        tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "client_mode_entered", "INIT_PROBE");
 
         // Create runtime. 65536 initial slots = enough headroom that the
         // Slab backing Vec never grows during a 1M-iter mdtest-hard run.
@@ -704,6 +709,15 @@ pub extern "C" fn benchfs_init(
                     peer_node_ids: Vec::new(),
                     arena_size: rc.locusta.arena_size,
                     ring_capacity: rc.locusta.ring_capacity,
+                    // Force-disable pre-allocation on the client side.
+                    // Each slot pins 96 MB (payload_buf + send_pool);
+                    // at ppn=20 (80 client procs/host) the global
+                    // `[locusta] pre_allocated_peer_count` would pin
+                    // 80 × 96 MB × N = far past per-host RAM and OOM
+                    // the dying ranks (iter141..iter167 SIGKILL).
+                    // Clients connect rather than accept, so they
+                    // never use the pool anyway.
+                    pre_allocated_peer_count_override: Some(0),
                     ..LocustaConfig::default()
                 };
                 if let Err(e) = std::fs::create_dir_all(&cfg.registry_dir) {
@@ -714,8 +728,10 @@ pub extern "C" fn benchfs_init(
                     ));
                     return std::ptr::null_mut();
                 }
+                tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "before_locusta_init", "INIT_PROBE");
                 match LocustaTransport::init(&cfg) {
                     Ok(t) => {
+                        tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "after_locusta_init", "INIT_PROBE");
                         tracing::info!(
                             "FFI client: LocustaTransport ready, registry={}",
                             cfg.registry_dir.display()
@@ -844,7 +860,10 @@ pub extern "C" fn benchfs_init(
         });
 
         match connect_result {
-            Ok(_) => tracing::info!("Successfully connected to server: {}", target_node),
+            Ok(_) => {
+                tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "after_connect_to_target", target = %target_node, "INIT_PROBE");
+                tracing::info!("Successfully connected to server: {}", target_node);
+            }
             Err(e) => {
                 set_error_message(&format!(
                     "Failed to connect to server {}: {:?}",
@@ -915,6 +934,7 @@ pub extern "C" fn benchfs_init(
             // controls this; set to >= peer_count to mimic join_all (lower
             // values can serially block on a single 120 s timeout).
             let chunk: usize = rc.prewarm.concurrency;
+            tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "prewarm_start", "INIT_PROBE");
             let _ = block_on_with_name("prewarm_connections", async move {
                 use futures::stream::{self, StreamExt};
                 let nodes = nodes_for_prewarm.clone();
@@ -931,6 +951,7 @@ pub extern "C" fn benchfs_init(
                 .await;
                 Ok::<(), crate::rpc::RpcError>(())
             });
+            tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "prewarm_done", elapsed_ms = prewarm_start.elapsed().as_millis() as u64, "INIT_PROBE");
             tracing::info!(
                 "Pre-warm complete in {} ms",
                 prewarm_start.elapsed().as_millis()
@@ -977,6 +998,7 @@ pub extern "C" fn benchfs_init(
     // Store node_id for use in statistics output during finalization
     set_node_id(node_id_str.to_string());
 
+    tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "benchfs_init_returning", "INIT_PROBE");
     // Return opaque pointer
     // We box the Rc to pass ownership to C
     let boxed = Box::new(benchfs);

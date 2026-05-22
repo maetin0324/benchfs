@@ -260,12 +260,26 @@ start_benchfsd() {
   local chunk_bytes=$2
 
   rm -rf "${BENCHFS_REGISTRY_DIR}"/*
+  # Clean /scrN/*. Per-job dirs (`/scrN/<PBS_JOBID>`) from PRIOR runs
+  # accumulate and eventually fill the 12 TB XFS RAID-0 — iter181 hit
+  # ENOSPC (errno 28) mid-write because iter178 left ~33 TB and earlier
+  # iterations added more. Removing siblings via `find` is safe because
+  # PBS reuses /scrN only on rerun; nothing outside our jobs writes
+  # there.
   "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
     --bind-to none --oversubscribe -x PBS_JOBID \
     bash -c '
       for n in 0 1 2 3; do
-        d="/scr${n}/${PBS_JOBID}"
-        [ -d "$d" ] && rm -rf "$d"/* 2>/dev/null
+        if [ -d "/scr${n}" ]; then
+          # Remove stale per-job dirs from prior runs (anything matching
+          # ".pbs" suffix). Hold the current JOBID so its own setup is
+          # idempotent.
+          find "/scr${n}" -maxdepth 1 -mindepth 1 -name "*.pbs" \
+            ! -name "${PBS_JOBID}" -exec rm -rf {} + 2>/dev/null || true
+          # And clear the current jobs leftover contents (re-runs).
+          d="/scr${n}/${PBS_JOBID}"
+          [ -d "$d" ] && rm -rf "$d"/* 2>/dev/null
+        fi
       done
     ' 2>/dev/null || true
 
@@ -311,6 +325,13 @@ start_benchfsd() {
   fi
   local benchfs_defer_init_prewarm="false"
   if [ "${BENCHFS_LOCUSTA_DEFER_HANDSHAKE:-0}" = "1" ]; then
+    benchfs_defer_init_prewarm="true"
+  fi
+  local benchfs_mpi_server_mesh="false"
+  if [ "${BENCHFS_LOCUSTA_MPI_SERVER_MESH:-0}" = "1" ]; then
+    benchfs_mpi_server_mesh="true"
+    # MPI server-mesh requires defer_init_prewarm to skip the file-based
+    # peer prewarm in LocustaTransport::init.
     benchfs_defer_init_prewarm="true"
   fi
   # [rpc] profile / force_put_writes  and [api] open/close_meta_async —
@@ -386,6 +407,9 @@ handshake_mode = "${benchfs_handshake_mode}"
 exchange_timeout_secs = ${benchfs_exchange_timeout_secs}
 wait_peer_ack_strict = ${benchfs_wait_peer_ack_strict}
 defer_init_prewarm = ${benchfs_defer_init_prewarm}
+mpi_server_mesh = ${benchfs_mpi_server_mesh}
+pre_allocated_peer_count = ${BENCHFS_LOCUSTA_PRE_ALLOC_PEERS:-0}
+rpc_wait_timeout_secs = ${BENCHFS_LOCUSTA_RPC_WAIT_TIMEOUT_SECS:-120}
 
 [iouring]
 queue_size = ${BENCHFS_IOURING_QUEUE_SIZE:-2048}
@@ -735,6 +759,7 @@ run_io500() {
     # fresh locusta client. Skipped silently when the binary isn't built.
     -x BENCHFS_REGISTRY_DIR="${BENCHFS_REGISTRY_DIR}"
     "${asan_args[@]}"
+    "${IO500_DIR}/io500_wrapper.sh"
     "${IO500_DIR}/io500"
     "${ini}"
   )

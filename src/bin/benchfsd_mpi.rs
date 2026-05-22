@@ -123,6 +123,52 @@ fn init_locusta_runtime(
         cfg.peer_node_ids.len()
     );
 
+    // Standalone-daemon mode (POC): if env BENCHFS_LOCUSTA_DAEMON_NAME
+    // is set, expose this benchfsd_mpi proc's relay daemon to LOCAL
+    // IOR clients via a named POSIX shared-memory control ring. The
+    // IOR clients (`libbenchfs.so` loaded into the io500 binary) then
+    // open the same SHM via `Client::connect` and route their RPCs
+    // through THIS daemon's already-warm QPs to remote peers — instead
+    // of each client process creating its own daemon (which is what
+    // made ppn=20 fragile at iter141..iter190).
+    //
+    // We leak the returned `(fd, ptr, size)` triple intentionally: the
+    // SHM must outlive the daemon, and the daemon outlives the whole
+    // benchfsd_mpi process. shm_unlink on graceful shutdown is handled
+    // by `cleanup_servers` in the job script.
+    if let Ok(daemon_shm) = std::env::var("BENCHFS_LOCUSTA_DAEMON_NAME") {
+        if !daemon_shm.is_empty() {
+            let capacity: u32 = std::env::var("BENCHFS_LOCUSTA_DAEMON_CTRL_CAPACITY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64);
+            match transport.expose_daemon_control_ring(&daemon_shm, capacity) {
+                Ok(handle) => {
+                    // Leak the OwnedFd + ptr so SHM stays mapped for
+                    // the lifetime of this process.
+                    std::mem::forget(handle);
+                    tracing::info!(
+                        "locusta standalone-daemon: control_ring exposed at {} capacity={}",
+                        daemon_shm,
+                        capacity
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to expose daemon control_ring at {}: {:?}",
+                        daemon_shm,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Note: MPI server-mesh handshake (if enabled) is invoked by the
+    // caller of `init_locusta_runtime` because we need access to the
+    // MPI Universe / world communicator that lives on the call stack
+    // higher up.
+
     // Registry mode: spawn the server-side discover task that accepts
     // dynamic client handshakes (`ior_client_*`) via the async
     // state machine. The task yields the reactor between Lustre
@@ -805,13 +851,40 @@ fn run_server(
 
     #[cfg(feature = "transport-locusta")]
     let locusta_state = if use_locusta {
-        Some(init_locusta_runtime(
+        let st = init_locusta_runtime(
             &node_id,
             state.mpi_rank,
             state.mpi_size,
             registry_dir,
             handler_context.clone(),
-        )?)
+        )?;
+        // MPI server-mesh handshake (Allgather-based) runs here so we
+        // still have access to the MPI world. `init_locusta_runtime`
+        // already skipped the per-peer file prewarm via
+        // `defer_init_prewarm = true`.
+        let rc_loc = &benchfs::runtime_config::RuntimeConfig::global().locusta;
+        if rc_loc.mpi_server_mesh {
+            if !rc_loc.defer_init_prewarm {
+                tracing::warn!(
+                    "[locusta] mpi_server_mesh = true requires defer_init_prewarm = true; \
+                     skipping MPI handshake"
+                );
+            } else {
+                let world = mpi::topology::SimpleCommunicator::world();
+                st.transport.mpi_handshake_servers(
+                    &world,
+                    state.mpi_rank,
+                    state.mpi_size,
+                    |rank| format!("node_{}", rank),
+                )?;
+                tracing::info!(
+                    "MPI_Allgather server-mesh handshake done (rank {}/{})",
+                    state.mpi_rank,
+                    state.mpi_size
+                );
+            }
+        }
+        Some(st)
         // NOTE: no `runtime.register_reactor("locusta", ...)` here on
         // purpose. The dispatch task below (poll_once_spawn) ticks
         // locusta state machines itself. WaitForResponse::poll also
@@ -999,7 +1072,32 @@ fn run_server(
                             let pending_grant = received.saturating_sub(granted + grant_rej);
                             let pending_write = granted.saturating_sub(ready);
                             let pending_reply = ready.saturating_sub(replied);
-                            tracing::info!(
+                            // Memory probe: surface /proc/self/status VmRSS,
+                            // VmPeak, VmData so we can see growth right
+                            // before signal-9 (= cgroup/OOM kill). Emit at
+                            // WARN so default RUST_LOG=warn captures it.
+                            // Cost is one `read_to_string` of a ~2 KiB
+                            // /proc file every 5 sec — negligible.
+                            let mem_summary: String = std::fs::read_to_string("/proc/self/status")
+                                .map(|s| {
+                                    let mut out = String::new();
+                                    for line in s.lines() {
+                                        if line.starts_with("VmRSS:")
+                                            || line.starts_with("VmPeak:")
+                                            || line.starts_with("VmData:")
+                                            || line.starts_with("VmHWM:")
+                                            || line.starts_with("VmSize:")
+                                        {
+                                            if !out.is_empty() {
+                                                out.push_str(" | ");
+                                            }
+                                            out.push_str(line.trim());
+                                        }
+                                    }
+                                    out
+                                })
+                                .unwrap_or_default();
+                            tracing::warn!(
                                 target: "wcb_put_pipeline",
                                 received = received,
                                 granted = granted,
@@ -1009,6 +1107,7 @@ fn run_server(
                                 pending_grant = pending_grant,
                                 pending_write = pending_write,
                                 pending_reply = pending_reply,
+                                mem = %mem_summary,
                                 "WCB_PUT_PIPELINE"
                             );
                             next_pipeline_dump_at = now + std::time::Duration::from_secs(5);
@@ -1057,7 +1156,14 @@ fn run_server(
                     let mut iter: u64 = 0;
                     loop {
                         iter = iter.wrapping_add(1);
-                        match accept_transport.try_accept_pending_peers(per_peer_timeout) {
+                        // Use the async drain so each batch yields the
+                        // reactor between accepts. Cap per-call to 16
+                        // (handle_one_udp_request × 16 ≈ 500 ms worst
+                        // case) so the loop never starves dispatch.
+                        match accept_transport
+                            .try_accept_pending_peers_async(per_peer_timeout, 16)
+                            .await
+                        {
                             Ok(added) if !added.is_empty() => {
                                 tracing::info!(
                                     "locusta accepted {} new client peer(s) on iter {}: {:?}",
@@ -1067,7 +1173,7 @@ fn run_server(
                                 );
                             }
                             Ok(_) => {
-                                if iter == 1 || iter % 50 == 0 {
+                                if iter == 1 || iter % 500 == 0 {
                                     tracing::info!(
                                         "locusta accept loop heartbeat iter={} (no new peers)",
                                         iter
@@ -1081,6 +1187,11 @@ fn run_server(
                                     e
                                 );
                             }
+                        }
+                        // Every ~5 s dump UDP accept-path timings so
+                        // we can see where server-side time is going.
+                        if iter % 50 == 0 {
+                            accept_transport.dump_udp_accept_stats();
                         }
                         pluvio_timer::sleep(scan_interval).await;
                     }

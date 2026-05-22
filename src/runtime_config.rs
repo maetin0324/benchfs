@@ -172,6 +172,31 @@ pub struct LocustaTuning {
     /// over per-peer handshake once `register_self` has published the
     /// address (avoids the chicken-and-egg deadlock from iter108).
     pub defer_init_prewarm: bool,
+    /// Number of peer slots to pre-allocate during server init
+    /// (each runs the full `prepare_peer` upfront: 3-5 ibv_reg_mr + 1
+    /// QP create ≈ 57-145 ms per slot, measured iter135). Subsequent
+    /// accepts pop from this pool in O(1) and only need `connect_peer`
+    /// (~0.6 ms), so the server can keep up with 800-client UDP bursts.
+    /// Set to your expected peer count (e.g., `ior_client_count + N`)
+    /// for the run; 0 disables and falls back to on-demand `prepare_peer`.
+    pub pre_allocated_peer_count: u16,
+    /// When true (benchfsd_mpi only), exchange server-server QP info
+    /// via `MPI_Allgather` instead of the file-based registry. Skips
+    /// init-time prewarm and any Lustre I/O for the server-mesh
+    /// handshake (40-server case completes in milliseconds vs
+    /// seconds via registry). Client (ior_client_*) handshake still
+    /// goes through the registry path.
+    pub mpi_server_mesh: bool,
+    /// Per-RPC wall-clock timeout for `WaitForResponse` (seconds).
+    /// When a Put/Get/Eager RPC's reply doesn't arrive within this
+    /// budget, the future returns `RpcError::TransportError` instead
+    /// of hanging forever. Without this, a single dead host wedges
+    /// every RPC targeting it until PBS walltime kills the job
+    /// (observed iter154/155/157/159: Sirius hosts go DOWN mid-run
+    /// and the locusta RC QP has no recovery — `lib/locusta/mlx5/src/
+    /// qp/mod.rs:983` explicitly leaves the QP dead). Set to 0 to
+    /// disable timeout (legacy hang-forever behaviour).
+    pub rpc_wait_timeout_secs: u64,
 }
 
 impl Default for LocustaTuning {
@@ -184,7 +209,7 @@ impl Default for LocustaTuning {
             recv_ring_size: 64 * 1024,
             send_buf_size: 64 * 1024,
             ring_capacity: 128,
-            accept_interval_ms: 100,
+            accept_interval_ms: 10,
             reactor_mode: false,
             dispatch_idle_sleep_us: 20,
             dispatch_idle_threshold: 16,
@@ -203,6 +228,12 @@ impl Default for LocustaTuning {
             exchange_timeout_secs: 120,
             wait_peer_ack_strict: false,
             defer_init_prewarm: false,
+            mpi_server_mesh: false,
+            pre_allocated_peer_count: 0,
+            // 120s: enough for slow but live RPCs (server doing 4 MiB
+            // disk read + RDMA write), short enough that a single dead
+            // host doesn't waste the whole 90 min PBS walltime budget.
+            rpc_wait_timeout_secs: 120,
         }
     }
 }
