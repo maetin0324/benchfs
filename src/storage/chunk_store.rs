@@ -2005,9 +2005,7 @@ impl IOUringChunkStore {
         // still write at offset 0 (the metadata server's own writes), but
         // the bulk-data path no longer pays the header overhead and stays
         // raw-data-at-offset-0 like the 5/9 baseline (106 GiB/s).
-        let host = gethostname::gethostname()
-            .to_string_lossy()
-            .into_owned();
+        let host = gethostname::gethostname().to_string_lossy().into_owned();
         // Transient io_uring ENOMEM retry. iter77-84 showed
         // `IORING_OP_WRITE_FIXED` CQE.res = -ENOMEM from kernel
         // `io_rw_alloc_async` under high in-flight pressure (~1 in
@@ -2344,8 +2342,7 @@ impl IOUringChunkStore {
                     "[write_chunk_via_registered] WRITE ENOMEM attempt={attempt}/{max_attempts} path={} chunk={} offset={} len={} — retrying",
                     file_path, chunk_index, offset, len
                 );
-                pluvio_timer::sleep(std::time::Duration::from_millis(1u64 << (attempt - 1)))
-                    .await;
+                pluvio_timer::sleep(std::time::Duration::from_millis(1u64 << (attempt - 1))).await;
                 continue;
             }
             break r;

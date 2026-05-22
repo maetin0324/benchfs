@@ -145,11 +145,7 @@ pub(crate) fn propagate_dir_index_insert(
                 if let Err(e) =
                     <DirIndexUpdateRequest as crate::rpc::AmRpc>::call(&req, &client).await
                 {
-                    tracing::warn!(
-                        "DirIndexUpdate insert -> {} failed: {:?}",
-                        owner_owned,
-                        e
-                    );
+                    tracing::warn!("DirIndexUpdate insert -> {} failed: {:?}", owner_owned, e);
                 }
             }
             Err(e) => {
@@ -196,11 +192,7 @@ pub(crate) fn propagate_dir_index_remove(ctx: &Rc<RpcHandlerContext>, path: &str
                 if let Err(e) =
                     <DirIndexUpdateRequest as crate::rpc::AmRpc>::call(&req, &client).await
                 {
-                    tracing::warn!(
-                        "DirIndexUpdate remove -> {} failed: {:?}",
-                        owner_owned,
-                        e
-                    );
+                    tracing::warn!("DirIndexUpdate remove -> {} failed: {:?}", owner_owned, e);
                 }
             }
             Err(e) => {
@@ -644,16 +636,12 @@ fn integrity_emit(line: &str) {
 /// `granted` is flat, allocator exhaustion is throttling PutGrant; if all
 /// three rise together but client still sees hang, the issue is upstream
 /// (relay daemon, RDMA write_imm, send ring) of the server entirely.
-pub static WCB_PUT_RECEIVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static WCB_PUT_GRANTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static WCB_PUT_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WCB_PUT_GRANTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WCB_PUT_GRANT_REJECTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub static WCB_PUT_READY: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static WCB_PUT_REPLIED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static WCB_PUT_READY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WCB_PUT_REPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Sync fast-path for `WriteChunkById::PutGrant`. The body of this handler
 /// has no `.await` (try_acquire + grant), so spawning it as a future onto
@@ -870,9 +858,7 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                     return;
                 }
                 let payload = &body[header_size..];
-                let parse_us = t_total
-                    .map(|t| t.elapsed().as_micros() as u64)
-                    .unwrap_or(0);
+                let parse_us = t_total.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
                 let t_path = if profile {
                     Some(std::time::Instant::now())
                 } else {
@@ -895,9 +881,7 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                 {
                     Ok(bytes) => WriteChunkResponseHeader::success(bytes as u64),
                     Err(e) => {
-                        eprintln!(
-                            "[locusta_handlers] WriteChunkById eager store failed: {e:?}"
-                        );
+                        eprintln!("[locusta_handlers] WriteChunkById eager store failed: {e:?}");
                         WriteChunkResponseHeader::error(-5)
                     }
                 };
@@ -909,12 +893,8 @@ impl LocustaServerHandler for WriteChunkByIdRequest<'_> {
                 };
                 h.reply(resp.as_bytes().to_vec());
                 if profile {
-                    let reply_us = t_reply
-                        .map(|t| t.elapsed().as_micros() as u64)
-                        .unwrap_or(0);
-                    let total_us = t_total
-                        .map(|t| t.elapsed().as_micros() as u64)
-                        .unwrap_or(0);
+                    let reply_us = t_reply.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+                    let total_us = t_total.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
                     crate::rpc::perf_breakdown::srv_record(
                         parse_us, path_us, disk_us, reply_us, total_us,
                     );
