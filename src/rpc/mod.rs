@@ -12,6 +12,7 @@ pub mod buffer_pool;
 pub mod client;
 pub mod connection;
 pub mod data_ops;
+pub mod ucx_relay;
 pub mod dir_index_ops;
 pub mod file_id;
 pub mod handlers;

@@ -66,8 +66,14 @@ pub fn reactor_mode_enabled() -> bool {
 /// reach into it from poll-time.
 pub struct LocustaInner {
     pub client: Client,
-    pub daemon: RelayDaemon,
-    pub server: ServerContext<RegisteredFixedBuffer>,
+    /// Embedded mode: in-process relay daemon. `None` in standalone
+    /// shared-daemon mode (POC iter191+) where the daemon lives in a
+    /// separate `benchfsd_mpi` process and this client talks to it via
+    /// a POSIX SHM control_ring instead of an in-process `Arc<JiffyQueue>`.
+    pub daemon: Option<RelayDaemon>,
+    /// Embedded mode: in-process RPC server. `None` in standalone
+    /// shared-daemon mode — the server runs in the daemon process.
+    pub server: Option<ServerContext<RegisteredFixedBuffer>>,
     /// Server-side pool of pinned, page-aligned, RDMA-registered buffers.
     /// Each handler that needs a buffer for a Put grant or a Get reply
     /// `acquire`s a [`FixedBuffer`] from here and wraps it in a
@@ -150,6 +156,14 @@ pub struct LocustaInner {
     /// ops are slow (the `locusta_qp/` directory grows to tens of
     /// thousands of files at 400-client scale).
     pub pending_discoveries: Vec<PendingDiscovery>,
+    /// Standalone-daemon client mode (iter193+): the node identity of
+    /// the daemon process whose SHM control_ring this client opened.
+    /// Populated from the daemon's `*.peers` manifest file. The client
+    /// excludes this node from its BenchFS data/metadata routing list
+    /// because the local daemon currently has no loopback path (when
+    /// dest_id points to self, the daemon would have no destinations
+    /// slab entry to forward through). `None` in embedded mode.
+    pub owner_node_id: Option<NodeId>,
 }
 
 /// A server-side handshake in progress. Created when discover spots a
@@ -276,7 +290,7 @@ impl LocustaInner {
             let recv_ring_size = rc.locusta.recv_ring_size;
             let send_buf_size = rc.locusta.send_buf_size;
             let max_inflight = rc.locusta.max_inflight;
-            let server_local = match self.server.prepare_peer(
+            let server_local = match self.server.as_mut().expect("server present in embedded mode").prepare_peer(
                 dest_id,
                 recv_ring_size,
                 send_buf_size,
@@ -295,7 +309,7 @@ impl LocustaInner {
                     continue;
                 }
             };
-            let relay_local = match self.daemon.prepare_destination(
+            let relay_local = match self.daemon.as_mut().expect("daemon present in embedded mode").prepare_destination(
                 dest_id,
                 recv_ring_size,
                 send_buf_size,
@@ -423,7 +437,7 @@ impl LocustaInner {
                 DiscoveryStep::NeedConnect { peer_relay, peer_server } => {
                     steps_done += 1;
                     let op_t = std::time::Instant::now();
-                    let cres1 = self.server.connect_peer(pd.dest_id, &peer_relay);
+                    let cres1 = self.server.as_mut().expect("server present in embedded mode").connect_peer(pd.dest_id, &peer_relay);
                     let dt1 = op_t.elapsed().as_micros() as u64;
                     connect_total_us += dt1;
                     connect_count += 1;
@@ -441,7 +455,7 @@ impl LocustaInner {
                         completed.push(idx);
                         continue;
                     }
-                    if let Err(e) = self.daemon.connect_destination(pd.dest_id, &peer_server) {
+                    if let Err(e) = self.daemon.as_mut().expect("daemon present in embedded mode").connect_destination(pd.dest_id, &peer_server) {
                         tracing::warn!(
                             target: "rpc_registry_discover",
                             peer = %pd.peer,
@@ -515,17 +529,38 @@ impl LocustaInner {
         // yields the reactor between Lustre polls). Both paths take
         // `inner.borrow_mut()` only for the short locusta-internal
         // phases, so the tick stays responsive.
-        self.daemon.poll_client_requests();
+        // Shared-daemon mode (POC): the daemon lives in another process,
+        // so skip its polls entirely. The client cq_ring is still driven
+        // from this process via `self.client.poll()` below.
+        // poll_control_ring must run on every daemon tick so cross-process
+        // clients can `Connect` (standalone-daemon mode, iter191+). Without
+        // this, clients' `Client::connect` sends a Connect message into the
+        // SHM control_ring but the daemon never drains it → handle_connect
+        // never fires → channel never transitions to Active → client spins
+        // forever in `Client::connect`'s "Active 待ち" loop. Job 21635
+        // observed: `total_drained=0` heartbeats indefinitely.
+        if let Some(daemon) = self.daemon.as_mut() {
+            daemon.poll_control_ring();
+            daemon.poll_client_requests();
+        }
         let t1 = t0.elapsed().as_micros() as u64;
-        self.daemon.process_pending_dma_writes();
+        if let Some(daemon) = self.daemon.as_mut() {
+            daemon.process_pending_dma_writes();
+        }
         let t2 = t0.elapsed().as_micros() as u64;
-        self.daemon.flush_all_destinations();
+        if let Some(daemon) = self.daemon.as_mut() {
+            daemon.flush_all_destinations();
+        }
         let t3 = t0.elapsed().as_micros() as u64;
-        self.daemon.poll_server_completions();
+        if let Some(daemon) = self.daemon.as_mut() {
+            daemon.poll_server_completions();
+        }
         let t4 = t0.elapsed().as_micros() as u64;
         self.client.poll();
         let t5 = t0.elapsed().as_micros() as u64;
-        self.server.poll();
+        if let Some(server) = self.server.as_mut() {
+            server.poll();
+        }
         let t6 = t0.elapsed().as_micros() as u64;
         // Sample slow ticks (≥1ms) to keep log volume manageable. Under
         // a healthy system every tick should be sub-100µs.
@@ -555,7 +590,7 @@ impl LocustaInner {
                     target: "pluvio_tick_timing",
                     kind = "credit_reads",
                     tick_n = n,
-                    credit_reads_issued = self.daemon.debug_credit_reads_issued,
+                    credit_reads_issued = self.daemon.as_ref().map(|d| d.debug_credit_reads_issued).unwrap_or(0),
                     "CREDIT_READ_COUNT"
                 );
             }
@@ -579,9 +614,110 @@ impl LocustaInner {
     ///      replying, so by the time we read this byte the peer's QPs
     ///      are already RTR/RTS — the first RDMA send won't RNR.
     ///   6. `connect_peer` + `connect_destination` on our QPs.
+    /// **iter199+ standalone-daemon loopback support**: set up an
+    /// in-process RDMA loopback peer for `self.local_node_id`. The
+    /// server's QP and the daemon's QP are wired to each other via
+    /// the local HCA (same LID, same port — RDMA loopback). dest_id
+    /// = next vacant slab key. After this, slots from co-resident
+    /// clients targeting `self.local_node_id` route via destinations[dest_id]
+    /// → RDMA WRITE to self → server's RDMA recv → handler →
+    /// reply back via the same loopback. Solves the cross-client
+    /// metadata visibility issue (iter197) without modifying locusta.
+    fn add_self_loopback(&mut self) -> Result<u16, RpcError> {
+        let self_id = self.local_node_id.clone();
+        if let Some(&existing) = self.node_to_dest.get(&self_id) {
+            return Ok(existing);
+        }
+        if self.server.is_none() || self.daemon.is_none() {
+            return Err(RpcError::ConnectionError(
+                "add_self_loopback requires embedded daemon+server".to_string(),
+            ));
+        }
+        let dest_id = self.next_dest_id;
+        self.next_dest_id = self
+            .next_dest_id
+            .checked_add(1)
+            .ok_or_else(|| RpcError::ConnectionError("dest_id space exhausted".to_string()))?;
+
+        let rc = crate::runtime_config::RuntimeConfig::global();
+        let recv_ring_size = rc.locusta.recv_ring_size;
+        let send_buf_size = rc.locusta.send_buf_size;
+        let max_inflight = rc.locusta.max_inflight;
+        let server_local = self
+            .server
+            .as_mut()
+            .unwrap()
+            .prepare_peer(
+                dest_id,
+                recv_ring_size,
+                send_buf_size,
+                512,
+                max_inflight,
+                &self.qp_config,
+            )
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "server.prepare_peer({dest_id}, self-loopback): {e:?}"
+                ))
+            })?;
+        let relay_local = self
+            .daemon
+            .as_mut()
+            .unwrap()
+            .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "daemon.prepare_destination({dest_id}, self-loopback): {e:?}"
+                ))
+            })?;
+        // Connect each side to the OTHER's local QP info — RDMA
+        // loopback through the local HCA (same LID).
+        self.server
+            .as_mut()
+            .unwrap()
+            .connect_peer(dest_id, &relay_local)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "server.connect_peer({dest_id}, self-loopback): {e:?}"
+                ))
+            })?;
+        self.daemon
+            .as_mut()
+            .unwrap()
+            .connect_destination(dest_id, &server_local)
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "daemon.connect_destination({dest_id}, self-loopback): {e:?}"
+                ))
+            })?;
+        self.node_to_dest.insert(self_id.clone(), dest_id);
+        tracing::info!(
+            "locusta self-loopback peer wired: node={} dest_id={}",
+            self_id,
+            dest_id
+        );
+        Ok(dest_id)
+    }
+
     fn add_peer_blocking(&mut self, peer: &str, deadline: Instant) -> Result<u16, RpcError> {
         if let Some(&existing) = self.node_to_dest.get(peer) {
             return Ok(existing);
+        }
+
+        // Standalone-daemon clients have no local HCA resources and
+        // rely on the daemon process's already-established peer mesh.
+        // The daemon publishes its peer manifest at init time; any
+        // peer NOT in `node_to_dest` here is either the daemon's OWN
+        // identity (= local-daemon's node, which the daemon can't
+        // forward to without loopback support) or an unknown peer.
+        // In both cases there's no HCA to run a fresh handshake, so
+        // return a clear error instead of panicking on
+        // `self.server.expect(...)`.
+        if self.server.is_none() {
+            return Err(RpcError::ConnectionError(format!(
+                "add_peer({peer}): unreachable in standalone-daemon client mode \
+                 (peer is the daemon's OWN node or missing from manifest)"
+            )));
         }
 
         let dest_id = self.next_dest_id;
@@ -596,7 +732,7 @@ impl LocustaInner {
         let send_buf_size = rc.locusta.send_buf_size;
         let max_inflight = rc.locusta.max_inflight;
         let server_local = self
-            .server
+            .server.as_mut().expect("server present in embedded mode")
             .prepare_peer(
                 dest_id,
                 recv_ring_size,
@@ -609,7 +745,7 @@ impl LocustaInner {
                 RpcError::ConnectionError(format!("server.prepare_peer({dest_id}): {e:?}"))
             })?;
         let relay_local = self
-            .daemon
+            .daemon.as_mut().expect("daemon present in embedded mode")
             .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("daemon.prepare_destination({dest_id}): {e:?}"))
@@ -645,14 +781,14 @@ impl LocustaInner {
                     self.local_node_id
                 ))
             })?;
-            self.server
+            self.server.as_mut().expect("server present in embedded mode")
                 .connect_peer(dest_id, &peer_relay)
                 .map_err(|e| {
                     RpcError::ConnectionError(format!(
                         "server.connect_peer({dest_id}, registry): {e:?}"
                     ))
                 })?;
-            self.daemon
+            self.daemon.as_mut().expect("daemon present in embedded mode")
                 .connect_destination(dest_id, &peer_server)
                 .map_err(|e| {
                     RpcError::ConnectionError(format!(
@@ -878,12 +1014,12 @@ impl LocustaInner {
             }
         };
 
-        self.server
+        self.server.as_mut().expect("server present in embedded mode")
             .connect_peer(dest_id, &response.relay_qp)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("server.connect_peer({dest_id}): {e:?}"))
             })?;
-        self.daemon
+        self.daemon.as_mut().expect("daemon present in embedded mode")
             .connect_destination(dest_id, &response.server_qp)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("daemon.connect_destination({dest_id}): {e:?}"))
@@ -1065,10 +1201,9 @@ impl LocustaInner {
         // iter135), drastically cutting per-accept time and letting
         // the server keep up with 800-client bursts.
         let t_prep_start = std::time::Instant::now();
-        let (dest_id, server_local, relay_local) = match (
-            self.server.try_claim_pre_allocated_peer(),
-            self.daemon.try_claim_pre_allocated_destination(),
-        ) {
+        let claim_server = self.server.as_mut().expect("accept_pre_allocated_inline: server present").try_claim_pre_allocated_peer();
+        let claim_daemon = self.daemon.as_mut().expect("accept_pre_allocated_inline: daemon present").try_claim_pre_allocated_destination();
+        let (dest_id, server_local, relay_local) = match (claim_server, claim_daemon) {
             (Some((sid, server_local)), Some((did, relay_local))) if sid == did => {
                 (sid, server_local, relay_local)
             }
@@ -1077,19 +1212,21 @@ impl LocustaInner {
                 // slow path. Re-push any partially claimed slot so we
                 // don't leak it.
                 if let Some((sid, info)) = server_slot {
-                    self.server.pre_allocated_peer_ids.push_front(sid);
-                    self.server.pre_allocated_local_info.insert(sid, info);
+                    let server_mut = self.server.as_mut().unwrap();
+                    server_mut.pre_allocated_peer_ids.push_front(sid);
+                    server_mut.pre_allocated_local_info.insert(sid, info);
                 }
                 if let Some((did, info)) = daemon_slot {
-                    self.daemon.pre_allocated_dest_ids.push_front(did);
-                    self.daemon.pre_allocated_dest_info.insert(did, info);
+                    let daemon_mut = self.daemon.as_mut().unwrap();
+                    daemon_mut.pre_allocated_dest_ids.push_front(did);
+                    daemon_mut.pre_allocated_dest_info.insert(did, info);
                 }
                 let dest_id = self.next_dest_id;
                 self.next_dest_id = self.next_dest_id.checked_add(1).ok_or_else(|| {
                     RpcError::ConnectionError("dest_id space exhausted".to_string())
                 })?;
                 let server_local = self
-                    .server
+                    .server.as_mut().expect("server present in embedded mode")
                     .prepare_peer(
                         dest_id,
                         recv_ring_size,
@@ -1104,7 +1241,7 @@ impl LocustaInner {
                         ))
                     })?;
                 let relay_local = self
-                    .daemon
+                    .daemon.as_mut().expect("daemon present in embedded mode")
                     .prepare_destination(dest_id, recv_ring_size, send_buf_size, &self.qp_config)
                     .map_err(|e| {
                         RpcError::ConnectionError(format!(
@@ -1118,12 +1255,12 @@ impl LocustaInner {
         self.udp_stats_prepare_us = self.udp_stats_prepare_us.saturating_add(prep_us);
 
         let t_connect_start = std::time::Instant::now();
-        self.server
+        self.server.as_mut().expect("server present in embedded mode")
             .connect_peer(dest_id, &request.relay_qp)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("server.connect_peer({dest_id}): {e:?}"))
             })?;
-        self.daemon
+        self.daemon.as_mut().expect("daemon present in embedded mode")
             .connect_destination(dest_id, &request.server_qp)
             .map_err(|e| {
                 RpcError::ConnectionError(format!("daemon.connect_destination({dest_id}): {e:?}"))
@@ -1565,6 +1702,10 @@ impl LocustaTransport {
             shm_base,
             shm_size: layout.total_size,
             cq_ring: cq_ring_for_relay,
+            // Embedded mode: client and daemon share the same process
+            // and use the in-process JiffyQueue (`req_queue`). The SHM
+            // req_ring is only used in standalone-daemon mode.
+            req_ring: None,
             arena_base,
             arena_rkey: arena_mr.rkey(),
             mr_addr: arena_mr.addr() as u64,
@@ -1645,8 +1786,8 @@ impl LocustaTransport {
 
         let inner = LocustaInner {
             client,
-            daemon,
-            server,
+            daemon: Some(daemon),
+            server: Some(server),
             server_buffer_allocator,
             _server_buffer_mrs: server_buffer_mrs,
             registry_scan_counter: 0,
@@ -1675,6 +1816,7 @@ impl LocustaTransport {
             peer_udp_addrs: HashMap::new(),
             cached_responses: HashMap::new(),
             peer_request_retries: HashMap::new(),
+            owner_node_id: None,
         };
         let inner = Rc::new(RefCell::new(inner));
 
@@ -1718,6 +1860,7 @@ impl LocustaTransport {
             let t0 = std::time::Instant::now();
             inner_mut
                 .server
+                .as_mut().expect("server present in embedded mode")
                 .pre_allocate_peers(
                     start_id,
                     pre_alloc_count,
@@ -1734,6 +1877,7 @@ impl LocustaTransport {
                 })?;
             inner_mut
                 .daemon
+                .as_mut().expect("daemon present in embedded mode")
                 .pre_allocate_destinations(
                     start_id,
                     pre_alloc_count,
@@ -1770,6 +1914,14 @@ impl LocustaTransport {
 
         if !rc_locusta.defer_init_prewarm {
             let mut inner_mut = inner.borrow_mut();
+            // iter199+: self-loopback peer FIRST so dest_id 0 is the
+            // local node and shared-daemon clients can route to OWNER
+            // via the same destinations slab as remote peers. The
+            // resulting `node_to_dest` published in the manifest
+            // includes self (with dest_id 0), eliminating the
+            // "consistent_hash hits OWNER → fail" pattern that
+            // dominated iters 5-9.
+            inner_mut.add_self_loopback()?;
             for peer in &cfg.peer_node_ids {
                 inner_mut.add_peer_blocking(peer, deadline)?;
             }
@@ -1781,6 +1933,223 @@ impl LocustaTransport {
             );
         }
         Ok(Self { inner })
+    }
+
+    /// **iter191+ shared-daemon mode**. Initialize a *client-only*
+    /// LocustaTransport that talks to a daemon already running in
+    /// another process via the daemon's control_ring SHM.
+    ///
+    /// The companion to [`expose_daemon_control_ring`] on the daemon
+    /// side: the daemon creates the SHM and registers it on its
+    /// `RelayDaemon`, then this constructor opens the same SHM, sends
+    /// a `Connect` message, and receives a per-client channel back.
+    ///
+    /// Differences vs [`init`]:
+    /// * No mlx5 device opened (the daemon owns the HCA).
+    /// * No `RelayDaemon` / `ServerContext` constructed —
+    ///   `LocustaInner.{daemon, server}` are `None`.
+    /// * No UDP control-plane bound (no peer handshake from this
+    ///   process; the daemon already has warm QPs).
+    /// * `node_to_dest` is populated from `peer_node_ids` with
+    ///   `dest_id = index`. The caller must pass the SAME peer order
+    ///   used by the daemon so dest_ids match.
+    ///
+    /// **Request-path IPC**: `Client::connect` constructs a SHM-backed
+    /// `FastForwardRing<RequestSlot>` (producer side) over the
+    /// per-client channel SHM. The daemon (in another process) sees
+    /// the same ring as a consumer in its `Channel::req_ring` and
+    /// drains it in `poll_client_requests`. The `JiffyQueue` handed
+    /// to `Client::connect` for signature compatibility is unused
+    /// when `req_ring` is `Some`.
+    pub fn init_shared_client(
+        shm_name: &str,
+        config: &LocustaConfig,
+    ) -> Result<Self, RpcError> {
+        use rrrpc::relay::client::ClientConfig;
+        use rrrpc::relay::control_ring::ControlRingProducer;
+        use rrrpc::relay::protocol::{ControlRingHeader, ControlSlot};
+        use rrrpc::relay::shm::open_control_ring_shm;
+
+        // ---- Open the daemon's control_ring SHM ----
+        let (_ctrl_fd, ctrl_base, _ctrl_size) =
+            open_control_ring_shm(shm_name).map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "open_control_ring_shm({shm_name}): {e}"
+                ))
+            })?;
+        // Layout matches `create_control_ring_shm`: header | slots[N].
+        let header_ptr = ctrl_base as *const ControlRingHeader;
+        let slots_ptr = unsafe {
+            ctrl_base.add(std::mem::size_of::<ControlRingHeader>()) as *mut ControlSlot
+        };
+        let control_ring = unsafe { ControlRingProducer::new(header_ptr, slots_ptr) };
+
+        // ---- Build a dummy req_queue ----
+        // `Client::connect` requires this arg by signature but the
+        // SHM `req_ring` constructed inside `connect` takes precedence
+        // when present (`req_ring.is_some()`), so this JiffyQueue is
+        // never enqueued in standalone mode. Kept for ABI parity with
+        // the embedded path.
+        let req_queue = Arc::new(JiffyQueue::<RequestSlot>::new(256));
+
+        // ---- Call Client::connect to allocate a per-client channel ----
+        let client_cfg = ClientConfig {
+            arena_size: config.arena_size,
+            ring_capacity: config.ring_capacity,
+            channel_name: None,
+        };
+        let client = Client::connect(&control_ring, &client_cfg, Arc::clone(&req_queue))
+            .map_err(|e| {
+                RpcError::ConnectionError(format!(
+                    "Client::connect(shared daemon shm={shm_name}): {e:?}"
+                ))
+            })?;
+
+        // ---- Read the daemon's peer→dest_id manifest ----
+        // The daemon writes `${registry}/standalone_daemon/${shm_basename}.peers`
+        // after `expose_daemon_control_ring`. Each line is one of:
+        //   <peer_node_id>\t<dest_id>
+        //   OWNER\t<node_id_of_this_daemon>
+        // We use this verbatim instead of `peer_idx → dest_id` because
+        // each daemon skips its own slot when allocating dest_ids, so
+        // the index ≠ rank mapping varies per daemon (iter193 bug).
+        let shm_basename = shm_name.trim_start_matches('/');
+        let manifest_path = config
+            .registry_dir
+            .join("standalone_daemon")
+            .join(format!("{shm_basename}.peers"));
+        // Poll for the manifest with a short timeout — the daemon may
+        // not have written it yet at the moment a client races ahead.
+        let mut manifest_body: Option<String> = None;
+        let deadline_manifest =
+            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match std::fs::read_to_string(&manifest_path) {
+                Ok(b) if b.contains("OWNER\t") => {
+                    manifest_body = Some(b);
+                    break;
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline_manifest {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let manifest_body = manifest_body.ok_or_else(|| {
+            RpcError::ConnectionError(format!(
+                "standalone-daemon manifest not available at {}",
+                manifest_path.display()
+            ))
+        })?;
+
+        let mut node_to_dest: HashMap<NodeId, u16> = HashMap::new();
+        let mut owner: Option<NodeId> = None;
+        for line in manifest_body.lines() {
+            let mut parts = line.splitn(2, '\t');
+            let key = match parts.next() {
+                Some(k) => k,
+                None => continue,
+            };
+            let val = match parts.next() {
+                Some(v) => v,
+                None => continue,
+            };
+            if key == "OWNER" {
+                owner = Some(val.to_string());
+            } else {
+                let dest_id: u16 = val.parse().map_err(|e| {
+                    RpcError::ConnectionError(format!(
+                        "manifest parse {key}={val}: {e}"
+                    ))
+                })?;
+                node_to_dest.insert(key.to_string(), dest_id);
+            }
+        }
+        tracing::info!(
+            target: "rpc_handshake_mode",
+            owner = owner.as_deref().unwrap_or("?"),
+            entries = node_to_dest.len(),
+            "init_shared_client loaded manifest"
+        );
+        let mut entry_dump: Vec<(NodeId, u16)> =
+            node_to_dest.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entry_dump.sort_by_key(|(_, v)| *v);
+        tracing::warn!(
+            target: "init_probe",
+            self_node = %config.local_node_id,
+            manifest_path = %manifest_path.display(),
+            entries = node_to_dest.len(),
+            owner = owner.as_deref().unwrap_or("?"),
+            body_len = manifest_body.len(),
+            dump = ?entry_dump,
+            "[shared_client] manifest loaded"
+        );
+
+        // ---- Bind a dummy UDP socket. Never used in shared-client
+        //      mode (no peer handshake from this process), but the
+        //      LocustaInner field is non-Option. Bind ephemeral on
+        //      loopback so it can't accidentally receive traffic. ----
+        let udp_socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| {
+            RpcError::ConnectionError(format!("bind dummy udp socket: {e}"))
+        })?;
+        let local_udp_addr = match udp_socket.local_addr() {
+            Ok(std::net::SocketAddr::V4(v4)) => v4,
+            _ => SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+        };
+
+        let qp_config = RcQpConfig {
+            max_send_wr: 1024,
+            ..RcQpConfig::default()
+        };
+
+        let inner = LocustaInner {
+            client,
+            daemon: None,
+            server: None,
+            server_buffer_allocator: None,
+            _server_buffer_mrs: Vec::new(),
+            registry_scan_counter: 0,
+            udp_stats_recvs: 0,
+            udp_stats_accepts: 0,
+            udp_stats_resend_cached: 0,
+            udp_stats_prepare_us: 0,
+            udp_stats_connect_us: 0,
+            udp_stats_send_resp_us: 0,
+            udp_stats_total_us: 0,
+            udp_stats_max_total_us: 0,
+            pending_discoveries: Vec::new(),
+            node_to_dest,
+            // No locally-allocated channel SHM in shared-client mode —
+            // the per-client channel SHM is owned by `Client` itself
+            // (Drop on Client closes it). Leave these null/zero so
+            // `Drop for LocustaInner` skips the dealloc path.
+            channel_base_ptr: std::ptr::null_mut(),
+            channel_layout_total: 0,
+            inflight: HashMap::new(),
+            small_req_scratch: Vec::with_capacity(256),
+            registry_dir: config.registry_dir.clone(),
+            local_node_id: config.local_node_id.clone(),
+            qp_config,
+            next_dest_id: config.peer_node_ids.len() as u16,
+            udp_socket,
+            local_udp_addr,
+            peer_udp_addrs: HashMap::new(),
+            cached_responses: HashMap::new(),
+            peer_request_retries: HashMap::new(),
+            owner_node_id: owner.clone(),
+        };
+
+        tracing::info!(
+            target: "rpc_handshake_mode",
+            shm_name,
+            owner = owner.as_deref().unwrap_or("?"),
+            peer_count = config.peer_node_ids.len(),
+            "LocustaTransport::init_shared_client connected to daemon SHM"
+        );
+        Ok(Self {
+            inner: Rc::new(RefCell::new(inner)),
+        })
     }
 
     /// Run the full QP handshake against `peer` at runtime, blocking
@@ -1853,6 +2222,7 @@ impl LocustaTransport {
                 let qp_config = inner.qp_config.clone();
                 let server_local = inner
                     .server
+                    .as_mut().expect("server present in embedded mode")
                     .prepare_peer(
                         dest_id,
                         recv_ring_size,
@@ -1868,6 +2238,7 @@ impl LocustaTransport {
                     })?;
                 let relay_local = inner
                     .daemon
+                    .as_mut().expect("daemon present in embedded mode")
                     .prepare_destination(dest_id, recv_ring_size, send_buf_size, &qp_config)
                     .map_err(|e| {
                         RpcError::ConnectionError(format!(
@@ -1918,13 +2289,13 @@ impl LocustaTransport {
                 q
             };
             let dest_id = dest_ids[peer];
-            inner.server.connect_peer(dest_id, &peer_relay).map_err(|e| {
+            inner.server.as_mut().expect("server present in embedded mode").connect_peer(dest_id, &peer_relay).map_err(|e| {
                 RpcError::ConnectionError(format!(
                     "server.connect_peer({dest_id}, mpi peer={peer}): {e:?}"
                 ))
             })?;
             inner
-                .daemon
+                .daemon.as_mut().expect("daemon present in embedded mode")
                 .connect_destination(dest_id, &peer_server)
                 .map_err(|e| {
                     RpcError::ConnectionError(format!(
@@ -1992,6 +2363,7 @@ impl LocustaTransport {
             let qp_config = inner.qp_config.clone();
             let server_local = inner
                 .server
+                .as_mut().expect("server present in embedded mode")
                 .prepare_peer(dest_id, recv_ring_size, send_buf_size, 512, max_inflight, &qp_config)
                 .map_err(|e| {
                     RpcError::ConnectionError(format!(
@@ -2000,6 +2372,7 @@ impl LocustaTransport {
                 })?;
             let relay_local = inner
                 .daemon
+                .as_mut().expect("daemon present in embedded mode")
                 .prepare_destination(dest_id, recv_ring_size, send_buf_size, &qp_config)
                 .map_err(|e| {
                     RpcError::ConnectionError(format!(
@@ -2060,6 +2433,7 @@ impl LocustaTransport {
             let mut inner = self.inner.borrow_mut();
             inner
                 .server
+                .as_mut().expect("server present in embedded mode")
                 .connect_peer(dest_id, &peer_relay)
                 .map_err(|e| {
                     RpcError::ConnectionError(format!(
@@ -2068,6 +2442,7 @@ impl LocustaTransport {
                 })?;
             inner
                 .daemon
+                .as_mut().expect("daemon present in embedded mode")
                 .connect_destination(dest_id, &peer_server)
                 .map_err(|e| {
                     RpcError::ConnectionError(format!(
@@ -2395,6 +2770,29 @@ impl LocustaTransport {
         self.inner.borrow().node_to_dest.contains_key(peer)
     }
 
+    /// Returns the node_id of the daemon process whose SHM this
+    /// transport is attached to (standalone-daemon client mode).
+    /// `None` in embedded mode.
+    pub fn owner_node_id(&self) -> Option<NodeId> {
+        self.inner.borrow().owner_node_id.clone()
+    }
+
+    /// Snapshot the daemon's current `node_to_dest` mapping. Used by
+    /// the standalone-daemon orchestration in `benchfsd_mpi.rs` to
+    /// publish a manifest file so co-resident clients can mirror the
+    /// same `peer → dest_id` map (each daemon allocates dest_ids
+    /// sequentially in `peer_node_ids` order, skipping self — without
+    /// the manifest a client attached to daemon at rank R would
+    /// misroute every RPC for peer ranks > R).
+    pub fn node_to_dest_snapshot(&self) -> Vec<(NodeId, u16)> {
+        self.inner
+            .borrow()
+            .node_to_dest
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
     /// Standalone-daemon mode (POC, iter191+):
     ///
     /// Expose this transport's relay daemon to LOCAL processes via a
@@ -2439,7 +2837,11 @@ impl LocustaTransport {
         let consumer = unsafe { ControlRingConsumer::new(header_ptr, slots_ptr) };
 
         let mut inner = self.inner.borrow_mut();
-        inner.daemon.control_ring = Some(consumer);
+        inner
+            .daemon
+            .as_mut()
+            .expect("expose_daemon_control_ring requires embedded daemon (not shared-client mode)")
+            .control_ring = Some(consumer);
         tracing::info!(
             "locusta: exposed daemon control_ring at {} (capacity={})",
             shm_name,
@@ -2720,12 +3122,18 @@ pub fn drain_server_requests<F>(inner: &mut LocustaInner, mut handler: F)
 where
     F: FnMut(Request<RegisteredFixedBuffer>),
 {
-    inner.server.poll();
-    let ready = inner.server.drain_ready();
+    let ready = {
+        let Some(server) = inner.server.as_mut() else {
+            // Shared-client mode has no in-process server; nothing to drain.
+            return;
+        };
+        server.poll();
+        server.drain_ready()
+    };
     for req in ready {
         handler(req);
     }
-    inner.server.flush_all();
+    inner.server.as_mut().unwrap().flush_all();
 }
 
 /// Size of the BenchFS-level `rpc_id` prefix that

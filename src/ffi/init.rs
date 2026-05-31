@@ -698,6 +698,36 @@ pub extern "C" fn benchfs_init(
             );
             return std::ptr::null_mut();
         }
+        // Shared-daemon mode (POC iter191+): when env
+        // `BENCHFS_LOCUSTA_DAEMON_NAME` is set, the client process
+        // attaches to an existing daemon's control_ring SHM instead
+        // of building its own RelayDaemon + ServerContext + mlx5
+        // resources. Eliminates the per-client `ibv_reg_mr × N peers`
+        // memory pressure that was driving server-side SIGKILL at
+        // ppn=20 (see project memory: 2026-05-22~23 session).
+        // Empty / unset → embedded mode (existing behaviour).
+        //
+        // **2026-06-01**: `BENCHFS_UCX_DAEMON_NAME` selects the same
+        // shared-client code path, but the daemon on the other end of
+        // SHM uses UCX (not locusta) for inter-daemon forwarding. The
+        // client side is identical — `LocustaTransport::init_shared_client`
+        // speaks the rrrpc SHM wire format regardless of who drains it.
+        // We therefore force `use_locusta` (= client uses SHM IPC) when
+        // either env var is set, because the toml `[transport] backend`
+        // refers to the daemon's network transport, not the client side.
+        let shared_daemon_shm = std::env::var("BENCHFS_LOCUSTA_DAEMON_NAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("BENCHFS_UCX_DAEMON_NAME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+        let force_shared_client = shared_daemon_shm.is_some();
+        #[cfg(feature = "transport-locusta")]
+        let use_locusta = use_locusta || force_shared_client;
+        #[cfg(not(feature = "transport-locusta"))]
+        let _ = force_shared_client;
         #[cfg(feature = "transport-locusta")]
         let locusta_transport: Option<Rc<crate::rpc::transport_locusta::LocustaTransport>> =
             if use_locusta {
@@ -729,7 +759,46 @@ pub extern "C" fn benchfs_init(
                     return std::ptr::null_mut();
                 }
                 tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "before_locusta_init", "INIT_PROBE");
-                match LocustaTransport::init(&cfg) {
+                // Branch on shared-daemon vs embedded. Both produce a
+                // `LocustaTransport` Rc that registers the same way as
+                // a pluvio Reactor downstream.
+                let init_result = if let Some(shm_name) = shared_daemon_shm.as_deref() {
+                    tracing::warn!(
+                        target: "init_probe",
+                        node_id = %node_id_str,
+                        stage = "before_locusta_init_shared",
+                        shm = %shm_name,
+                        "INIT_PROBE shared-daemon mode selected"
+                    );
+                    // Discover peers up-front so node_to_dest matches the
+                    // daemon's allocation order. The daemon and clients
+                    // both call discover_data_nodes against the same
+                    // registry; nodes are sorted numerically inside that
+                    // helper so the order is deterministic.
+                    let peers = match discover_data_nodes(registry_dir_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "shared-daemon mode: discover_data_nodes failed ({}); proceeding with empty peer list",
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
+                    let cfg_shared = LocustaConfig {
+                        registry_dir: cfg.registry_dir.clone(),
+                        local_node_id: cfg.local_node_id.clone(),
+                        peer_node_ids: peers,
+                        arena_size: cfg.arena_size,
+                        ring_capacity: cfg.ring_capacity,
+                        pre_allocated_peer_count_override: Some(0),
+                        ..LocustaConfig::default()
+                    };
+                    LocustaTransport::init_shared_client(shm_name, &cfg_shared)
+                } else {
+                    LocustaTransport::init(&cfg)
+                };
+                match init_result {
                     Ok(t) => {
                         tracing::warn!(target: "init_probe", node_id = %node_id_str, stage = "after_locusta_init", "INIT_PROBE");
                         tracing::info!(
@@ -774,6 +843,14 @@ pub extern "C" fn benchfs_init(
                 None
             };
 
+        // Capture the standalone-daemon OWNER (if any) before the
+        // transport is moved into the connection pool, so we can
+        // filter it from data_nodes below.
+        #[cfg(feature = "transport-locusta")]
+        let standalone_owner: Option<String> = locusta_transport
+            .as_ref()
+            .and_then(|t| t.owner_node_id());
+
         // Create connection pool. Locusta path skips UCX endpoint setup
         // entirely and short-circuits inside ConnectionPool::get_or_connect.
         let connection_pool = {
@@ -817,7 +894,7 @@ pub extern "C" fn benchfs_init(
 
         // Discover data nodes BEFORE connecting (critical for load distribution)
         tracing::info!("Discovering data nodes from registry...");
-        let discovered_nodes = match discover_data_nodes(registry_dir_str) {
+        let mut discovered_nodes = match discover_data_nodes(registry_dir_str) {
             Ok(nodes) => {
                 tracing::info!(
                     "Discovered {} data nodes for distributed connections",
@@ -833,6 +910,23 @@ pub extern "C" fn benchfs_init(
                 vec!["node_0".to_string()]
             }
         };
+
+        // Standalone-daemon clients (iter200+): NO filtering. The daemon
+        // self-handshakes itself as a loopback peer via RDMA (in-process
+        // through the local HCA), so dest_id for OWNER is a real
+        // destination. OWNER-routed RPCs go: client SHM → daemon →
+        // RDMA self-loopback → daemon's own server handler → reply
+        // back via same loopback → channel cq_ring → client. All
+        // clients share the same data_nodes view → consistent_hash
+        // agrees across ranks (required for IOR `reorderTasks=1`).
+        #[cfg(feature = "transport-locusta")]
+        if let Some(ref owner) = standalone_owner {
+            tracing::info!(
+                "standalone-daemon: full {} data_nodes (self-loopback enables OWNER={} routing)",
+                discovered_nodes.len(),
+                owner
+            );
+        }
 
         // Distribute initial connections across nodes using client node_id hash
         // This prevents all 256 clients from connecting to node_0 simultaneously

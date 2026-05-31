@@ -51,7 +51,16 @@ BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 # ior_integration/benchfs_backend (libbenchfs-linked). Auto-enables the
 # [find] phase via external-script when present.
 BENCHFS_PFIND_BIN="${BENCHFS_PFIND_BIN:-$(realpath "${SCRIPT_DIR}/../../ior_integration/benchfs_backend/bin/benchfs_pfind" 2>/dev/null)}"
-if [ -x "${BENCHFS_PFIND_BIN:-/nonexistent}" ]; then
+# Parallel pfind wrapper: spawns N copies via ssh across distinct PBS hosts,
+# each handling a (rank % size)-partitioned subset of files. Set
+# BENCHFS_PFIND_PARALLEL=0 to fall back to singleton.
+BENCHFS_PFIND_PARALLEL_BIN="${BENCHFS_PFIND_PARALLEL_BIN:-$(realpath "${SCRIPT_DIR}/../../ior_integration/benchfs_backend/src/benchfs_pfind_parallel.sh" 2>/dev/null)}"
+if [ "${BENCHFS_PFIND_PARALLEL:-1}" = "1" ] && [ -x "${BENCHFS_PFIND_PARALLEL_BIN:-/nonexistent}" ]; then
+  BENCHFS_PFIND_BIN_EFFECTIVE="${BENCHFS_PFIND_PARALLEL_BIN}"
+else
+  BENCHFS_PFIND_BIN_EFFECTIVE="${BENCHFS_PFIND_BIN}"
+fi
+if [ -x "${BENCHFS_PFIND_BIN_EFFECTIVE:-/nonexistent}" ]; then
   IO500_FIND_RUN="${IO500_FIND_RUN:-TRUE}"
 fi
 BENCHFSD_LOG_BASE_DIR="${JOB_OUTPUT_DIR}/benchfsd_logs"
@@ -79,9 +88,18 @@ SUMMARY_CSV="${JOB_OUTPUT_DIR}/sweep_summary.csv"
 : ${BEST_CHUNK_BYTES:=4194304}
 
 # BenchFS scratch dir detection (one /scrN per vnode, up to 4 per physical node).
+# BENCHFS_SCR_SKIP="1,3" などで「動かない /scrN 番号」を除外できる。
+# Sirius で /scr1 が cluster-wide で落ちている時 (2026-05-31 観測) など、
+# 全 host 共通で broken な /scrN を script レベルで skip するために使う。
 detect_all_scratch_dirs() {
   BENCHFS_ALL_SCRATCH_DIRS=()
+  local skip_csv="${BENCHFS_SCR_SKIP:-}"
   for n in 0 1 2 3; do
+    if [ -n "$skip_csv" ]; then
+      case ",${skip_csv}," in
+        *",${n},"*) continue;;
+      esac
+    fi
     local candidate="/scr${n}/${PBS_JOBID}"
     if [ -d "$candidate" ]; then
       BENCHFS_ALL_SCRATCH_DIRS+=("$candidate")
@@ -104,6 +122,19 @@ exec > >(tee "${JOB_OUTPUT_DIR}/job_stdout.log") 2> >(tee "${JOB_OUTPUT_DIR}/job
 UNIQUE_HOSTFILE="${JOB_OUTPUT_DIR}/unique_nodes"
 sort -u "${PBS_NODEFILE}" > "${UNIQUE_HOSTFILE}"
 echo "Physical nodes: ${NNODES} (from ${VNODES} vnodes)"
+
+# io500 10-node research category: clients must run on at most 10 physical
+# hosts; servers may use any number. CLIENT_NNODES restricts the IOR/mdtest
+# launch hostfile to the first N phys hosts while benchfsd_mpi still spans
+# all VNODES (so server count scales without violating the rule). Defaults
+# to NNODES (current behaviour: clients on all server hosts).
+CLIENT_NNODES="${CLIENT_NNODES:-${NNODES}}"
+if [ "${CLIENT_NNODES}" -gt "${NNODES}" ]; then
+  CLIENT_NNODES="${NNODES}"
+fi
+CLIENT_HOSTFILE="${JOB_OUTPUT_DIR}/client_hosts"
+head -n "${CLIENT_NNODES}" "${UNIQUE_HOSTFILE}" > "${CLIENT_HOSTFILE}"
+echo "Client physical hosts: ${CLIENT_NNODES} (from ${NNODES} server hosts)"
 
 cp "$0" "${JOB_OUTPUT_DIR}"
 cp "${PBS_NODEFILE}" "${JOB_OUTPUT_DIR}"
@@ -171,6 +202,15 @@ export BENCHFS_IOURING_SUBMIT_DEPTH
 export BENCHFS_IOURING_SUBMIT_TIMEOUT_US
 export BENCHFS_IOURING_COMPLETE_TIMEOUT_US
 
+# UCX_TLS default: exclude shared-memory transports (mm,sm) because
+# benchfs_init creates a UCX worker even for locusta backend (see
+# project_2026_05_25_cluster_instability.md), and uct_mm_iface_t_new
+# SIGSEGVs at scale (10 phys × ~32 procs = 320 ranks). The worker is
+# unused for actual RPCs in locusta mode — keeping rc,ud,self only is
+# enough for the structural init.
+: ${UCX_TLS:=rc,ud,self}
+export UCX_TLS
+
 # Locusta server dispatch tuning. Defaults match the conservative
 # values baked into benchfsd_mpi; override here for sweep runs.
 : ${BENCHFS_LOCUSTA_DISPATCH_SLEEP_US:=20}
@@ -179,7 +219,61 @@ export BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
 export BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
 
 cmd_mpirun_util=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self)
-cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx -x PATH -x LD_LIBRARY_PATH -x UCX_RCACHE_ENABLE -x UCX_MEMTYPE_CACHE -x UCX_TLS -x UCX_LOG_LEVEL -x UCX_RNDV_THRESH)
+cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx --mca coll '^hcoll' -x PATH -x LD_LIBRARY_PATH -x UCX_RCACHE_ENABLE -x UCX_MEMTYPE_CACHE -x UCX_TLS -x UCX_LOG_LEVEL -x UCX_RNDV_THRESH)
+
+# Per-host scratch validation. Some Sirius hosts (a01, a24) have /scrN
+# directories that are root-owned and not mounted as separate scratch
+# filesystems — PBS prologue does not create per-job dirs there, so
+# `/scr0/$PBS_JOBID` never exists on those hosts. Running BenchFS on
+# such a host wastes the entire job allocation: benchfsd silently fails
+# to start, the wrapper script prints `ERROR: failed to start benchfsd
+# for final run`, and PBS marks the job F with no benchmark output.
+#
+# Probe every host. On any failure, print a clear error listing the
+# broken hosts and exit before launching benchfsd. The user can then
+# resubmit and let PBS pick a different host set.
+echo "Validating per-host scratch dirs (skip=${BENCHFS_SCR_SKIP:-})..."
+SCRATCH_PROBE_OUTPUT=$("${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+  --map-by ppr:1:node --bind-to none --oversubscribe \
+  -x BENCHFS_SCR_SKIP \
+  bash -c '
+    h=$(hostname)
+    bad=""
+    skip_csv="${BENCHFS_SCR_SKIP:-}"
+    for n in 0 1 2 3; do
+      if [ -n "$skip_csv" ]; then
+        case ",${skip_csv}," in
+          *",${n},"*) continue;;
+        esac
+      fi
+      d="/scr${n}/${PBS_JOBID}"
+      if [ ! -d "$d" ]; then
+        bad="${bad} /scr${n}"
+      elif ! touch "$d/.scr_probe.$$" 2>/dev/null; then
+        bad="${bad} /scr${n}(RO)"
+      else
+        rm -f "$d/.scr_probe.$$"
+      fi
+    done
+    if [ -n "$bad" ]; then
+      echo "SCRATCH_BAD ${h}:${bad}"
+    else
+      echo "SCRATCH_OK ${h}"
+    fi
+  ' 2>&1)
+echo "${SCRATCH_PROBE_OUTPUT}" | grep -E "^SCRATCH_(BAD|OK)" || true
+BAD_HOSTS=$(echo "${SCRATCH_PROBE_OUTPUT}" | grep "^SCRATCH_BAD" || true)
+if [ -n "${BAD_HOSTS}" ]; then
+  echo ""
+  echo "==========================================="
+  echo "ERROR: broken /scrN scratch on these hosts:"
+  echo "${BAD_HOSTS}"
+  echo "Aborting before benchfsd launch. Resubmit without host pin or"
+  echo "exclude the offending hosts via PBS_SELECT_OVERRIDE."
+  echo "==========================================="
+  exit 1
+fi
+echo "Scratch dirs OK on all ${NNODES} hosts."
 
 # Optional UCX-only TCP fallback for debugging cross-node RDMA-related bugs.
 # Set FORCE_UCX_TCP=1 to force BenchFS's internal UCX context to TCP/SHM
@@ -243,6 +337,23 @@ stop_benchfsd() {
       if ! kill -0 $BENCHFSD_PID 2>/dev/null; then
         wait $BENCHFSD_PID 2>/dev/null || true
         unset BENCHFSD_PID
+        # Best-effort: clean standalone-daemon SHMs left behind on every
+        # phys host. Vnode-keyed names `/dev/shm/benchfs_daemon_v<idx>`
+        # accumulate per dead daemon; the next iter's
+        # `create_control_ring_shm` calls `shm_unlink` first so it'd
+        # still recover, but explicit cleanup keeps /dev/shm tidy and
+        # surfaces leak symptoms early.
+        if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ]; then
+          # Multiple vnodes share one phys host, so glob all daemon SHMs
+          # left in /dev/shm rather than computing a single name. The
+          # cleanup runs once per phys host (-np "$NNODES" against the
+          # UNIQUE_HOSTFILE), and all per-vnode SHMs on that host are
+          # visible since vnodes share the OS namespace.
+          "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+            --map-by ppr:1:node --bind-to none --oversubscribe \
+            bash -c 'find /dev/shm -maxdepth 1 -user "$USER" -type f -delete 2>/dev/null || true' \
+            2>/dev/null || true
+        fi
         return 0
       fi
       sleep 1; elapsed=$((elapsed + 1))
@@ -252,6 +363,12 @@ stop_benchfsd() {
     pkill -9 benchfsd_mpi 2>/dev/null || true
     sleep 3
     unset BENCHFSD_PID
+    if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ]; then
+      "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+        --map-by ppr:1:node --bind-to none --oversubscribe \
+        bash -c 'find /dev/shm -maxdepth 1 -user "$USER" -type f -delete 2>/dev/null || true' \
+        2>/dev/null || true
+    fi
   fi
 }
 
@@ -260,6 +377,51 @@ start_benchfsd() {
   local chunk_bytes=$2
 
   rm -rf "${BENCHFS_REGISTRY_DIR}"/*
+
+  # Pre-startup cleanup of stale standalone-daemon SHM rings. A previous
+  # forced-kill (qdel -W force) or PBS exit=-20 bypasses stop_benchfsd's
+  # cleanup; the leftover /dev/shm/benchfs_daemon_* would cause SIGBUS
+  # at client benchfs_init if the new daemon's expose_daemon_control_ring
+  # races with a stale-mmap from before.
+  if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ]; then
+    # /dev/shm/benchfs_daemon_* — daemon control_ring SHM
+    # /dev/shm/relay_ch_* — per-IOR-client channel SHM (256MB+ each!)
+    # iter78-82 SIGBUS root cause 2026-05-28: iter77 walltime-killed by PBS
+    # without graceful stop_benchfsd → IOR client processes + benchfsd
+    # daemons may still hold open fds to /dev/shm files. `rm -f` only
+    # removes directory entries; the unlinked inodes stay allocated in
+    # tmpfs until last fd closes (POSIX semantics). With zombie
+    # processes, /dev/shm appears mostly free via `rm` but is actually
+    # full → new client ftruncate silently returns ENOSPC → mmap'd pages
+    # not backed → SIGBUS on first write in init_channel_header
+    # (shm.rs:337). The signal trace shows "nonexistent physical address"
+    # which is the tmpfs page-fault failure mode.
+    #
+    # Fix: pkill any leftover benchfsd_mpi/io500 processes FIRST (they
+    # owned the leaked fds), THEN rm -f the SHM files. Without the
+    # pkill step, rm -f leaves orphan-but-open files alive in tmpfs.
+    # CRITICAL: --map-by node forces ONE proc per phys host. Without it
+    # mpirun assigns all "-np NNODES" procs to the FIRST host (which has
+    # 24 slots), so a05+ never get the cleanup — confirmed by iter86 probe
+    # (a05/06/08 had 1180-1245 leaked relay_ch_* files filling 100% of
+    # /dev/shm because cleanup landed only on a02-a04).
+    # Aggressive cleanup: kill any leftover daemons/io500 from prior jobs,
+    # then remove all user-owned /dev/shm files. Two mpirun calls (kill + rm)
+    # keep each command simple and easier to debug.
+    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+      --map-by ppr:1:node --bind-to none --oversubscribe \
+      bash -c 'pkill -9 -u "$USER" -f benchfsd_mpi; pkill -9 -u "$USER" -f io500_wrapper; pkill -9 -u "$USER" -x io500; sleep 2; echo "[CLEAN $(hostname)] killed leftover daemon/io500 procs"' \
+      2>&1 | grep -E "^\[CLEAN" || true
+    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+      --map-by ppr:1:node --bind-to none --oversubscribe \
+      bash -c 'n=$(find /dev/shm -maxdepth 1 -user "$USER" -type f 2>/dev/null | wc -l); find /dev/shm -maxdepth 1 -user "$USER" -type f -delete 2>/dev/null; echo "[CLEAN $(hostname)] removed $n shm files"' \
+      2>&1 | grep -E "^\[CLEAN" || true
+    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+      --map-by ppr:1:node --bind-to none --oversubscribe \
+      bash -c 'echo "[SHM_PROBE $(hostname)] $(df -h /dev/shm | tail -1) files=$(ls /dev/shm 2>/dev/null | wc -l) benchfsd=$(pgrep -fc benchfsd_mpi 2>/dev/null) io500=$(pgrep -fc io500_wrapper 2>/dev/null)"' \
+      2>&1 | grep -E "^\[SHM_PROBE"
+  fi
+
   # Clean /scrN/*. Per-job dirs (`/scrN/<PBS_JOBID>`) from PRIOR runs
   # accumulate and eventually fill the 12 TB XFS RAID-0 — iter181 hit
   # ENOSPC (errno 28) mid-write because iter178 left ~33 TB and earlier
@@ -376,6 +538,10 @@ log_level = "info"
 chunk_size = ${chunk_bytes}
 use_iouring = true
 max_storage_gb = 0
+chunk_layout = "${BENCHFS_CHUNK_LAYOUT:-per_chunk}"
+unified_shards = ${BENCHFS_UNIFIED_SHARDS:-1}
+chunk_mmap_write = ${BENCHFS_CHUNK_MMAP_WRITE:-false}
+chunk_force_direct = ${BENCHFS_CHUNK_FORCE_DIRECT:-false}
 
 [network]
 bind_addr = "0.0.0.0:50051"
@@ -408,7 +574,7 @@ exchange_timeout_secs = ${benchfs_exchange_timeout_secs}
 wait_peer_ack_strict = ${benchfs_wait_peer_ack_strict}
 defer_init_prewarm = ${benchfs_defer_init_prewarm}
 mpi_server_mesh = ${benchfs_mpi_server_mesh}
-pre_allocated_peer_count = ${BENCHFS_LOCUSTA_PRE_ALLOC_PEERS:-0}
+pre_allocated_peer_count = ${BENCHFS_LOCUSTA_PRE_ALLOC_PEERS:-64}
 rpc_wait_timeout_secs = ${BENCHFS_LOCUSTA_RPC_WAIT_TIMEOUT_SECS:-120}
 
 [iouring]
@@ -420,7 +586,8 @@ submit_timeout_us = ${BENCHFS_IOURING_SUBMIT_TIMEOUT_US:-1000}
 complete_timeout_us = ${BENCHFS_IOURING_COMPLETE_TIMEOUT_US:-1000}
 
 [metadata]
-persist = "${BENCHFS_METADATA_PERSIST:-off}"
+persist = "${BENCHFS_METADATA_PERSIST:-writethrough}"
+xattr_size = ${BENCHFS_METADATA_XATTR_SIZE:-false}
 flush_interval_ms = ${BENCHFS_METADATA_FLUSH_MS:-50}
 dirty_high_watermark = ${BENCHFS_METADATA_DIRTY_HWM:-16384}
 distributed = ${benchfs_metadata_distributed}
@@ -452,6 +619,7 @@ add_peer_timeout_secs = ${BENCHFS_ADD_PEER_TIMEOUT_SECS:-300}
 [api]
 open_meta_async = ${benchfs_open_meta_async}
 close_meta_async = ${benchfs_close_meta_async}
+fsync_on_close = ${BENCHFS_API_FSYNC_ON_CLOSE:-true}
 
 [cluster]
 expected_nodes = ${BENCHFS_EXPECTED_NODES:-0}
@@ -521,6 +689,31 @@ CONFIG_FILE="$2"
 WORLD_RANK=${OMPI_COMM_WORLD_RANK:-${LOCAL_RANK}}
 RANK_CONFIG="${CONFIG_FILE%.toml}_rank${WORLD_RANK}.toml"
 sed "s|^data_dir = .*|data_dir = \"${RANK_DATA_DIR}\"|" "${CONFIG_FILE}" > "${RANK_CONFIG}"
+# Standalone-daemon mode (iter191+): expose this benchfsd_mpi's
+# RelayDaemon to local IOR clients via a per-(host,vnode-slot) POSIX
+# SHM. See io500_wrapper.sh for the empirical rationale (PBS vnodes
+# are invisible to MPI; OpenMPI groups by hostname). The SHM suffix
+# is just our LOCAL_RANK because there's exactly one benchfsd per
+# vnode-slot and LRs 0..SERVERS_PER_HOST-1 are distinct on each host.
+# Hostname is required to distinguish daemons on different phys hosts
+# (the LR namespace resets per host).
+# `create_control_ring_shm` unlinks the name before recreating, so
+# stale SHM from a crashed prior daemon is auto-cleaned.
+if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ]; then
+  LR="${OMPI_COMM_WORLD_LOCAL_RANK:-0}"
+  export BENCHFS_LOCUSTA_DAEMON_NAME="/benchfs_daemon_$(hostname -s)_${LR}"
+  echo "[wrapper] standalone-daemon lr=${LR}: exposing SHM ${BENCHFS_LOCUSTA_DAEMON_NAME}" >&2
+fi
+# UCX standalone-daemon mode (2026-06-01). Mirrors
+# BENCHFS_LOCUSTA_STANDALONE_DAEMON but exposes a UCX-backed daemon at
+# `/benchfs_ucx_daemon_$(hostname)_${LR}`. Co-resident IOR clients
+# attach via BENCHFS_UCX_DAEMON_NAME (same SHM wire format as locusta —
+# only the daemon's network transport differs).
+if [ "${BENCHFS_UCX_STANDALONE_DAEMON:-0}" = "1" ]; then
+  LR="${OMPI_COMM_WORLD_LOCAL_RANK:-0}"
+  export BENCHFS_UCX_DAEMON_NAME="/benchfs_ucx_daemon_$(hostname -s)_${LR}"
+  echo "[wrapper] ucx-daemon lr=${LR}: exposing SHM ${BENCHFS_UCX_DAEMON_NAME}" >&2
+fi
 if [ -n "${RANK_NUMA}" ] && command -v numactl >/dev/null 2>&1; then
   exec numactl --cpunodebind="${RANK_NUMA}" --membind="${RANK_NUMA}" \
     "${BENCHFS_INNER_BINARY}" "$1" "${RANK_CONFIG}" "${@:3}"
@@ -551,6 +744,13 @@ WRAPPER_EOF
     -x PLUVIO_URING_ALWAYS_POLL
     -x LOCUSTA_DAEMON_EVENT_BUDGET
     -x BENCHFS_EXPECTED_NODES="$((VNODES * ${BENCHFS_SERVER_RANKS_PER_VNODE:-1}))"
+    # Standalone-daemon mode opt-in (iter191+). When 1, the wrapper
+    # below sets BENCHFS_LOCUSTA_DAEMON_NAME from `hostname` so this
+    # benchfsd exposes its RelayDaemon via per-host SHM.
+    -x BENCHFS_LOCUSTA_STANDALONE_DAEMON="${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}"
+    -x BENCHFS_LOCUSTA_DAEMON_CTRL_CAPACITY="${BENCHFS_LOCUSTA_DAEMON_CTRL_CAPACITY:-64}"
+    -x BENCHFS_UCX_STANDALONE_DAEMON="${BENCHFS_UCX_STANDALONE_DAEMON:-0}"
+    -x BENCHFS_UCX_DAEMON_CTRL_CAPACITY="${BENCHFS_UCX_DAEMON_CTRL_CAPACITY:-64}"
     "${datadir_wrapper}"
     "${BENCHFS_REGISTRY_DIR}"
     "${config_file}"
@@ -611,6 +811,12 @@ write_ini() {
   local ior_hard_run="${hard_run}"
   if [ "${SKIP_IOR:-0}" = "1" ]; then
     ior_easy_run="FALSE"
+    ior_hard_run="FALSE"
+  fi
+  # SKIP_IOR_HARD=1 disables BOTH ior-hard-write and ior-hard-read but
+  # keeps ior-easy and mdtest. Used to chase find/mdtest performance at
+  # ppn=20 + compliance when ior-hard-write SIGKILLs (iter70-72).
+  if [ "${SKIP_IOR_HARD:-0}" = "1" ]; then
     ior_hard_run="FALSE"
   fi
   # SKIP_IOR_HARD_READ=1 keeps ior-hard-write but disables ior-hard-read.
@@ -682,7 +888,7 @@ run = ${mdtest_hard_run}
 run = ${mdtest_hard_run}
 [find]
 run = ${IO500_FIND_RUN:-FALSE}
-external-script = ${BENCHFS_PFIND_BIN:-}
+external-script = ${BENCHFS_PFIND_BIN_EFFECTIVE:-${BENCHFS_PFIND_BIN:-}}
 # benchfs_pfind is MPI-aware; when BENCHFS_PFIND_NPROC>1, prefix with
 # mpirun. Default empty → singleton (MPI_Init returns size=1) — avoids
 # the nested-mpirun hang in job 20536 where 32 pfind ranks × 40 server
@@ -741,8 +947,27 @@ run_io500() {
       -x LIBC_FATAL_STDERR_=1
     )
   fi
+  # Only override mpirun's host placement when CLIENT_NNODES < NNODES (10-node
+  # research category with separate server / client host pools). For the
+  # default `CLIENT_NNODES == NNODES` case we MUST keep PBS_NODEFILE driving
+  # mpirun: PBS_NODEFILE lists each vnode separately (= 4 entries per phys
+  # host), so OpenMPI sees 4 slots per host and assigns ranks 0–3 of every
+  # local block to distinct vnodes; combined with
+  # `BENCHFS_LOCUSTA_DAEMON_NAME = hostname + LOCAL_RANK % SERVERS_PER_HOST`
+  # this evenly balances clients across the 4 daemons per host. Forcing
+  # `--hostfile $CLIENT_HOSTFILE` (which is `sort -u PBS_NODEFILE` = 1 slot
+  # per host) breaks that balance: with `--oversubscribe`, OpenMPI's
+  # round-robin places consecutive ranks on different hosts, and each
+  # host's LOCAL_RANK sequence shifts so most clients pile onto a single
+  # local daemon. iter101 (no override) hit 258 / read 507; iter115+
+  # silently picked up the override and dropped to 193 / read 333.
+  local maybe_hostfile=()
+  if [ "${CLIENT_NNODES}" -lt "${NNODES}" ]; then
+    maybe_hostfile=(--hostfile "${CLIENT_HOSTFILE}")
+  fi
   local cmd=(
     "${cmd_mpirun_common[@]}"
+    "${maybe_hostfile[@]}"
     -np "$np"
     --bind-to none
     --oversubscribe
@@ -754,10 +979,30 @@ run_io500() {
     -x LOCUSTA_DAEMON_EVENT_BUDGET
     -x BENCHFS_UCX_AM_BREAKDOWN
     -x BENCHFS_DHAT_DIR="${BENCHFS_DHAT_DIR:-${out_dir}/dhat}"
+    -x BENCHFS_DIAG_DIR
     # benchfs_pfind (io500 external-script for the find phase) inherits
     # rank 0's env via popen and needs the registry path to bootstrap a
     # fresh locusta client. Skipped silently when the binary isn't built.
     -x BENCHFS_REGISTRY_DIR="${BENCHFS_REGISTRY_DIR}"
+    # Standalone-daemon mode opt-in (iter191+). When 1, io500_wrapper.sh
+    # derives BENCHFS_LOCUSTA_DAEMON_NAME from hostname + LOCAL_RANK %
+    # SERVERS_PER_HOST so each client attaches to the matching local
+    # benchfsd's SHM control_ring (one daemon per vnode-slot) instead
+    # of each client building its own RelayDaemon.
+    -x BENCHFS_LOCUSTA_STANDALONE_DAEMON="${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}"
+    # UCX standalone-daemon mode: same wrapper logic, picks up
+    # BENCHFS_UCX_DAEMON_NAME from `hostname + LOCAL_RANK` on the
+    # client side (= the matching daemon's SHM ring).
+    -x BENCHFS_UCX_STANDALONE_DAEMON="${BENCHFS_UCX_STANDALONE_DAEMON:-0}"
+    -x BENCHFS_SERVERS_PER_HOST="$(( VNODES / NNODES * ${BENCHFS_SERVER_RANKS_PER_VNODE:-1} ))"
+    # Diagnostic: enable per-readdir trace in benchfs_pfind. Unconditional
+    # so the find-phase stderr captures the full walk shape (otherwise
+    # only `dir_index<8 || %256==0` get logged).
+    -x BENCHFS_PFIND_VERBOSE="${BENCHFS_PFIND_VERBOSE:-0}"
+    # Parallel pfind wrapper inherits PBS_NODEFILE (already in mpirun env)
+    # and uses these to control its ssh fan-out.
+    -x BENCHFS_PFIND_NRANKS="${BENCHFS_PFIND_NRANKS:-10}"
+    -x PBS_NODEFILE
     "${asan_args[@]}"
     "${IO500_DIR}/io500_wrapper.sh"
     "${IO500_DIR}/io500"
@@ -799,8 +1044,22 @@ block_size_list=(1g 4g)
 ppn_list=(4 16)
 fpp_list=(TRUE FALSE)
 
-# Total client procs: ppn * VNODES (we treat each vnode as 1 server slot).
-NP_BASE=$VNODES
+# Total client procs: ppn * NP_BASE. Historically (pre-iter108) we used
+# NP_BASE=VNODES, treating each vnode as 1 slot — so BEST_PPN=20 at 10
+# phys × 4 vnodes/host = 800 IOR ranks total (= 80 procs per phys host).
+# iter108 changed NP_BASE → CLIENT_NNODES (= 10) for the 10-node research
+# category split (server unconstrained, client ≤ 10 phys). That divided
+# the client count by 4 silently and tanked ior-easy-read from 507 → 333
+# (iter115+ regression) because each phys host ran ppn=20 instead of
+# ppn=80. iter101's "ppn=20" was actually 800 ranks; today's was 200.
+# Fix: only override when CLIENT_NNODES < NNODES (true 10-node split);
+# otherwise keep NP_BASE=VNODES so BEST_PPN keeps the same per-vnode
+# meaning across iters.
+if [ "${CLIENT_NNODES}" -lt "${NNODES}" ]; then
+  NP_BASE=$CLIENT_NNODES
+else
+  NP_BASE=$VNODES
+fi
 
 server_config_id=0
 runid=0

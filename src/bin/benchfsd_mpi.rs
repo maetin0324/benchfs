@@ -152,6 +152,48 @@ fn init_locusta_runtime(
                         daemon_shm,
                         capacity
                     );
+
+                    // Write a peer→dest_id manifest under the registry
+                    // so co-resident clients can mirror our exact
+                    // routing table. Each daemon assigns dest_ids
+                    // sequentially in `peer_node_ids` order, skipping
+                    // self — so daemon at rank R's slab keys are NOT
+                    // `node_to_dest[node_X] == X`. Without this
+                    // manifest, clients connected to daemon_3 routing
+                    // to node_5 would hit destinations[4] (= node_4)
+                    // and time out (iter193).
+                    let mut manifest_dir = PathBuf::from(registry_dir);
+                    manifest_dir.push("standalone_daemon");
+                    let shm_basename = daemon_shm.trim_start_matches('/');
+                    let manifest_path = manifest_dir.join(format!("{shm_basename}.peers"));
+                    let snapshot = transport.node_to_dest_snapshot();
+                    let mut body = String::with_capacity(snapshot.len() * 16);
+                    for (peer, dest_id) in &snapshot {
+                        body.push_str(&format!("{peer}\t{dest_id}\n"));
+                    }
+                    // Owner identity line (last) so client knows which
+                    // node_X is the local daemon (= the gap in dest_id
+                    // space).
+                    body.push_str(&format!("OWNER\t{node_id}\n"));
+                    if let Err(e) = std::fs::create_dir_all(&manifest_dir) {
+                        tracing::error!(
+                            "Failed to mkdir {}: {:?}",
+                            manifest_dir.display(),
+                            e
+                        );
+                    } else if let Err(e) = std::fs::write(&manifest_path, &body) {
+                        tracing::error!(
+                            "Failed to write daemon manifest {}: {:?}",
+                            manifest_path.display(),
+                            e
+                        );
+                    } else {
+                        tracing::info!(
+                            "locusta standalone-daemon: wrote manifest {} ({} peer entries)",
+                            manifest_path.display(),
+                            snapshot.len()
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -194,6 +236,13 @@ fn init_locusta_runtime(
     dispatch.register::<MetadataUpdateRequest>();
     dispatch.register::<WriteChunkByIdRequest<'_>>();
     dispatch.register::<ReadChunkByIdRequest<'_>>();
+    // FsyncChunkRequest NOT registered — its RPC path triggers rrrpc race
+    // (iter75/76 server.rs:1592 panic). Replaced by piggyback fsync in
+    // MetadataUpdateRequest handler: IOUringChunkStore marks chunks dirty
+    // on write, the close-time MetadataUpdate handler drains and fsyncs
+    // them before responding. This preserves io500 rule #3 (close ack 前
+    // persistent storage 保存済み) without per-chunk RPC fan-out and
+    // without the broken FsyncChunkRequest path.
     dispatch.register::<benchfs::rpc::readdir_ops::ReaddirRequest>();
     dispatch.register::<benchfs::rpc::dir_index_ops::DirIndexUpdateRequest>();
 
@@ -631,6 +680,10 @@ fn run_server(
     }
 
     let effective_backend = config.storage.effective_backend().to_string();
+    // Shared io_uring backend for both chunk_store and inode_store. Only
+    // populated by the "iouring" backend branch — the other backends keep
+    // inode_store on std::fs.
+    let mut io_uring_backend_for_inode: Option<Rc<benchfs::storage::IOUringBackend>> = None;
     let (chunk_store, allocator): (
         Rc<dyn ChunkStore>,
         Rc<pluvio_uring::allocator::FixedBufferAllocator>,
@@ -705,6 +758,7 @@ fn run_server(
             // Pass reactor explicitly to ensure DmaFile uses the same io_uring instance
             // that has the registered buffers (fixes SEGFAULT with 4+ nodes)
             let io_backend = Rc::new(IOUringBackend::new(allocator.clone(), reactor_for_backend));
+            io_uring_backend_for_inode = Some(io_backend.clone());
             // Increase LRU cache size to 32768 to reduce cache thrashing
             // With 4 ppn × 4096 chunks = 16384 files per node, 8192 was causing ~50% miss rate
             let chunk_store = Rc::new(IOUringChunkStore::with_capacity(
@@ -808,6 +862,7 @@ fn run_server(
                 &config.node.data_dir,
                 config.storage.chunk_size as u64,
                 policy,
+                io_uring_backend_for_inode.clone(),
             ) {
                 Ok(s) => {
                     eprintln!(
@@ -1215,6 +1270,80 @@ fn run_server(
             },
             "rpc_handler_registration".to_string(),
         );
+
+        // UCX standalone-daemon mode (2026-06-01): when
+        // `BENCHFS_UCX_DAEMON_NAME` env is set, expose a POSIX SHM
+        // control ring so co-resident IOR clients route their RPCs
+        // through this daemon's UCX endpoints — the UCX equivalent of
+        // `BENCHFS_LOCUSTA_DAEMON_NAME`. See `src/rpc/ucx_relay.rs`
+        // for the daemon design.
+        if let Ok(daemon_shm) = std::env::var("BENCHFS_UCX_DAEMON_NAME") {
+            if !daemon_shm.is_empty() {
+                eprintln!(
+                    "[ucx_relay] rank={} node_id={} starting daemon at {}",
+                    state.mpi_rank, node_id, daemon_shm
+                );
+                let capacity: u32 = std::env::var("BENCHFS_UCX_DAEMON_CTRL_CAPACITY")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(64);
+                let peer_node_ids: Vec<String> = (0..state.mpi_size)
+                    .map(|r| format!("node_{}", r))
+                    .collect();
+                let daemon = std::rc::Rc::new(benchfs::rpc::ucx_relay::UcxRelayDaemon::new(
+                    node_id.clone(),
+                    peer_node_ids,
+                    connection_pool.clone(),
+                ));
+                match daemon.expose_control_ring(&daemon_shm, capacity) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[ucx_relay] rank={} expose_control_ring OK at {} (capacity={})",
+                            state.mpi_rank, daemon_shm, capacity
+                        );
+                        match daemon.write_manifest(
+                            std::path::Path::new(registry_dir),
+                            &daemon_shm,
+                        ) {
+                            Ok(()) => eprintln!(
+                                "[ucx_relay] rank={} write_manifest OK at {}",
+                                state.mpi_rank, registry_dir
+                            ),
+                            Err(e) => eprintln!(
+                                "[ucx_relay] rank={} write_manifest failed: {:?}",
+                                state.mpi_rank, e
+                            ),
+                        }
+                        let daemon_clone = std::rc::Rc::clone(&daemon);
+                        pluvio_runtime::spawn_with_name(
+                            async move {
+                                eprintln!("[ucx_relay] poll loop starting");
+                                loop {
+                                    daemon_clone.poll_control_ring();
+                                    daemon_clone.drain_req_rings_and_forward();
+                                    pluvio_timer::sleep(
+                                        std::time::Duration::from_micros(10),
+                                    )
+                                    .await;
+                                }
+                            },
+                            "ucx_relay_poll".to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[ucx_relay] rank={} expose_control_ring({}) failed: {:?}",
+                            state.mpi_rank, daemon_shm, e
+                        );
+                    }
+                }
+            }
+        } else {
+            eprintln!(
+                "[ucx_relay] rank={} BENCHFS_UCX_DAEMON_NAME not set, skipping",
+                state.mpi_rank
+            );
+        }
     }
 
     // Spawn node registration task (must run after RPC handlers are ready)

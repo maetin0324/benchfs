@@ -46,6 +46,10 @@ thiserror = "2.0"
 futures = "0.3"
 async-trait = "0.1"
 
+# UCX standalone-daemon mode infrastructure
+slab = "0.4"
+nix = { version = "0.30", features = ["mman", "fs"] }
+
 # System
 libc = "0.2"
 futures-timer = "3.0.3"
