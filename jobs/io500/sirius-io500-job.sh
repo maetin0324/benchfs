@@ -343,7 +343,8 @@ stop_benchfsd() {
         # `create_control_ring_shm` calls `shm_unlink` first so it'd
         # still recover, but explicit cleanup keeps /dev/shm tidy and
         # surfaces leak symptoms early.
-        if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ]; then
+        if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ] \
+           || [ "${BENCHFS_UCX_STANDALONE_DAEMON:-0}" = "1" ]; then
           # Multiple vnodes share one phys host, so glob all daemon SHMs
           # left in /dev/shm rather than computing a single name. The
           # cleanup runs once per phys host (-np "$NNODES" against the
@@ -363,7 +364,8 @@ stop_benchfsd() {
     pkill -9 benchfsd_mpi 2>/dev/null || true
     sleep 3
     unset BENCHFSD_PID
-    if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ]; then
+    if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ] \
+       || [ "${BENCHFS_UCX_STANDALONE_DAEMON:-0}" = "1" ]; then
       "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
         --map-by ppr:1:node --bind-to none --oversubscribe \
         bash -c 'find /dev/shm -maxdepth 1 -user "$USER" -type f -delete 2>/dev/null || true' \
@@ -383,8 +385,10 @@ start_benchfsd() {
   # cleanup; the leftover /dev/shm/benchfs_daemon_* would cause SIGBUS
   # at client benchfs_init if the new daemon's expose_daemon_control_ring
   # races with a stale-mmap from before.
-  if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ]; then
-    # /dev/shm/benchfs_daemon_* — daemon control_ring SHM
+  if [ "${BENCHFS_LOCUSTA_STANDALONE_DAEMON:-0}" = "1" ] \
+     || [ "${BENCHFS_UCX_STANDALONE_DAEMON:-0}" = "1" ]; then
+    # /dev/shm/benchfs_daemon_* — daemon control_ring SHM (locusta)
+    # /dev/shm/benchfs_ucx_daemon_* — daemon control_ring SHM (UCX, 2026-06-01)
     # /dev/shm/relay_ch_* — per-IOR-client channel SHM (256MB+ each!)
     # iter78-82 SIGBUS root cause 2026-05-28: iter77 walltime-killed by PBS
     # without graceful stop_benchfsd → IOR client processes + benchfsd
