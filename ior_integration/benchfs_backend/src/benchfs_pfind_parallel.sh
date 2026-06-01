@@ -57,11 +57,17 @@ if [ "$NRANKS" -gt "$NHOSTS" ]; then
     NRANKS="$NHOSTS"
 fi
 
-# Stash output dir unique per invocation
+# Stash output dir unique per invocation. Keep on failure so we can
+# inspect each rank's stderr — io500 retries the find phase otherwise
+# and the original hang context vanishes.
 RUN_ID="$$_$(date +%s%N)"
-WORK_DIR="$TMPDIR_BASE/benchfs_pfind_$RUN_ID"
+WORK_DIR="${BENCHFS_PFIND_KEEPDIR:-$TMPDIR_BASE/benchfs_pfind_$RUN_ID}"
 mkdir -p "$WORK_DIR"
-trap 'rm -rf "$WORK_DIR" 2>/dev/null || true' EXIT
+PFIND_PERSIST_LOGS="${BENCHFS_PFIND_PERSIST_LOGS:-1}"
+if [ "$PFIND_PERSIST_LOGS" = "0" ]; then
+    trap 'rm -rf "$WORK_DIR" 2>/dev/null || true' EXIT
+fi
+echo "[pfind-parallel] WORK_DIR=$WORK_DIR" >&2
 
 echo "[pfind-parallel] launching $NRANKS ranks across hosts: ${HOSTS[*]:0:$NRANKS}" >&2
 
@@ -100,9 +106,23 @@ for ((i=0; i<NRANKS; i++)); do
     PIDS+=($!)
 done
 
-# Wait for all
+# Wait for all with a hard cap so a single stuck pfind rank can't
+# block the entire io500 sequence. The find phase is allowed to skew
+# results but it must not stall the rest of the test.
 FAIL=0
+PFIND_DEADLINE_SEC="${BENCHFS_PFIND_DEADLINE_SEC:-300}"
+START_TS=$(date +%s)
 for pid in "${PIDS[@]}"; do
+    REMAINING=$(( PFIND_DEADLINE_SEC - ( $(date +%s) - START_TS ) ))
+    if [ "$REMAINING" -le 0 ]; then
+        REMAINING=1
+    fi
+    if ! timeout "${REMAINING}s" tail --pid="$pid" -f /dev/null 2>/dev/null; then
+        echo "[pfind-parallel] pid=$pid timeout after ${PFIND_DEADLINE_SEC}s, killing" >&2
+        kill -9 "$pid" 2>/dev/null || true
+        FAIL=1
+        continue
+    fi
     if ! wait "$pid"; then
         FAIL=1
     fi

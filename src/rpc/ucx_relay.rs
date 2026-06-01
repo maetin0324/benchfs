@@ -80,6 +80,15 @@ struct UcxPending {
     channel_id: u32,
     small_res_off: u32,
     small_res_cap: u32,
+    /// Copied from the originating RequestSlot so that handle_reply
+    /// can route the AM-reply data correctly: for HAS_DMA_READ the
+    /// chunk bytes belong at dma_off..dma_off+dma_len and the small_res
+    /// receives only the response header. (Otherwise the chunk content
+    /// is truncated to small_res_cap and ior-hard-read fails its
+    /// length check.)
+    flags: u8,
+    dma_off: u32,
+    dma_len: u32,
 }
 
 pub struct UcxRelayDaemon {
@@ -317,6 +326,9 @@ impl UcxRelayDaemon {
                         channel_id: k as u32,
                         small_res_off: slot.small_res_off,
                         small_res_cap: slot.small_res_cap,
+                        flags: slot.flags,
+                        dma_off: slot.dma_off,
+                        dma_len: slot.dma_len,
                     });
                     let relay_req_id = pending_key as u16;
                     inner
@@ -374,7 +386,7 @@ impl UcxRelayDaemon {
     ) {
         let small_req_len = slot.small_req_len as usize;
         if small_req_len < 2 {
-            self.complete_with_status(relay_req_id, 0xfe, &[]);
+            self.complete_with_status(relay_req_id, 0xfe, &[], &[]);
             return;
         }
 
@@ -395,12 +407,12 @@ impl UcxRelayDaemon {
             Some(s) => s,
             None => {
                 tracing::error!("ucx_relay: no header_size for rpc_id={}", rpc_id);
-                self.complete_with_status(relay_req_id, 0xfd, &[]);
+                self.complete_with_status(relay_req_id, 0xfd, &[], &[]);
                 return;
             }
         };
         if small_req_slice.len() < 2 + header_size {
-            self.complete_with_status(relay_req_id, 0xfd, &[]);
+            self.complete_with_status(relay_req_id, 0xfd, &[], &[]);
             return;
         }
         let header_bytes = small_req_slice[2..2 + header_size].to_vec();
@@ -436,7 +448,7 @@ impl UcxRelayDaemon {
                     target_node_id,
                     e
                 );
-                self.complete_with_status(relay_req_id, 0xfc, &[]);
+                self.complete_with_status(relay_req_id, 0xfc, &[], &[]);
                 return;
             }
         };
@@ -444,7 +456,7 @@ impl UcxRelayDaemon {
             Some(c) => c,
             None => {
                 tracing::error!("ucx_relay: client has no Connection (locusta-only mode?)");
-                self.complete_with_status(relay_req_id, 0xfb, &[]);
+                self.complete_with_status(relay_req_id, 0xfb, &[], &[]);
                 return;
             }
         };
@@ -457,7 +469,7 @@ impl UcxRelayDaemon {
                     reply_stream_id,
                     e
                 );
-                self.complete_with_status(relay_req_id, 0xfa, &[]);
+                self.complete_with_status(relay_req_id, 0xfa, &[], &[]);
                 return;
             }
         };
@@ -473,7 +485,7 @@ impl UcxRelayDaemon {
                 relay_req_id,
                 e
             );
-            self.complete_with_status(relay_req_id, 0xf9, &[]);
+            self.complete_with_status(relay_req_id, 0xf9, &[], &[]);
             return;
         }
         let msg = match reply_stream.wait_msg().await {
@@ -484,7 +496,7 @@ impl UcxRelayDaemon {
                     reply_stream_id,
                     relay_req_id
                 );
-                self.complete_with_status(relay_req_id, 0xf8, &[]);
+                self.complete_with_status(relay_req_id, 0xf8, &[], &[]);
                 return;
             }
         };
@@ -501,16 +513,20 @@ impl UcxRelayDaemon {
                     relay_req_id,
                     e
                 );
-                self.complete_with_status(relay_req_id, 0xf7, &[]);
+                self.complete_with_status(relay_req_id, 0xf7, &header_bytes, &[]);
                 return;
             }
         };
-        let mut combined = header_bytes;
-        combined.extend_from_slice(&data_bytes);
-        self.complete_with_status(relay_req_id, 0, &combined);
+        self.complete_with_status(relay_req_id, 0, &header_bytes, &data_bytes);
     }
 
-    fn complete_with_status(&self, relay_req_id: u16, status: u8, resp_payload: &[u8]) {
+    fn complete_with_status(
+        &self,
+        relay_req_id: u16,
+        status: u8,
+        header_payload: &[u8],
+        data_payload: &[u8],
+    ) {
         let mut inner = self.inner.borrow_mut();
         let pending = match inner.pending.try_remove(relay_req_id as usize) {
             Some(p) => p,
@@ -523,11 +539,47 @@ impl UcxRelayDaemon {
             Some(c) => c,
             None => return,
         };
-        let resp_len = resp_payload.len() as u32;
+        let req_flags = RequestFlags::from_bits_truncate(pending.flags);
+
+        // Get-pattern (HAS_DMA_READ): chunk bytes go into the client's
+        // dma_off..dma_off+dma_len arena slot; small_res carries only
+        // the response header so it never overflows the small_res
+        // capacity. Without this split, ior-hard-read truncates the
+        // payload at small_res_cap and fails IOR's length check.
+        let small_res_owned: Vec<u8>;
+        let small_res_bytes: &[u8];
+        if req_flags.contains(RequestFlags::HAS_DMA_READ) {
+            if pending.dma_len > 0 {
+                let cap = pending.dma_len as usize;
+                let to_copy = data_payload.len().min(cap);
+                if to_copy > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data_payload.as_ptr(),
+                            channel.arena_base.add(pending.dma_off as usize),
+                            to_copy,
+                        );
+                    }
+                }
+            }
+            small_res_bytes = header_payload;
+        } else if data_payload.is_empty() {
+            small_res_bytes = header_payload;
+        } else {
+            // Eager / oneway path: server may stitch a small trailing
+            // body to its reply (e.g. variable-length response data).
+            // Concatenate header + body into the client's small_res
+            // arena slot as one buffer.
+            small_res_owned =
+                [header_payload, data_payload].concat();
+            small_res_bytes = &small_res_owned;
+        }
+
+        let resp_len = small_res_bytes.len() as u32;
         let completion = if resp_len <= 52 {
             let mut inline = [0u8; 52];
             let copy = (resp_len as usize).min(52);
-            inline[..copy].copy_from_slice(&resp_payload[..copy]);
+            inline[..copy].copy_from_slice(&small_res_bytes[..copy]);
             CompletionSlot {
                 req_id: pending.client_req_id,
                 transport_status: status,
@@ -540,7 +592,7 @@ impl UcxRelayDaemon {
             let copy_len = resp_len.min(pending.small_res_cap) as usize;
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    resp_payload.as_ptr(),
+                    small_res_bytes.as_ptr(),
                     channel.arena_base.add(pending.small_res_off as usize),
                     copy_len,
                 );
