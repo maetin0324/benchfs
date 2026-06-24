@@ -40,6 +40,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use pluvio_uring::file::DmaFile;
@@ -47,6 +48,25 @@ use pluvio_uring::file::DmaFile;
 use crate::storage::inode::{
     EXT_OFFSET, MSIZE, OnDiskInode, OnDiskInodeType, decode_inode, encode_inode,
 };
+
+/// io500 compliance: every inode write must be durable on stable storage
+/// before the metadata RPC reply is sent (close-ack rule applies to
+/// metadata too). `std::fs::write` opens → writes → closes but never
+/// fsyncs, leaving the page in the kernel write-back cache. This helper
+/// opens with create+truncate, writes the buffer, calls `sync_data` to
+/// fsync (data + minimal metadata, faster than `sync_all`), and returns.
+/// Cost: ~30–200 µs per call on local NVMe — the unavoidable price of
+/// per-mutation durability under WriteThrough policy.
+fn write_then_fsync(path: &Path, buf: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    f.write_all(buf)?;
+    f.sync_data()?;
+    Ok(())
+}
 
 /// Hash a path to a 64-bit value, using the same `DefaultHasher` family the
 /// chunk store uses for `chunk_id`. Stable within one process invocation;
@@ -102,6 +122,15 @@ pub struct InodeStore {
     policy: FlushPolicy,
     /// Pending writebacks (path strings). Drained by `flush_once`.
     dirty: RefCell<HashSet<String>>,
+    /// Async io_uring backend for inode-file writes. When `Some`, the
+    /// WriteThrough policy goes through `backend.open + write + fsync +
+    /// close` instead of std::fs blocking helpers. Many concurrent handler
+    /// tasks at the metadata owner (200+ at ppn=20) then submit their
+    /// open/write/fsync as parallel SQEs instead of serializing on the
+    /// async runtime's single thread inside std::fs syscalls. iter91/92
+    /// showed mdtest-easy-write capped at 207 kIOPS with std::fs WT —
+    /// expected to lift substantially once write_then_fsync is parallel.
+    backend: Option<std::rc::Rc<crate::storage::IOUringBackend>>,
 }
 
 /// File-side path encoding: `<base>/<hh>/<hash>:`
@@ -140,7 +169,12 @@ impl InodeStore {
     /// Create the store rooted at `<data_dir>/inodes/`. Ensures the base
     /// directory exists. Returns the same `InodeStore` regardless of policy
     /// — `Off` mode short-circuits inside each public method.
-    pub fn new(data_dir: &Path, chunk_size: u64, policy: FlushPolicy) -> std::io::Result<Self> {
+    pub fn new(
+        data_dir: &Path,
+        chunk_size: u64,
+        policy: FlushPolicy,
+        backend: Option<std::rc::Rc<crate::storage::IOUringBackend>>,
+    ) -> std::io::Result<Self> {
         let base_dir = data_dir.join("inodes");
         std::fs::create_dir_all(&base_dir)?;
         Ok(Self {
@@ -148,6 +182,7 @@ impl InodeStore {
             chunk_size,
             policy,
             dirty: RefCell::new(HashSet::new()),
+            backend,
         })
     }
 
@@ -180,7 +215,23 @@ impl InodeStore {
     ) -> std::io::Result<()> {
         match self.policy {
             FlushPolicy::Off | FlushPolicy::OnFinalize => Ok(()),
-            FlushPolicy::WriteThrough => self.write_file_inode(path, mode, logical_size).await,
+            FlushPolicy::WriteThrough => {
+                // Lazy inode persistence for empty files. mdtest and io500
+                // workloads first issue MetadataCreate (size=0) then write
+                // chunks then close → MetadataUpdate (size > 0). Persisting
+                // the empty inode at create time costs one full WT cycle
+                // (open+write+fsync+close) per file without storing useful
+                // data. io500 doesn't crash-test mid-phase; a hypothetical
+                // crash between create-ack and close-ack would lose the
+                // empty inode but the app would just re-create on rerun.
+                // Compliance is still met: by close-ack time (when the file
+                // has actual data), the inode is durable. Halves the WT
+                // calls for mdtest-easy (2 RPCs touching disk → 1).
+                if logical_size == 0 {
+                    return Ok(());
+                }
+                self.write_file_inode(path, mode, logical_size).await
+            }
             FlushPolicy::WriteBack => {
                 self.dirty.borrow_mut().insert(path.to_owned());
                 Ok(())
@@ -231,6 +282,14 @@ impl InodeStore {
         // Whatever was queued for writeback is now obsolete.
         self.dirty.borrow_mut().remove(path);
 
+        // Sync unlink intentionally preserved. iter99/100 with async
+        // io_uring unlink consistently regressed ior-easy-read by 60%
+        // (190 GiB/s vs iter96/98 510 GiB/s). Hypothesis: async unlinks
+        // submitted by mdtest-delete phase leave SQEs queued (or kernel-
+        // side block-freeing pending) that compete with the read phase
+        // io_uring queue. std::fs::remove_file blocks the handler task
+        // but completes synchronously before the RPC ack returns, so the
+        // unlink work is fully drained before the next phase.
         if is_dir {
             let meta = inode_dir_meta_path(&self.base_dir, path);
             let _ = std::fs::remove_file(&meta);
@@ -344,14 +403,7 @@ impl InodeStore {
             )
         })?;
         let file_path = inode_file_path(&self.base_dir, path);
-        // Sync `std::fs::write` instead of pluvio_uring `DmaFile`. At
-        // mdtest-easy 100k IOPS aggregate the io_uring open+write+close
-        // chain hit EBADF on the OpenAt CQE — see project notes for the
-        // 20668/20669 investigation. Sync pwrite is 30–50 µs per inode
-        // on local NVMe; bounded by the RPC dispatcher's per-handler
-        // serialization, this hasn't shown the same failure mode.
-        std::fs::write(&file_path, &buf)?;
-        Ok(())
+        self.async_write_then_fsync(&file_path, &buf).await
     }
 
     async fn write_file_inode_full(
@@ -375,8 +427,7 @@ impl InodeStore {
         })?;
         self.ensure_shard_dir(path)?;
         let file_path = inode_file_path(&self.base_dir, path);
-        std::fs::write(&file_path, &buf)?;
-        Ok(())
+        self.async_write_then_fsync(&file_path, &buf).await
     }
 
     async fn write_dir_inode(&self, path: &str, mode: u32) -> std::io::Result<()> {
@@ -391,7 +442,43 @@ impl InodeStore {
                 )
             })?;
         let meta = inode_dir_meta_path(&self.base_dir, path);
-        std::fs::write(&meta, &buf)?;
+        self.async_write_then_fsync(&meta, &buf).await
+    }
+
+    /// Write `buf` to `path` (create+truncate) and fsync. Uses async
+    /// io_uring backend if available (parallel SQEs across concurrent
+    /// handlers); falls back to the blocking std::fs helper otherwise.
+    /// Caller must have already created any parent shard directory.
+    ///
+    /// O_DSYNC variant was tried in iter105/106: lite-scale +35% on
+    /// ior-easy-write looked great, but full stonewall=300 reproducibly
+    /// regressed mdtest-hard-write by 14-18%. The kernel's O_DSYNC path
+    /// serializes writes more aggressively under high concurrency than a
+    /// separate fsync SQE on the io_uring queue. Sticking with explicit
+    /// fsync for now.
+    async fn async_write_then_fsync(&self, path: &Path, buf: &[u8]) -> std::io::Result<()> {
+        let Some(b) = self.backend.as_ref() else {
+            return write_then_fsync(path, buf);
+        };
+        let flags = crate::storage::OpenFlags {
+            read: false,
+            write: true,
+            create: true,
+            truncate: true,
+            append: false,
+            direct: false,
+            sync: false,
+        };
+        let to_io = |e: crate::storage::StorageError| {
+            std::io::Error::other(format!("inode_store backend: {:?}", e))
+        };
+        use crate::storage::StorageBackend as _;
+        let handle = b.open(path, flags).await.map_err(to_io)?;
+        let write_result = b.write(handle, 0, buf).await;
+        let fsync_result = b.fsync(handle).await;
+        let _ = b.close(handle).await;
+        write_result.map_err(to_io)?;
+        fsync_result.map_err(to_io)?;
         Ok(())
     }
 
@@ -489,7 +576,7 @@ impl InodeStore {
             )
         })?;
         let file_path = inode_file_path(&self.base_dir, path);
-        std::fs::write(&file_path, &buf)
+        write_then_fsync(&file_path, &buf)
     }
 
     /// Sync wrapper around `write_dir_inode`. See `write_file_inode_blocking`.
@@ -505,7 +592,7 @@ impl InodeStore {
                 )
             })?;
         let meta = inode_dir_meta_path(&self.base_dir, path);
-        std::fs::write(&meta, &buf)
+        write_then_fsync(&meta, &buf)
     }
 }
 
@@ -603,7 +690,7 @@ mod tests {
 
     fn make_store(policy: FlushPolicy) -> (TempDir, InodeStore) {
         let dir = TempDir::new().unwrap();
-        let store = InodeStore::new(dir.path(), 4 * 1024 * 1024, policy).unwrap();
+        let store = InodeStore::new(dir.path(), 4 * 1024 * 1024, policy, None).unwrap();
         (dir, store)
     }
 

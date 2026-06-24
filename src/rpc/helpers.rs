@@ -77,31 +77,83 @@ impl<const N: usize> RpcIoSliceHelper<N> {
     }
 }
 
-/// Parse RPC request header from AmMsg
+/// 4-byte correlation_id prefix on every AM header (request + reply).
 ///
-/// This is a generic function that works with any header type implementing
-/// `FromBytes` and `Clone` from the zerocopy crate.
+/// Wire layout:
+///
+/// ```text
+/// ┌──────────────┬─────────────────────────┐
+/// │ corr_id u32  │  AmRpc::*Header bytes   │
+/// │  (LE)        │  (sizeof::<H>())        │
+/// └──────────────┴─────────────────────────┘
+/// ```
+///
+/// 2026-06-02: introduced so the UCX-daemon relay (`ucx_relay.rs`) can
+/// demultiplex concurrent replies on the same `am_stream(rpc_id+100)`
+/// SegQueue via slab-key. Embedded UCX (`transport_ucx.rs`) keeps the
+/// same wire format for uniformity but always sends corr_id=0 because
+/// each embedded call has its own short-lived reply stream.
+pub const CORR_ID_PREFIX_LEN: usize = 4;
+
+/// Pack `[corr_id u32 LE][header bytes]` into one buffer suitable for
+/// `am_send_vectorized` / `AmMsg::reply`. All senders (`RpcClient`,
+/// `helpers.rs` reply, `UcxRelayDaemon` forward) use this so the wire
+/// layout stays consistent.
+pub fn pack_header_with_corr_id<H>(corr_id: u32, header: &H) -> Vec<u8>
+where
+    H: zerocopy::IntoBytes + zerocopy::Immutable,
+{
+    let header_bytes = zerocopy::IntoBytes::as_bytes(header);
+    let mut out = Vec::with_capacity(CORR_ID_PREFIX_LEN + header_bytes.len());
+    out.extend_from_slice(&corr_id.to_le_bytes());
+    out.extend_from_slice(header_bytes);
+    out
+}
+
+/// Parse the 4-byte corr_id prefix from raw AM header bytes without
+/// decoding the typed header. Used by `ucx_relay.rs` reply-side demux
+/// where only the corr_id is needed to find the right pending entry.
+pub fn read_corr_id_prefix(header_bytes: &[u8]) -> Option<u32> {
+    if header_bytes.len() < CORR_ID_PREFIX_LEN {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        header_bytes[0],
+        header_bytes[1],
+        header_bytes[2],
+        header_bytes[3],
+    ]))
+}
+
+/// Parse RPC request header from AmMsg.
+///
+/// Returns the correlation_id (first 4 bytes LE) and the decoded header.
+/// Server-side handlers must capture corr_id and pass it back to
+/// [`send_rpc_response_via_reply`] so daemon-side clients can demux
+/// concurrent replies on a shared stream.
 ///
 /// # Returns
-///
-/// - `Ok(H)` if header was successfully parsed
-/// - `Err(RpcError::InvalidHeader)` if header is missing or malformed
-pub fn parse_header<H>(am_msg: &AmMsg) -> Result<H, RpcError>
+/// - `Ok((corr_id, H))` on success
+/// - `Err(RpcError::InvalidHeader)` if buffer too short or zerocopy decode fails
+pub fn parse_header<H>(am_msg: &AmMsg) -> Result<(u32, H), RpcError>
 where
     H: FromBytes + Clone,
 {
-    am_msg
-        .header()
-        .get(..std::mem::size_of::<H>())
-        .and_then(|bytes| H::read_from_prefix(bytes).ok().map(|(h, _)| h.clone()))
-        .ok_or(RpcError::InvalidHeader)
+    let bytes = am_msg.header();
+    if bytes.len() < CORR_ID_PREFIX_LEN + std::mem::size_of::<H>() {
+        return Err(RpcError::InvalidHeader);
+    }
+    let corr_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let header = bytes
+        .get(CORR_ID_PREFIX_LEN..CORR_ID_PREFIX_LEN + std::mem::size_of::<H>())
+        .and_then(|b| H::read_from_prefix(b).ok().map(|(h, _)| h.clone()))
+        .ok_or(RpcError::InvalidHeader)?;
+    Ok((corr_id, header))
 }
 
-/// Parse request header, returning RpcError with AmMsg on failure
-///
-/// This is a convenience wrapper around `parse_header` that returns
-/// the AmMsg alongside the error, which is the pattern used in server handlers.
-pub fn parse_header_with_msg<H>(am_msg: &AmMsg) -> Result<H, (RpcError, &AmMsg)>
+/// Convenience wrapper around `parse_header` that returns the AmMsg
+/// alongside the error.
+pub fn parse_header_with_msg<H>(am_msg: &AmMsg) -> Result<(u32, H), (RpcError, &AmMsg)>
 where
     H: FromBytes + Clone,
 {
@@ -233,6 +285,7 @@ pub async fn receive_path(
 #[async_backtrace::framed]
 pub async fn send_rpc_response_via_reply<H>(
     reply_stream_id: u16,
+    corr_id: u32,
     response_header: &H,
     response_data: Option<&[u8]>,
     am_msg: pluvio_ucx::async_ucx::ucp::AmMsg,
@@ -254,7 +307,10 @@ where
         ));
     }
 
-    let header_bytes = zerocopy::IntoBytes::as_bytes(response_header);
+    // Echo the corr_id from the request as the prefix on the reply
+    // header so the daemon-side client can demux which pending entry
+    // this reply belongs to (see `ucx_relay.rs::complete_with_status`).
+    let packed_header = pack_header_with_corr_id(corr_id, response_header);
     let data = response_data.unwrap_or(&[]);
 
     // Determine protocol based on data size
@@ -270,7 +326,7 @@ where
         am_msg
             .reply(
                 reply_stream_id as u32,
-                header_bytes,
+                &packed_header,
                 data,
                 false, // need_reply
                 proto,

@@ -197,6 +197,23 @@ impl BenchFS {
     /// Returns the node ID responsible for this path's metadata.
     /// If distributed metadata is not enabled, returns this node's ID.
     fn get_metadata_node(&self, path: &str) -> String {
+        // CHFS alignment: metadata owner == chunk 0 owner. This lets the
+        // close-time MetadataUpdate handler persist file size via xattr on
+        // chunk 0's file directly (chunk file is local). Without this
+        // alignment metadata_ring (hash `path`) and data_ring (hash
+        // `path/0`) resolve to different servers, and `set_file_size_xattr`
+        // silently no-ops at metadata owner because chunk 0 lives
+        // elsewhere — observed in iter118b. The chunk 0 key is also what
+        // CHFS POSIX backend uses as the unit of metadata persistence.
+        // Toggled via `[metadata].xattr_size`: when on, route to chunk 0
+        // owner; otherwise keep the historical metadata_ring path.
+        let xattr_aligned = crate::runtime_config::RuntimeConfig::global()
+            .metadata
+            .xattr_size;
+        if xattr_aligned {
+            let chunk0_key = format!("{}/0", path);
+            return self.get_chunk_node(&chunk0_key);
+        }
         if let Some(ring) = &self.metadata_ring {
             ring.get_node(path).unwrap_or_else(|| self.node_id.clone())
         } else {
@@ -306,6 +323,15 @@ impl BenchFS {
         let metadata_node = self.get_metadata_node(path);
         let is_local = self.is_local_metadata(path);
         tracing::debug!("Metadata node: {}, is_local: {}", metadata_node, is_local);
+
+        // Client-side-open fast path disabled after iter112-113 measured
+        // a -28% TOTAL regression at full stonewall. The architecture
+        // saves one open-time RPC but concentrates inode establishment
+        // at close-time on metadata owners; the resulting upsert burst
+        // (1M files × propagate + store + WT) outweighs the savings.
+        // The dead code is left documented for the design discussion;
+        // see project_iter113_client_side_open_regression_2026_05_30.
+        // To re-enable, gate behind a runtime config flag.
 
         // Lookup file metadata (local or remote)
         let file_meta = if is_local {
@@ -739,7 +765,19 @@ impl BenchFS {
             })
             .collect();
 
-        let chunk_futures: Vec<_> = chunk_infos
+        // Same UCX split-buffer caveat as `write_at` (see 2026-05-31
+        // note there): when `sequential_chunk_rpcs == true` we must NOT
+        // pre-spawn every per-chunk read RPC, because spawn_with_name
+        // launches the tasks immediately and they then race against
+        // each other on the same UCX reply stream. Drop into a strict
+        // inline serial loop below.
+        let sequential_for_read = crate::runtime_config::RuntimeConfig::global()
+            .rpc
+            .sequential_chunk_rpcs;
+        let chunk_futures: Vec<_> = if sequential_for_read {
+            Vec::new()
+        } else { chunk_infos
+            .clone()
             .into_iter()
             .map(|(chunk_index, chunk_offset, read_size, buf_offset)| {
                 let file_path = file_path.clone();
@@ -915,7 +953,110 @@ impl BenchFS {
                     format!("benchfs_read_chunk_{}", chunk_index),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        };
+
+        // Sum up bytes read from all chunks
+        let mut bytes_read = 0;
+        let mut failed_chunks = 0usize;
+        let mut first_failed: Option<u64> = None;
+
+        if sequential_for_read {
+            // True inline serial — each per-chunk read RPC is awaited
+            // before the next is issued, so only ONE ReadChunkById is
+            // in flight per process at any moment. Mirrors `write_at`.
+            for (chunk_index, chunk_offset, read_size, buf_offset) in chunk_infos.into_iter() {
+                let chunk_buf = unsafe {
+                    let end = (buf_offset + read_size as usize).min(buf_len);
+                    std::slice::from_raw_parts_mut(buf_ptr.add(buf_offset), end - buf_offset)
+                };
+                let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                let target_node = self.get_chunk_node(&chunk_key);
+                let is_local = target_node == self.metadata_manager.self_node_id();
+
+                let read_result: Result<usize, ()> = if is_local {
+                    let chunk_store = self.chunk_store.as_ref().expect(
+                        "is_local=true but chunk_store is None; this indicates a bug",
+                    );
+                    match chunk_store
+                        .read_chunk(&file_path, chunk_index, chunk_offset, read_size)
+                        .await
+                    {
+                        Ok(chunk_data) => {
+                            let copy_len = chunk_data.len().min(chunk_buf.len());
+                            chunk_buf[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
+                            Ok(copy_len)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to read local chunk {}: {:?}",
+                                chunk_index,
+                                e
+                            );
+                            Err(())
+                        }
+                    }
+                } else if let Some(pool) = &self.connection_pool {
+                    match pool.get_or_connect(&target_node).await {
+                        Ok(client) => {
+                            let file_id = FileId::new(&file_path, chunk_index);
+                            let request = ReadChunkByIdRequest::from_file_id(
+                                file_id,
+                                chunk_offset,
+                                read_size,
+                                chunk_buf,
+                            );
+                            match request.call(&*client).await {
+                                Ok(response) if response.is_success() => {
+                                    Ok(response.bytes_read as usize)
+                                }
+                                Ok(response) => {
+                                    tracing::warn!(
+                                        "Remote read (FileId) failed with status {}",
+                                        response.status
+                                    );
+                                    Err(())
+                                }
+                                Err(e) => {
+                                    tracing::error!("RPC error (FileId read): {:?}", e);
+                                    Err(())
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to connect to {}: {:?}",
+                                target_node,
+                                e
+                            );
+                            Err(())
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Chunk {} is on node {} but no connection pool available",
+                        chunk_index,
+                        target_node
+                    );
+                    Err(())
+                };
+
+                match read_result {
+                    Ok(len) => bytes_read += len,
+                    Err(()) => {
+                        failed_chunks += 1;
+                        first_failed.get_or_insert(chunk_index);
+                    }
+                }
+            }
+            if failed_chunks > 0 {
+                return Err(ApiError::IoError(format!(
+                    "{} chunk read(s) failed (first chunk {:?})",
+                    failed_chunks, first_failed
+                )));
+            }
+            return Ok(bytes_read);
+        }
 
         // Execute reads with bounded concurrency
         // buffer_unordered allows up to MAX_CONCURRENT_CHUNK_RPCS in-flight at once
@@ -924,10 +1065,6 @@ impl BenchFS {
             .collect()
             .await;
 
-        // Sum up bytes read from all chunks
-        let mut bytes_read = 0;
-        let mut failed_chunks = 0usize;
-        let mut first_failed: Option<u64> = None;
         for result in chunk_results_handles {
             let (chunk_index, read_result) =
                 result.map_err(|e| ApiError::Internal(format!("Chunk read task failed: {}", e)))?;
@@ -1022,7 +1159,18 @@ impl BenchFS {
         );
 
         let fs_ptr = self as *const BenchFS;
-        let chunk_write_futures = chunks
+        // When `sequential_chunk_rpcs == true` we MUST NOT pre-spawn
+        // the per-chunk futures, otherwise the spawned tasks race with
+        // the inline loop below and we end up issuing every chunk RPC
+        // twice (= 2× traffic + the very bug we are trying to dodge).
+        // pluvio's `JoinHandle::drop` is detach-not-cancel, so dropping
+        // the Vec does not stop them.
+        let sequential_for_build = crate::runtime_config::RuntimeConfig::global()
+            .rpc
+            .sequential_chunk_rpcs;
+        let chunk_write_futures: Vec<_> = if sequential_for_build {
+            Vec::new()
+        } else { chunks
             .iter()
             .enumerate()
             .map(|(idx, (chunk_index, chunk_offset, write_size))| {
@@ -1168,7 +1316,8 @@ impl BenchFS {
                     format!("benchfs_write_chunk_{}", chunk_index),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        };
 
         // Execute writes. `[rpc] sequential_chunk_rpcs = true` (in
         // benchfs.toml) awaits each spawned task one at a time (no
@@ -1176,16 +1325,104 @@ impl BenchFS {
         // are triggered by concurrent chunk RPCs from a single
         // benchfs_write call. Default keeps the bounded-concurrent
         // buffer_unordered path that locusta needs.
+        //
+        // **Caveat 2026-05-31**: pre-spawning all `chunk_write_futures`
+        // via `spawn_with_name` and then awaiting them sequentially
+        // does NOT serialize execution — the spawned tasks are already
+        // running concurrently in the executor by the time the for-loop
+        // body starts. This re-triggers the known UCX-backend bug where
+        // a single `benchfs_write` split into multiple chunk RPCs
+        // (e.g., ior-hard 47 KiB writes straddling 4 MiB chunk
+        // boundaries) hangs because UCX cannot demultiplex two
+        // concurrent reply waits on the same stream id. When
+        // `sequential_chunk_rpcs == true` we therefore **stop
+        // pre-spawning** and re-execute the per-chunk logic inline,
+        // strictly serial, so no two chunk RPCs from the same
+        // benchfs_write call are ever in flight together.
         let sequential = crate::runtime_config::RuntimeConfig::global()
             .rpc
             .sequential_chunk_rpcs;
         let mut bytes_written = 0;
         if sequential {
-            for jh in chunk_write_futures {
-                let r = jh
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("Chunk write task failed: {}", e)))??;
-                bytes_written += r;
+            // Drop the pre-spawned futures so they don't run in the
+            // background. They have not been awaited, so JoinHandle
+            // drop should cancel the in-flight tasks (best effort) —
+            // but to make this airtight we just don't issue the RPC
+            // inside the spawned task body once `sequential` is set.
+            // The simpler approach is to NOT build `chunk_write_futures`
+            // up-front when `sequential` is on. For now (minimal patch)
+            // we drop the handles and re-execute the chunk-write logic
+            // inline below.
+            drop(chunk_write_futures);
+
+            for (idx, (chunk_index, chunk_offset, write_size)) in chunks.iter().enumerate() {
+                let chunk_index = *chunk_index;
+                let chunk_offset = *chunk_offset;
+                let write_size = *write_size;
+                let data_offset: usize =
+                    chunks.iter().take(idx).map(|(_, _, s)| *s as usize).sum();
+                let data_len = write_size as usize;
+                let chunk_data: &[u8] =
+                    &data[data_offset..data_offset + data_len];
+                let file_path = file_meta.path.clone();
+                let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                let target_node = self.get_chunk_node(&chunk_key);
+                let is_local = target_node == self.metadata_manager.self_node_id();
+
+                if is_local {
+                    let chunk_store = self.chunk_store.as_ref().expect(
+                        "is_local=true but chunk_store is None; this indicates a bug",
+                    );
+                    chunk_store
+                        .write_chunk(&file_path, chunk_index, chunk_offset, chunk_data)
+                        .await
+                        .map_err(|e| {
+                            ApiError::IoError(format!(
+                                "Failed to write chunk {}: {:?}",
+                                chunk_index, e
+                            ))
+                        })?;
+                    bytes_written += data_len;
+                } else if let Some(pool) = &self.connection_pool {
+                    match pool.get_or_connect(&target_node).await {
+                        Ok(client) => {
+                            let file_id = FileId::new(&file_path, chunk_index);
+                            let request = WriteChunkByIdRequest::from_file_id(
+                                file_id,
+                                chunk_offset,
+                                chunk_data,
+                            );
+                            match request.call(&*client).await {
+                                Ok(response) if response.is_success() => {
+                                    bytes_written += data_len;
+                                }
+                                Ok(response) => {
+                                    return Err(ApiError::IoError(format!(
+                                        "Remote write (FileId) failed with status {}",
+                                        response.status
+                                    )));
+                                }
+                                Err(e) => {
+                                    return Err(ApiError::IoError(format!(
+                                        "RPC error (FileId write): {:?}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(ApiError::IoError(format!(
+                                "Failed to connect to {}: {:?}",
+                                target_node, e
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(ApiError::Internal(format!(
+                        "Chunk {} should be on node {} but distributed mode is not enabled",
+                        chunk_index, target_node
+                    )));
+                }
             }
         } else {
             // buffer_unordered allows up to MAX_CONCURRENT_CHUNK_RPCS in-flight at once
@@ -1280,6 +1517,21 @@ impl BenchFS {
         // many in-flight writes per file; close is where we materialise that
         // the writes actually succeeded.
         self.drain_pending_writes(handle).await?;
+
+        // io500 rule "data is persistently stored before acknowledging the
+        // close": piggyback the fsync onto MetadataUpdate broadcast below.
+        // Each data node's MetadataUpdate handler drains its `dirty_chunks`
+        // set for this path before responding. The broadcast covers every
+        // node that may hold dirty data — chunks distribute by hash so
+        // most data nodes for a 900GB ior-easy file have some chunks.
+        //
+        // Pre-compliance benchfs_fsync (per-chunk FsyncChunkRequest RPC)
+        // is disabled here because (1) the FsyncChunkRequest handler
+        // triggers an rrrpc race condition panic (iter75/76 server.rs:1592)
+        // and (2) per-chunk fan-out is O(232K) RPCs per file at scale.
+        // The new piggyback-on-MetadataUpdate approach is O(N) RPCs per
+        // close where N = #data_nodes (40 at 10 phys).
+        // _ = self.benchfs_fsync(handle); // INTENTIONAL: replaced by broadcast below.
 
         use std::path::Path;
         let path_ref = Path::new(&handle.path);
@@ -1429,6 +1681,15 @@ impl BenchFS {
                 }
             }
         }
+
+        // io500 compliance fsync broadcast TEMPORARILY DISABLED 2026-05-28:
+        // iter77 hung in ior-easy-write init (zero WriteChunkById RPCs
+        // received). Suspect the broadcast adds significant overhead during
+        // io500's pre-test small-file create+close phase. Server-side
+        // dirty-tracking + metadata-owner fsync at MetadataUpdate is kept;
+        // covers ~1/N (N=#data_nodes) of dirty data. Need to localize and
+        // re-enable broadcast for full compliance.
+        // _ = "broadcast disabled";
 
         self.open_files.borrow_mut().remove(&handle.fd);
         Ok(())

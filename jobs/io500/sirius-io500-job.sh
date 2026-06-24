@@ -26,9 +26,32 @@ cleanup_exported_bash_functions() {
   done
 }
 
+# 2026-06-05: PBS no longer auto-exports the `module` bash function,
+# so we must explicitly source the Modules init script before `module
+# purge` / `module load`. Without this the openmpi module silently
+# fails to load (`module: コマンドが見つかりません`), mpirun stays out
+# of PATH, and every downstream mpirun call fails with "command not
+# found" — but `|| true` in cleanup paths swallows the error, so the
+# script appears to hang at the next mpirun step instead of failing
+# loudly. Was previously implicit; broke after a cluster update.
+if [ -r /etc/profile.d/modules.sh ]; then
+  source /etc/profile.d/modules.sh
+elif [ -r /usr/share/Modules/init/bash ]; then
+  source /usr/share/Modules/init/bash
+fi
 module purge
 module load openmpi/5.0.9/gcc11.5.0
+if ! command -v mpirun >/dev/null 2>&1; then
+  echo "FATAL: mpirun not in PATH after module load — module system likely broken" >&2
+  exit 2
+fi
 cleanup_exported_bash_functions
+
+# 2026-06-11: PMIx tool listener fails with PMIX_ERR_FILE_OPEN_FAILURE when
+# the head node's /var/tmp/pbs.<JOBID>/ is unwritable (seen on a02, a05).
+# Redirect the OMPI/PMIx session dir to /tmp which is always writable.
+export TMPDIR=/tmp
+export PMIX_SERVER_TMPDIR=/tmp
 
 SCRIPT_DIR="${SCRIPT_DIR:-/work/NBB/rmaeda/workspace/rust/benchfs/jobs/io500}"
 PROJECT_ROOT="${PROJECT_ROOT:-/work/NBB/rmaeda/workspace/rust/benchfs}"
@@ -45,6 +68,7 @@ JOBID=$(echo "$PBS_JOBID" | cut -d . -f 1)
 NNODES=$(sort -u "${PBS_NODEFILE}" | wc -l)
 
 JOB_OUTPUT_DIR="${OUTPUT_DIR}/${JOB_START}-${JOBID}-${NNODES}n"
+export JOB_OUTPUT_DIR
 JOB_BACKEND_DIR="${BACKEND_DIR}/$(basename -- "${JOB_OUTPUT_DIR}")"
 BENCHFS_REGISTRY_DIR="${JOB_BACKEND_DIR}/registry"
 # Path to the external find driver built from
@@ -93,7 +117,10 @@ SUMMARY_CSV="${JOB_OUTPUT_DIR}/sweep_summary.csv"
 # 全 host 共通で broken な /scrN を script レベルで skip するために使う。
 detect_all_scratch_dirs() {
   BENCHFS_ALL_SCRATCH_DIRS=()
+  # Accept commas or semicolons as separators (qsub -v uses commas as
+  # variable separators, so we need an alt format for in-line lists).
   local skip_csv="${BENCHFS_SCR_SKIP:-}"
+  skip_csv="${skip_csv//;/,}"
   for n in 0 1 2 3; do
     if [ -n "$skip_csv" ]; then
       case ",${skip_csv}," in
@@ -218,8 +245,16 @@ export UCX_TLS
 export BENCHFS_LOCUSTA_DISPATCH_SLEEP_US
 export BENCHFS_LOCUSTA_DISPATCH_IDLE_THRESHOLD
 
-cmd_mpirun_util=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self)
-cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx --mca coll '^hcoll' -x PATH -x LD_LIBRARY_PATH -x UCX_RCACHE_ENABLE -x UCX_MEMTYPE_CACHE -x UCX_TLS -x UCX_LOG_LEVEL -x UCX_RNDV_THRESH)
+# 2026-06-03 PMIx gds/shmem2 mmap>ftruncate scaling bug fix.
+# sigprobe (job 27534) caught client mpirun SIGBUS BUS_ADRERR at
+# /var/tmp/pbs.<JOBID>/ompi.<PID>/1/pmix-gds-shmem2.<host>-prterun-...jobdata.<PID>
+# — PMIx's V2 shmem GDS component mmap's the jobdata file with a
+# size > the file's ftruncated size at 800 ranks × 10 hosts, hitting
+# unbacked pages on access. Forcing the heap-based `hash` GDS
+# bypasses the shmem code path entirely.
+export PMIX_MCA_gds=hash
+cmd_mpirun_util=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ob1 --mca btl tcp,sm,self -x PMIX_MCA_gds)
+cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mca pml ucx --mca btl self --mca osc ucx --mca coll '^hcoll' -x PATH -x LD_LIBRARY_PATH -x UCX_RCACHE_ENABLE -x UCX_MEMTYPE_CACHE -x UCX_TLS -x UCX_LOG_LEVEL -x UCX_RNDV_THRESH -x PMIX_MCA_gds)
 
 # Per-host scratch validation. Some Sirius hosts (a01, a24) have /scrN
 # directories that are root-owned and not mounted as separate scratch
@@ -233,47 +268,246 @@ cmd_mpirun_common=(mpirun --mca routed direct --mca plm_rsh_no_tree_spawn 1 --mc
 # broken hosts and exit before launching benchfsd. The user can then
 # resubmit and let PBS pick a different host set.
 echo "Validating per-host scratch dirs (skip=${BENCHFS_SCR_SKIP:-})..."
-SCRATCH_PROBE_OUTPUT=$("${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+# 2026-06-23: probe each host directly via ssh in parallel instead of
+# through mpirun. Earlier today four consecutive 10 phys jobs hung at
+# the mpirun-based probe (cpupercent=0, no output for 1 h, walltime
+# burned). Even `timeout --kill-after` couldn't recover — orte's launch
+# wait is in a kernel state SIGKILL won't preempt. Direct ssh side-steps
+# orte entirely: each host gets its own 60 s budget, hung hosts get
+# tagged SCRATCH_HANG, healthy ones proceed.
+do_ssh_probe() {
+  local h="$1" jobid="$2" skip_csv="$3"
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+      -o PasswordAuthentication=no -o BatchMode=yes \
+      "$h" "PBS_JOBID=${jobid} BENCHFS_SCR_SKIP='${skip_csv}' bash -s" <<'PROBE_EOS'
+    h=$(hostname)
+    skip_csv="${BENCHFS_SCR_SKIP:-}"
+    skip_csv="${skip_csv//;/,}"
+    timeout_bin=$(command -v timeout || echo "")
+    for attempt in $(seq 1 30); do
+      bad=""
+      hang=""
+      for n in 0 1 2 3; do
+        if [ -n "$skip_csv" ]; then
+          case ",${skip_csv}," in
+            *",${n},"*) continue;;
+          esac
+        fi
+        d="/scr${n}/${PBS_JOBID}"
+        if [ -n "$timeout_bin" ]; then
+          $timeout_bin 5 test -d "$d"; rc=$?
+        else
+          test -d "$d"; rc=$?
+        fi
+        if [ "$rc" = "124" ]; then hang="${hang} /scr${n}"; continue
+        elif [ "$rc" != "0" ]; then bad="${bad} /scr${n}"; continue
+        fi
+        if [ -n "$timeout_bin" ]; then
+          $timeout_bin 5 touch "$d/.scr_probe.$$" 2>/dev/null; rc=$?
+        else
+          touch "$d/.scr_probe.$$" 2>/dev/null; rc=$?
+        fi
+        if [ "$rc" = "124" ]; then hang="${hang} /scr${n}"
+        elif [ "$rc" != "0" ]; then bad="${bad} /scr${n}(RO)"
+        else
+          [ -n "$timeout_bin" ] && $timeout_bin 5 rm -f "$d/.scr_probe.$$" 2>/dev/null \
+            || rm -f "$d/.scr_probe.$$" 2>/dev/null
+        fi
+      done
+      [ -z "$bad" ] && [ -z "$hang" ] && break
+      [ "$attempt" -lt 30 ] && sleep 10
+    done
+    if [ -n "$hang" ]; then echo "SCRATCH_HANG ${h}:${hang}"
+    elif [ -n "$bad" ]; then echo "SCRATCH_WAIT ${h}:${bad}"
+    else echo "SCRATCH_OK ${h}"; fi
+PROBE_EOS
+}
+SCRATCH_PROBE_OUTPUT=""
+SSH_PROBE_TIMEOUT="${SSH_PROBE_TIMEOUT:-360}"
+declare -a probe_pids=()
+declare -A probe_files=()
+probe_dir=$(mktemp -d)
+trap "rm -rf $probe_dir" EXIT
+while IFS= read -r host; do
+  outf="${probe_dir}/${host}.out"
+  probe_files["$host"]="$outf"
+  (
+    timeout --kill-after=15s ${SSH_PROBE_TIMEOUT}s bash -c "$(declare -f do_ssh_probe); do_ssh_probe '$host' '${PBS_JOBID}' '${BENCHFS_SCR_SKIP:-}'" \
+      > "$outf" 2>&1 \
+      || echo "SCRATCH_HANG $host:ssh_or_probe_timeout (rc=$?)" >> "$outf"
+  ) &
+  probe_pids+=("$!")
+done < "${UNIQUE_HOSTFILE}"
+# Wait with global cap; if a child is still alive after total budget,
+# kill it so the script moves on.
+probe_deadline=$(( $(date +%s) + SSH_PROBE_TIMEOUT + 30 ))
+for pid in "${probe_pids[@]}"; do
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$probe_deadline" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 2
+  done
+done
+for host in "${!probe_files[@]}"; do
+  outf="${probe_files[$host]}"
+  if [ -s "$outf" ]; then
+    SCRATCH_PROBE_OUTPUT+=$'\n'"$(cat "$outf")"
+  else
+    SCRATCH_PROBE_OUTPUT+=$'\n'"SCRATCH_HANG $host:no_response"
+  fi
+done
+probe_rc=0
+# Old code kept below for compat: this `bash -c` block is no longer
+# invoked (the heredoc above replaces it) but the original mpirun-style
+# fallback is preserved here for forensics. Replaced 2026-06-23.
+if false; then
+SCRATCH_PROBE_OUTPUT=$(timeout --kill-after=30s 600s "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
   --map-by ppr:1:node --bind-to none --oversubscribe \
   -x BENCHFS_SCR_SKIP \
   bash -c '
     h=$(hostname)
-    bad=""
     skip_csv="${BENCHFS_SCR_SKIP:-}"
-    for n in 0 1 2 3; do
-      if [ -n "$skip_csv" ]; then
-        case ",${skip_csv}," in
-          *",${n},"*) continue;;
-        esac
-      fi
-      d="/scr${n}/${PBS_JOBID}"
-      if [ ! -d "$d" ]; then
-        bad="${bad} /scr${n}"
-      elif ! touch "$d/.scr_probe.$$" 2>/dev/null; then
-        bad="${bad} /scr${n}(RO)"
+    skip_csv="${skip_csv//;/,}"
+    # 2026-06-18: forensics (jobs 29204/29205 on a19/a21 vs 29206 on
+    # a05) PROVED /scrN is NOT broken on any host. All 4 disks mount
+    # cleanly (xfs rw) and the prologue creates /scrN/JOBID owned by
+    # the user on every disk, identically on flagged and healthy hosts.
+    # The old SCRATCH_BAD a19/a21 /scr0/1/3 was a FALSE POSITIVE: a
+    # timing race with the PBS prologue per-disk reformat (umount + mkfs
+    # of disks holding terabytes from the previous job is slow; the data
+    # disks scr0/1/3 lag the lighter scr2). The dirs always appear;
+    # benchfsd launches after this probe so by then they exist. So just
+    # WAIT for the prologue to finish (up to 300 s),
+    # never declare a host "broken", never drop/shrink. If a dir is
+    # still missing after the wait, emit SCRATCH_WAIT (informational)
+    # and proceed with ALL hosts anyway — the prologue completes before
+    # benchfsd needs the dir.
+    # 2026-06-23: wrap each filesystem op in `timeout 5` so a stuck
+    # mount (rare-but-real per-host kernel state) cannot block the
+    # whole job at this probe. Without it the probe hangs forever and
+    # the entire walltime is wasted. With the timeout, a stuck host
+    # reports SCRATCH_HANG and we still proceed.
+    timeout_bin=$(command -v timeout || echo "")
+    fs_test() {
+      local op="$1" path="$2"
+      if [ -n "$timeout_bin" ]; then
+        $timeout_bin 5 "$op" "$path" 2>/dev/null
       else
-        rm -f "$d/.scr_probe.$$"
+        "$op" "$path" 2>/dev/null
       fi
+    }
+    for attempt in $(seq 1 30); do
+      bad=""
+      hang=""
+      for n in 0 1 2 3; do
+        if [ -n "$skip_csv" ]; then
+          case ",${skip_csv}," in
+            *",${n},"*) continue;;
+          esac
+        fi
+        d="/scr${n}/${PBS_JOBID}"
+        # stat -d may hang on a stuck mount; gate with timeout.
+        if [ -n "$timeout_bin" ]; then
+          $timeout_bin 5 test -d "$d"; rc=$?
+        else
+          test -d "$d"; rc=$?
+        fi
+        if [ "$rc" = "124" ]; then
+          hang="${hang} /scr${n}"
+          continue
+        elif [ "$rc" != "0" ]; then
+          bad="${bad} /scr${n}"
+          continue
+        fi
+        if [ -n "$timeout_bin" ]; then
+          $timeout_bin 5 touch "$d/.scr_probe.$$" 2>/dev/null; rc=$?
+        else
+          touch "$d/.scr_probe.$$" 2>/dev/null; rc=$?
+        fi
+        if [ "$rc" = "124" ]; then
+          hang="${hang} /scr${n}"
+        elif [ "$rc" != "0" ]; then
+          bad="${bad} /scr${n}(RO)"
+        else
+          [ -n "$timeout_bin" ] && $timeout_bin 5 rm -f "$d/.scr_probe.$$" 2>/dev/null \
+            || rm -f "$d/.scr_probe.$$" 2>/dev/null
+        fi
+      done
+      [ -z "$bad" ] && [ -z "$hang" ] && break
+      [ "$attempt" -lt 30 ] && sleep 10
     done
-    if [ -n "$bad" ]; then
-      echo "SCRATCH_BAD ${h}:${bad}"
+    if [ -n "$hang" ]; then
+      echo "SCRATCH_HANG ${h}:${hang}"
+    elif [ -n "$bad" ]; then
+      # NOT broken — prologue just not finished. Report and proceed.
+      echo "SCRATCH_WAIT ${h}:${bad}"
     else
       echo "SCRATCH_OK ${h}"
     fi
   ' 2>&1)
-echo "${SCRATCH_PROBE_OUTPUT}" | grep -E "^SCRATCH_(BAD|OK)" || true
-BAD_HOSTS=$(echo "${SCRATCH_PROBE_OUTPUT}" | grep "^SCRATCH_BAD" || true)
-if [ -n "${BAD_HOSTS}" ]; then
+probe_rc=$?
+fi  # end of disabled mpirun-probe fallback
+echo "${SCRATCH_PROBE_OUTPUT}" | grep -E "^SCRATCH_(WAIT|OK|HANG)" || true
+# 2026-06-18: auto-shrink REMOVED (per user). Forensics proved /scrN is
+# never truly broken — SCRATCH_WAIT just means the PBS prologue hadn't
+# finished reformatting some disks when the probe looked. Dropping those
+# hosts was throwing away healthy servers and lowering the score for no
+# reason. We now ALWAYS run on the full allocated host set; the prologue
+# completes before benchfsd needs the dirs.
+WAIT_HOSTS=$(echo "${SCRATCH_PROBE_OUTPUT}" | grep "^SCRATCH_WAIT" || true)
+if [ -n "${WAIT_HOSTS}" ]; then
   echo ""
-  echo "==========================================="
-  echo "ERROR: broken /scrN scratch on these hosts:"
-  echo "${BAD_HOSTS}"
-  echo "Aborting before benchfsd launch. Resubmit without host pin or"
-  echo "exclude the offending hosts via PBS_SELECT_OVERRIDE."
-  echo "==========================================="
+  echo "NOTE: prologue still finishing /scrN on these hosts at probe time"
+  echo "(NOT broken — dirs appear before benchfsd launch; keeping all hosts):"
+  echo "${WAIT_HOSTS}"
+fi
+# 2026-06-23: a SCRATCH_HANG entry means a host had a stuck filesystem
+# syscall (touch/test timed out after 5 s). benchfsd would also hang on
+# that host — drop it from the allocation so the rest of the job can run.
+HANG_HOSTS=$(echo "${SCRATCH_PROBE_OUTPUT}" | grep "^SCRATCH_HANG" | awk '{print $2}' | cut -d: -f1 | sort -u)
+if [ "$probe_rc" = "124" ]; then
+  # mpirun timed out — we have no per-host output. Print diagnostics
+  # and abort early so PBS doesn't burn the rest of the walltime.
+  echo ""
+  echo "FATAL: scratch probe mpirun timed out (>=600s). Likely a host's"
+  echo "       sshd or orte launch is stuck. Aborting before benchfsd."
+  echo "Hostfile: ${UNIQUE_HOSTFILE}"
+  cat "${UNIQUE_HOSTFILE}" || true
   exit 1
 fi
-echo "Scratch dirs OK on all ${NNODES} hosts."
+if [ -n "${HANG_HOSTS}" ]; then
+  echo ""
+  echo "DROP: hosts with stuck filesystem syscall (auto-shrink, hang≠wait):"
+  echo "${HANG_HOSTS}"
+  KEEP_FILE="${JOB_OUTPUT_DIR}/unique_nodes.kept"
+  grep -v -F -x -f <(echo "${HANG_HOSTS}") "${UNIQUE_HOSTFILE}" > "${KEEP_FILE}" || true
+  if [ ! -s "${KEEP_FILE}" ]; then
+    echo "FATAL: all hosts hung. Aborting."
+    exit 1
+  fi
+  mv "${UNIQUE_HOSTFILE}" "${UNIQUE_HOSTFILE}.orig"
+  cp "${KEEP_FILE}" "${UNIQUE_HOSTFILE}"
+  NNODES=$(wc -l < "${UNIQUE_HOSTFILE}")
+  # Also rewrite the PBS-style per-vnode hostfile (4 entries/host) the
+  # downstream mpirun calls use as PBS_NODEFILE.
+  NEW_NODEFILE="${JOB_OUTPUT_DIR}/pbs_nodefile.kept"
+  : > "${NEW_NODEFILE}"
+  while IFS= read -r hh; do
+    for _ in 1 2 3 4; do echo "${hh}" >> "${NEW_NODEFILE}"; done
+  done < "${UNIQUE_HOSTFILE}"
+  VNODES=$(wc -l < "${NEW_NODEFILE}")
+  export PBS_NODEFILE="${NEW_NODEFILE}"
+  # Truncate CLIENT_NNODES too.
+  if [ "${CLIENT_NNODES:-0}" -gt "${NNODES}" ]; then
+    CLIENT_NNODES="${NNODES}"
+  fi
+  head -n "${CLIENT_NNODES}" "${UNIQUE_HOSTFILE}" > "${CLIENT_HOSTFILE}"
+  export NNODES VNODES CLIENT_NNODES
+  echo "After drop: NNODES=${NNODES} VNODES=${VNODES} CLIENT_NNODES=${CLIENT_NNODES}"
+fi
+echo "Proceeding with ${NNODES} hosts (${VNODES} vnodes)."
 
 # Optional UCX-only TCP fallback for debugging cross-node RDMA-related bugs.
 # Set FORCE_UCX_TCP=1 to force BenchFS's internal UCX context to TCP/SHM
@@ -312,14 +546,26 @@ parse_size_to_bytes() {
 
 check_server_ready() {
   local expected_count=$1
-  local max_attempts=180
+  local max_attempts="${CHECK_SERVER_READY_TIMEOUT:-600}"
   local attempt=0
+  local last_progress_attempt=0
+  local last_count=0
   while [ $attempt -lt $max_attempts ]; do
     local ready_count=$(find "${BENCHFS_REGISTRY_DIR}" -name "node_*.addr" -type f 2>/dev/null | wc -l)
+    if [ "$ready_count" -ne "$last_count" ]; then
+      echo "BenchFS servers registered: ${ready_count}/${expected_count} (t=${attempt}s)"
+      last_count=$ready_count
+      last_progress_attempt=$attempt
+    fi
     if [ "$ready_count" -eq "$expected_count" ]; then
       echo "BenchFS servers registered: $ready_count/$expected_count"
       sleep 10
       return 0
+    fi
+    # If no new daemons in 120 s after at least 1 was registered, bail.
+    if [ "$ready_count" -gt 0 ] && [ $((attempt - last_progress_attempt)) -ge 120 ]; then
+      echo "ERROR: BenchFS daemon registration stalled at $ready_count/$expected_count for 120s"
+      return 1
     fi
     sleep 1
     attempt=$((attempt + 1))
@@ -372,13 +618,81 @@ stop_benchfsd() {
         2>/dev/null || true
     fi
   fi
+  # 2026-06-02 SIGBUS forensic: rescue core files from /scr0/$PBS_JOBID/cores/
+  # on every host before PBS epilogue wipes /scr0/$PBS_JOBID. Copies into
+  # JOB_OUTPUT_DIR/cores/<host>/ (Lustre). Only runs when IO500_ENABLE_CORE=1.
+  if [ "${IO500_ENABLE_CORE:-0}" = "1" ]; then
+    mkdir -p "${JOB_OUTPUT_DIR}/cores"
+    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+      --map-by ppr:1:node --bind-to none --oversubscribe \
+      -x JOB_OUTPUT_DIR -x PBS_JOBID \
+      bash -c '
+        h=$(hostname -s)
+        src="/scr0/${PBS_JOBID}/cores"
+        if [ -d "$src" ] && [ -n "$(ls -A $src 2>/dev/null)" ]; then
+          dst="${JOB_OUTPUT_DIR}/cores/${h}"
+          mkdir -p "$dst"
+          cp -p "$src"/* "$dst"/ 2>/dev/null || true
+          n=$(ls "$dst" 2>/dev/null | wc -l)
+          echo "[core-rescue $h] saved $n core files to $dst"
+        else
+          echo "[core-rescue $h] no cores at $src"
+        fi
+      ' 2>&1 | grep -E "^\[core-rescue" || true
+    # Per-host coredumpctl probe — user-readable systemd-coredump events.
+    # dmesg is restricted, /var/log/messages is restricted, but
+    # `coredumpctl list` and `coredumpctl info <pid>` work in user mode
+    # for crashes owned by $USER. This is the practical way to get siginfo
+    # (Signal: BUS, Code: BUS_ADRERR=2 etc.) and the executable that died.
+    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+      --map-by ppr:1:node --bind-to none --oversubscribe \
+      -x JOB_OUTPUT_DIR -x PBS_JOBID -x USER \
+      bash -c '
+        h=$(hostname -s)
+        out="${JOB_OUTPUT_DIR}/coredumpctl_${h}.txt"
+        {
+          echo "=== coredumpctl list (last 15 min, user=$USER) ==="
+          coredumpctl list --since "15 min ago" --no-pager 2>&1 | head -80
+          echo
+          echo "=== coredumpctl info on most recent 5 crashes ==="
+          # Latest 5 PIDs from the list — `coredumpctl list` output cols:
+          # TIME PID UID GID SIG COREFILE EXE SIZE
+          coredumpctl list --since "15 min ago" --no-pager -q 2>/dev/null \
+            | tail -n +1 | awk "{print \$5\" \"\$8\" \"\$11}" \
+            | head -5 \
+            | while read pid sig exe; do
+                if [ -n "$pid" ]; then
+                  echo "--- PID=$pid SIG=$sig EXE=$exe ---"
+                  coredumpctl info "$pid" --no-pager 2>&1 | head -50
+                  echo
+                fi
+              done
+          echo
+          echo "=== kernel.core_pattern ==="
+          cat /proc/sys/kernel/core_pattern 2>/dev/null
+          echo
+          echo "=== /var/lib/systemd/coredump (last 5 entries) ==="
+          ls -la /var/lib/systemd/coredump 2>&1 | tail -10
+          echo
+          echo "=== journalctl --user CRASH/segfault ==="
+          journalctl --user --since "15 min ago" --no-pager 2>&1 | grep -iE "crash|segfault|sigbus|signal" | tail -20
+          echo
+          echo "=== journalctl (system) last crash records ==="
+          journalctl --since "15 min ago" --no-pager -p err 2>&1 | tail -30
+        } > "$out" 2>&1
+        echo "[coredump $h] saved to $out"
+      ' 2>&1 | grep -E "^\[coredump" || true
+  fi
 }
 
 start_benchfsd() {
   local config_id=$1
   local chunk_bytes=$2
+  echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] entry config_id=${config_id}"
 
+  echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] rm -rf ${BENCHFS_REGISTRY_DIR}/*"
   rm -rf "${BENCHFS_REGISTRY_DIR}"/*
+  echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] rm done rc=$?"
 
   # Pre-startup cleanup of stale standalone-daemon SHM rings. A previous
   # forced-kill (qdel -W force) or PBS exit=-20 bypasses stop_benchfsd's
@@ -410,20 +724,76 @@ start_benchfsd() {
     # (a05/06/08 had 1180-1245 leaked relay_ch_* files filling 100% of
     # /dev/shm because cleanup landed only on a02-a04).
     # Aggressive cleanup: kill any leftover daemons/io500 from prior jobs,
-    # then remove all user-owned /dev/shm files. Two mpirun calls (kill + rm)
-    # keep each command simple and easier to debug.
-    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+    # then remove all user-owned /dev/shm files.
+    #
+    # 2026-06-02 hardening — earlier runs (job 27267 / 27277) showed
+    # `[SHM_PROBE] benchfsd=3 io500=3` AFTER a single `pkill -9`, meaning
+    # a few benchfsd_mpi survived SIGKILL (likely mid-blocking-syscall
+    # in io_uring waitcomp or mlx5 destroy). The surviving processes
+    # held /dev/shm fds open, so the next benchfs_init's ftruncate +
+    # mmap on a freshly created SHM produced a sparse / unbacked region
+    # → SIGBUS on first write (iter78-82 pattern). Fix: loop SIGKILL up
+    # to 5 rounds until pgrep returns 0, AND probe again after rm so we
+    # can see which hosts are still wedged.
+    # 2026-06-23 fix: use `pkill -x` (basename exact) instead of `-f`.
+    # `-f benchfsd_mpi` matches anything with "benchfsd_mpi" in argv —
+    # including the mpirun process itself (its argv carries the bash -c
+    # string with "benchfsd_mpi" inside). That triggered a SIGKILL race
+    # on rank 0's local mpirun in the same PBS job, which 29735/29792
+    # left in a state that never returned. The exact-match form only
+    # kills the actual binary. Same for io500.
+    # Outer `timeout 60s` is a belt-and-braces guard so even if mpirun
+    # itself wedges we don't burn the whole walltime.
+    echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] SHM-cleanup mpirun (pkill)"
+    timeout --kill-after=15s 60s "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
       --map-by ppr:1:node --bind-to none --oversubscribe \
-      bash -c 'pkill -9 -u "$USER" -f benchfsd_mpi; pkill -9 -u "$USER" -f io500_wrapper; pkill -9 -u "$USER" -x io500; sleep 2; echo "[CLEAN $(hostname)] killed leftover daemon/io500 procs"' \
-      2>&1 | grep -E "^\[CLEAN" || true
-    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+      bash -c '
+        h=$(hostname)
+        mine=$$
+        tot=0
+        for attempt in 1 2 3 4 5; do
+          pkill -9 -u "$USER" -x benchfsd_mpi 2>/dev/null || true
+          pkill -9 -u "$USER" -x io500_wrapper.sh 2>/dev/null || true
+          pkill -9 -u "$USER" -x io500 2>/dev/null || true
+          sleep 1
+          surv_b=$(pgrep -u "$USER" -x benchfsd_mpi 2>/dev/null | wc -l)
+          surv_i=$(pgrep -u "$USER" -x io500_wrapper.sh 2>/dev/null | wc -l)
+          surv_x=$(pgrep -u "$USER" -x io500 2>/dev/null | wc -l)
+          tot=$(( surv_b + surv_i + surv_x ))
+          if [ "$tot" -eq 0 ]; then break; fi
+        done
+        if [ "$tot" -gt 0 ]; then
+          echo "[CLEAN $h] WARN $tot procs survived 5x SIGKILL after $attempt rounds"
+          pgrep -u "$USER" -x benchfsd_mpi 2>/dev/null | head -6 | sed "s/^/[CLEAN $h surv pid] /"
+        fi
+        echo "[CLEAN $h] killed leftover daemon/io500 procs (rounds=$attempt surv=$tot)"
+      ' 2>&1 | grep -E "^\[CLEAN" || true
+    echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] SHM-cleanup mpirun (pkill) done"
+    echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] SHM-rm mpirun (find -delete)"
+    timeout --kill-after=15s 60s "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
       --map-by ppr:1:node --bind-to none --oversubscribe \
       bash -c 'n=$(find /dev/shm -maxdepth 1 -user "$USER" -type f 2>/dev/null | wc -l); find /dev/shm -maxdepth 1 -user "$USER" -type f -delete 2>/dev/null; echo "[CLEAN $(hostname)] removed $n shm files"' \
       2>&1 | grep -E "^\[CLEAN" || true
-    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+    echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] SHM-rm mpirun done"
+    # Probe after rm: surviving processes => SIGBUS risk on next init.
+    # `pgrep -fc` may double-count the parent bash (its argv contains
+    # the pattern), so we subtract our own $$ to get the real count.
+    echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] SHM-probe mpirun"
+    timeout --kill-after=15s 60s "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
       --map-by ppr:1:node --bind-to none --oversubscribe \
-      bash -c 'echo "[SHM_PROBE $(hostname)] $(df -h /dev/shm | tail -1) files=$(ls /dev/shm 2>/dev/null | wc -l) benchfsd=$(pgrep -fc benchfsd_mpi 2>/dev/null) io500=$(pgrep -fc io500_wrapper 2>/dev/null)"' \
-      2>&1 | grep -E "^\[SHM_PROBE"
+      bash -c '
+        h=$(hostname)
+        mine=$$
+        surv_b=$(pgrep -u "$USER" -f benchfsd_mpi 2>/dev/null | grep -v "^${mine}$" | wc -l)
+        surv_i=$(pgrep -u "$USER" -f io500_wrapper 2>/dev/null | grep -v "^${mine}$" | wc -l)
+        shm_i=$(df -i /dev/shm 2>/dev/null | tail -1 | awk "{print \$3 \"/\" \$2}")
+        echo "[SHM_PROBE $h] $(df -h /dev/shm | tail -1) files=$(ls /dev/shm 2>/dev/null | wc -l) inodes=$shm_i benchfsd_real=${surv_b} io500_real=${surv_i}"
+        if [ "${surv_b}" -gt 0 ] || [ "${surv_i}" -gt 0 ]; then
+          pgrep -u "$USER" -fl benchfsd_mpi 2>/dev/null | grep -v "^${mine} " | head -4 | sed "s/^/[SHM_PROBE $h surv] /"
+          pgrep -u "$USER" -fl io500_wrapper 2>/dev/null | grep -v "^${mine} " | head -4 | sed "s/^/[SHM_PROBE $h surv] /"
+        fi
+        ls -la /dev/shm 2>/dev/null | head -20 | sed "s/^/[SHM_LS $h] /"
+      ' 2>&1 | grep -E "^\[SHM_PROBE|^\[SHM_LS"
   fi
 
   # Clean /scrN/*. Per-job dirs (`/scrN/<PBS_JOBID>`) from PRIOR runs
@@ -432,6 +802,7 @@ start_benchfsd() {
   # iterations added more. Removing siblings via `find` is safe because
   # PBS reuses /scrN only on rerun; nothing outside our jobs writes
   # there.
+  echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] scrN cleanup mpirun"
   "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
     --bind-to none --oversubscribe -x PBS_JOBID \
     bash -c '
@@ -448,6 +819,7 @@ start_benchfsd() {
         fi
       done
     ' 2>/dev/null || true
+  echo "[START_BENCHFSD $(date +%H:%M:%S.%N)] scrN cleanup mpirun done"
 
   local server_log_dir="${BENCHFSD_LOG_BASE_DIR}/server_${config_id}"
   mkdir -p "${server_log_dir}"
@@ -541,6 +913,7 @@ log_level = "info"
 [storage]
 chunk_size = ${chunk_bytes}
 use_iouring = true
+storage_backend = "${BENCHFS_STORAGE_BACKEND:-iouring}"
 max_storage_gb = 0
 chunk_layout = "${BENCHFS_CHUNK_LAYOUT:-per_chunk}"
 unified_shards = ${BENCHFS_UNIFIED_SHARDS:-1}
@@ -734,8 +1107,17 @@ WRAPPER_EOF
   # different node_ids in the chunk hash so chunk files don't collide.
   local server_ranks_per_vnode="${BENCHFS_SERVER_RANKS_PER_VNODE:-1}"
   local server_np=$((VNODES * server_ranks_per_vnode))
+  # 2026-06-13: pin daemon placement to UNIQUE_HOSTFILE. Without an
+  # explicit hostfile prte spreads ranks over the FULL PBS allocation,
+  # which broke the SCRATCH_BAD host-drop path in 28801: daemons landed
+  # on the dropped host (a21) and skipped the head node (a01), so a01's
+  # clients found no local daemon SHM. ppr keeps exactly
+  # vnodes-per-host daemons on every listed host.
+  local ppr_per_host=$((VNODES / NNODES * server_ranks_per_vnode))
   local cmd=(
     "${cmd_mpirun_common[@]}"
+    --hostfile "${UNIQUE_HOSTFILE}"
+    --map-by "ppr:${ppr_per_host}:node"
     -np "$server_np"
     --bind-to none
     --oversubscribe
@@ -746,6 +1128,11 @@ WRAPPER_EOF
     -x BENCHFS_SCRATCH_DIRS="${BENCHFS_SCRATCH_DIRS_CSV}"
     -x BENCHFS_INNER_BINARY
     -x PLUVIO_URING_ALWAYS_POLL
+    # 2026-06-12: userspace SQPOLL (submit-offload thread in
+    # pluvio_uring). Kernel SQPOLL freezes hosts at 20-phys load, so
+    # the daemon offloads io_uring_enter to a dedicated thread instead.
+    -x PLUVIO_URING_SUBMIT_THREAD
+    -x BENCHFS_PIPELINE_DUMP_MS
     -x LOCUSTA_DAEMON_EVENT_BUDGET
     -x BENCHFS_EXPECTED_NODES="$((VNODES * ${BENCHFS_SERVER_RANKS_PER_VNODE:-1}))"
     # Standalone-daemon mode opt-in (iter191+). When 1, the wrapper
@@ -1008,6 +1395,7 @@ run_io500() {
     # and uses these to control its ssh fan-out.
     -x BENCHFS_PFIND_NRANKS="${BENCHFS_PFIND_NRANKS:-10}"
     -x PBS_NODEFILE
+    ${IO500_SIGPROBE:+ -x LD_PRELOAD}
     "${asan_args[@]}"
     "${IO500_DIR}/io500_wrapper.sh"
     "${IO500_DIR}/io500"
@@ -1026,8 +1414,64 @@ run_io500() {
   fi
   local stonewall_for_timeout="${IO500_STONEWALL_FOR_TIMEOUT:-${default_stonewall}}"
   local timeout_s=$(( stonewall_for_timeout > 0 ? stonewall_for_timeout * 12 + 600 : 1800 ))
-  timeout --signal=TERM --kill-after=30 "${timeout_s}" \
-    "${cmd[@]}" > "${out_dir}/io500_stdout.log" 2> "${out_dir}/io500_stderr.log" || true
+  set +e
+  # 2026-06-02 SIGBUS forensic: IO500_SIGPROBE=1 sets LD_PRELOAD to the
+  # local sigprobe lib so timeout/mpirun/ranks all install a SA_SIGINFO
+  # SIGBUS handler that writes si_code/si_addr/RIP to fd=2 AND to
+  # /dev/shm/sigprobe_pid<N>_tid<T>.log (so it survives bash stderr
+  # redirection). Build: jobs/diag/sigprobe/build_and_install.sh
+  local sigprobe_env=""
+  if [ "${IO500_SIGPROBE:-0}" = "1" ]; then
+    local probe_lib="${BENCHFS_PREFIX%/release}/../jobs/diag/sigprobe/libsigprobe.so"
+    probe_lib="$(readlink -f "${probe_lib}" 2>/dev/null || echo "${probe_lib}")"
+    if [ -f "${probe_lib}" ]; then
+      sigprobe_env="LD_PRELOAD=${probe_lib}"
+      export LD_PRELOAD="${probe_lib}"
+      echo "[sigprobe] LD_PRELOAD=${probe_lib}"
+    else
+      echo "[sigprobe] WARN: libsigprobe.so not found at ${probe_lib}"
+    fi
+  fi
+  # 2026-06-02 SIGBUS forensic: bypass timeout(1) entirely. If bash still
+  # reports "バスエラー" for `mpirun ...`, the SIGBUS is in mpirun
+  # itself. If bash reports a non-signal exit code, the prior SIGBUS was
+  # in timeout(1) (perhaps PBS/cgroup sending it). The first arg in
+  # cmd[@] is `mpirun` so we just drop the `timeout` prefix.
+  if [ "${IO500_BYPASS_TIMEOUT:-0}" = "1" ]; then
+    "${cmd[@]}" > "${out_dir}/io500_stdout.log" 2> "${out_dir}/io500_stderr.log"
+    local rc=$?
+    echo "[bypass-timeout-exit] code=${rc}" > "${out_dir}/timeout_exit.log"
+  else
+    timeout --signal=TERM --kill-after=30 "${timeout_s}" \
+      "${cmd[@]}" > "${out_dir}/io500_stdout.log" 2> "${out_dir}/io500_stderr.log"
+    local rc=$?
+    echo "[timeout-exit] code=${rc} (128+7=135 => bash WIFSIGNALED with SIGBUS)" \
+      > "${out_dir}/timeout_exit.log"
+  fi
+  # Unset LD_PRELOAD for downstream commands (stop_benchfsd etc.)
+  if [ -n "${sigprobe_env}" ]; then
+    unset LD_PRELOAD
+  fi
+  # Gather sigprobe logs from all hosts.
+  if [ "${IO500_SIGPROBE:-0}" = "1" ]; then
+    mkdir -p "${out_dir}/sigprobe"
+    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "${NNODES}" \
+      --map-by ppr:1:node --bind-to none --oversubscribe \
+      -x JOB_OUTPUT_DIR -x USER -x out_dir="${out_dir}" \
+      bash -c '
+        h=$(hostname -s)
+        dst="${out_dir}/sigprobe/${h}"
+        mkdir -p "${dst}"
+        n=$(ls /dev/shm/sigprobe_pid*.log 2>/dev/null | wc -l)
+        if [ "${n}" -gt 0 ]; then
+          cp /dev/shm/sigprobe_pid*.log "${dst}/" 2>/dev/null
+          rm -f /dev/shm/sigprobe_pid*.log
+          echo "[sigprobe-collect ${h}] collected ${n} logs"
+        else
+          echo "[sigprobe-collect ${h}] no logs"
+        fi
+      ' 2>&1 | grep -E "^\[sigprobe-collect" || true
+  fi
 }
 
 # Parse [RESULT] lines from io500 stdout. Echoes "phase score" per line.
@@ -1206,6 +1650,53 @@ if [ -n "${best_transfer}" ]; then
   final_mdtest="${IO500_FINAL_MDTEST:-1}"
   write_ini "${ini}" "${data_dir}" "${result_dir}" \
     "${FINAL_STONEWALL}" "${best_transfer}" "${best_block}" "${best_fpp}" "${final_hard}" "${best_chunk_bytes}" "${final_mdtest}"
+
+  # 2026-06-02 SIGBUS forensic: dump /dev/shm AFTER benchfsd_mpi servers
+  # finished registering, BEFORE client mpirun launches. The SIGBUS that
+  # hits client mpirun on a12-a23 host sets fires only when BenchFS
+  # server is up; pure mpirun on the same hosts succeeds. So the
+  # server-created SHM state must be triggering it. This probe lists
+  # every /dev/shm file + its size + an ftruncate-vs-stat check.
+  if [ "${SHM_PROBE_BEFORE_CLIENT:-1}" = "1" ]; then
+    "${cmd_mpirun_util[@]}" --hostfile "${UNIQUE_HOSTFILE}" -np "$NNODES" \
+      --map-by ppr:1:node --bind-to none --oversubscribe \
+      -x JOB_OUTPUT_DIR -x USER \
+      bash -c '
+        h=$(hostname -s)
+        out="${JOB_OUTPUT_DIR}/preclient_shm_${h}.txt"
+        {
+          echo "=== df -h /dev/shm ==="
+          df -h /dev/shm
+          echo "=== df -i /dev/shm ==="
+          df -i /dev/shm
+          echo "=== /dev/shm full listing (all owners, sizes) ==="
+          ls -la /dev/shm
+          echo "=== per-user breakdown ==="
+          ls -la /dev/shm | awk "NR>2 {users[\$3]++; sizes[\$3]+=\$5} END {for (u in users) printf \"%-15s files=%d total_bytes=%d\n\", u, users[u], sizes[u]}"
+          echo "=== rmaeda-owned (potentially BenchFS) SHM detail ==="
+          # Show file stat: blocks, size, modtime. If size > 0 but blocks=0 = sparse / unbacked.
+          for f in /dev/shm/*; do
+            if [ -f "$f" ] && [ "$(stat -c %U "$f")" = "$USER" ]; then
+              stat -c "%n size=%s blocks=%b mode=%a mtime=%y" "$f"
+            fi
+          done
+          echo "=== ulimit summary ==="
+          ulimit -a
+          echo "=== memory pressure / cgroup limits ==="
+          if [ -r /proc/self/cgroup ]; then
+            grep -E "memory|name=systemd" /proc/self/cgroup
+          fi
+          for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.swap.max; do
+            if [ -r "$f" ]; then echo "$f = $(cat $f)"; fi
+          done
+          # Also check this process actual cgroup memory accounting
+          if [ -r /proc/self/status ]; then
+            grep -E "VmRSS|VmHWM|VmData|VmSize" /proc/self/status
+          fi
+        } > "$out" 2>&1
+        echo "[preclient-shm $h] dumped"
+      ' 2>&1 | grep -E "^\[preclient-shm" || true
+  fi
 
   current_run_label="final"
   IO500_STONEWALL_FOR_TIMEOUT="${FINAL_STONEWALL}" \

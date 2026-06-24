@@ -1,0 +1,34 @@
+# BenchFS UCX transport profile + per-RPC breakdown logging.
+#
+# Use this to capture AM_SEND_TIMING / AM_SEND_BREAKDOWN data for
+# UCX investigations (see project_ucx_path_broken_2026_05_16.md).
+# Same loader semantics as locusta_default.toml.
+
+# === Transport ===
+# Leave BENCHFS_TRANSPORT unset → UCX is the default path.
+# BENCHFS_TRANSPORT = "ucx"   # (uncomment to be explicit)
+
+# === pluvio runtime scheduling ===
+BENCHFS_REACTOR_POLL_INTERVAL = 2
+BENCHFS_STATUS_CACHE_ITERS = 2
+
+# === io_uring ===
+BENCHFS_CHUNK_FD_CACHE_SIZE = 0
+BENCHFS_IOURING_QUEUE_SIZE = 2048
+BENCHFS_IOURING_SUBMIT_DEPTH = 512
+
+# === RPC client ===
+BENCHFS_MAX_CONCURRENT_CHUNK_RPCS = 16
+
+# === Logging / stats (full breakdown) ===
+# `ucx_am_breakdown=debug` enables the per-am_send call/await split in
+# async-ucx (see lib/pluvio/pluvio_ucx/lib/async-ucx/src/ucp/endpoint/am.rs).
+# `pluvio_ucx::worker::am=debug` emits AM_SEND_TIMING.
+ENABLE_STATS = 1
+BENCHFS_UCX_AM_BREAKDOWN = 1
+RUST_LOG_S = "info,pluvio_ucx::worker::am=debug,ucx_am_breakdown=debug"
+RUST_LOG_C = "info,pluvio_ucx::worker::am=debug,ucx_am_breakdown=debug"
+
+# === UCX library env (used only when transport=UCX) ===
+# UCX_RNDV_THRESH = "inf"     # uncomment to force eager (job 20372 result: no change)
+# UCX_LOG_LEVEL = "info"

@@ -115,30 +115,105 @@ impl IOUringBackend {
         // First submit consumes the FixedBuffer; we keep it alive but loop
         // over `write_fixed_raw` if the kernel returns a short write so
         // ior-hard's 47KB transfers don't leave silent gaps on disk.
-        let (first_n, _fixed_buffer) = dma_file
+        //
+        // **ENOMEM handling (2026-05-31)**: kernel `io_rw_alloc_async`
+        // can return CQE.res == -ENOMEM under heavy in-flight pressure.
+        // `dma_file.write_fixed` surfaces this as `Err(io::Error)` with
+        // raw_os_error() == Some(ENOMEM). The FixedBuffer is consumed by
+        // that call, but `buf_index` + `buf_ptr` were captured above so
+        // the tail short-write loop can reissue the transfer via
+        // `write_fixed_raw`. Treat the first ENOMEM as a "0-byte
+        // success" and let the tail loop drive retries.
+        let write_fixed_res = dma_file
             .write_fixed(fixed_buffer, offset, write_len)
-            .await
-            .map_err(StorageError::IoError)?;
-        if first_n < 0 {
-            return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
-                -first_n,
-            )));
-        }
-        let mut total = first_n as usize;
+            .await;
+        let mut total: usize = match write_fixed_res {
+            Ok((first_n, _fixed_buffer)) => {
+                if first_n < 0 {
+                    let err_code = -first_n;
+                    if err_code == libc::ENOMEM {
+                        eprintln!(
+                            "[write_fixed_direct] ENOMEM CQE.res=-12, fd={} offset={} len={} — handing off to tail retry",
+                            handle.0, offset, write_len
+                        );
+                        pluvio_timer::sleep(std::time::Duration::from_millis(1)).await;
+                        0
+                    } else {
+                        return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                            err_code,
+                        )));
+                    }
+                } else {
+                    first_n as usize
+                }
+            }
+            Err(io_err) => {
+                if io_err.raw_os_error() == Some(libc::ENOMEM) {
+                    eprintln!(
+                        "[write_fixed_direct] ENOMEM Err(io_err), fd={} offset={} len={} — handing off to tail retry",
+                        handle.0, offset, write_len
+                    );
+                    pluvio_timer::sleep(std::time::Duration::from_millis(1)).await;
+                    0
+                } else {
+                    return Err(StorageError::IoError(io_err));
+                }
+            }
+        };
+        // Carry over: did the first submit fail with ENOMEM? The tail
+        // loop uses this to seed `enomem_attempts` and to know whether
+        // the very first iteration should treat its result as the
+        // retry-after-ENOMEM case.
+        let first_submit_failed_enomem = total == 0;
+        // ENOMEM retry budget (CQE.res == -ENOMEM from kernel
+        // `io_rw_alloc_async` under heavy in-flight pressure). The
+        // first failed submit already burned one attempt.
+        const MAX_ENOMEM_ATTEMPTS: u32 = 8;
+        let mut enomem_attempts: u32 = if first_submit_failed_enomem { 1 } else { 0 };
         while total < write_len as usize {
             let cur_ptr = unsafe { buf_ptr.add(total) };
             let cur_offset = offset + total as u64;
             let remaining = write_len as usize - total;
-            let n = dma_file
+            let raw_res = dma_file
                 .write_fixed_raw(cur_offset, cur_ptr, remaining as u32, buf_index)
-                .await
-                .map_err(StorageError::IoError)?;
+                .await;
+            let n = match raw_res {
+                Ok(n) => n,
+                Err(io_err) => {
+                    if io_err.raw_os_error() == Some(libc::ENOMEM) {
+                        // Treat the Err(ENOMEM) the same as CQE.res ==
+                        // -ENOMEM so the retry logic below kicks in.
+                        -(libc::ENOMEM as i32)
+                    } else {
+                        return Err(StorageError::IoError(io_err));
+                    }
+                }
+            };
             if n > 0 {
                 total += n as usize;
             } else if n == 0 {
                 return Err(StorageError::IoError(std::io::Error::other(
                     "write_fixed_raw returned 0 on retry",
                 )));
+            } else if -n == libc::ENOMEM {
+                enomem_attempts += 1;
+                if enomem_attempts > MAX_ENOMEM_ATTEMPTS {
+                    eprintln!(
+                        "[write_fixed_direct] ENOMEM giving up after {} attempts fd={} offset={} remaining={}",
+                        enomem_attempts, handle.0, cur_offset, remaining
+                    );
+                    return Err(StorageError::IoError(std::io::Error::from_raw_os_error(
+                        libc::ENOMEM,
+                    )));
+                }
+                // Exponential backoff: 1, 2, 4, 8, 16, 32, 64, 128 ms
+                let sleep_ms = 1u64 << (enomem_attempts - 1).min(7);
+                eprintln!(
+                    "[write_fixed_direct] ENOMEM tail attempt={}/{} fd={} offset={} remaining={} sleep={}ms",
+                    enomem_attempts, MAX_ENOMEM_ATTEMPTS, handle.0, cur_offset, remaining, sleep_ms
+                );
+                pluvio_timer::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                continue;
             } else {
                 return Err(StorageError::IoError(std::io::Error::from_raw_os_error(-n)));
             }

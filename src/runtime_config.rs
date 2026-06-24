@@ -84,6 +84,12 @@ pub struct ApiConfig {
     /// Same idea for `benchfs_close` (`MetadataUpdate` for size). Was
     /// env `BENCHFS_CLOSE_META_ASYNC=1`.
     pub close_meta_async: bool,
+    /// io500 compliance: at `benchfs_close`, fsync every chunk of the
+    /// file across the cluster before the metadata-sync RPC. Ensures
+    /// the rule "data is persistently stored before acknowledging the
+    /// close" is satisfied for chunk data (the metadata side is handled
+    /// by `[metadata].persist = "writethrough"`).
+    pub fsync_on_close: bool,
 }
 
 impl Default for ApiConfig {
@@ -91,6 +97,7 @@ impl Default for ApiConfig {
         Self {
             open_meta_async: false,
             close_meta_async: false,
+            fsync_on_close: false,
         }
     }
 }
@@ -393,6 +400,16 @@ pub struct StatsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct MetadataConfig {
     pub persist: String,
+    /// CHFS-style xattr metadata persistence. When `true`, the close-time
+    /// `MetadataUpdate` handler stores the file size in chunk 0's
+    /// `user.benchfs.size` xattr instead of doing a separate inode_store
+    /// WT (open + write + fsync + close = 4 io_uring SQEs). The xattr is
+    /// persisted together with the chunk-fsync that `dirty_chunks` already
+    /// issues, so compliance is preserved (data + inode-side size both
+    /// durable before close ack). On XFS, short xattrs live inline in the
+    /// inode → essentially free per-file persistence.
+    #[serde(default)]
+    pub xattr_size: bool,
     /// Writeback only — drain cadence in ms.
     pub flush_interval_ms: u64,
     /// Writeback only — high watermark on the dirty set; the next
@@ -413,6 +430,7 @@ impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
             persist: "off".to_string(),
+            xattr_size: false,
             flush_interval_ms: 50,
             dirty_high_watermark: 16384,
             distributed: true,
@@ -489,6 +507,14 @@ pub struct StorageConfig {
     pub unified_shards: u32,
     /// Use `mmap` for chunk writes (vs pwrite via io_uring).
     pub chunk_mmap_write: bool,
+    /// Force every chunk file open to use `O_DIRECT`, bypassing the
+    /// kernel page cache for both read and write paths. When false (the
+    /// default), `direct_io_aligned(offset,len)` auto-picks O_DIRECT for
+    /// aligned 4 KiB requests only. Set true for io500-style measurement
+    /// where page-cache effects must be eliminated (eg writethrough
+    /// metadata evicts chunk data between write and read phases, so the
+    /// honest read perf is disk-bound regardless).
+    pub chunk_force_direct: bool,
 }
 
 impl Default for StorageConfig {
@@ -497,6 +523,7 @@ impl Default for StorageConfig {
             chunk_layout: "per_chunk".to_string(),
             unified_shards: 1,
             chunk_mmap_write: false,
+            chunk_force_direct: false,
         }
     }
 }

@@ -1,0 +1,102 @@
+# BenchFS runtime profile — locusta backend defaults (validated 2026-05-19).
+#
+# All knobs live in this single TOML file. Loaded once at process startup
+# via `RuntimeConfig::global()` from the path in BENCHFS_CONFIG (the only
+# remaining env var, used solely to point the loader at this file).
+#
+# To override individual values:
+#   1. Copy this profile to `<my>.toml` and edit, then export
+#      BENCHFS_CONFIG=/path/to/<my>.toml before launching benchfsd_mpi
+#      and IOR.
+#   2. There is **no env-var fallback** — all the legacy BENCHFS_*
+#      variables have been removed in favour of these TOML keys.
+
+# === Transport ===
+[transport]
+backend = "locusta"
+
+# === Locusta tuning ===
+# Validated good values (jobs 20382 + 20238 record).
+[locusta]
+arena_size               = 268435456    # 256 MiB DMA arena (default 8 MiB exhausts on 4 MB transfers).
+max_inflight             = 128          # Per-peer credit. >128 over-drove HCA at 160-client × 40-server.
+recv_ring_size           = 32768        # RC RQ size per peer (halved from 64K default for faster QP setup).
+send_buf_size            = 32768        # RC SQ buf size per peer (halved likewise).
+ring_capacity            = 128
+accept_interval_ms       = 100          # Server UDP accept drain cadence.
+reactor_mode             = true         # Pluvio Reactor is the sole driver of inner.tick (+38% mdtest-stat).
+dispatch_idle_sleep_us   = 20
+dispatch_idle_threshold  = 16
+mlx5_auto_spread         = true         # Round-robin HCA across local MPI ranks.
+skip_recv_copy           = false        # Diagnostics-only: skipping breaks data integrity.
+
+# === Pre-warm ===
+[prewarm]
+enabled                  = true
+# `concurrency = 80` mimics join_all (failures don't serially block the
+# next chunk). Smaller values like 8 turned out to make pre-warm WORSE
+# at 10-phys fan-in (each chunk waits 120s on the first timeout).
+concurrency              = 80
+
+# === io_uring ===
+[iouring]
+queue_size               = 2048
+submit_depth             = 512
+sq_poll_ms               = 0          # SQPOLL kernel thread keep-alive.
+chunk_fd_cache_size      = 0            # ior-hard pattern saturates fd cache; disable.
+submit_timeout_us        = 1000
+complete_timeout_us      = 1000
+
+# === Pluvio runtime scheduling ===
+[scheduling]
+reactor_poll_interval    = 2            # Client side (default 8); server is already 2.
+status_cache_iters       = 100
+
+# === RPC client ===
+[rpc]
+max_concurrent_chunk_rpcs = 16
+sequential_chunk_rpcs    = false
+disable_rdma             = false
+force_rdma               = false
+timeout_secs             = 600
+max_retries              = 0
+retry_delay_ms           = 100
+retry_backoff            = 2.0
+
+# === API (client-side) ===
+[api]
+open_meta_async          = false
+close_meta_async         = false
+fsync_on_close           = true                # io500 rule: chunks must be persistent at close time.
+
+# === Metadata ===
+[metadata]
+persist                  = "writethrough"      # io500 rule: metadata must be persistent before close acks. WT flushes per mutation.
+flush_interval_ms        = 50
+dirty_high_watermark     = 16384
+distributed              = true
+central_parent_index     = true         # CHFS-style central index for find phase VALID.
+
+# === Cluster topology ===
+[cluster]
+# 0 = auto-detect from registry directory. Set to the expected MPI rank
+# count to make benchfs_init wait for all peers before returning.
+expected_nodes           = 0
+
+# === Observability ===
+[observability]
+chrome_tracing           = false
+integrity_log            = false
+integrity_dir            = "/tmp"
+
+# === Storage layout ===
+[storage]
+chunk_layout             = "per_chunk"
+unified_shards           = 1
+chunk_mmap_write         = false
+chunk_force_direct       = false               # auto O_DIRECT only for aligned IO. force=true breaks ior-hard 47KB writes with EINVAL.
+
+# === Stats / breakdown ===
+[stats]
+enabled                  = false
+ucx_am_breakdown         = false

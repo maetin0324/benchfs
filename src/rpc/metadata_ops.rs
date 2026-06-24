@@ -202,9 +202,9 @@ impl AmRpc for MetadataLookupRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: MetadataLookupRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        // Parse request header (capture corr_id for reply echo)
+        let (corr_id, header): (u32, MetadataLookupRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -226,7 +226,14 @@ impl AmRpc for MetadataLookupRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -381,8 +388,9 @@ impl AmRpc for MetadataCreateFileRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header: MetadataCreateFileRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, MetadataCreateFileRequestHeader) = match parse_header(&am_msg)
+        {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -409,7 +417,14 @@ impl AmRpc for MetadataCreateFileRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -520,8 +535,9 @@ impl AmRpc for MetadataCreateDirRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header: MetadataCreateDirRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, MetadataCreateDirRequestHeader) = match parse_header(&am_msg)
+        {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -549,7 +565,14 @@ impl AmRpc for MetadataCreateDirRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -726,8 +749,8 @@ impl AmRpc for MetadataDeleteRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header: MetadataDeleteRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, MetadataDeleteRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -764,7 +787,14 @@ impl AmRpc for MetadataDeleteRequest {
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -956,8 +986,8 @@ impl AmRpc for MetadataUpdateRequest {
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header: MetadataUpdateRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, MetadataUpdateRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -968,14 +998,42 @@ impl AmRpc for MetadataUpdateRequest {
         };
         let path = Path::new(&path_str);
 
-        // Get current file metadata
+        // Drain any in-flight chunk writes for `path_str` before the close
+        // ack so the client never observes durable=false. Mirrors the
+        // locusta MetadataUpdate handler — both chunk-store backends need
+        // this for io500 fsync_on_close compliance. No-op if no chunks
+        // were written here.
+        use crate::storage::chunk_store::{IOUringChunkStore, PosixChunkStore};
+        use std::any::Any;
+        let chunk_store_any = &*ctx.chunk_store as &dyn Any;
+        if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
+            if let Err(e) = io_uring_store.fsync_dirty_chunks_for_path(&path_str).await {
+                tracing::trace!(
+                    "[metadata_ops] fsync_dirty_chunks_for_path({}) failed: {:?}",
+                    path_str,
+                    e
+                );
+            }
+        } else if let Some(posix_store) = chunk_store_any.downcast_ref::<PosixChunkStore>() {
+            if let Err(e) = posix_store.fsync_dirty_chunks_for_path(&path_str).await {
+                tracing::trace!(
+                    "[metadata_ops] posix fsync_dirty_chunks_for_path({}) failed: {:?}",
+                    path_str,
+                    e
+                );
+            }
+        }
+
+        // Get current file metadata. Non-owner servers that just drained
+        // chunks still ack success here (mirrors locusta handler).
         let mut file_meta = match ctx.metadata_manager.get_file_metadata(path) {
             Ok(meta) => meta,
             Err(_) => {
-                let error_header = MetadataUpdateResponseHeader::error(-2); // ENOENT
+                let ok_header = MetadataUpdateResponseHeader::success();
                 return send_rpc_response_via_reply(
                     Self::reply_stream_id(),
-                    &error_header,
+                    corr_id,
+                    &ok_header,
                     None,
                     am_msg,
                 )
@@ -993,17 +1051,65 @@ impl AmRpc for MetadataUpdateRequest {
                 file_meta.size.max(header.new_size)
             };
         }
+        let new_size_after = file_meta.size;
 
         // Note: Mode update would be handled here if FileMetadata supported it
 
-        // Store updated metadata
+        // Store updated metadata + persist size via xattr (mirrors locusta
+        // handler). When [metadata].xattr_size is true, set chunk-0 xattr;
+        // otherwise fall back to the persistent inode_store on WT policy.
         let response_header = match ctx.metadata_manager.update_file_metadata(file_meta) {
-            Ok(()) => MetadataUpdateResponseHeader::success(),
+            Ok(()) => {
+                let use_xattr = crate::runtime_config::RuntimeConfig::global()
+                    .metadata
+                    .xattr_size;
+                if use_xattr {
+                    if let Some(io_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
+                        if let Err(e) = io_store.set_file_size_xattr(&path_str, new_size_after) {
+                            tracing::trace!(
+                                "set_file_size_xattr({}) failed: {:?}",
+                                path_str,
+                                e
+                            );
+                        }
+                    } else if let Some(posix_store) =
+                        chunk_store_any.downcast_ref::<PosixChunkStore>()
+                    {
+                        if let Err(e) =
+                            posix_store.set_file_size_xattr(&path_str, new_size_after)
+                        {
+                            tracing::trace!(
+                                "posix set_file_size_xattr({}) failed: {:?}",
+                                path_str,
+                                e
+                            );
+                        }
+                    }
+                } else if let Some(store) = ctx.inode_store.as_ref() {
+                    if store.policy().flushes_per_op() {
+                        if let Err(e) = store.update_size(&path_str, new_size_after).await {
+                            tracing::warn!(
+                                "[metadata_ops] inode_store.update_size({}) failed: {}",
+                                path_str,
+                                e
+                            );
+                        }
+                    }
+                }
+                MetadataUpdateResponseHeader::success()
+            }
             Err(_e) => MetadataUpdateResponseHeader::error(-5), // EIO
         };
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -1253,8 +1359,8 @@ impl AmRpc for ShutdownRequest {
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header: ShutdownRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, ShutdownRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -1272,7 +1378,14 @@ impl AmRpc for ShutdownRequest {
         let response_header = ShutdownResponseHeader::new(true);
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

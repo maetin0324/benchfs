@@ -791,7 +791,26 @@ fn run_server(
             (chunk_store, allocator)
         }
         "posix" => {
-            tracing::info!("Using POSIX synchronous I/O for storage backend");
+            // 2026-06-23 fix: default O_DIRECT=false. The previous hardcoded
+            // `true` failed on ior-hard's 47008-byte unaligned writes (EIO
+            // bubbled up as `Remote write status -5`) and starved the
+            // locusta arena (sync pwrite held grant slots for ms instead
+            // of µs). Buffered writes hit page cache, return in <1 µs, and
+            // io500 close-time `fsync_dirty_chunks_for_path` still flushes
+            // to disk for compliance. Set `BENCHFS_POSIX_DIRECT_IO=1` to
+            // restore the O_DIRECT path (per-call alignment fallback in
+            // PosixChunkStore::direct_io_aligned still applies, so unaligned
+            // writes succeed via buffered I/O even with the env on).
+            let use_direct = std::env::var("BENCHFS_POSIX_DIRECT_IO")
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v == "1" || v == "true" || v == "yes"
+                })
+                .unwrap_or(false);
+            tracing::info!(
+                "Using POSIX synchronous I/O for storage backend (O_DIRECT={})",
+                use_direct
+            );
 
             // io_uring reactor for allocator only (no actual I/O submission).
             // buffer_size must match chunk_size so that RPC data transfers can
@@ -809,7 +828,7 @@ fn run_server(
                 .build();
 
             let allocator = uring_reactor.allocator.clone();
-            let chunk_store = Rc::new(PosixChunkStore::new(&chunk_store_dir, true)?);
+            let chunk_store = Rc::new(PosixChunkStore::new(&chunk_store_dir, use_direct)?);
             (chunk_store, allocator)
         }
         _ => {
@@ -1074,8 +1093,17 @@ fn run_server(
                     // If granted == ready ≪ replied, server is stuck on
                     // chunk_store. If received ≫ granted, allocator is
                     // throttling. Etc.
-                    let mut next_pipeline_dump_at =
-                        last_progress_at + std::time::Duration::from_secs(5);
+                    // Freeze-forensics probe: BENCHFS_PIPELINE_DUMP_MS
+                    // shrinks the stats heartbeat (default 5000 ms) down to
+                    // ~100 ms so the LAST line before a host lockup brackets
+                    // the in-flight operation to within one interval.
+                    let pipeline_dump_every = std::time::Duration::from_millis(
+                        std::env::var("BENCHFS_PIPELINE_DUMP_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(5000),
+                    );
+                    let mut next_pipeline_dump_at = last_progress_at + pipeline_dump_every;
                     loop {
                         let drained = if reactor_mode {
                             // Drain only — Reactor handles inner.tick().
@@ -1152,6 +1180,22 @@ fn run_server(
                                     out
                                 })
                                 .unwrap_or_default();
+                            // Breadcrumbs for freeze forensics: io_uring
+                            // in-flight (submitted vs completed on this
+                            // daemon's ring) and read-path stage counters.
+                            // At the moment of a host lockup the last dump
+                            // shows exactly which subsystem held work.
+                            let reactor = pluvio_uring::reactor::IoUringReactor::get_or_init();
+                            let io_submitted = reactor
+                                .user_data_counter
+                                .load(Ordering::Relaxed);
+                            let io_completed = reactor.completed_count();
+                            let r_recv = benchfs::rpc::locusta_handlers::READ_RECEIVED
+                                .load(Ordering::Relaxed);
+                            let r_io = benchfs::rpc::locusta_handlers::READ_IO_DONE
+                                .load(Ordering::Relaxed);
+                            let r_rep = benchfs::rpc::locusta_handlers::READ_REPLIED
+                                .load(Ordering::Relaxed);
                             tracing::warn!(
                                 target: "wcb_put_pipeline",
                                 received = received,
@@ -1162,10 +1206,18 @@ fn run_server(
                                 pending_grant = pending_grant,
                                 pending_write = pending_write,
                                 pending_reply = pending_reply,
+                                io_submitted = io_submitted,
+                                io_completed = io_completed,
+                                io_inflight = io_submitted.saturating_sub(io_completed),
+                                read_recv = r_recv,
+                                read_io_done = r_io,
+                                read_replied = r_rep,
+                                read_in_io = r_recv.saturating_sub(r_io),
+                                read_in_reply = r_io.saturating_sub(r_rep),
                                 mem = %mem_summary,
                                 "WCB_PUT_PIPELINE"
                             );
-                            next_pipeline_dump_at = now + std::time::Duration::from_secs(5);
+                            next_pipeline_dump_at = now + pipeline_dump_every;
                         }
                         if drained > 0 {
                             empty_polls = 0;

@@ -125,8 +125,8 @@ for nnodes in "${nnodes_list[@]}"; do
     select_spec="${PBS_SELECT_OVERRIDE:-${nnodes}:ncpus=24:mem=124gb:ngpus=1}"
     cmd_qsub=(
       qsub
-      -q mcrp
-      -A NBB
+      -q "${PBS_QUEUE:-mcrp}"
+      -A "${PBS_ACCOUNT:-NBB}"
       -l select="${select_spec}"
       -l place="${PBS_PLACE:-exclhost}"
       -l walltime="${ELAPSTIM_REQ}"

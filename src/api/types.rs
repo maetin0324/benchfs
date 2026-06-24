@@ -54,6 +54,14 @@ pub struct OpenFlags {
 
     /// Append mode
     pub append: bool,
+
+    /// `O_EXCL`: fail with EEXIST if file already exists. Only meaningful
+    /// together with `create`. The new client-side-open design SKIPS the
+    /// MetadataCreate RPC entirely on `create && !exclusive`; the
+    /// metadata is established lazily by the close-time MetadataUpdate
+    /// upsert. With `exclusive`, an atomic test-and-set MetadataCreate is
+    /// still required (single RPC to hash(path) owner).
+    pub exclusive: bool,
 }
 
 impl OpenFlags {
@@ -64,6 +72,7 @@ impl OpenFlags {
             create: false,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 
@@ -74,6 +83,7 @@ impl OpenFlags {
             create: false,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 
@@ -84,6 +94,7 @@ impl OpenFlags {
             create: false,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 
@@ -94,6 +105,7 @@ impl OpenFlags {
             create: true,
             truncate: false,
             append: false,
+            exclusive: false,
         }
     }
 }

@@ -79,30 +79,50 @@ static uint64_t           g_total_files = 0;
 static int                g_mpi_rank = 0;
 static int                g_mpi_size = 1;
 
-/* dir stack — owned strings (we strdup each pushed path) */
+/* dir stack — owned strings (we strdup each pushed path).
+ * Each entry also carries its depth from the root, used by the
+ * tree-partition scheme to decide whether this rank owns the subtree. */
 struct dir_stack {
     char   **paths;
+    int     *depths;
     size_t   len;
     size_t   cap;
 };
 
-static void stack_push(struct dir_stack *s, char *owned_path) {
+static void stack_push(struct dir_stack *s, char *owned_path, int depth) {
     if (s->len == s->cap) {
         size_t newcap = s->cap == 0 ? 64 : s->cap * 2;
         s->paths = realloc(s->paths, newcap * sizeof(char *));
+        s->depths = realloc(s->depths, newcap * sizeof(int));
         s->cap = newcap;
     }
-    s->paths[s->len++] = owned_path;
+    s->paths[s->len] = owned_path;
+    s->depths[s->len] = depth;
+    s->len++;
 }
 
-static char *stack_pop(struct dir_stack *s) {
+static char *stack_pop(struct dir_stack *s, int *out_depth) {
     if (s->len == 0) return NULL;
-    return s->paths[--s->len];
+    s->len--;
+    if (out_depth) *out_depth = s->depths[s->len];
+    return s->paths[s->len];
 }
 
 static void stack_free(struct dir_stack *s) {
     for (size_t i = 0; i < s->len; i++) free(s->paths[i]);
     free(s->paths);
+    free(s->depths);
+}
+
+/* FNV-1a 64-bit hash for owner partitioning. Deterministic across all
+ * pfind ranks so they agree which rank owns each subtree. */
+static uint64_t pfind_hash_path(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) {
+        h ^= (unsigned char)(*s++);
+        h *= 1099511628211ULL;
+    }
+    return h;
 }
 
 struct dir_collect {
@@ -126,7 +146,9 @@ static int filler_cb(void *arg, const char *name, int entry_type, uint64_t size)
         char *buf = malloc(need);
         if (buf == NULL) return 0;
         snprintf(buf, need, "%s/%s", dc->cur_path, name);
-        stack_push(&dc->subdirs, buf);
+        /* Depth is set later by the main loop when this subdir is moved
+         * onto the work stack — use depth=0 as a placeholder here. */
+        stack_push(&dc->subdirs, buf, 0);
     } else if (entry_type == 0 /* file */) {
         if (dc->files.len == dc->files.cap) {
             size_t newcap = dc->files.cap == 0 ? 64 : dc->files.cap * 2;
@@ -267,6 +289,20 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* Env-based rank/size: lets a shell wrapper launch N copies in
+     * parallel (one per host via ssh / pdsh / mpirun) without nesting
+     * MPI inside io500's outer mpirun context. Takes precedence over
+     * MPI_Init values when set. */
+    {
+        const char *rank_env = getenv("BENCHFS_PFIND_RANK");
+        const char *size_env = getenv("BENCHFS_PFIND_SIZE");
+        if (rank_env && size_env) {
+            g_mpi_rank = atoi(rank_env);
+            g_mpi_size = atoi(size_env);
+            fprintf(stderr, "[pfind] env: rank=%d size=%d\n", g_mpi_rank, g_mpi_size);
+        }
+    }
+
     struct opts o;
     if (parse_args(argc, argv, &o) != 0) {
 #ifdef BENCHFS_PFIND_WITH_MPI
@@ -284,54 +320,92 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "[pfind] benchfs_init done\n");
 
-    /* Static partition: every directory we visit gets a deterministic
-     * `dir_index` (incremented in a deterministic DFS order shared by
-     * every rank). Rank `r` only stats files of directories where
-     * `dir_index % nproc == r`. All ranks still walk the full tree to
-     * keep `dir_index` consistent — the savings come from doing zero
-     * BenchFS stat()s for directories owned by other ranks. */
+    /* Tree-partition scheme (replaces the older dir_index % N approach):
+     *
+     * - Above `OWNER_DEPTH_THRESHOLD` (default 3), ALL ranks readdir the
+     *   directory so structural enumeration is shared. The cost is cheap:
+     *   for the io500 layout this is just root + {mdtest-*,ior-*} +
+     *   test-dir.0-0 = a handful of dirs.
+     *
+     * - AT or below that depth, only the rank `r` where
+     *   `hash(path) % nproc == r` reads the directory; other ranks skip
+     *   readdir + descent entirely. For io500 this is one rank per
+     *   `mdtest_tree.RANK.0/` leaf — readdir RPC count drops by N× vs
+     *   the old "every rank walks every dir" pattern.
+     *
+     * Threshold is overridable via `BENCHFS_PFIND_OWNER_DEPTH` (default 3). */
+    int owner_depth_threshold = 3;
+    {
+        const char *od = getenv("BENCHFS_PFIND_OWNER_DEPTH");
+        if (od != NULL) {
+            int v = atoi(od);
+            if (v >= 0) owner_depth_threshold = v;
+        }
+    }
+
     struct dir_stack work = {0};
-    stack_push(&work, strdup(o.root));
+    stack_push(&work, strdup(o.root), 0);
     uint64_t dir_index = 0;
-    fprintf(stderr, "[pfind] starting walk at %s\n", o.root);
+    uint64_t skipped = 0;
+    fprintf(stderr, "[pfind] starting walk at %s (owner_depth_threshold=%d, size=%d, rank=%d)\n",
+            o.root, owner_depth_threshold, g_mpi_size, g_mpi_rank);
 
     char *cur;
-    while ((cur = stack_pop(&work)) != NULL) {
+    int cur_depth;
+    while ((cur = stack_pop(&work, &cur_depth)) != NULL) {
+        int verbose_pfind = getenv("BENCHFS_PFIND_VERBOSE") != NULL;
+
+        /* Owner partition: at/below threshold, skip if not our subtree. */
+        int we_own_subtree = 1;
+        if (cur_depth >= owner_depth_threshold && g_mpi_size > 1) {
+            uint64_t h = pfind_hash_path(cur);
+            we_own_subtree = ((h % (uint64_t)g_mpi_size) == (uint64_t)g_mpi_rank);
+            if (!we_own_subtree) {
+                skipped++;
+                if (verbose_pfind) {
+                    fprintf(stderr, "[pfind] skip (not owner) depth=%d: %s\n", cur_depth, cur);
+                }
+                free(cur);
+                continue;
+            }
+        }
+
         struct dir_collect dc;
         memset(&dc, 0, sizeof(dc));
         snprintf(dc.cur_path, sizeof(dc.cur_path), "%s", cur);
 
-        if (dir_index < 8 || dir_index % 256 == 0) {
-            fprintf(stderr, "[pfind] readdir #%" PRIu64 ": %s\n", dir_index, cur);
+        if (verbose_pfind || dir_index < 8 || dir_index % 256 == 0) {
+            fprintf(stderr, "[pfind] readdir #%" PRIu64 " depth=%d: %s\n", dir_index, cur_depth, cur);
         }
         int rc = benchfs_readdir(g_ctx, cur, filler_cb, &dc);
         if (rc < 0) {
             fprintf(stderr, "benchfs_pfind[%d]: readdir(%s) failed: %s\n",
                     g_mpi_rank, cur, benchfs_get_error());
         }
+        if (verbose_pfind) {
+            fprintf(stderr, "[pfind]   #%" PRIu64 " returned %zu subdirs, %zu files (stack=%zu)\n",
+                    dir_index, dc.subdirs.len, dc.files.len, work.len);
+        }
 
         for (size_t i = 0; i < dc.subdirs.len; i++) {
-            stack_push(&work, dc.subdirs.paths[i]);
+            stack_push(&work, dc.subdirs.paths[i], cur_depth + 1);
         }
         free(dc.subdirs.paths);
+        free(dc.subdirs.depths);
         dc.subdirs.paths = NULL;
+        dc.subdirs.depths = NULL;
         dc.subdirs.len = dc.subdirs.cap = 0;
 
-        /* readdirplus: filler already populated size for each file.
-         * No per-file benchfs_stat() RPC needed — was the 50 kIOPS
-         * bottleneck (400 k stat × 1 RTT per file at iter72-87). */
-        int we_own = (dir_index % (uint64_t)g_mpi_size) == (uint64_t)g_mpi_rank;
+        /* All files in an owned subtree count — no per-file ownership
+         * filter needed because the subtree split happened at readdir
+         * time above. readdirplus filled `sizes` so no per-file stat. */
         for (size_t i = 0; i < dc.files.len; i++) {
-            if (we_own) {
-                benchfs_stat_t st;
-                memset(&st, 0, sizeof(st));
-                st.st_size = (off_t)dc.files.sizes[i];
-                /* Mode bits are not used by io500's default predicates
-                 * (-name / -size / -newer); leave them at 0. */
-                g_total_files++;
-                if (match_predicates(&o, dc.files.names[i], &st)) {
-                    g_hits++;
-                }
+            benchfs_stat_t st;
+            memset(&st, 0, sizeof(st));
+            st.st_size = (off_t)dc.files.sizes[i];
+            g_total_files++;
+            if (match_predicates(&o, dc.files.names[i], &st)) {
+                g_hits++;
             }
             free(dc.files.names[i]);
         }
@@ -341,6 +415,8 @@ int main(int argc, char **argv) {
         dir_index++;
     }
     stack_free(&work);
+    fprintf(stderr, "[pfind] walk done: %" PRIu64 " readdirs, %" PRIu64 " skipped, %" PRIu64 " total files, %" PRIu64 " hits\n",
+            dir_index, skipped, g_total_files, g_hits);
 
     benchfs_finalize(g_ctx);
 
@@ -354,8 +430,13 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    if (g_mpi_rank == 0) {
+    /* MPI mode: only rank 0 prints (after MPI_Reduce sums all ranks).
+     * Env-based parallel mode (BENCHFS_PFIND_SIZE set, no MPI): every
+     * rank prints its OWN partial — the parallel wrapper sums them. */
+    int env_parallel = (getenv("BENCHFS_PFIND_SIZE") != NULL);
+    if (g_mpi_rank == 0 || env_parallel) {
         printf("MATCHED %" PRIu64 "/%" PRIu64 "\n", global_hits, global_total);
+        fflush(stdout);
     }
 
 #ifdef BENCHFS_PFIND_WITH_MPI

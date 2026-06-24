@@ -421,6 +421,23 @@ impl RpcServer {
             );
         }
 
+        // Spawn DirIndexUpdate handler (UCX). Mirrors the locusta
+        // dispatch entry registered in `bin/benchfsd_mpi.rs` so the UCX
+        // backend can also drive CHFS-style central parent index
+        // (`BENCHFS_CENTRAL_PARENT_INDEX=1`).
+        {
+            use crate::rpc::dir_index_ops::DirIndexUpdateRequest;
+            let server = self.clone_for_handler();
+            pluvio_runtime::spawn_with_name(
+                async move {
+                    if let Err(e) = server.listen::<DirIndexUpdateRequest, _, _>().await {
+                        tracing::error!("DirIndexUpdate handler error: {:?}", e);
+                    }
+                },
+                "rpc_dir_index_update_handler".to_string(),
+            );
+        }
+
         tracing::info!("All RPC handlers registered successfully");
         Ok(())
     }

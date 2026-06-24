@@ -324,8 +324,8 @@ impl AmRpc for ReaddirRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         mut am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        let header: ReaddirRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, ReaddirRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
         let path_str = match receive_path(&ctx, &mut am_msg, header.path_len).await {
@@ -348,6 +348,7 @@ impl AmRpc for ReaddirRequest {
 
         send_rpc_response_via_reply(
             Self::reply_stream_id(),
+            corr_id,
             &resp_header,
             Some(&entry_data),
             am_msg,

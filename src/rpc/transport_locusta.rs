@@ -911,11 +911,31 @@ impl LocustaInner {
         let mut last_send = Instant::now() - recv_timeout;
         let response = loop {
             if last_send.elapsed() >= recv_timeout {
-                self.udp_socket
-                    .send_to(&request_bytes, peer_addr)
-                    .map_err(|e| {
-                        RpcError::ConnectionError(format!("send_to({peer_addr}, {peer}): {e}"))
-                    })?;
+                match self.udp_socket.send_to(&request_bytes, peer_addr) {
+                    Ok(_) => {}
+                    // EPERM (conntrack table full / transient firewall
+                    // drop under the 80-daemon handshake storm) and
+                    // ENOBUFS/EAGAIN are retryable: treat like a lost
+                    // datagram and retransmit after the backoff.
+                    // 28778 (2026-06-12) died at startup because one
+                    // EPERM here was fatal for the whole 20-phys run.
+                    Err(e)
+                        if matches!(
+                            e.raw_os_error(),
+                            Some(libc::EPERM) | Some(libc::ENOBUFS) | Some(libc::EAGAIN)
+                        ) =>
+                    {
+                        tracing::warn!(
+                            target: "udp_handshake",
+                            "send_to({peer_addr}, {peer}) transient error, will retransmit: {e}"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(RpcError::ConnectionError(format!(
+                            "send_to({peer_addr}, {peer}): {e}"
+                        )));
+                    }
+                }
                 last_send = Instant::now();
                 // Double the backoff for the next attempt, capped at
                 // MAX_RECV_TIMEOUT. Also reflect it into the socket
@@ -1060,7 +1080,13 @@ impl LocustaInner {
             Ok(v) => v,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    // EINTR: a signal interrupted recv. Treat as "no
+                    // packet" so the accept loop retries next tick
+                    // instead of surfacing a scary ConnectionError.
+                    // 28476 (2026-06-11) showed multi-minute EINTR
+                    // storms on one daemon wedging its handshake path.
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 return Ok(None);
             }
@@ -1280,8 +1306,29 @@ impl LocustaInner {
             .send_to(&response_bytes, from_v4);
         let send_us = t_send_start.elapsed().as_micros() as u64;
         self.udp_stats_send_resp_us = self.udp_stats_send_resp_us.saturating_add(send_us);
-        send_res
-            .map_err(|e| RpcError::ConnectionError(format!("send_to({from_v4}, response): {e}")))?;
+        // A transient send failure (EPERM from a full conntrack table,
+        // ENOBUFS, EAGAIN) must not poison the accept loop: the peer
+        // retransmits its REQUEST on its own backoff and we re-answer
+        // from `cached_responses`. Only treat other errors as fatal.
+        match send_res {
+            Ok(_) => {}
+            Err(ref e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EPERM) | Some(libc::ENOBUFS) | Some(libc::EAGAIN)
+                ) =>
+            {
+                tracing::warn!(
+                    target: "udp_handshake",
+                    "send_to({from_v4}, response) transient error, peer will retransmit: {e}"
+                );
+            }
+            Err(e) => {
+                return Err(RpcError::ConnectionError(format!(
+                    "send_to({from_v4}, response): {e}"
+                )));
+            }
+        }
 
         self.node_to_dest.insert(peer.clone(), dest_id);
         self.cached_responses
@@ -1702,6 +1749,7 @@ impl LocustaTransport {
             shm_base,
             shm_size: layout.total_size,
             cq_ring: cq_ring_for_relay,
+            pending_cq: std::collections::VecDeque::new(),
             // Embedded mode: client and daemon share the same process
             // and use the in-process JiffyQueue (`req_queue`). The SHM
             // req_ring is only used in standalone-daemon mode.

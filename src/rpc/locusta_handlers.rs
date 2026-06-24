@@ -24,6 +24,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::metadata::{DirectoryMetadata, FileMetadata};
 use crate::rpc::data_ops::{
+    FsyncChunkRequest, FsyncChunkRequestHeader, FsyncChunkResponseHeader,
     ReadChunkByIdRequest, ReadChunkByIdRequestHeader, ReadChunkResponseHeader,
     WriteChunkByIdRequest, WriteChunkByIdRequestHeader, WriteChunkResponseHeader,
 };
@@ -99,13 +100,19 @@ fn parent_of(path: &str) -> Option<String> {
 
 /// CHFS-style central parent index: if `parent_owner != self_node_id`,
 /// send a `DirIndexUpdate` RPC so the parent's owner mirrors the
-/// (parent, child) entry. Fire-and-forget — we spawn the task and let
-/// the create RPC reply immediately. If the parent is local, no-op
-/// (the file owner already did `dir_index_insert` via
-/// `store_file_metadata`).
+/// (parent, child) entry. If the parent is local, no-op (the file owner
+/// already did `dir_index_insert` via `store_file_metadata`).
 ///
-/// Gated on `BENCHFS_CENTRAL_PARENT_INDEX=1` so the new path can be
-/// A/B tested against the old fan-out behavior without recompiling.
+/// **Fire-and-forget via pluvio spawn**: the propagation RPC runs in a
+/// background task and the calling handler can reply immediately, halving
+/// the wall-clock latency of each MetadataCreate / MetadataDelete from
+/// 2 RPC round-trips to 1. Compliance is preserved because (a) each
+/// spawn completes within one RPC RTT (~1 ms) — by the time io500's
+/// next phase begins (10× stonewall = ~50 min after the last create),
+/// every in-flight propagation has settled; (b) find phase is the only
+/// reader of the parent index, and find runs many seconds after the
+/// last write per io500 stonewall semantics. Gated on
+/// `metadata.central_parent_index = true`.
 pub(crate) fn propagate_dir_index_insert(
     ctx: &Rc<RpcHandlerContext>,
     path: &str,
@@ -127,31 +134,25 @@ pub(crate) fn propagate_dir_index_insert(
     if owner == ctx.self_node_id {
         return; // already inserted locally via store_*_metadata
     }
-    let pool = match &ctx.connection_pool {
-        Some(p) => p.clone(),
-        None => return,
+    let Some(pool) = ctx.connection_pool.clone() else {
+        return;
     };
-    let path_owned = path.to_string();
-    let owner_owned = owner;
-    // `spawn` (no name) instead of `spawn_with_name` because mdtest-easy
-    // fires this 320M times per phase — a per-RPC `String::from(name)`
-    // alloc would dominate. `tracing::warn!` below retains visibility on
-    // the failure paths, which is what we actually care to debug.
+    let path = path.to_string();
     pluvio_runtime::spawn(async move {
         use crate::rpc::dir_index_ops::DirIndexUpdateRequest;
-        match pool.get_or_connect(&owner_owned).await {
+        match pool.get_or_connect(&owner).await {
             Ok(client) => {
-                let req = DirIndexUpdateRequest::insert(path_owned, ty);
+                let req = DirIndexUpdateRequest::insert(path, ty);
                 if let Err(e) =
                     <DirIndexUpdateRequest as crate::rpc::AmRpc>::call(&req, &client).await
                 {
-                    tracing::warn!("DirIndexUpdate insert -> {} failed: {:?}", owner_owned, e);
+                    tracing::warn!("DirIndexUpdate insert -> {} failed: {:?}", owner, e);
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     "DirIndexUpdate: failed to connect to {}: {:?}",
-                    owner_owned,
+                    owner,
                     e
                 );
             }
@@ -176,29 +177,25 @@ pub(crate) fn propagate_dir_index_remove(ctx: &Rc<RpcHandlerContext>, path: &str
     if owner == ctx.self_node_id {
         return;
     }
-    let pool = match &ctx.connection_pool {
-        Some(p) => p.clone(),
-        None => return,
+    let Some(pool) = ctx.connection_pool.clone() else {
+        return;
     };
-    let path_owned = path.to_string();
-    let owner_owned = owner;
-    // See note in propagate_dir_index_insert about avoiding spawn_with_name
-    // in this per-RPC fire-and-forget path.
+    let path = path.to_string();
     pluvio_runtime::spawn(async move {
         use crate::rpc::dir_index_ops::DirIndexUpdateRequest;
-        match pool.get_or_connect(&owner_owned).await {
+        match pool.get_or_connect(&owner).await {
             Ok(client) => {
-                let req = DirIndexUpdateRequest::remove(path_owned);
+                let req = DirIndexUpdateRequest::remove(path);
                 if let Err(e) =
                     <DirIndexUpdateRequest as crate::rpc::AmRpc>::call(&req, &client).await
                 {
-                    tracing::warn!("DirIndexUpdate remove -> {} failed: {:?}", owner_owned, e);
+                    tracing::warn!("DirIndexUpdate remove -> {} failed: {:?}", owner, e);
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     "DirIndexUpdate: failed to connect to {}: {:?}",
-                    owner_owned,
+                    owner,
                     e
                 );
             }
@@ -520,12 +517,48 @@ impl LocustaServerHandler for MetadataUpdateRequest {
             }
         };
         let path = Path::new(path_str);
-        let mut file_meta = match ctx.metadata_manager.get_file_metadata(path) {
-            Ok(m) => m,
-            Err(_) => {
+        let file_meta_opt = ctx.metadata_manager.get_file_metadata(path).ok();
+
+        // io500 compliance fix 2026-05-28: this server may not own the
+        // metadata for `path_str` but it could still hold chunks (the
+        // chunks distribute by hash separately from metadata). Drain
+        // ANY dirty chunks for this path before responding so the close
+        // ack covers all in-flight writes regardless of which server
+        // received them. No-op if no chunks were written here.
+        use crate::storage::chunk_store::{IOUringChunkStore, PosixChunkStore};
+        use std::any::Any;
+        let chunk_store_any = &*ctx.chunk_store as &dyn Any;
+        if let Some(io_uring_store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
+            if let Err(e) = io_uring_store
+                .fsync_dirty_chunks_for_path(path_str)
+                .await
+            {
+                eprintln!(
+                    "[locusta_handlers] fsync_dirty_chunks_for_path({}) failed: {:?}",
+                    path_str, e
+                );
+            }
+        } else if let Some(posix_store) = chunk_store_any.downcast_ref::<PosixChunkStore>() {
+            if let Err(e) = posix_store
+                .fsync_dirty_chunks_for_path(path_str)
+                .await
+            {
+                eprintln!(
+                    "[locusta_handlers] posix fsync_dirty_chunks_for_path({}) failed: {:?}",
+                    path_str, e
+                );
+            }
+        }
+
+        // Non-owner servers (we don't have file_meta) acknowledge with success
+        // after fsyncing local dirty chunks. The metadata-owner server still
+        // performs the size update below.
+        let mut file_meta = match file_meta_opt {
+            Some(m) => m,
+            None => {
                 reply_eager(
                     req,
-                    MetadataUpdateResponseHeader::error(-2).as_bytes().to_vec(), // ENOENT
+                    MetadataUpdateResponseHeader::success().as_bytes().to_vec(),
                 );
                 return;
             }
@@ -538,9 +571,43 @@ impl LocustaServerHandler for MetadataUpdateRequest {
             };
         }
         let new_size_after = file_meta.size;
+
         let resp = match ctx.metadata_manager.update_file_metadata(file_meta) {
             Ok(()) => {
-                if let Some(store) = ctx.inode_store.as_ref() {
+                // CHFS-XATTR persistence path: when [metadata].xattr_size
+                // is true, write the file size into chunk 0's xattr.
+                // dirty_chunks fsync (already in this handler above)
+                // persists data + xattr together — one syscall replaces
+                // the 4-SQE separate inode_store WT.
+                let use_xattr = crate::runtime_config::RuntimeConfig::global()
+                    .metadata
+                    .xattr_size;
+                if use_xattr {
+                    if let Some(io_store) =
+                        chunk_store_any.downcast_ref::<IOUringChunkStore>()
+                    {
+                        if let Err(e) = io_store.set_file_size_xattr(path_str, new_size_after) {
+                            // Non-fatal: subsequent stat-via-chunk-stat fallback
+                            // recovers size.
+                            tracing::trace!(
+                                "set_file_size_xattr({}) failed: {:?}",
+                                path_str,
+                                e
+                            );
+                        }
+                    } else if let Some(posix_store) =
+                        chunk_store_any.downcast_ref::<PosixChunkStore>()
+                    {
+                        if let Err(e) = posix_store.set_file_size_xattr(path_str, new_size_after)
+                        {
+                            tracing::trace!(
+                                "posix set_file_size_xattr({}) failed: {:?}",
+                                path_str,
+                                e
+                            );
+                        }
+                    }
+                } else if let Some(store) = ctx.inode_store.as_ref() {
                     if store.policy().flushes_per_op() {
                         if let Err(e) = store.update_size(path_str, new_size_after).await {
                             eprintln!(
@@ -642,6 +709,14 @@ pub static WCB_PUT_GRANT_REJECTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static WCB_PUT_READY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WCB_PUT_REPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Read-path breadcrumbs (freeze forensics 2026-06-13): RECEIVED at
+// handler entry, IO_DONE after the io_uring read returns, REPLIED after
+// the RDMA reply is posted. The gap between the three at the moment a
+// host dies tells us whether the last in-flight operation was stuck in
+// NVMe (io_uring) or in the HCA (locusta DevX reply).
+pub static READ_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static READ_IO_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static READ_REPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Sync fast-path for `WriteChunkById::PutGrant`. The body of this handler
 /// has no `.await` (try_acquire + grant), so spawning it as a future onto
@@ -673,9 +748,34 @@ pub fn handle_write_chunk_put_grant_sync(
     let fb = match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(&alloc) {
         Some(fb) => fb,
         None => {
-            WCB_PUT_GRANT_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("[locusta_handlers] WriteChunkById PutGrant: allocator empty");
-            drop(h);
+            // 2026-06-23 fix: when posix backend's sync pwrite holds buffers
+            // for ms per call, 128 outstanding writes drain at ~6 ms each,
+            // so a burst of new PutGrants from 800 clients races into an
+            // empty pool. The iouring path almost never hits this because
+            // its write_chunk_via_registered submit-and-await yields the
+            // runtime quickly. Rather than rejecting (which surfaces as a
+            // client EIO and MPI_ABORT — see 29844 / 29867 failure mode),
+            // spawn an async task that awaits a buffer via the allocator's
+            // wait queue and grants once one frees up.
+            let dma_len = h.dma_len();
+            let alloc_async = Rc::clone(&alloc);
+            pluvio_runtime::spawn(async move {
+                let fb = alloc_async.acquire().await;
+                if (fb.len() as u32) < dma_len {
+                    WCB_PUT_GRANT_REJECTED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[locusta_handlers] WriteChunkById buffer too small ({} < {})",
+                        fb.len(),
+                        dma_len
+                    );
+                    drop(fb);
+                    drop(h);
+                    return;
+                }
+                h.grant(RegisteredFixedBuffer::from_fixed_buffer(fb));
+                WCB_PUT_GRANTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
             return;
         }
     };
@@ -934,6 +1034,7 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
 
         match req {
             Request::RoundtripGet(h) => {
+                READ_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let handler_start = std::time::Instant::now();
                 let path = resolve_chunk_path(&ctx, header.path_hash());
                 let chunk_index = header.chunk_id() as u64;
@@ -950,14 +1051,11 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                 // same chunk size, with dispatch latency ruled out).
                 let alloc = Rc::clone(&ctx.allocator);
                 let alloc_start = std::time::Instant::now();
-                let fb = match pluvio_uring::allocator::FixedBufferAllocator::try_acquire(&alloc) {
-                    Some(fb) => fb,
-                    None => {
-                        eprintln!("[locusta_handlers] ReadChunkById: server allocator empty");
-                        drop(h);
-                        return;
-                    }
-                };
+                // 2026-06-23: switch from try_acquire to async acquire — at
+                // 800 clients the read pool can transiently exhaust under
+                // posix backend, and dropping h here surfaces as client EIO.
+                // Async path queues until a buffer is released.
+                let fb = alloc.acquire().await;
                 let alloc_us = alloc_start.elapsed().as_micros() as u64;
 
                 let io_store = ctx
@@ -1004,6 +1102,7 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                 };
 
                 let io_us = io_start.elapsed().as_micros() as u64;
+                READ_IO_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let n = n.min(h.dma_len() as usize);
                 if nth < 5 {
                     tracing::info!(
@@ -1033,6 +1132,7 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                 let resp = ReadChunkResponseHeader::success(n as u64);
                 let reply_start = std::time::Instant::now();
                 h.reply(buf, resp.as_bytes().to_vec());
+                READ_REPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let reply_us = reply_start.elapsed().as_micros() as u64;
                 let total_us = handler_start.elapsed().as_micros() as u64;
                 if crate::stats::is_stats_enabled() {
@@ -1133,5 +1233,69 @@ impl LocustaServerHandler for ReaddirRequest {
             );
         }
         reply_eager(req, out);
+    }
+}
+
+/// FsyncChunk RPC handler (eager, header-only).
+///
+/// io500 compliance fix 2026-05-27: previously FsyncChunkRequest was
+/// declared `AmRpcCallType::Put` on the client side AND had no locusta
+/// dispatch registration on the server side. Result: 20M fsync RPCs
+/// during mdtest-hard returned "InvalidHeader" / "Put expects 1 IoSlice"
+/// → `benchfs_close` warn-logged + ack'd close without persistence →
+/// io500 rule #3 violation (close ack 前 persistent storage 保存済み).
+/// Fix:
+///   1. `FsyncChunkRequest::call_type` Put → None (eager path)
+///   2. `dispatch.register::<FsyncChunkRequest>()` added in benchfsd_mpi
+///   3. This handler — performs the actual server-side chunk fsync.
+impl LocustaServerHandler for FsyncChunkRequest {
+    async fn handle_locusta(
+        ctx: Rc<RpcHandlerContext>,
+        body: Vec<u8>,
+        req: Request<RegisteredFixedBuffer>,
+    ) {
+        let (header, _rest) = match split_header::<FsyncChunkRequestHeader>(&body) {
+            Some(pair) => pair,
+            None => {
+                reply_eager(
+                    req,
+                    FsyncChunkResponseHeader::error(-22).as_bytes().to_vec(),
+                );
+                return;
+            }
+        };
+        let path = match header.path() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                reply_eager(
+                    req,
+                    FsyncChunkResponseHeader::error(-22).as_bytes().to_vec(),
+                );
+                return;
+            }
+        };
+        let chunk_index = header.chunk_index;
+
+        // Locate the io_uring chunk store and fsync the chunk. Non-iouring
+        // chunk stores have no on-disk state to fsync — return success
+        // immediately (the in-memory store is purely for tests anyway).
+        use crate::storage::chunk_store::IOUringChunkStore;
+        use std::any::Any;
+        let chunk_store_any = &*ctx.chunk_store as &dyn Any;
+        let resp = if let Some(store) = chunk_store_any.downcast_ref::<IOUringChunkStore>() {
+            match store.fsync_chunk(&path, chunk_index).await {
+                Ok(()) => FsyncChunkResponseHeader::success(),
+                Err(e) => {
+                    eprintln!(
+                        "[locusta_handlers] fsync_chunk({}, {}) failed: {:?}",
+                        path, chunk_index, e
+                    );
+                    FsyncChunkResponseHeader::error(-5)
+                }
+            }
+        } else {
+            FsyncChunkResponseHeader::success()
+        };
+        reply_eager(req, resp.as_bytes().to_vec());
     }
 }

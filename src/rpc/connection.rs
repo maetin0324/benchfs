@@ -99,6 +99,13 @@ impl ConnectionPool {
         })
     }
 
+    /// Expose the underlying pluvio_ucx::Worker. Needed so callers
+    /// (ucx_relay) can register memory regions with the same UCX context
+    /// that endpoints in this pool are connected through.
+    pub fn worker(&self) -> &Rc<Worker> {
+        &self.worker
+    }
+
     /// Register this worker's address in the shared filesystem
     ///
     /// # Arguments

@@ -373,10 +373,35 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
             None
         };
 
-        // Parse request header
-        let header: ReadChunkByIdRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        // Parse request header (corr_id needed to echo back on reply)
+        let (corr_id, header): (u32, ReadChunkByIdRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
+        };
+
+        // 2026-06-04 Step 4 zero-copy direct RDMA: detect RMA suffix in
+        // header bytes. UcxRelayDaemon::forward_one appends
+        //   [rma_target_addr u64 LE][rkey_buf_len u32 LE][rkey_buf bytes]
+        // after the typed header when forwarding READ RPCs whose client
+        // has a registered SHM arena MR. If present, the server fills
+        // its fixed_buffer from disk, ucp_put's the chunk bytes directly
+        // into the client's arena, then am_send's a tiny ACK (header
+        // only). This saves the 4 MB Rndv server→daemon and the daemon's
+        // memcpy → arena, replacing them with one inline RDMA WRITE.
+        let raw_header_bytes = am_msg.header();
+        let typed_header_end =
+            crate::rpc::helpers::CORR_ID_PREFIX_LEN + std::mem::size_of::<ReadChunkByIdRequestHeader>();
+        let rma_info: Option<(u64, Vec<u8>)> = if raw_header_bytes.len() >= typed_header_end + 12 {
+            let suffix = &raw_header_bytes[typed_header_end..];
+            let addr = u64::from_le_bytes(suffix[..8].try_into().ok().unwrap_or([0; 8]));
+            let rkey_len = u32::from_le_bytes(suffix[8..12].try_into().ok().unwrap_or([0; 4])) as usize;
+            if rkey_len > 0 && suffix.len() >= 12 + rkey_len {
+                Some((addr, suffix[12..12 + rkey_len].to_vec()))
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         let parse_elapsed = handler_start.map(|s| s.elapsed());
@@ -641,7 +666,9 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
         } else {
             None
         };
-        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
+        // Pack [corr_id u32 LE][header] for the daemon-relay demux
+        let header_vec =
+            crate::rpc::helpers::pack_header_with_corr_id(corr_id, &response_header);
         let header_bytes: &[u8] = &header_vec;
 
         // Step 4: RDMA/UCX reply timing (only when stats enabled)
@@ -652,24 +679,52 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
         };
         let result = if let Some((mut fixed_buffer, bytes_read)) = fixed_buffer_opt {
             let data_slice = &fixed_buffer.as_mut_slice()[..bytes_read];
-            let data_slices = [std::io::IoSlice::new(data_slice)];
 
-            let proto = if crate::rpc::should_use_rdma(bytes_read as u64) {
-                Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+            // 2026-06-04 Step 4 zero-copy direct RDMA: if the originator
+            // shipped (rma_target_addr, rkey_buf) in the request header,
+            // ucp_put_nbx the chunk bytes straight into the client's
+            // SHM arena, then am_send a tiny ACK (header only, no data).
+            // This skips the 4 MB Rndv server→daemon hop and the daemon
+            // memcpy → arena step, mirroring locusta's zero-copy path.
+            if let Some((rma_addr, rkey_buf)) = rma_info.as_ref() {
+                let put_res = unsafe {
+                    am_msg
+                        .reply_put(data_slice, *rma_addr, rkey_buf)
+                        .await
+                };
+                match put_res {
+                    Ok(()) => unsafe {
+                        am_msg
+                            .reply_vectorized(
+                                Self::reply_stream_id() as u32,
+                                header_bytes,
+                                &[],
+                                false,
+                                None,
+                            )
+                            .await
+                    },
+                    Err(e) => Err(e),
+                }
             } else {
-                None
-            };
+                let data_slices = [std::io::IoSlice::new(data_slice)];
+                let proto = if crate::rpc::should_use_rdma(bytes_read as u64) {
+                    Some(pluvio_ucx::async_ucx::ucp::AmProto::Rndv)
+                } else {
+                    None
+                };
 
-            unsafe {
-                am_msg
-                    .reply_vectorized(
-                        Self::reply_stream_id() as u32,
-                        header_bytes,
-                        &data_slices,
-                        false,
-                        proto,
-                    )
-                    .await
+                unsafe {
+                    am_msg
+                        .reply_vectorized(
+                            Self::reply_stream_id() as u32,
+                            header_bytes,
+                            &data_slices,
+                            false,
+                            proto,
+                        )
+                        .await
+                }
             }
         } else if let Some(ref data) = response_data {
             let data_slices = [std::io::IoSlice::new(data)];
@@ -723,18 +778,40 @@ impl<'a> AmRpc for ReadChunkByIdRequest<'a> {
         if let Some(handler_start) = handler_start {
             let total_us = handler_start.elapsed().as_micros() as u64;
             let parse_us = parse_elapsed.map(|d| d.as_micros() as u64).unwrap_or(0);
-            tracing::debug!(
-                rpc_type = "READ",
-                chunk_id = header.chunk_id(),
-                total_us = total_us,
-                parse_us = parse_us,
-                buffer_acquire_us = buffer_acquire_us,
-                io_read_us = io_read_us,
-                response_construct_us = response_construct_us,
-                reply_us = reply_us,
-                bytes = header.length,
-                "RPC_TIMING_READ"
-            );
+            // 2026-06-03 chase loop iter2: aggregate per-N samples and
+            // emit as tracing::warn! so we capture even at RUST_LOG=warn.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            static SUM_TOTAL: AtomicU64 = AtomicU64::new(0);
+            static SUM_PARSE: AtomicU64 = AtomicU64::new(0);
+            static SUM_BUFACQ: AtomicU64 = AtomicU64::new(0);
+            static SUM_IO_READ: AtomicU64 = AtomicU64::new(0);
+            static SUM_RESP_CON: AtomicU64 = AtomicU64::new(0);
+            static SUM_REPLY: AtomicU64 = AtomicU64::new(0);
+            static SUM_BYTES: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            SUM_TOTAL.fetch_add(total_us, Ordering::Relaxed);
+            SUM_PARSE.fetch_add(parse_us, Ordering::Relaxed);
+            SUM_BUFACQ.fetch_add(buffer_acquire_us, Ordering::Relaxed);
+            SUM_IO_READ.fetch_add(io_read_us, Ordering::Relaxed);
+            SUM_RESP_CON.fetch_add(response_construct_us, Ordering::Relaxed);
+            SUM_REPLY.fetch_add(reply_us, Ordering::Relaxed);
+            SUM_BYTES.fetch_add(header.length, Ordering::Relaxed);
+            if n.is_multiple_of(4096) {
+                let nf = n as f64;
+                tracing::warn!(
+                    target: "rpc_read_timing",
+                    n = n,
+                    avg_total_us = SUM_TOTAL.load(Ordering::Relaxed) as f64 / nf,
+                    avg_parse_us = SUM_PARSE.load(Ordering::Relaxed) as f64 / nf,
+                    avg_buffer_acquire_us = SUM_BUFACQ.load(Ordering::Relaxed) as f64 / nf,
+                    avg_io_read_us = SUM_IO_READ.load(Ordering::Relaxed) as f64 / nf,
+                    avg_response_construct_us = SUM_RESP_CON.load(Ordering::Relaxed) as f64 / nf,
+                    avg_reply_us = SUM_REPLY.load(Ordering::Relaxed) as f64 / nf,
+                    total_bytes_GiB = SUM_BYTES.load(Ordering::Relaxed) as f64 / (1u64 << 30) as f64,
+                    "[rpc_read_timing] server-side ReadChunk handler breakdown"
+                );
+            }
         }
 
         Ok((crate::rpc::ServerResponse::new(response_header), am_msg))
@@ -881,9 +958,9 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
             None
         };
 
-        // Parse request header
-        let header: WriteChunkByIdRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        // Parse request header (corr_id needed to echo back on reply)
+        let (corr_id, header): (u32, WriteChunkByIdRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -1145,7 +1222,9 @@ impl AmRpc for WriteChunkByIdRequest<'_> {
         } else {
             None
         };
-        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
+        // Pack [corr_id u32 LE][header] for the daemon-relay demux
+        let header_vec =
+            crate::rpc::helpers::pack_header_with_corr_id(corr_id, &response_header);
         let header_bytes: &[u8] = &header_vec;
 
         // Step 5: Reply timing (only when stats enabled)
@@ -1325,7 +1404,15 @@ impl AmRpc for FsyncChunkRequest {
     }
 
     fn call_type(&self) -> AmRpcCallType {
-        AmRpcCallType::Put // Fsync is a write-like operation
+        // Fsync is header-only (path + chunk_id) — no payload IoSlice.
+        // Locusta `Put` path requires data.len() == 1 (small_req + DMA write
+        // buffer). Using None (eager) routes through send_call_eager which
+        // sends just the header and waits for a small_res response —
+        // exactly what fsync needs (server fsyncs the chunk file and acks).
+        // Compliance fix 2026-05-27: bug "Put expects 1 IoSlice, got 0" made
+        // 20M fsync RPCs fail silently during mdtest-hard close — files were
+        // closed without persistence, violating io500 rule #3.
+        AmRpcCallType::None
     }
 
     fn request_header(&self) -> &Self::RequestHeader {
@@ -1352,8 +1439,8 @@ impl AmRpc for FsyncChunkRequest {
         ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        let header: Self::RequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, Self::RequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => {
                 tracing::error!("Failed to parse FsyncChunk request header: {:?}", e);
                 return Err((RpcError::InvalidHeader, am_msg));
@@ -1413,7 +1500,9 @@ impl AmRpc for FsyncChunkRequest {
             ));
         }
 
-        let header_vec = zerocopy::IntoBytes::as_bytes(&response_header).to_vec();
+        // Pack [corr_id u32 LE][header] for the daemon-relay demux
+        let header_vec =
+            crate::rpc::helpers::pack_header_with_corr_id(corr_id, &response_header);
         let header_bytes: &[u8] = &header_vec;
 
         let result = unsafe {

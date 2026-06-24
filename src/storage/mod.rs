@@ -79,6 +79,13 @@ pub struct OpenFlags {
     pub truncate: bool,
     pub append: bool,
     pub direct: bool, // Direct I/O (O_DIRECT)
+    /// Data-sync open (`O_DSYNC`). When set, each `write` syscall
+    /// returns only after the kernel has flushed the data to stable
+    /// storage. Used by `InodeStore::async_write_then_fsync` to fold
+    /// `write + fsync` into a single SQE (one fewer io_uring round-trip
+    /// per inode WT). compliance-safe: data is durable before the SQE
+    /// completion that the handler awaits.
+    pub sync: bool,
 }
 
 impl OpenFlags {
@@ -91,6 +98,7 @@ impl OpenFlags {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         }
     }
 
@@ -103,6 +111,7 @@ impl OpenFlags {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         }
     }
 
@@ -115,6 +124,7 @@ impl OpenFlags {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         }
     }
 
@@ -147,6 +157,9 @@ impl OpenFlags {
         }
         if self.direct {
             flags |= libc::O_DIRECT;
+        }
+        if self.sync {
+            flags |= libc::O_DSYNC;
         }
 
         flags

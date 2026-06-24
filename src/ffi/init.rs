@@ -367,6 +367,153 @@ pub struct benchfs_context_t {
 /// * `node_id` - Node identifier (unique per process)
 /// * `registry_dir` - Directory for service discovery
 /// * `data_dir` - Data storage directory (required for server, optional for client)
+/// .init_array hook: fires when ld.so loads libbenchfs.so, before
+/// `main()` runs in the IOR/benchfsd_mpi process. 2026-06-02 SIGBUS
+/// debugging:
+///
+/// (1) Prints a `[BENCHFS_LOAD]` line — if absent on a host, SIGBUS
+///     fires in ld.so dependency resolution before .so init.
+///
+/// (2) Installs a SIGBUS handler that writes
+///     `[SIGBUS] pid=X si_code=N si_addr=ADDR` (async-signal-safe via
+///     raw libc::write) before chaining to SIG_DFL. si_code keys
+///     (linux):
+///       1 = BUS_ADRALN  (address alignment)
+///       2 = BUS_ADRERR  (non-existent physical address — tmpfs back
+///                        fail, ftruncate/mmap size mismatch)
+///       3 = BUS_OBJERR  (object-specific HW error)
+///       4 = BUS_MCEERR_AR (HW memory error, action required)
+///       5 = BUS_MCEERR_AO (HW memory error, action optional)
+///     si_addr is the faulting virtual address — compare against the
+///     channel-SHM mmap regions to localize which mapping failed.
+///
+/// Core files are unreliable on Sirius (systemd-coredump pipe pattern
+/// strips cwd, so `ulimit -c unlimited` + `cd /scr0/.../cores` does
+/// nothing). The signal handler is our authoritative path.
+#[unsafe(no_mangle)]
+pub extern "C" fn __benchfs_loadprobe() {
+    let pid = unsafe { libc::getpid() };
+    eprintln!(
+        "[BENCHFS_LOAD] pid={} libbenchfs.so loaded (.init_array)",
+        pid
+    );
+    // Install async-signal-safe SIGBUS handler.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = __benchfs_sigbus_handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Async-signal-safe SIGBUS handler. Uses only `libc::write` and stack
+/// buffers — no allocator, no Rust formatting machinery. After logging,
+/// the SA_RESETHAND flag (set in `__benchfs_loadprobe`) means the next
+/// SIGBUS uses the default action (so re-raising here would loop us
+/// back to the default disposition, terminating the process).
+#[unsafe(no_mangle)]
+pub extern "C" fn __benchfs_sigbus_handler(
+    _sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    // Build "[SIGBUS] pid=NNN si_code=N si_addr=0xHEX\n" into a stack
+    // buffer using only digit/hex conversion — no heap, no locks.
+    let pid = unsafe { libc::getpid() } as u64;
+    let info_ref = unsafe { &*info };
+    let si_code = info_ref.si_code as i64;
+    let si_addr = unsafe { (*info).si_addr() } as usize as u64;
+
+    let mut buf = [0u8; 128];
+    let mut n: usize = 0;
+
+    // "[SIGBUS] pid="
+    const PREFIX: &[u8] = b"[SIGBUS] pid=";
+    for &b in PREFIX {
+        buf[n] = b;
+        n += 1;
+    }
+    n += __benchfs_write_u64(&mut buf[n..], pid);
+
+    // " si_code="
+    const C: &[u8] = b" si_code=";
+    for &b in C {
+        buf[n] = b;
+        n += 1;
+    }
+    n += __benchfs_write_i64(&mut buf[n..], si_code);
+
+    // " si_addr=0x"
+    const A: &[u8] = b" si_addr=0x";
+    for &b in A {
+        buf[n] = b;
+        n += 1;
+    }
+    n += __benchfs_write_hex_u64(&mut buf[n..], si_addr);
+    buf[n] = b'\n';
+    n += 1;
+
+    unsafe {
+        libc::write(2, buf.as_ptr() as *const libc::c_void, n);
+    }
+    // SA_RESETHAND means the next SIGBUS uses SIG_DFL. Raise to trigger
+    // the default action (core dump if enabled, else terminate).
+    unsafe {
+        libc::raise(libc::SIGBUS);
+    }
+}
+
+fn __benchfs_write_u64(buf: &mut [u8], mut v: u64) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 24];
+    let mut i = 0;
+    while v > 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    for j in 0..i {
+        buf[j] = tmp[i - 1 - j];
+    }
+    i
+}
+
+fn __benchfs_write_i64(buf: &mut [u8], v: i64) -> usize {
+    if v < 0 {
+        buf[0] = b'-';
+        return 1 + __benchfs_write_u64(&mut buf[1..], (-v) as u64);
+    }
+    __benchfs_write_u64(buf, v as u64)
+}
+
+fn __benchfs_write_hex_u64(buf: &mut [u8], v: u64) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 16];
+    let mut i = 0;
+    let mut x = v;
+    while x > 0 {
+        let d = (x & 0xf) as u8;
+        tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        x >>= 4;
+        i += 1;
+    }
+    for j in 0..i {
+        buf[j] = tmp[i - 1 - j];
+    }
+    i
+}
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static __BENCHFS_INIT_ARRAY: extern "C" fn() = __benchfs_loadprobe;
+
 /// * `is_server` - Non-zero for server mode, zero for client mode
 /// * `chunk_size` - Chunk size in bytes (0 to use default 4MiB)
 ///
@@ -381,6 +528,9 @@ pub extern "C" fn benchfs_init(
     is_server: i32,
     chunk_size: usize,
 ) -> *mut benchfs_context_t {
+    // EARLY benchfs_init probe (restored 2026-06-02 — eprintln, low overhead)
+    let _pid_e = unsafe { libc::getpid() };
+    eprintln!("[BENCHFS_INIT_ENTRY] pid={} is_server={}", _pid_e, is_server);
     #[cfg(feature = "dhat-heap")]
     dhat_profile::start_if_first();
     // Use default chunk size if 0 is passed
@@ -389,7 +539,9 @@ pub extern "C" fn benchfs_init(
     } else {
         chunk_size
     };
+    eprintln!("[BENCHFS_INIT_ENTRY] pid={} pre-logging", _pid_e);
     crate::logging::init_with_hostname("info");
+    eprintln!("[BENCHFS_INIT_ENTRY] pid={} post-logging", _pid_e);
 
     // Honor [stats] enabled in benchfs.toml on the client (FFI) side so
     // that RPC_CLIENT_TIMING and other stats-gated paths emit data.

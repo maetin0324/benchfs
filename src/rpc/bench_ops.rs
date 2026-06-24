@@ -121,9 +121,10 @@ impl AmRpc for BenchPingRequest {
         _ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // Parse request header
-        let header: BenchPingRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        // Parse request header (corr_id needed to echo back on reply
+        // so the daemon-relay can demux concurrent same-rpc replies).
+        let (corr_id, header): (u32, BenchPingRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -137,7 +138,14 @@ impl AmRpc for BenchPingRequest {
             BenchPingResponseHeader::new(header.sequence_number, server_timestamp_ns);
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {
@@ -249,8 +257,8 @@ impl AmRpc for BenchShutdownRequest {
         am_msg: AmMsg,
     ) -> Result<(crate::rpc::ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
         // Parse request header
-        let header: BenchShutdownRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        let (corr_id, header): (u32, BenchShutdownRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
 
@@ -268,7 +276,14 @@ impl AmRpc for BenchShutdownRequest {
         let response_header = BenchShutdownResponseHeader::new(true);
 
         // Send response using reply_ep
-        send_rpc_response_via_reply(Self::reply_stream_id(), &response_header, None, am_msg).await
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
+            am_msg,
+        )
+        .await
     }
 
     fn error_response(error: &RpcError) -> Self::ResponseHeader {

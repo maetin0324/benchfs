@@ -425,18 +425,27 @@ impl RpcClient {
             ));
         }
 
-        // Send the RPC request with timeout
+        // Send the RPC request with timeout.
+        //
+        // Wire header layout: [corr_id u32 LE][AmRpc::RequestHeader].
+        // Embedded UCX (this path) uses corr_id=0 because each call has
+        // its own short-lived reply stream — demux isn't needed. The
+        // server still sees the prefix and echoes it back, keeping the
+        // wire format uniform with the daemon-relay path
+        // (`ucx_relay.rs`), which actually uses corr_id for demux.
+        let packed_header =
+            crate::rpc::helpers::pack_header_with_corr_id(0u32, header);
         tracing::debug!(
-            "Sending AM request: rpc_id={}, header_size={}, need_reply={}, proto={:?}",
+            "Sending AM request: rpc_id={}, header_size={} (incl 4B corr_id), need_reply={}, proto={:?}",
             rpc_id,
-            std::mem::size_of_val(zerocopy::IntoBytes::as_bytes(header)),
+            packed_header.len(),
             need_reply,
             proto
         );
 
         let send_future = self.conn.as_ref().unwrap().endpoint().am_send_vectorized(
             rpc_id as u32,
-            zerocopy::IntoBytes::as_bytes(header),
+            &packed_header,
             &data,
             need_reply,
             proto,
@@ -509,11 +518,16 @@ impl RpcClient {
             reply_stream_id
         );
 
-        // Deserialize the response header
+        // Deserialize the response header. Reply layout is
+        // [corr_id u32 LE][ResponseHeader bytes]; embedded UCX ignores
+        // corr_id (we never demux on a per-call stream) but we still
+        // skip 4 bytes to keep the wire format uniform with the
+        // daemon-relay path.
         let recv_start = exec_start.map(|_| Instant::now());
-        let response_header = msg
-            .header()
-            .get(..std::mem::size_of::<T::ResponseHeader>())
+        let resp_header_bytes = msg.header();
+        let resp_offset = crate::rpc::helpers::CORR_ID_PREFIX_LEN;
+        let response_header = resp_header_bytes
+            .get(resp_offset..resp_offset + std::mem::size_of::<T::ResponseHeader>())
             .and_then(|bytes| zerocopy::FromBytes::read_from_bytes(bytes).ok())
             .ok_or_else(|| RpcError::InvalidHeader)?;
 
@@ -663,9 +677,12 @@ impl RpcClient {
         let data = request.request_data();
         let proto = request.proto(); // TODO: Use when pluvio_ucx exports AmProto
 
+        // Wire format: [corr_id u32 LE][header bytes]. corr_id=0 is fine
+        // for fire-and-forget no-reply RPCs since there's no demux step.
+        let packed_header = crate::rpc::helpers::pack_header_with_corr_id(0u32, header);
         let send_future = self.conn.as_ref().unwrap().endpoint().am_send_vectorized(
             rpc_id as u32,
-            zerocopy::IntoBytes::as_bytes(header),
+            &packed_header,
             &data,
             false, // need_reply = false
             proto, // proto - TODO: pass actual proto when available

@@ -738,6 +738,13 @@ pub struct PosixChunkStore {
 
     /// Reusable aligned buffer (single-thread, so RefCell is fine)
     aligned_buffer: RefCell<AlignedBuffer>,
+
+    /// Per-path dirty chunk set. Mirrors `IOUringChunkStore::dirty_chunks`
+    /// so that PosixChunkStore can participate in the same close-time
+    /// fsync compliance flow (drained by MetadataUpdate handler).
+    /// Kept here so that the only measured difference vs the io_uring
+    /// backend is the syscall path, not the persistence logic.
+    dirty_chunks: RefCell<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
 }
 
 impl PosixChunkStore {
@@ -746,6 +753,16 @@ impl PosixChunkStore {
 
     /// O_DIRECT alignment requirement
     const ALIGNMENT: usize = 4096;
+
+    /// O_DIRECT is only usable when (offset, length) are both 512-byte aligned.
+    /// ior-hard's 47008-byte writes at arbitrary offsets break this, so we
+    /// fall back to non-direct buffered I/O per call. 2026-06-23 fix —
+    /// previously `use_direct_io = true` was hardcoded, which made
+    /// `BENCHFS_STORAGE_BACKEND=posix` blow up with EIO on ior-hard
+    /// (per the 29846 UCX+posix failure mode).
+    fn direct_io_aligned(use_direct_io: bool, offset: u64, length: u64) -> bool {
+        use_direct_io && (offset % 512 == 0) && (length % 512 == 0)
+    }
 
     pub fn new<P: AsRef<Path>>(base_dir: P, use_direct_io: bool) -> ChunkStoreResult<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
@@ -771,6 +788,7 @@ impl PosixChunkStore {
             chunk_size,
             use_direct_io,
             aligned_buffer,
+            dirty_chunks: RefCell::new(std::collections::HashMap::new()),
         })
     }
 
@@ -787,7 +805,7 @@ impl PosixChunkStore {
         format!("{:x}", chunk_index % Self::SHARD_COUNT)
     }
 
-    fn chunk_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
+    pub(crate) fn chunk_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
         let path_hash = self.hash_path(file_path);
         let shard = self.shard_dir(chunk_index);
         self.base_dir
@@ -832,8 +850,11 @@ impl PosixChunkStore {
 
         // Open
         let open_start = std::time::Instant::now();
+        let bytes_to_write = data.len().min(self.chunk_size - offset as usize);
+        let effective_direct =
+            Self::direct_io_aligned(self.use_direct_io, offset, bytes_to_write as u64);
         let mut flags = libc::O_WRONLY | libc::O_CREAT;
-        if self.use_direct_io {
+        if effective_direct {
             flags |= libc::O_DIRECT;
         }
         let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o644 as libc::mode_t) };
@@ -844,9 +865,8 @@ impl PosixChunkStore {
 
         // Prepare aligned buffer and write
         let write_start = std::time::Instant::now();
-        let bytes_to_write = data.len().min(self.chunk_size - offset as usize);
 
-        let written = if self.use_direct_io {
+        let written = if effective_direct {
             // O_DIRECT: copy data into aligned buffer, round write size up to 512-byte boundary
             let mut buf = self.aligned_buffer.borrow_mut();
             let aligned_len = (bytes_to_write + 511) & !511;
@@ -915,7 +935,140 @@ impl PosixChunkStore {
             "CHUNK_IO_TIMING"
         );
 
+        // io500 compliance: mark this chunk dirty so the close-time
+        // MetadataUpdate handler can fsync it via
+        // `fsync_dirty_chunks_for_path` before the client observes
+        // close-ack. Mirrors IOUringChunkStore so the only measured
+        // difference is the underlying syscall path.
+        self.dirty_chunks
+            .borrow_mut()
+            .entry(file_path.to_string())
+            .or_default()
+            .insert(chunk_index);
+
         Ok(written)
+    }
+
+    /// io500 compliance — drain the dirty chunk set for `file_path` and
+    /// fsync each chunk file (open + fsync + close per chunk). Mirrors
+    /// `IOUringChunkStore::fsync_dirty_chunks_for_path` so PosixChunkStore
+    /// can be benchmarked under the same close-time persistence flow.
+    pub async fn fsync_dirty_chunks_for_path(
+        &self,
+        file_path: &str,
+    ) -> ChunkStoreResult<()> {
+        let chunks: Vec<u64> = {
+            let mut map = self.dirty_chunks.borrow_mut();
+            match map.remove(file_path) {
+                Some(set) => set.into_iter().collect(),
+                None => return Ok(()),
+            }
+        };
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let n = chunks.len();
+        let t0 = std::time::Instant::now();
+        let mut first_err: Option<ChunkStoreError> = None;
+        for chunk_index in chunks {
+            let chunk_file_path = self.chunk_path(file_path, chunk_index);
+            if !chunk_file_path.exists() {
+                continue;
+            }
+            let c_path = match std::ffi::CString::new(chunk_file_path.as_os_str().as_encoded_bytes()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY) };
+            if fd < 0 {
+                if first_err.is_none() {
+                    first_err = Some(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+                }
+                continue;
+            }
+            let r = unsafe { libc::fsync(fd) };
+            if r < 0 && first_err.is_none() {
+                first_err = Some(ChunkStoreError::IoError(std::io::Error::last_os_error()));
+            }
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        if crate::stats::is_stats_enabled() {
+            tracing::info!(
+                target: "compliance_fsync",
+                path = file_path,
+                chunks = n,
+                elapsed_us = t0.elapsed().as_micros() as u64,
+                "FSYNC_DIRTY_PATH_POSIX"
+            );
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// CHFS-XATTR-style metadata persistence: store `size` as an
+    /// extended attribute on chunk 0's file. Mirror of
+    /// `IOUringChunkStore::set_file_size_xattr` — same xattr name,
+    /// same on-disk representation, so the two backends produce
+    /// interchangeable scratch state and `get_file_size_xattr` results.
+    pub fn set_file_size_xattr(&self, file_path: &str, size: u64) -> std::io::Result<()> {
+        let chunk0 = self.chunk_path(file_path, 0);
+        if !chunk0.exists() {
+            return Ok(());
+        }
+        let cpath = std::ffi::CString::new(chunk0.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+        let name = c"user.benchfs.size";
+        let value = size.to_le_bytes();
+        let rc = unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Read the size xattr from chunk 0 (mirror of
+    /// `IOUringChunkStore::get_file_size_xattr`).
+    pub fn get_file_size_xattr(&self, file_path: &str) -> std::io::Result<Option<u64>> {
+        let chunk0 = self.chunk_path(file_path, 0);
+        if !chunk0.exists() {
+            return Ok(None);
+        }
+        let cpath = std::ffi::CString::new(chunk0.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+        let name = c"user.benchfs.size";
+        let mut buf = [0u8; 8];
+        let rc = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if rc == 8 {
+            Ok(Some(u64::from_le_bytes(buf)))
+        } else if rc == -1 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENODATA) {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Read a chunk using synchronous POSIX I/O
@@ -949,8 +1102,11 @@ impl PosixChunkStore {
 
         // Open
         let open_start = std::time::Instant::now();
+        let read_len = length as usize;
+        let effective_direct =
+            Self::direct_io_aligned(self.use_direct_io, offset, read_len as u64);
         let mut flags = libc::O_RDONLY;
-        if self.use_direct_io {
+        if effective_direct {
             flags |= libc::O_DIRECT;
         }
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
@@ -961,9 +1117,8 @@ impl PosixChunkStore {
 
         // Read
         let read_start = std::time::Instant::now();
-        let read_len = length as usize;
 
-        let data = if self.use_direct_io {
+        let data = if effective_direct {
             // O_DIRECT: read into aligned buffer, round up to 512-byte boundary
             let mut buf = self.aligned_buffer.borrow_mut();
             let aligned_len = (read_len + 511) & !511;
@@ -1061,8 +1216,11 @@ impl PosixChunkStore {
 
         // Open
         let open_start = std::time::Instant::now();
+        let read_len = (length as usize).min(buf.len());
+        let effective_direct =
+            Self::direct_io_aligned(self.use_direct_io, offset, read_len as u64);
         let mut flags = libc::O_RDONLY;
-        if self.use_direct_io {
+        if effective_direct {
             flags |= libc::O_DIRECT;
         }
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
@@ -1073,9 +1231,8 @@ impl PosixChunkStore {
 
         // Read
         let read_start = std::time::Instant::now();
-        let read_len = (length as usize).min(buf.len());
 
-        let bytes_read = if self.use_direct_io {
+        let bytes_read = if effective_direct {
             // O_DIRECT: read into internal aligned buffer, then copy to destination
             let mut aligned_buf = self.aligned_buffer.borrow_mut();
             let aligned_len = (read_len + 511) & !511;
@@ -1316,6 +1473,18 @@ pub struct IOUringChunkStore {
     /// FPP mode (40-server unified holds N rank files, each only
     /// receiving 1/40 of that rank's data — `data_per_rank / 40`).
     unified_chunk_prealloc: RefCell<std::collections::HashSet<(String, u64)>>,
+
+    /// io500 compliance fix 2026-05-28: per-path dirty chunk set. After
+    /// `write_chunk` succeeds the chunk is marked dirty here. The
+    /// `MetadataUpdateRequest` server handler (called by `benchfs_close`
+    /// before returning to the client) drains the dirty set for the
+    /// given path via `fsync_dirty_chunks_for_path`. This bypasses the
+    /// broken separate FsyncChunkRequest RPC (rrrpc race condition,
+    /// iter75 panic at server.rs:1592). All writes for a file must
+    /// have ack'd to the client before MetadataUpdate is sent, so the
+    /// dirty set at MetadataUpdate time covers exactly what was
+    /// written.
+    dirty_chunks: RefCell<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1378,6 +1547,7 @@ impl IOUringChunkStore {
                 fd_cache_cap.min(1024),
             )),
             unified_chunk_prealloc: RefCell::new(std::collections::HashSet::new()),
+            dirty_chunks: RefCell::new(std::collections::HashMap::new()),
             mmap_enabled: crate::runtime_config::RuntimeConfig::global()
                 .storage
                 .chunk_mmap_write,
@@ -1419,13 +1589,81 @@ impl IOUringChunkStore {
     /// Get the path for a chunk file
     /// Directory structure: base_dir/path_hash/shard/chunk_index
     /// where shard = chunk_index % 16 (hex formatted)
-    fn chunk_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
+    pub(crate) fn chunk_path(&self, file_path: &str, chunk_index: u64) -> PathBuf {
         let path_hash = self.hash_path(file_path);
         let shard = self.shard_dir(chunk_index);
         self.base_dir
             .join(path_hash)
             .join(shard)
             .join(format!("{}", chunk_index))
+    }
+
+    /// CHFS-XATTR-style metadata persistence: store `size` as an
+    /// extended attribute on chunk 0's file. On XFS the value is small
+    /// enough to live inline inside the inode (no extra disk block), and
+    /// the chunk-fsync that the close-time `fsync_dirty_chunks_for_path`
+    /// already issues persists the xattr together with the data. This
+    /// replaces the separate `inode_store.update_size` which costs 4
+    /// io_uring SQEs (open + write + fsync + close) per file at close.
+    /// No-op when chunk 0 doesn't exist yet; size is then recovered
+    /// lazily by `stat` (returns 0 / lookup fails).
+    pub fn set_file_size_xattr(&self, file_path: &str, size: u64) -> std::io::Result<()> {
+        let chunk0 = self.chunk_path(file_path, 0);
+        if !chunk0.exists() {
+            return Ok(());
+        }
+        let cpath = std::ffi::CString::new(chunk0.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+        let name = c"user.benchfs.size";
+        let value = size.to_le_bytes();
+        let rc = unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Read the size xattr from chunk 0. Returns `None` if the chunk
+    /// file or xattr doesn't exist (treat as unknown / size derivable
+    /// from chunk-stat fallback).
+    pub fn get_file_size_xattr(&self, file_path: &str) -> std::io::Result<Option<u64>> {
+        let chunk0 = self.chunk_path(file_path, 0);
+        if !chunk0.exists() {
+            return Ok(None);
+        }
+        let cpath = std::ffi::CString::new(chunk0.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+        let name = c"user.benchfs.size";
+        let mut buf = [0u8; 8];
+        let rc = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if rc == 8 {
+            Ok(Some(u64::from_le_bytes(buf)))
+        } else if rc == -1 {
+            let e = std::io::Error::last_os_error();
+            // ENODATA / ENOATTR → just no xattr yet
+            if e.raw_os_error() == Some(libc::ENODATA) {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Number of sharded sub-files per logical file when unified layout is
@@ -1552,6 +1790,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         };
         let handle = self.backend.open(&chunk_file_path, flags).await?;
         let result = self.backend.write(handle, 0, &header_buf).await;
@@ -1607,6 +1846,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         };
         let handle = self.backend.open(&chunk_file_path, flags).await?;
         let mut buf = vec![0u8; std::mem::size_of::<PosixMetadataHeader>()];
@@ -1657,6 +1897,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         };
         let handle = self.backend.open(&chunk_file_path, flags).await?;
         let mut buf = vec![0u8; std::mem::size_of::<BenchfsChunk0Extension>()];
@@ -1691,6 +1932,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         };
         let handle = self.backend.open(&chunk_file_path, flags).await?;
         let result = self.backend.write(handle, EXT_OFFSET, ext.as_bytes()).await;
@@ -1742,6 +1984,21 @@ impl IOUringChunkStore {
         offset.is_multiple_of(Self::DIRECT_IO_ALIGN) && len.is_multiple_of(Self::DIRECT_IO_ALIGN)
     }
 
+    /// Effective O_DIRECT decision: honors `[storage].chunk_force_direct`
+    /// to mandate O_DIRECT even for unaligned IO (caller is responsible
+    /// for ensuring alignment via buffer choice + request shape — currently
+    /// only safe to enable for workloads that already use FixedBufferArena
+    /// + 4 KiB-multiple transfers).
+    pub(crate) fn effective_direct_io(offset: u64, len: u64) -> bool {
+        if crate::runtime_config::RuntimeConfig::global()
+            .storage
+            .chunk_force_direct
+        {
+            return true;
+        }
+        Self::direct_io_aligned(offset, len)
+    }
+
     /// Unified-layout open: one fd per (path, write_or_read, use_direct).
     /// Always cached. Same `O_RDWR` semantics as the per-chunk cache —
     /// once opened, the handle survives both write and read phases.
@@ -1781,6 +2038,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: use_direct,
+            sync: false,
         };
         let handle = self.backend.open(&data_path, flags).await?;
         let mut evicted: Vec<FileHandle> = Vec::new();
@@ -1861,6 +2119,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: use_direct,
+            sync: false,
         };
         let handle = self.backend.open(&chunk_file_path, flags).await?;
         // Pre-allocate the full chunk size on first open-for-write so
@@ -1948,6 +2207,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: use_direct,
+            sync: false,
         };
 
         let open_syscall_start = std::time::Instant::now();
@@ -2075,7 +2335,69 @@ impl IOUringChunkStore {
 
         tracing::trace!("Wrote {} bytes (attempts={})", written, attempt);
 
+        // io500 compliance: mark this chunk dirty so the next
+        // `fsync_dirty_chunks_for_path` (called by close-time
+        // MetadataUpdateRequest) durably flushes it before the client
+        // observes close-ack. See dirty_chunks field doc.
+        self.dirty_chunks
+            .borrow_mut()
+            .entry(file_path.to_string())
+            .or_default()
+            .insert(chunk_index);
+
         Ok(bytes_to_write)
+    }
+
+    /// io500 compliance — drain the dirty chunk set for `file_path` and
+    /// fsync each chunk to persistent storage. Called by the close-time
+    /// `MetadataUpdateRequest` server handler so that close-ack happens
+    /// only after data is durable. Idempotent (no-op if dirty set empty).
+    ///
+    /// Concurrency is bounded by `max_concurrent_chunk_rpcs` (default 16)
+    /// so a 232K-chunk ior-easy file fsync doesn't issue 232K parallel
+    /// io_uring fsync SQEs.
+    pub async fn fsync_dirty_chunks_for_path(
+        &self,
+        file_path: &str,
+    ) -> ChunkStoreResult<()> {
+        let chunks: Vec<u64> = {
+            let mut map = self.dirty_chunks.borrow_mut();
+            match map.remove(file_path) {
+                Some(set) => set.into_iter().collect(),
+                None => return Ok(()),
+            }
+        };
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let n = chunks.len();
+        let t0 = std::time::Instant::now();
+        let mut first_err: Option<ChunkStoreError> = None;
+        // Sequential fsync per chunk. async_io_uring fsync_chunk uses
+        // open + fsync + close internally; with chunk_fd_cache enabled
+        // open/close are cheap. Sequential keeps server tick responsive
+        // — parallel would saturate the io_uring depth and starve
+        // pending writes from other paths.
+        for chunk_index in chunks {
+            if let Err(e) = self.fsync_chunk(file_path, chunk_index).await {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if crate::stats::is_stats_enabled() {
+            tracing::info!(
+                target: "compliance_fsync",
+                path = file_path,
+                chunks = n,
+                elapsed_us = t0.elapsed().as_micros() as u64,
+                "FSYNC_DIRTY_PATH"
+            );
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Read a chunk from file using io_uring
@@ -2140,6 +2462,7 @@ impl IOUringChunkStore {
             truncate: false,
             append: false,
             direct: false,
+            sync: false,
         };
 
         let handle = self.backend.open(&chunk_file_path, flags).await?;

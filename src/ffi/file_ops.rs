@@ -164,6 +164,7 @@ fn c_flags_to_open_flags(flags: i32) -> OpenFlags {
         create: false,
         truncate: false,
         append: false,
+        exclusive: false,
     };
 
     // Access mode
@@ -194,7 +195,13 @@ fn c_flags_to_open_flags(flags: i32) -> OpenFlags {
     if flags & BENCHFS_O_APPEND != 0 {
         open_flags.append = true;
     }
-    // Note: EXCL flag is handled implicitly by the create flag in BenchFS
+    // O_EXCL gates the atomic test-and-set MetadataCreate RPC. Without
+    // exclusive, benchfs_open elides the create RPC and the close-time
+    // MetadataUpdate upserts the inode. With exclusive, a single
+    // MetadataCreate RPC enforces EEXIST semantics on hash(path) owner.
+    if flags & BENCHFS_O_EXCL != 0 {
+        open_flags.exclusive = true;
+    }
 
     open_flags
 }

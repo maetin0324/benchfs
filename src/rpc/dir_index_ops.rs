@@ -23,7 +23,9 @@ use pluvio_ucx::async_ucx::ucp::AmMsg;
 use rrrpc::server::Request;
 
 use crate::metadata::InodeType;
-use crate::rpc::helpers::{RpcIoSliceHelper, parse_header};
+use crate::rpc::helpers::{
+    RpcIoSliceHelper, parse_header, receive_path, send_rpc_response_via_reply,
+};
 #[cfg(feature = "transport-locusta")]
 use crate::rpc::locusta_buffer::RegisteredFixedBuffer;
 #[cfg(feature = "transport-locusta")]
@@ -184,19 +186,43 @@ impl AmRpc for DirIndexUpdateRequest {
     }
 
     async fn server_handler(
-        _ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
-        am_msg: AmMsg,
+        ctx: Rc<crate::rpc::handlers::RpcHandlerContext>,
+        mut am_msg: AmMsg,
     ) -> Result<(ServerResponse<Self::ResponseHeader>, AmMsg), (RpcError, AmMsg)> {
-        // UCX path is not used for DirIndexUpdate (locusta-only). Parse
-        // header so we don't choke on bad input, then return EIO.
-        let _: DirIndexUpdateRequestHeader = match parse_header(&am_msg) {
-            Ok(h) => h,
+        // UCX-side mirror of the locusta `handle_locusta` impl below. Kept
+        // in lockstep so a transport A/B compares only UCX vs locusta, not
+        // a logic gap.
+        let (corr_id, header): (u32, DirIndexUpdateRequestHeader) = match parse_header(&am_msg) {
+            Ok(x) => x,
             Err(e) => return Err((e, am_msg)),
         };
-        Err((
-            RpcError::HandlerError("DirIndexUpdate is locusta-only".to_string()),
+
+        let path_str = match receive_path(&ctx, &mut am_msg, header.path_len).await {
+            Ok(p) => p,
+            Err(e) => return Err((e, am_msg)),
+        };
+
+        let response_header = match header.op {
+            DIR_INDEX_OP_INSERT => {
+                ctx.metadata_manager
+                    .dir_index_insert(&path_str, header.inode_type_enum());
+                DirIndexUpdateResponseHeader::success()
+            }
+            DIR_INDEX_OP_REMOVE => {
+                ctx.metadata_manager.dir_index_remove(&path_str);
+                DirIndexUpdateResponseHeader::success()
+            }
+            _ => DirIndexUpdateResponseHeader::error(-22),
+        };
+
+        send_rpc_response_via_reply(
+            Self::reply_stream_id(),
+            corr_id,
+            &response_header,
+            None,
             am_msg,
-        ))
+        )
+        .await
     }
 
     fn error_response(_error: &RpcError) -> Self::ResponseHeader {
