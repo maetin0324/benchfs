@@ -450,9 +450,9 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         let entries = vec![
-            ("a.txt".to_string(), InodeType::File),
-            ("b".to_string(), InodeType::Directory),
-            ("c.lnk".to_string(), InodeType::Symlink),
+            ("a.txt".to_string(), InodeType::File, 123),
+            ("b".to_string(), InodeType::Directory, 0),
+            ("c.lnk".to_string(), InodeType::Symlink, 0),
         ];
         let mut buf = Vec::new();
         let n = encode_entries(&mut buf, &entries);
@@ -460,6 +460,7 @@ mod tests {
         let decoded = decode_entries(&buf).unwrap();
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0].name, "a.txt");
+        assert_eq!(decoded[0].size, 123);
         assert!(matches!(decoded[0].entry_type, InodeType::File));
         assert!(matches!(decoded[1].entry_type, InodeType::Directory));
         assert!(matches!(decoded[2].entry_type, InodeType::Symlink));
@@ -470,7 +471,7 @@ mod tests {
         // 256 KiB budget with 100-byte names: roughly 2500 entries fit.
         let mut entries = Vec::new();
         for i in 0..10_000 {
-            entries.push((format!("name_{i:050}_padding"), InodeType::File));
+            entries.push((format!("name_{i:050}_padding"), InodeType::File, 0));
         }
         let mut buf = Vec::new();
         let packed = encode_entries(&mut buf, &entries);

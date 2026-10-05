@@ -111,6 +111,12 @@ mimalloc-allocator = ["dep:mimalloc"]
 # to find the dominant allocation sites during mdtest-hard.
 dhat-heap = ["dep:dhat"]
 
+# Experimental probes for the small-scale latency residual (see
+# docs/locusta-latency-experiments.md). Compiled out by default; the TOML
+# knobs `exp_dispatch_reap_uring` / `exp_inline_get_max_bytes` select them.
+exp-uring-reap = []
+exp-inline-get = []
+
 # Debug profile with full debug symbols for perf profiling
 [profile.dev]
 debug = 2                  # Full debug info (DWARF)

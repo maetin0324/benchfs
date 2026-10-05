@@ -617,6 +617,8 @@ pub extern "C" fn benchfs_init(
             tracing::info!(
                 "benchfs_init: reusing existing locusta client context (idempotent re-init)"
             );
+            #[cfg(feature = "transport-locusta")]
+            if !set_locusta_client_session(&existing, true) { return std::ptr::null_mut(); }
             let boxed = Box::new(existing);
             return Box::into_raw(boxed) as *mut benchfs_context_t;
         }
@@ -1232,11 +1234,24 @@ pub extern "C" fn benchfs_init(
             chunk_size,
         ));
 
+        #[cfg(feature = "transport-locusta")]
+        let effective_locusta = connection_pool.locusta_transport_ref().is_some();
+        #[cfg(not(feature = "transport-locusta"))]
+        let effective_locusta = false;
+        tracing::info!(node = %node_id_str,
+            transport = if effective_locusta { "locusta" } else { "ucx" },
+            "BENCHFS_EFFECTIVE_CLIENT");
+
         // Runtime already stored in thread-local storage above
         set_connection_pool(connection_pool);
 
         benchfs
     };
+
+    #[cfg(feature = "transport-locusta")]
+    if use_locusta_client && !set_locusta_client_session(&benchfs, true) {
+        return std::ptr::null_mut();
+    }
 
     // Store in thread-local context
     set_benchfs_ctx(benchfs.clone());
@@ -1249,6 +1264,16 @@ pub extern "C" fn benchfs_init(
     // We box the Rc to pass ownership to C
     let boxed = Box::new(benchfs);
     Box::into_raw(boxed) as *mut benchfs_context_t
+}
+
+#[cfg(feature = "transport-locusta")]
+fn set_locusta_client_session(fs: &BenchFS, open: bool) -> bool {
+    let Some(transport) = fs.connection_pool_ref().and_then(|p| p.locusta_transport_ref()) else { return true; };
+    let transport = transport.clone();
+    match block_on_with_name("locusta_client_session", async move { transport.client_session(open).await }) {
+        Ok(()) => true,
+        other => { tracing::error!(error = ?other, open, "client session update failed"); false }
+    }
 }
 
 /// Finalize and destroy a BenchFS instance
@@ -1359,6 +1384,10 @@ pub extern "C" fn benchfs_finalize(ctx: *mut benchfs_context_t) {
     }
 
     if use_locusta_client {
+        #[cfg(feature = "transport-locusta")]
+        if let Some(fs) = super::runtime::get_benchfs_ctx_rc() {
+            set_locusta_client_session(&fs, false);
+        }
         tracing::info!("benchfs_finalize: locusta client — preserving TLS state for next phase");
         #[cfg(feature = "dhat-heap")]
         dhat_profile::stop_if_last();

@@ -1127,6 +1127,27 @@ impl LocustaServerHandler for ReadChunkByIdRequest<'_> {
                         hash
                     ));
                 }
+                #[cfg(feature = "exp-inline-get")]
+                {
+                    let max = crate::runtime_config::RuntimeConfig::global()
+                        .locusta
+                        .exp_inline_get_max_bytes;
+                    if n <= max {
+                        // Experiment C2: the data rides in the small reply; no
+                        // RDMA WRITE. One extra server-side copy of n bytes.
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static INLINE: AtomicU64 = AtomicU64::new(0);
+                        let k = INLINE.fetch_add(1, Ordering::Relaxed);
+                        if k == 0 || k.is_multiple_of(10000) {
+                            tracing::info!(n, k, "EXP_INLINE_GET reply");
+                        }
+                        let mut reply = ReadChunkResponseHeader::success(n as u64).as_bytes().to_vec();
+                        reply.extend_from_slice(unsafe { std::slice::from_raw_parts(fb.as_ptr(), n) });
+                        h.reply_inline(reply);
+                        READ_REPLIED.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
                 let mut buf = RegisteredFixedBuffer::from_fixed_buffer(fb);
                 buf.shrink_to(n);
                 let resp = ReadChunkResponseHeader::success(n as u64);

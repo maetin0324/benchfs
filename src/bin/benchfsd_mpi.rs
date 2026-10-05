@@ -236,13 +236,7 @@ fn init_locusta_runtime(
     dispatch.register::<MetadataUpdateRequest>();
     dispatch.register::<WriteChunkByIdRequest<'_>>();
     dispatch.register::<ReadChunkByIdRequest<'_>>();
-    // FsyncChunkRequest NOT registered — its RPC path triggers rrrpc race
-    // (iter75/76 server.rs:1592 panic). Replaced by piggyback fsync in
-    // MetadataUpdateRequest handler: IOUringChunkStore marks chunks dirty
-    // on write, the close-time MetadataUpdate handler drains and fsyncs
-    // them before responding. This preserves io500 rule #3 (close ack 前
-    // persistent storage 保存済み) without per-chunk RPC fan-out and
-    // without the broken FsyncChunkRequest path.
+    dispatch.register::<benchfs::rpc::data_ops::FsyncChunkRequest>();
     dispatch.register::<benchfs::rpc::readdir_ops::ReaddirRequest>();
     dispatch.register::<benchfs::rpc::dir_index_ops::DirIndexUpdateRequest>();
 
@@ -684,6 +678,8 @@ fn run_server(
     // populated by the "iouring" backend branch — the other backends keep
     // inode_store on std::fs.
     let mut io_uring_backend_for_inode: Option<Rc<benchfs::storage::IOUringBackend>> = None;
+    // Experiment C1 handle (feature `exp-uring-reap`); see docs/locusta-latency-experiments.md.
+    let mut exp_uring_reactor: Option<Rc<IoUringReactor>> = None;
     let (chunk_store, allocator): (
         Rc<dyn ChunkStore>,
         Rc<pluvio_uring::allocator::FixedBufferAllocator>,
@@ -752,6 +748,7 @@ fn run_server(
 
             let allocator = uring_reactor.allocator.clone();
             let reactor_for_backend = uring_reactor.clone();
+            exp_uring_reactor = Some(uring_reactor.clone());
             runtime.register_reactor("io_uring", uring_reactor);
 
             // Create IOUringBackend and chunk store
@@ -998,6 +995,14 @@ fn run_server(
         }
     };
 
+    #[cfg(feature = "transport-locusta")]
+    let effective_locusta = connection_pool.locusta_transport_ref().is_some();
+    #[cfg(not(feature = "transport-locusta"))]
+    let effective_locusta = false;
+    tracing::info!(node = %node_id,
+        transport = if effective_locusta { "locusta" } else { "ucx" },
+        "BENCHFS_EFFECTIVE_SERVER");
+
     // Registration will be done after runtime starts (moved to async task below)
 
     // Register all RPC handlers FIRST (before publishing address)
@@ -1028,6 +1033,21 @@ fn run_server(
             // implementation handles this rate fine).
             let dispatch = Rc::clone(&locusta_state.as_ref().unwrap().dispatch);
             let transport = Rc::clone(&locusta_state.as_ref().unwrap().transport);
+            let exp_reap_requested = benchfs::runtime_config::RuntimeConfig::global()
+                .locusta
+                .exp_dispatch_reap_uring;
+            #[cfg(feature = "exp-uring-reap")]
+            let exp_reap: Option<Rc<IoUringReactor>> =
+                exp_uring_reactor.take().filter(|_| exp_reap_requested);
+            #[cfg(feature = "exp-uring-reap")]
+            if exp_reap.is_some() {
+                tracing::warn!("EXP_URING_REAP: dispatch loop reaps io_uring completions every iteration");
+            }
+            #[cfg(not(feature = "exp-uring-reap"))]
+            if exp_reap_requested {
+                tracing::warn!("exp_dispatch_reap_uring is set but feature exp-uring-reap is not compiled; ignored");
+            }
+            let _ = &exp_uring_reactor;
 
             // Register the LocustaTransport as a pluvio Reactor when
             // BENCHFS_LOCUSTA_REACTOR=1. This makes the runtime call
@@ -1068,6 +1088,9 @@ fn run_server(
                     let rc_locusta = &benchfs::runtime_config::RuntimeConfig::global().locusta;
                     let idle_sleep_us: u64 = rc_locusta.dispatch_idle_sleep_us;
                     let idle_threshold: u32 = rc_locusta.dispatch_idle_threshold;
+                    let idle_mode = rc_locusta.dispatch_idle_mode;
+                    tracing::info!(?idle_mode, idle_sleep_us, idle_threshold,
+                        "Locusta dispatch policy (spin_while_clients occupies one runtime core while connected)");
                     // BENCHFS_LOCUSTA_REACTOR=1 — when on, the pluvio
                     // Reactor (registered below) is the sole driver of
                     // `inner.tick()`. The dispatch task only drains and
@@ -1111,6 +1134,12 @@ fn run_server(
                         } else {
                             dispatch.poll_once_spawn(&transport)
                         };
+                        // Experiment C1: completion reaping decoupled from the
+                        // reactor's poll interval / status cache / timeouts.
+                        #[cfg(feature = "exp-uring-reap")]
+                        if let Some(reactor) = exp_reap.as_ref() {
+                            reactor.poll_submit_and_completions();
+                        }
                         iter = iter.wrapping_add(1);
                         if drained > 0 {
                             total_drained = total_drained.saturating_add(drained as u64);
@@ -1227,7 +1256,7 @@ fn run_server(
                             YieldOnce::default().await;
                         } else {
                             empty_polls = empty_polls.saturating_add(1);
-                            if empty_polls < idle_threshold {
+                            if !idle_mode.should_sleep(dispatch.connected_clients(), empty_polls, idle_threshold, idle_sleep_us) {
                                 YieldOnce::default().await;
                             } else {
                                 pluvio_timer::sleep(std::time::Duration::from_micros(
@@ -1329,6 +1358,7 @@ fn run_server(
         // through this daemon's UCX endpoints — the UCX equivalent of
         // `BENCHFS_LOCUSTA_DAEMON_NAME`. See `src/rpc/ucx_relay.rs`
         // for the daemon design.
+        #[cfg(feature = "transport-locusta")]
         if let Ok(daemon_shm) = std::env::var("BENCHFS_UCX_DAEMON_NAME") {
             if !daemon_shm.is_empty() {
                 eprintln!(

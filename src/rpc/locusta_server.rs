@@ -64,6 +64,7 @@ type DynLauncher = Box<
 
 /// Per-process router from `rpc_id` to its [`LocustaServerHandler`].
 pub struct LocustaServerDispatch {
+    clients: std::cell::RefCell<crate::rpc::client_session::ClientSessions>,
     ctx: Rc<RpcHandlerContext>,
     handlers: HashMap<u16, DynLauncher>,
 }
@@ -71,10 +72,13 @@ pub struct LocustaServerDispatch {
 impl LocustaServerDispatch {
     pub fn new(ctx: Rc<RpcHandlerContext>) -> Self {
         Self {
+            clients: Default::default(),
             ctx,
             handlers: HashMap::new(),
         }
     }
+
+    pub fn connected_clients(&self) -> usize { self.clients.borrow().count() }
 
     /// Register `H` as the handler for `H::rpc_id()`.
     /// Panics on duplicate registration.
@@ -126,6 +130,14 @@ impl LocustaServerDispatch {
         // borrows from `req` via `small_req`, so any move of `req`
         // invalidates `body`.
         let body_owned = body.to_vec();
+        if rpc_id == crate::rpc::client_session::RPC_CLIENT_SESSION {
+            if let Request::RoundtripEager(h) = req {
+                let status = if self.clients.borrow_mut().update(&body_owned).is_ok() { 0 } else { 1 };
+                tracing::info!(clients = self.connected_clients(), status, "LOCUSTA_CLIENT_SESSION");
+                h.reply(vec![status]);
+            }
+            return None;
+        }
         // Sync fast path: PutGrant for chunk writes has no .await; handle
         // inline so we save one Box::pin + executor::spawn per RPC.
         let req = if rpc_id == crate::rpc::data_ops::RPC_WRITE_CHUNK_BY_ID {

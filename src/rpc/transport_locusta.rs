@@ -1414,6 +1414,8 @@ impl Drop for LocustaInner {
 /// Handle exposed to BenchFS. Cheap to clone (`Rc` underneath).
 #[derive(Clone)]
 pub struct LocustaTransport {
+    user_buffers: Rc<RefCell<crate::rpc::user_buffer::UserBufferCache>>,
+    client_session_users: Rc<std::cell::Cell<usize>>,
     pub inner: Rc<RefCell<LocustaInner>>,
 }
 
@@ -1980,7 +1982,7 @@ impl LocustaTransport {
                  caller must invoke add_peer per peer after register_self"
             );
         }
-        Ok(Self { inner })
+        Ok(Self { inner, client_session_users: Rc::new(std::cell::Cell::new(0)), user_buffers: Rc::new(RefCell::new(crate::rpc::user_buffer::UserBufferCache::new(rc_locusta))) })
     }
 
     /// **iter191+ shared-daemon mode**. Initialize a *client-only*
@@ -2196,6 +2198,8 @@ impl LocustaTransport {
             "LocustaTransport::init_shared_client connected to daemon SHM"
         );
         Ok(Self {
+            client_session_users: Rc::new(std::cell::Cell::new(0)),
+            user_buffers: Rc::new(RefCell::new(crate::rpc::user_buffer::UserBufferCache::new(&crate::runtime_config::RuntimeConfig::global().locusta))),
             inner: Rc::new(RefCell::new(inner)),
         })
     }
@@ -2935,6 +2939,89 @@ impl LocustaTransport {
         .await
     }
 
+    /// Open/close the logical FFI connection. Multiple FFI contexts share a
+    /// transport, so only the first open and last close notify the servers.
+    pub async fn client_session(&self, open: bool) -> Result<(), RpcError> {
+        if !open { self.clear_user_buffer_cache(); }
+        let users = self.client_session_users.get();
+        if open && users > 0 { self.client_session_users.set(users + 1); return Ok(()); }
+        if !open && users != 1 { self.client_session_users.set(users.saturating_sub(1)); return Ok(()); }
+        let (name, peers) = {
+            let inner = self.inner.borrow();
+            let name = inner.local_node_id.clone();
+            let peers = session_peers(&name, inner.node_to_dest.keys());
+            (name, peers)
+        };
+        let mut body = vec![u8::from(open)];
+        body.extend_from_slice(name.as_bytes());
+        for peer in peers {
+            let response = self.send_eager(&peer, crate::rpc::client_session::RPC_CLIENT_SESSION,
+                &[std::io::IoSlice::new(&body)]).await?;
+            if response.header_bytes != [0] {
+                return Err(RpcError::TransportError(format!("client session rejected by {peer}")));
+            }
+        }
+        self.client_session_users.set(usize::from(open));
+        Ok(())
+    }
+
+    /// Register a caller-owned range for one synchronous FFI invocation.
+    /// # Safety
+    /// User memory must remain valid (and exclusive for reads) until every
+    /// chunk RPC completes and the returned scope is dropped.
+    pub unsafe fn begin_user_buffer(&self, ptr: usize, len: usize, writable: bool)
+        -> Option<crate::rpc::user_buffer::UserBufferScope>
+    {
+        let inner = self.inner.borrow();
+        // A shared daemon cannot dereference pointers in this process.
+        let pd = &inner.daemon.as_ref()?.rdma.as_ref()?.pd;
+        unsafe { self.user_buffers.borrow_mut().begin(pd, ptr, len, writable) }
+    }
+
+    pub fn user_buffer_slice(&self, ptr: usize, len: usize, writable: bool)
+        -> Option<crate::rpc::user_buffer::UserBufferSlice>
+    {
+        self.user_buffers.borrow().lookup(ptr, len, writable)
+    }
+
+    pub fn clear_user_buffer_cache(&self) { self.user_buffers.borrow_mut().clear_idle(); }
+
+    /// Zero-copy Put/Get for a range registered at the BenchFS FFI entry.
+    /// The local relay understands an external descriptor; the server wire
+    /// protocol and grant/reply ordering are identical to arena-backed DMA.
+    pub async fn send_with_user_buffer(
+        &self, dest: &NodeId, rpc_id: u16, parts: &[std::io::IoSlice<'_>],
+        buf: &crate::rpc::user_buffer::UserBufferSlice, get: bool,
+    ) -> Result<RpcResponse, RpcError> {
+        let dest_id = self.lookup_dest(dest)?;
+        let mut in_flight = crate::rpc::user_buffer::InFlightDma::default();
+        let completion_id = {
+            let mut inner = self.inner.borrow_mut();
+            let small_req = stage_small_req(&mut inner, rpc_id, parts);
+            let bytes = unsafe { std::slice::from_raw_parts(small_req.as_ptr(), small_req.len()) };
+            let (id, fut) = {
+                let mut batch = inner.client.batch();
+                let fut = if get {
+                    batch.call_get_registered(dest_id, bytes, &buf.buffer)
+                } else {
+                    batch.call_put_registered(dest_id, bytes, &buf.buffer)
+                }.map_err(|e| RpcError::TransportError(format!("external MR submit: {e:?}")))?;
+                (fut.req_id(), fut)
+            };
+            in_flight.0 = true;
+            inner.inflight.insert(id, fut);
+            id
+        };
+        let response = self.wait_for(completion_id, dest.clone()).await?;
+        in_flight.0 = false; // completion covers all DMA, including the Get dual arrival
+        let data_len = match &response {
+            Response::DmaAndSmallRes { dma_len, .. } => *dma_len as usize,
+            Response::SmallRes { .. } => 0,
+        };
+        let header_bytes = copy_small_res_data(&self.inner.borrow(), response.small_res_data());
+        Ok(RpcResponse { header_bytes, data_len })
+    }
+
     /// Allocate a buffer from the locusta client arena.
     ///
     /// The returned `DmaBuffer` is RDMA-registered and can be used directly
@@ -3158,6 +3245,15 @@ impl std::future::Future for WaitForResponse {
         cx.waker().wake_by_ref();
         std::task::Poll::Pending
     }
+}
+
+/// Peers that receive client session open/close. `node_to_dest` also holds
+/// the in-process loopback destination for the local node; a client has no
+/// server behind it, so notifying it would wait for a reply until timeout.
+fn session_peers<'a>(local: &str, known: impl Iterator<Item = &'a NodeId>) -> Vec<NodeId> {
+    let mut peers: Vec<NodeId> = known.filter(|p| p.as_str() != local).cloned().collect();
+    peers.sort();
+    peers
 }
 
 /// Helper for the server side of the loop: drain incoming requests and
@@ -3557,5 +3653,20 @@ impl RpcTransport for LocustaTransport {
                 .map_err(|e| RpcError::TransportError(format!("send_oneway_eager: {e:?}")))?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod session_peer_tests {
+    use super::*;
+
+    #[test]
+    fn session_peers_skip_local_loopback() {
+        let known: Vec<NodeId> = ["node_1", "client_3", "node_0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(session_peers("client_3", known.iter()), vec!["node_0", "node_1"]);
+        assert!(session_peers("client_3", [].iter()).is_empty());
     }
 }

@@ -12,6 +12,7 @@ pub mod buffer_pool;
 pub mod client;
 pub mod connection;
 pub mod data_ops;
+#[cfg(feature = "transport-locusta")]
 pub mod ucx_relay;
 pub mod dir_index_ops;
 pub mod file_id;
@@ -240,3 +241,9 @@ impl std::fmt::Display for RpcError {
 }
 
 impl std::error::Error for RpcError {}
+
+#[cfg(feature = "transport-locusta")]
+pub mod user_buffer;
+
+#[cfg(feature = "transport-locusta")]
+pub mod client_session;

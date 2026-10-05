@@ -1,0 +1,369 @@
+--- a/rrrpc/src/relay/client.rs
++++ b/rrrpc/src/relay/client.rs
+@@ -81,6 +81,26 @@
+             ring_capacity: 128,
+             channel_name: None,
+         }
++    }
++}
++
++/// Borrowed, externally registered DMA range for the embedded relay.
++/// Construction is unsafe: registration and memory must survive completion.
++#[derive(Clone, Copy)]
++pub struct RegisteredBuffer {
++    addr: u64,
++    len: u32,
++    lkey: u32,
++    rkey: u32,
++}
++
++impl RegisteredBuffer {
++    /// # Safety
++    /// Keys must cover this range in the relay's PD. The range and MR must
++    /// remain valid until completion; Get requires exclusive writable memory.
++    /// Only use with an embedded relay in the same address space.
++    pub unsafe fn new(addr: u64, len: u32, lkey: u32, rkey: u32) -> Self {
++        Self { addr, len, lkey, rkey }
+     }
+ }
+ 
+@@ -872,8 +892,14 @@
+         dest_id: DestId,
+         payload: &[u8],
+         dma_buf: Option<&DmaBuffer>,
++        external: Option<&RegisteredBuffer>,
+         is_dma_read: bool,
+     ) -> Result<ResponseFuture, ClientError> {
++        // The descriptor occupies the last 16 inline bytes. Reject before
++        // creating pending state; caller can use the normal copy path.
++        if external.is_some() && (payload.len() > 208 || self.req_ring.is_some()) {
++            return Err(ClientError::NotConnected);
++        }
+         self.ensure_window()?;
+ 
+         let completion_id = self.next_completion_id;
+@@ -906,6 +932,19 @@
+             }
+         }
+ 
++        if let Some(buf) = external {
++            slot.flags |= RequestFlags::EXTERNAL_DMA.bits();
++            slot.dma_len = buf.len;
++            slot.small_req_inline[208..216].copy_from_slice(&buf.addr.to_ne_bytes());
++            slot.small_req_inline[216..220].copy_from_slice(&buf.lkey.to_ne_bytes());
++            slot.small_req_inline[220..224].copy_from_slice(&buf.rkey.to_ne_bytes());
++            if is_dma_read {
++                slot.flags |= RequestFlags::HAS_DMA_READ.bits();
++                self.pending.get_mut(req_id as usize).unwrap().dma_resp_len = buf.len;
++            } else {
++                slot.flags |= RequestFlags::HAS_DMA_WRITE.bits();
++            }
++        }
+         self.submit_request(slot);
+ 
+         let batch = self
+@@ -1080,7 +1119,7 @@
+     ) -> Result<ResponseFuture, ClientError> {
+         let future = self
+             .client
+-            .submit_roundtrip(self.id, dest, payload, None, false)?;
++            .submit_roundtrip(self.id, dest, payload, None, None, false)?;
+         self.outstanding += 1;
+         Ok(future)
+     }
+@@ -1094,7 +1133,7 @@
+     ) -> Result<ResponseFuture, ClientError> {
+         let future = self
+             .client
+-            .submit_roundtrip(self.id, dest, payload, Some(dma_buf), false)?;
++            .submit_roundtrip(self.id, dest, payload, Some(dma_buf), None, false)?;
+         self.outstanding += 1;
+         Ok(future)
+     }
+@@ -1108,7 +1147,25 @@
+     ) -> Result<ResponseFuture, ClientError> {
+         let future = self
+             .client
+-            .submit_roundtrip(self.id, dest, payload, Some(recv_buf), true)?;
++            .submit_roundtrip(self.id, dest, payload, Some(recv_buf), None, true)?;
++        self.outstanding += 1;
++        Ok(future)
++    }
++
++    /// Put from an external MR (embedded relay only).
++    pub fn call_put_registered(&mut self, dest: DestId, payload: &[u8], buf: &RegisteredBuffer)
++        -> Result<ResponseFuture, ClientError>
++    {
++        let future = self.client.submit_roundtrip(self.id, dest, payload, None, Some(buf), false)?;
++        self.outstanding += 1;
++        Ok(future)
++    }
++
++    /// Get into an external MR (embedded relay only).
++    pub fn call_get_registered(&mut self, dest: DestId, payload: &[u8], buf: &RegisteredBuffer)
++        -> Result<ResponseFuture, ClientError>
++    {
++        let future = self.client.submit_roundtrip(self.id, dest, payload, None, Some(buf), true)?;
+         self.outstanding += 1;
+         Ok(future)
+     }
+--- a/rrrpc/src/relay/daemon.rs
++++ b/rrrpc/src/relay/daemon.rs
+@@ -145,6 +145,7 @@
+     pub small_res_cap: u32,
+     pub dma_off: u32,
+     pub dma_len: u32,
++    pub external_dma: Option<(u64, u32, u32)>,
+     pub state: PendingState,
+ }
+ 
+@@ -896,6 +897,7 @@
+             small_res_cap: slot.small_res_cap,
+             dma_off: slot.dma_off,
+             dma_len: slot.dma_len,
++            external_dma: slot.external_dma(),
+             state,
+         }) as u16
+     }
+@@ -973,7 +975,9 @@
+             }
+             msg_count += 1;
+         } else if flags.contains(RequestFlags::HAS_DMA_READ) && slot.dma_len > 0 {
+-            let (client_addr, client_rkey) = if channel.arena_mr.is_some() {
++            let (client_addr, client_rkey) = if let Some((addr, _, rkey)) = slot.external_dma() {
++                (addr, rkey)
++            } else if channel.arena_mr.is_some() {
+                 (channel.mr_addr + slot.dma_off as u64, channel.arena_rkey)
+             } else {
+                 (0, 0)
+@@ -1055,7 +1059,9 @@
+             };
+             Self::enqueue_outgoing(dest, call_id, unsafe { as_bytes(&dma_write_req) });
+         } else if flags.contains(RequestFlags::HAS_DMA_READ) && slot.dma_len > 0 {
+-            let (client_addr, client_rkey) = if channel.arena_mr.is_some() {
++            let (client_addr, client_rkey) = if let Some((addr, _, rkey)) = slot.external_dma() {
++                (addr, rkey)
++            } else if channel.arena_mr.is_some() {
+                 (channel.mr_addr + slot.dma_off as u64, channel.arena_rkey)
+             } else {
+                 (0, 0)
+@@ -1101,6 +1107,7 @@
+             small_res_cap: slot.small_res_cap,
+             dma_off: slot.dma_off,
+             dma_len: slot.dma_len,
++            external_dma: slot.external_dma(),
+             state,
+         }) as u16;
+ 
+@@ -1170,7 +1177,9 @@
+                 Self::enqueue_outgoing(dest, call_id, dma_bytes);
+             } else if flags.contains(RequestFlags::HAS_DMA_READ) && slot.dma_len > 0 {
+                 // Get パターン: RelayDmaReadReq (client の DMA arena アドレスを通知)
+-                let (client_addr, client_rkey) = if let Some(ref _arena_mr) = channel.arena_mr {
++                let (client_addr, client_rkey) = if let Some((addr, _, rkey)) = slot.external_dma() {
++                    (addr, rkey)
++                } else if let Some(ref _arena_mr) = channel.arena_mr {
+                     (channel.mr_addr + slot.dma_off as u64, channel.arena_rkey)
+                 } else {
+                     (0, 0)
+@@ -2182,7 +2191,7 @@
+     }
+ 
+     fn try_issue_put_dma_write(&mut self, relay_req_id: u16) -> bool {
+-        let (channel_id, dest_id, dma_off, dma_len, server_addr, server_rkey) = {
++        let (channel_id, dest_id, dma_off, dma_len, external_dma, server_addr, server_rkey) = {
+             let Some(req) = self.pending.get(relay_req_id as usize) else {
+                 return true;
+             };
+@@ -2198,6 +2207,7 @@
+                 req.dest_id,
+                 req.dma_off,
+                 req.dma_len,
++                req.external_dma,
+                 *server_addr,
+                 *server_rkey,
+             )
+@@ -2221,8 +2231,10 @@
+             return false;
+         };
+ 
+-        let src_addr = channel.mr_addr + dma_off as u64;
+-        let src_lkey = arena_mr.lkey();
++        let (src_addr, src_lkey) = match external_dma {
++            Some((addr, lkey, _)) => (addr, lkey),
++            None => (channel.mr_addr + dma_off as u64, arena_mr.lkey()),
++        };
+         let imm = pack_dma_immediate(IMM_DMA_REQ_WRITE_DONE, relay_req_id);
+         let qp_ref = rdma_dest.qp.borrow();
+         let Ok(ctx) = qp_ref.emit_ctx() else {
+--- a/rrrpc/src/wire.rs
++++ b/rrrpc/src/wire.rs
+@@ -56,6 +56,18 @@
+ }
+ const _: () = assert!(size_of::<RequestSlot>() == 256);
+ 
++impl RequestSlot {
++    /// External DMA descriptor is local to the client/relay; network format is unchanged.
++    pub fn external_dma(&self) -> Option<(u64, u32, u32)> {
++        if self.flags & RequestFlags::EXTERNAL_DMA.bits() == 0 { return None; }
++        Some((
++            u64::from_ne_bytes(self.small_req_inline[208..216].try_into().unwrap()),
++            u32::from_ne_bytes(self.small_req_inline[216..220].try_into().unwrap()),
++            u32::from_ne_bytes(self.small_req_inline[220..224].try_into().unwrap()),
++        ))
++    }
++}
++
+ /// Relay → Client の完了スロット (64B)
+ #[repr(C, align(64))]
+ #[derive(Clone, Copy)]
+@@ -109,6 +121,8 @@
+         const HAS_DMA_WRITE    = 0b0000_0100;
+         /// response-side DMA read (get buffer)
+         const HAS_DMA_READ     = 0b0000_1000;
++        /// Embedded client supplies address/lkey/rkey in the last 16 inline bytes.
++        const EXTERNAL_DMA    = 0b0001_0000;
+     }
+ }
+ 
+--- a/mlx5/src/pd.rs
++++ b/mlx5/src/pd.rs
+@@ -143,6 +143,24 @@
+ }
+ 
+ impl Pd {
++    /// Register an explicit ODP range. Kernel MMU notifiers invalidate
++    /// translations on unmap/remap, so this MR may be cached across frees.
++    ///
++    /// # Safety
++    /// The caller must keep the virtual range valid with the required access
++    /// during each DMA operation, and retain this MR until DMA completes.
++    /// Between operations the range may be unmapped or reused. Never use the
++    /// keys to access freed memory. ODP support is required; no pinned fallback.
++    pub unsafe fn register_odp(&self, addr: *mut u8, len: usize, writable: bool)
++        -> io::Result<MemoryRegion>
++    {
++        let access = if writable {
++            AccessFlags::ON_DEMAND | AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE
++        } else { AccessFlags::ON_DEMAND };
++        // ODP's MMU notifier lifetime is stronger than ordinary register().
++        unsafe { self.register(addr, len, access) }
++    }
++
+     /// Register a memory region with the HCA.
+     ///
+     /// Registers a memory buffer starting at `addr` with size `len` bytes.
+@@ -217,6 +235,53 @@
+     pub fn is_empty(&self) -> bool {
+         self.len() == 0
+     }
++
++    /// Synchronously populate the ODP translations of the whole region
++    /// (`ibv_advise_mr` prefetch with FLUSH), so the first DMA does not take
++    /// an HCA page fault. A responder-side fault is answered with an RNR NAK
++    /// and stalls the peer for the QP's `min_rnr_timer`.
++    ///
++    /// Best effort: on error the MR stays valid and faults on demand.
++    /// Translations dropped later by an MMU invalidation are also re-faulted
++    /// on demand; this is only an initial warm-up.
++    pub fn prefetch_odp(&self, writable: bool) -> io::Result<()> {
++        let unsupported = || io::Error::from(io::ErrorKind::Unsupported);
++        let length = u32::try_from(self.len()).map_err(|_| unsupported())?;
++        // `ibv_advise_mr` is a static inline in verbs.h; this is its body.
++        unsafe {
++            let pd = self._pd.as_ptr();
++            let ctx = (*pd).context;
++            // __VERBS_ABI_IS_EXTENDED
++            if (*ctx).abi_compat as usize != usize::MAX {
++                return Err(unsupported());
++            }
++            let offset = std::mem::offset_of!(mlx5_sys::verbs_context, context);
++            let vctx = (ctx as *mut u8).sub(offset) as *mut mlx5_sys::verbs_context;
++            let op_offset = std::mem::offset_of!(mlx5_sys::verbs_context, advise_mr);
++            if (*vctx).sz < std::mem::size_of::<mlx5_sys::verbs_context>() - op_offset {
++                return Err(unsupported());
++            }
++            let advise = (*vctx).advise_mr.ok_or_else(unsupported)?;
++            let advice = if writable {
++                mlx5_sys::ib_uverbs_advise_mr_advice_IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE
++            } else {
++                mlx5_sys::ib_uverbs_advise_mr_advice_IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH
++            };
++            let mut sge = mlx5_sys::ibv_sge {
++                addr: self.addr() as u64,
++                length,
++                lkey: self.lkey(),
++            };
++            let rc = advise(
++                pd,
++                advice,
++                mlx5_sys::ib_uverbs_advise_mr_flag_IB_UVERBS_ADVISE_MR_FLAG_FLUSH,
++                &mut sge,
++                1,
++            );
++            if rc == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(rc)) }
++        }
++    }
+ }
+ 
+ // =============================================================================
+--- a/rrrpc/src/relay/tests.rs
++++ b/rrrpc/src/relay/tests.rs
+@@ -1967,3 +1967,37 @@
+ 
+     harness.run_ops(&ops);
+ }
++
++#[test]
++fn external_user_mr_descriptor_preserves_inline_header_and_direction() {
++    let mut h = TestHarness::new(64, 1024 * 1024);
++    // Mock relay only inspects descriptors; no DMA is issued in this test.
++    let external = unsafe { RegisteredBuffer::new(0x1234_0000, 65536, 42, 43) };
++    for get in [false, true] {
++        let header = [0x5a; 208];
++        let mut batch = h.client.batch();
++        let _response = if get {
++            batch.call_get_registered(7, &header, &external)
++        } else {
++            batch.call_put_registered(7, &header, &external)
++        }.unwrap();
++        drop(batch);
++        let slot = h.client.req_queue.try_dequeue().unwrap();
++        assert_eq!(slot.external_dma(), Some((0x1234_0000, 42, 43)));
++        assert_eq!(slot.dma_len, 65536);
++        assert_eq!(slot.small_req_len, 208);
++        assert_eq!(slot.small_req_inline[..208], header);
++        assert_eq!(slot.flags & RequestFlags::HAS_DMA_READ.bits() != 0, get);
++        assert_eq!(slot.flags & RequestFlags::HAS_DMA_WRITE.bits() != 0, !get);
++        assert_eq!(h.client.pending[slot.req_id as usize].has_dma_read, get);
++    }
++}
++
++#[test]
++fn external_user_mr_oversize_header_has_no_pending_side_effect() {
++    let mut h = TestHarness::new(64, 1024 * 1024);
++    let external = unsafe { RegisteredBuffer::new(0x1234_0000, 65536, 42, 43) };
++    assert!(h.client.batch().call_get_registered(0, &[0; 209], &external).is_err());
++    assert!(h.client.pending.is_empty());
++    assert!(h.client.req_queue.try_dequeue().is_none());
++}
+--- a/rrrpc/src/server.rs
++++ b/rrrpc/src/server.rs
+@@ -252,6 +252,17 @@
+     pub fn dma_len(&self) -> u32 {
+         self.dma_read_len
+     }
++    /// Experimental: answer a Get with the data inside the small response and
++    /// no RDMA WRITE. The client still sees `dma_len` as requested, so the
++    /// caller must recognise the longer small response and copy the bytes.
++    pub fn reply_inline(mut self, data: Vec<u8>) {
++        self.consumed = true;
++        self.sink.borrow_mut().push(InternalAction::SmallRes {
++            req_id: self.req_id,
++            status: CompletionStatus::Ok as u8,
++            data: PayloadBytes::from_vec(data),
++        });
++    }
+     /// segment から zero-copy RDMA WRITE + metadata を返す (self を consume)
+     pub fn reply(mut self, segment: B, metadata: Vec<u8>) {
+         self.consumed = true;

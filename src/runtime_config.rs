@@ -118,6 +118,25 @@ impl Default for TransportConfig {
     }
 }
 
+/// Dispatch always yields cooperatively. Connected clients keep one server
+/// runtime core busy in SpinWhileClients mode, including gaps between RPCs.
+/// Measured on Sirius (job 43223, 2+2 ppn1) the runtime thread used 0.97 core
+/// in both modes: with `reactor_mode` the executor busy-polls anyway, so the
+/// sleep only delays completions (docs/locusta-user-buffers.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchIdleMode {
+    #[default]
+    Sleep,
+    SpinWhileClients,
+}
+impl DispatchIdleMode {
+    pub fn should_sleep(self, clients: usize, empty: u32, threshold: u32, sleep_us: u64) -> bool {
+        sleep_us > 0 && empty >= threshold
+            && !(self == Self::SpinWhileClients && clients > 0)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LocustaTuning {
@@ -139,6 +158,33 @@ pub struct LocustaTuning {
     /// Server-side dispatch task idle sleep (microseconds) after
     /// `dispatch_idle_threshold` empty polls.
     pub dispatch_idle_sleep_us: u64,
+    /// sleep (default) or spin_while_clients. The latter occupies one core
+    /// while client sessions are connected; it still yields to other tasks.
+    /// In reactor_mode the core is busy in both modes (measured 0.97 core),
+    /// so spin_while_clients costs no extra CPU there and removes the 20 us
+    /// idle-sleep latency (4 KiB: +33 % write / +46 % read at 2+2 ppn1).
+    pub dispatch_idle_mode: DispatchIdleMode,
+    /// Transparently register ordinary FFI buffers using explicit ODP MRs.
+    /// Unsupported registration and small requests use the copy path.
+    pub user_mr_cache: bool,
+    pub user_mr_min_bytes: usize,
+    /// Per-runtime MR limits, in addition to arena_size (both multiply by ppn).
+    /// Bytes are page-rounded virtual coverage, a conservative resident bound.
+    pub user_mr_cache_entries: usize,
+    pub user_mr_cache_bytes: usize,
+    /// Idle entries expire on the next entry call; finalize clears idle MRs.
+    pub user_mr_cache_idle_ms: u64,
+    /// Re-run the ODP prefetch for a read destination on every cache reuse.
+    /// A buffer freed and reallocated at the same address loses its device
+    /// translations; without this the next Get faults at the HCA and the
+    /// server's RDMA WRITE waits out an RNR NAK (tens of ms).
+    pub user_mr_prefetch_on_reuse: bool,
+    /// Experiment C1 (feature `exp-uring-reap`): the dispatch loop reaps
+    /// io_uring completions every iteration instead of the reactor cadence.
+    pub exp_dispatch_reap_uring: bool,
+    /// Experiment C2 (feature `exp-inline-get`): Get replies of at most this
+    /// many bytes carry the data inside the small reply (no RDMA WRITE). 0 = off.
+    pub exp_inline_get_max_bytes: usize,
     /// Number of empty `drain_and_spawn` polls before the dispatch task
     /// switches from `YieldOnce` to `sleep(dispatch_idle_sleep_us)`.
     pub dispatch_idle_threshold: u32,
@@ -219,6 +265,15 @@ impl Default for LocustaTuning {
             accept_interval_ms: 10,
             reactor_mode: false,
             dispatch_idle_sleep_us: 20,
+            dispatch_idle_mode: DispatchIdleMode::Sleep,
+            user_mr_cache: true,
+            user_mr_min_bytes: 65536,
+            user_mr_cache_entries: 64,
+            user_mr_cache_bytes: 64 * 1024 * 1024,
+            user_mr_cache_idle_ms: 30000,
+            user_mr_prefetch_on_reuse: true,
+            exp_dispatch_reap_uring: false,
+            exp_inline_get_max_bytes: 0,
             dispatch_idle_threshold: 16,
             bind_ip: None,
             mlx5_device: None,
@@ -614,6 +669,20 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_policy_preserves_yield_and_tracks_clients() {
+        use DispatchIdleMode::*;
+        assert!(Sleep.should_sleep(1, 16, 16, 20));
+        assert!(!Sleep.should_sleep(0, 15, 16, 20));
+        assert!(!SpinWhileClients.should_sleep(1, u32::MAX, 16, 20));
+        assert!(SpinWhileClients.should_sleep(0, 16, 16, 20));
+        assert!(!Sleep.should_sleep(0, u32::MAX, 16, 0));
+        assert!(!SpinWhileClients.should_sleep(0, u32::MAX, 16, 0));
+        let cfg: RuntimeConfig = toml::from_str("[locusta]\ndispatch_idle_mode = \"spin_while_clients\"").unwrap();
+        assert_eq!(cfg.locusta.dispatch_idle_mode, SpinWhileClients);
+        assert!(toml::from_str::<RuntimeConfig>("[locusta]\ndispatch_idle_mode = \"spin\"").is_err());
+    }
 
     #[test]
     fn empty_file_takes_defaults() {

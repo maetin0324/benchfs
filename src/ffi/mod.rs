@@ -81,6 +81,7 @@
 pub mod error;
 pub mod file_ops;
 pub mod init;
+#[cfg(feature = "transport-locusta")]
 pub mod io_buffer;
 pub mod metadata;
 pub mod runtime;
@@ -89,5 +90,6 @@ pub mod runtime;
 pub use error::*;
 pub use file_ops::*;
 pub use init::*;
+#[cfg(feature = "transport-locusta")]
 pub use io_buffer::*;
 pub use metadata::*;

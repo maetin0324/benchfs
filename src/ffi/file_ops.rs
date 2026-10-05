@@ -361,6 +361,10 @@ pub extern "C" fn benchfs_write(
         let result = with_benchfs_client_ctx(|fs| {
             let fs_ptr = fs as *const BenchFSClient;
             let fs_ref = &*fs_ptr;
+            #[cfg(feature = "transport-locusta")]
+            let _user_buffer = fs_ref.connection_pool()
+                .and_then(|pool| pool.locusta_transport_ref())
+                .and_then(|transport| transport.begin_user_buffer(buffer as usize, size, false));
 
             // Seek to the specified offset before writing
             if let Err(e) = fs_ref.seek(&handle_clone, offset, 0) {
@@ -438,6 +442,10 @@ pub extern "C" fn benchfs_read(
         let result = with_benchfs_client_ctx(|fs| {
             let fs_ptr = fs as *const BenchFSClient;
             let fs_ref = &*fs_ptr;
+            #[cfg(feature = "transport-locusta")]
+            let _user_buffer = fs_ref.connection_pool()
+                .and_then(|pool| pool.locusta_transport_ref())
+                .and_then(|transport| transport.begin_user_buffer(buffer as usize, size, true));
 
             // Seek to the specified offset before reading
             if let Err(e) = fs_ref.seek(&handle_clone, offset, 0) {

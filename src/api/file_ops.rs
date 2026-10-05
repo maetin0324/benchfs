@@ -1895,7 +1895,6 @@ impl BenchFS {
     /// For distributed mode, fsync RPCs are sent to remote nodes holding chunks.
     #[async_backtrace::framed]
     pub async fn benchfs_fsync(&self, handle: &FileHandle) -> ApiResult<()> {
-        use crate::config::defaults::MAX_CONCURRENT_CHUNK_RPCS;
         use futures::stream::{self, StreamExt};
         use std::path::Path;
 
@@ -1928,74 +1927,74 @@ impl BenchFS {
         let self_node_id = self.metadata_manager.self_node_id().to_string();
         let fs_ptr = self as *const BenchFS;
 
-        // Create fsync futures for all chunks
-        let fsync_futures: Vec<_> = (0..chunk_count)
+        // Create fsync futures for all chunks. These are lazy futures, not
+        // spawned tasks: spawn_with_name starts every task immediately, so
+        // buffer_unordered would not bound concurrency and a 16 GiB file
+        // (4096 chunks at 4 MiB) put all FsyncChunk RPCs in flight at once
+        // and hung (E3 bisect 42709). Ported from the src-core tree.
+        let fsync_futures = (0..chunk_count)
             .map(|chunk_index| {
                 let file_path = file_path.clone();
                 let self_node_id = self_node_id.clone();
 
-                spawn_with_name(
-                    async move {
-                        let fs = unsafe { &*fs_ptr };
-                        let chunk_key = format!("{}/{}", &file_path, chunk_index);
-                        let target_node = fs.get_chunk_node(&chunk_key);
-                        let is_local = target_node == self_node_id;
+                async move {
+                    let fs = unsafe { &*fs_ptr };
+                    let chunk_key = format!("{}/{}", &file_path, chunk_index);
+                    let target_node = fs.get_chunk_node(&chunk_key);
+                    let is_local = target_node == self_node_id;
 
-                        if is_local {
-                            // Fsync local chunk (requires chunk_store)
-                            let chunk_store = fs.chunk_store.as_ref().expect(
-                                "is_local=true but chunk_store is None; this indicates a bug",
-                            );
-                            chunk_store
-                                .fsync_chunk(&file_path, chunk_index)
-                                .await
-                                .map_err(|e| {
-                                    ApiError::IoError(format!(
-                                        "Failed to fsync chunk {}: {:?}",
-                                        chunk_index, e
-                                    ))
-                                })
-                        } else if let Some(pool) = &fs.connection_pool {
-                            // Send fsync RPC to remote node
-                            match pool.get_or_connect(&target_node).await {
-                                Ok(client) => {
-                                    use crate::rpc::data_ops::FsyncChunkRequest;
+                    if is_local {
+                        // Fsync local chunk (requires chunk_store)
+                        let chunk_store = fs.chunk_store.as_ref().expect(
+                            "is_local=true but chunk_store is None; this indicates a bug",
+                        );
+                        chunk_store
+                            .fsync_chunk(&file_path, chunk_index)
+                            .await
+                            .map_err(|e| {
+                                ApiError::IoError(format!(
+                                    "Failed to fsync chunk {}: {:?}",
+                                    chunk_index, e
+                                ))
+                            })
+                    } else if let Some(pool) = &fs.connection_pool {
+                        // Send fsync RPC to remote node
+                        match pool.get_or_connect(&target_node).await {
+                            Ok(client) => {
+                                use crate::rpc::data_ops::FsyncChunkRequest;
 
-                                    let request =
-                                        FsyncChunkRequest::new(file_path.clone(), chunk_index);
-                                    match request.call(&*client).await {
-                                        Ok(response) if response.is_success() => {
-                                            tracing::trace!(
-                                                "Remote fsync chunk {} on node {} succeeded",
-                                                chunk_index,
-                                                target_node
-                                            );
-                                            Ok(())
-                                        }
-                                        Ok(response) => Err(ApiError::IoError(format!(
-                                            "Remote fsync chunk {} failed with status {}",
-                                            chunk_index, response.status
-                                        ))),
-                                        Err(e) => Err(ApiError::IoError(format!(
-                                            "RPC error for fsync chunk {}: {:?}",
-                                            chunk_index, e
-                                        ))),
+                                let request =
+                                    FsyncChunkRequest::new(file_path.clone(), chunk_index);
+                                match request.call(&*client).await {
+                                    Ok(response) if response.is_success() => {
+                                        tracing::trace!(
+                                            "Remote fsync chunk {} on node {} succeeded",
+                                            chunk_index,
+                                            target_node
+                                        );
+                                        Ok(())
                                     }
+                                    Ok(response) => Err(ApiError::IoError(format!(
+                                        "Remote fsync chunk {} failed with status {}",
+                                        chunk_index, response.status
+                                    ))),
+                                    Err(e) => Err(ApiError::IoError(format!(
+                                        "RPC error for fsync chunk {}: {:?}",
+                                        chunk_index, e
+                                    ))),
                                 }
-                                Err(e) => Err(ApiError::IoError(format!(
-                                    "Failed to connect to {} for fsync: {:?}",
-                                    target_node, e
-                                ))),
                             }
-                        } else {
-                            // No connection pool in standalone mode, local fsync only
-                            Ok(())
+                            Err(e) => Err(ApiError::IoError(format!(
+                                "Failed to connect to {} for fsync: {:?}",
+                                target_node, e
+                            ))),
                         }
-                    },
-                    format!("benchfs_fsync_chunk_{}", chunk_index),
-                )
-            })
-            .collect::<Vec<_>>();
+                    } else {
+                        // No connection pool in standalone mode, local fsync only
+                        Ok(())
+                    }
+                }
+            });
 
         // Execute fsync operations with bounded concurrency
         let results: Vec<_> = stream::iter(fsync_futures)
@@ -2005,9 +2004,7 @@ impl BenchFS {
 
         // Check for any errors
         for result in results {
-            let chunk_result =
-                result.map_err(|e| ApiError::Internal(format!("Fsync task failed: {}", e)))?;
-            chunk_result?;
+            result?;
         }
 
         tracing::debug!(

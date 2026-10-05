@@ -1507,7 +1507,7 @@ impl AmRpc for FsyncChunkRequest {
 
         let result = unsafe {
             am_msg
-                .reply_vectorized(Self::rpc_id() as u32, header_bytes, &[], false, None)
+                .reply_vectorized(Self::reply_stream_id() as u32, header_bytes, &[], false, None)
                 .await
         };
 

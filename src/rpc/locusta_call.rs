@@ -113,6 +113,22 @@ pub trait LocustaCallable: AmRpc {
                     .map_err(|_| RpcError::InvalidHeader)
             };
 
+        // Experiment C2 (`exp-inline-get`): a Get answered with the data inside
+        // the small reply. Bytes after the header belong in the recv buffer.
+        #[cfg(feature = "exp-inline-get")]
+        let inline_get = |resp: &mut crate::rpc::transport::RpcResponse, dst: *mut u8, cap: usize| {
+            let hdr_size = std::mem::size_of::<Self::ResponseHeader>();
+            if resp.header_bytes.len() > hdr_size {
+                let data = &resp.header_bytes[hdr_size..];
+                let n = data.len().min(cap);
+                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, n) };
+                resp.data_len = n;
+                resp.header_bytes.truncate(hdr_size);
+            }
+        };
+        #[cfg(not(feature = "exp-inline-get"))]
+        let inline_get = |_: &mut crate::rpc::transport::RpcResponse, _: *mut u8, _: usize| {};
+
         match self.call_type() {
             AmRpcCallType::None => {
                 // Per-stage profiling for WriteChunkById eager path
@@ -270,6 +286,12 @@ pub trait LocustaCallable: AmRpc {
                 // application buffer directly — no alloc + memcpy in
                 // `transport_locusta::send_put` (jobs 20146 timing).
                 let src_ptr = payload.as_ptr();
+                if header_bytes.len() + 2 <= 208 {
+                    if let Some(buf) = transport.user_buffer_slice(src_ptr as usize, payload.len(), false) {
+                        let resp = transport.send_with_user_buffer(&peer_id, Self::rpc_id(), &header_only, &buf, false).await?;
+                        return decode(resp);
+                    }
+                }
                 if let Some(dma_buf_raw) = crate::ffi::io_buffer::io_buffer_ptr_raw(src_ptr) {
                     // SAFETY: same single-thread invariant as the Get path
                     // — the IO_BUFFERS map only mutates from synchronous C
@@ -323,6 +345,13 @@ pub trait LocustaCallable: AmRpc {
                 // same convention (see `data_ops.rs:209`).
                 let recv_ptr = resp_buf[0].as_ptr();
                 let recv_len = resp_buf[0].len();
+                if header_bytes.len() + 2 <= 208 {
+                    if let Some(buf) = transport.user_buffer_slice(recv_ptr as usize, recv_len, true) {
+                        let mut resp = transport.send_with_user_buffer(&peer_id, Self::rpc_id(), &header_only, &buf, true).await?;
+                        inline_get(&mut resp, recv_ptr as *mut u8, recv_len);
+                        return decode(resp);
+                    }
+                }
                 // Zero-copy fast path: if the caller's recv buffer was
                 // allocated from the locusta arena via
                 // `benchfs_alloc_io_buffer`, hand the underlying DmaBuffer
@@ -338,7 +367,7 @@ pub trait LocustaCallable: AmRpc {
                     // the whole phase, so the DmaBuffer is stable through
                     // this RPC's await.
                     let dma_buf: &rrrpc::relay::client::DmaBuffer = unsafe { &*dma_buf_raw };
-                    let resp = watchdog(
+                    let mut resp = watchdog(
                         "get_with_buffer",
                         &peer_id,
                         Self::rpc_id(),
@@ -351,11 +380,12 @@ pub trait LocustaCallable: AmRpc {
                         ),
                     )
                     .await?;
+                    inline_get(&mut resp, recv_ptr as *mut u8, recv_len);
                     return decode(resp);
                 }
                 let recv: &mut [u8] =
                     unsafe { std::slice::from_raw_parts_mut(recv_ptr as *mut u8, recv_len) };
-                let resp = watchdog(
+                let mut resp = watchdog(
                     "get",
                     &peer_id,
                     Self::rpc_id(),
@@ -363,6 +393,7 @@ pub trait LocustaCallable: AmRpc {
                     transport.send_get(&peer_id, Self::rpc_id(), &header_only, recv),
                 )
                 .await?;
+                inline_get(&mut resp, recv_ptr as *mut u8, recv_len);
                 decode(resp)
             }
             AmRpcCallType::PutGet => Err(RpcError::HandlerError(
